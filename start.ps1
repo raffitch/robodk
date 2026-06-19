@@ -40,13 +40,25 @@ function Stop-PriorInstances {
 
 function Open-Browser($url) {
     # Wait (in the background) for the port to accept connections, then open the
-    # default browser — so we don't open before the server is listening.
+    # default browser — so we don't open before the server is listening. Tries
+    # both IPv4/IPv6 localhost, waits up to ~60s, and falls back to explorer.
     $port = ([uri]$url).Port
     Start-Job -ArgumentList $url, $port -ScriptBlock {
         param($url, $port)
-        for ($i = 0; $i -lt 60; $i++) {
-            try { (New-Object Net.Sockets.TcpClient).Connect('localhost', $port); Start-Process $url; break }
-            catch { Start-Sleep -Milliseconds 500 }
+        function Test-Up($p) {
+            foreach ($h in @('127.0.0.1', 'localhost')) {
+                try { $c = New-Object Net.Sockets.TcpClient; $c.Connect($h, $p); $u = $c.Connected; $c.Close()
+                      if ($u) { return $true } } catch {}
+            }
+            return $false
+        }
+        for ($i = 0; $i -lt 120; $i++) {
+            if (Test-Up $port) {
+                Start-Sleep -Milliseconds 600   # let the server finish standing up
+                try { Start-Process $url } catch { try { Start-Process explorer.exe $url } catch {} }
+                return
+            }
+            Start-Sleep -Milliseconds 500
         }
     } | Out-Null
 }

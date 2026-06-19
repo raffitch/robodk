@@ -33,6 +33,7 @@ class CalibrationParams:
     holdout_count: int | None = None    # override config.calibration.holdout_count
     refine: bool | None = None          # override config.calibration.refine
     save_frames: bool = True
+    mode: str = "calibrate"             # "calibrate" | "preview" (generate poses only)
 
 
 @dataclass
@@ -82,27 +83,24 @@ class CalibrationJob:
 
         stamp = time.strftime("%Y%m%d-%H%M%S")
         run_dir = new_run_dir("calibration", stamp)
+        preview = self.params.mode == "preview"
 
         try:
             # --- NEUTRAL: frame the board, derive the working distance -------
-            ctx.progress(0, ccfg.pose_count, f"moving to {neutral}")
-            rdk.move_j(neutral)
-            time.sleep(ccfg.settle_s)
-            seed_frame = cam.grab()
-            seed_det = board.detect(seed_frame.color, K, dist,
-                                    min_corners=ccfg.min_charuco_corners)
-            if seed_det is None:
-                raise RuntimeError(
-                    f"ChArUco board not visible at {neutral} — reposition the board "
-                    f"or the {neutral} pose so the camera sees it, then retry")
-            self._emit_frame(ctx, board.annotate(seed_frame.color, seed_det, K, dist,
-                                                 f"{neutral} (board OK)"))
-            look = float(np.linalg.norm(seed_det.t_target2cam))
-            ctx.log(f"board visible at {neutral}; working distance ~{look:.0f} mm")
-            seed_T = rdk.tcp_pose_T()
+            seed_T, look = self._goto_neutral(ctx, rdk, cam, board, K, dist, neutral)
 
             # --- plan reachable viewpoints + create temp targets -------------
             poses = self._plan_poses(ctx, rdk, seed_T, look)
+
+            if preview:
+                # Stop here: the temp targets are left in the station so the user
+                # can inspect (and jog through) them in RoboDK before committing.
+                msg = (f"Generated {len(poses)} reachable poses around {neutral}. "
+                       f"Inspect them in RoboDK (named TasniCalib_*), then Run "
+                       f"calibration — or Clear poses.")
+                ctx.log(msg)
+                return {"mode": "preview", "n_poses": len(poses), "can_apply": False,
+                        "summary": msg, "poses": [n for n, _ in poses]}
 
             # --- capture -----------------------------------------------------
             views, skipped = self._capture(ctx, rdk, cam, board, K, dist,
@@ -139,24 +137,48 @@ class CalibrationJob:
                 report=report.to_dict(), summary=summary, run_dir=str(run_dir),
                 tool_name=self.tool_name, n_captured=len(views), n_skipped=skipped)
             return {
+                "mode": "calibrate",
                 "summary": summary, "report": report.to_dict(), "run_dir": str(run_dir),
                 "tool_name": self.tool_name, "n_captured": len(views),
                 "n_skipped": skipped, "can_apply": True,
             }
         finally:
-            # Always clean up temp targets and park at NEUTRAL.
-            if self._temp_targets:
-                ctx.log(f"removing {len(self._temp_targets)} temporary targets")
-                rdk.delete_items(self._temp_targets)
-                self._temp_targets = []
-            try:
-                rdk.move_j(neutral)
-            except Exception:
-                pass
+            # A calibrate run cleans up its temp targets and parks at NEUTRAL. A
+            # preview deliberately LEAVES the targets for inspection in RoboDK.
+            if not preview:
+                if self._temp_targets:
+                    ctx.log(f"removing {len(self._temp_targets)} temporary targets")
+                    rdk.delete_items(self._temp_targets)
+                    self._temp_targets = []
+                try:
+                    rdk.move_j(neutral)
+                except Exception:
+                    pass
 
     # -- helpers ------------------------------------------------------------
+    def _goto_neutral(self, ctx, rdk, cam, board, K, dist, neutral):
+        """Move to NEUTRAL, confirm the board is visible, return (seed pose,
+        working distance derived from the board detection)."""
+        ccfg = self.services.config.calibration
+        ctx.progress(0, ccfg.pose_count, f"moving to {neutral}")
+        rdk.move_j(neutral)
+        time.sleep(ccfg.settle_s)
+        frame = cam.grab()
+        det = board.detect(frame.color, K, dist, min_corners=ccfg.min_charuco_corners)
+        if det is None:
+            raise RuntimeError(
+                f"ChArUco board not visible at {neutral} — reposition the board or "
+                f"the {neutral} pose so the camera sees it, then retry")
+        self._emit_frame(ctx, board.annotate(frame.color, det, K, dist, f"{neutral} (board OK)"))
+        look = float(np.linalg.norm(det.t_target2cam))
+        ctx.log(f"board visible at {neutral}; working distance ~{look:.0f} mm")
+        return rdk.tcp_pose_T(), look
+
     def _plan_poses(self, ctx, rdk, seed_T, look):
         ccfg = self.services.config.calibration
+        prior = rdk.list_targets("TasniCalib_")        # clear leftovers from a prior preview/run
+        if prior:
+            rdk.delete_items(prior)
         candidates = generate_calibration_poses(
             seed_T, count=ccfg.pose_count, look_distance_mm=look,
             cone_half_angle_deg=ccfg.cone_half_angle_deg,

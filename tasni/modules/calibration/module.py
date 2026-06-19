@@ -158,13 +158,32 @@ class CalibrationModule(WorkflowModule):
         def run(body: RunBody) -> dict:
             if services.jobs.running:
                 raise HTTPException(409, "a job is already running")
-            params = CalibrationParams(
-                holdout_count=body.holdout_count,
-                refine=body.refine,
-            )
+            params = CalibrationParams(holdout_count=body.holdout_count,
+                                       refine=body.refine, mode="calibrate")
             self._active_job = CalibrationJob(services, params)
             services.jobs.start(self._active_job, name="calibration")
             return {"status": "started"}
+
+        @router.post("/poses/preview")
+        def poses_preview() -> dict:
+            """Generate the calibration poses and leave them in RoboDK as
+            TasniCalib_* targets to inspect — moves to NEUTRAL but does NOT
+            capture or solve."""
+            if services.jobs.running:
+                raise HTTPException(409, "a job is already running")
+            self._active_job = CalibrationJob(services, CalibrationParams(mode="preview"))
+            services.jobs.start(self._active_job, name="pose-preview")
+            return {"status": "started"}
+
+        @router.post("/poses/clear")
+        def poses_clear() -> dict:
+            """Delete the generated TasniCalib_* targets from the station."""
+            try:
+                existing = services.rdk.list_targets("TasniCalib_")
+                services.rdk.delete_items(existing)
+                return {"cleared": len(existing)}
+            except Exception as e:
+                raise HTTPException(503, f"RoboDK unavailable: {e}")
 
         @router.post("/cancel")
         def cancel() -> dict:

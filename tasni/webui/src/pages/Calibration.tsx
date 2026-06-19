@@ -21,8 +21,15 @@ interface Report {
   board_consistency_mm: { rms: number; max: number };
 }
 interface RunResult {
-  summary: string; report: Report; run_dir: string;
-  tool_name: string | null; n_captured: number; n_skipped: string[]; can_apply: boolean;
+  mode?: string;
+  summary: string;
+  report?: Report;
+  run_dir?: string;
+  tool_name?: string;
+  n_captured?: number;
+  n_poses?: number;
+  n_skipped?: string[];
+  can_apply: boolean;
 }
 
 const band = (px: number) => (px < 1 ? "good" : px < 3 ? "warn" : "bad");
@@ -116,6 +123,21 @@ export default function Calibration() {
       await api.post("/run", { holdout_count: holdout, refine });
     } catch (e: any) { addLog("run: " + e.message, true); setRunning(false); }
   };
+  const previewPoses = async () => {
+    if (!window.confirm("This moves the real robot to NEUTRAL and generates the calibration "
+        + "poses in RoboDK (no capture, no solve) so you can inspect them. Cell clear?")) return;
+    setLogs([]); setResult(null); setCanApply(false); setPct(0);
+    setStatus("generating poses…"); setRunning(true);
+    try {
+      await api.post("/poses/preview");
+    } catch (e: any) { addLog("preview: " + e.message, true); setRunning(false); }
+  };
+  const clearPoses = async () => {
+    try {
+      const r = await api.post<{ cleared: number }>("/poses/clear");
+      addLog(`cleared ${r.cleared} generated poses from RoboDK.`);
+    } catch (e: any) { addLog("clear: " + e.message, true); }
+  };
   const cancel = () => api.post("/cancel").catch(() => {});
   const apply = async () => {
     try {
@@ -197,9 +219,14 @@ export default function Calibration() {
         </div>
         <div className="btn-row">
           <button onClick={run} disabled={running || !ready}>Run calibration</button>
+          <button className="secondary" onClick={previewPoses} disabled={running || !ready}>Preview poses</button>
+          <button className="secondary" onClick={clearPoses} disabled={running || !ready}>Clear poses</button>
           <button className="secondary" onClick={cancel} disabled={!running}>Cancel</button>
         </div>
         {!ready && <div className="hint">Connect to RoboDK (top of page) to enable Run.</div>}
+        <div className="hint"><b>Preview poses</b> generates the {config?.calibration.pose_count ?? 15}
+          {" "}poses and shows them in RoboDK (as <code>TasniCalib_*</code>) so you can check them
+          before committing — no capture. <b>Clear poses</b> removes them.</div>
         <div className="hint">
           Moves to {config?.neutral_target ?? "NEUTRAL"}, auto-generates reachable poses around that
           view, captures + detects the board at each, solves TSAI, reports quality, then deletes the
@@ -217,8 +244,9 @@ export default function Calibration() {
 
       <div className="card">
         <h2>Quality metrics</h2>
-        {result ? <Metrics result={result} /> :
-          <div className="hint">Run a calibration to see reprojection and held-out validation errors.</div>}
+        {result?.report ? <Metrics result={result} />
+          : result ? <div className="ok-text">{result.summary}</div>
+          : <div className="hint">Run a calibration to see reprojection and held-out validation errors.</div>}
         <div className="btn-row">
           <button onClick={apply} disabled={!canApply}>Apply to tool</button>
         </div>
@@ -241,6 +269,7 @@ export default function Calibration() {
 
 function Metrics({ result }: { result: RunResult }) {
   const r = result.report;
+  if (!r) return null;
   const rows: [string, string, string][] = [
     ["Solver", "TSAI" + (r.refined ? " + reprojection refinement" : ""), ""],
     [`Train fit (${r.train.n_views} poses)`,
@@ -263,7 +292,7 @@ function Metrics({ result }: { result: RunResult }) {
           </tr>
         ))}
       </tbody></table>
-      {result.n_skipped.length > 0 &&
+      {result.n_skipped && result.n_skipped.length > 0 &&
         <div className="hint">Skipped (no board): {result.n_skipped.join(", ")}</div>}
       <div className="hint">Artifacts: <code>{result.run_dir}</code></div>
     </>

@@ -55,8 +55,12 @@ def _build_fakes():
             state["cam"] = seed_T if name == "NEUTRAL" else state["targets"][name]
         def tcp_pose_T(self): return state["cam"]
         def is_reachable(self, T): return True
+        def list_targets(self, prefix=""): return [n for n in state["targets"] if n.startswith(prefix)]
         def add_target(self, name, T): state["targets"][name] = T
-        def delete_items(self, names): FakeRdk.deleted = list(names)
+        def delete_items(self, names):
+            FakeRdk.deleted = list(names)
+            for n in names:
+                state["targets"].pop(n, None)
         def set_tool_pose(self, tool, T): FakeRdk.applied = (tool, T)
     rdk = FakeRdk()
 
@@ -116,6 +120,19 @@ def test_autogenerate_job():
         print("[auto job]\n" + result["summary"])
 
 
+def test_preview_mode_generates_but_does_not_solve():
+    services, rdk, _ = _build_fakes()
+    job = service_mod.CalibrationJob(services, service_mod.CalibrationParams(mode="preview"))
+    result = job(_Ctx())
+    assert result["mode"] == "preview"
+    assert result["n_poses"] == 15
+    assert result["can_apply"] is False
+    assert job.solved_X is None          # no solve in preview
+    assert rdk.deleted == []             # preview LEAVES the temp targets
+    print("[preview]", result["summary"])
+
+
 if __name__ == "__main__":
     test_autogenerate_job()
-    print("\nAuto-generate calibration job test passed.")
+    test_preview_mode_generates_but_does_not_solve()
+    print("\nAuto-generate + preview calibration job tests passed.")
