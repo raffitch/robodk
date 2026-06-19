@@ -67,10 +67,31 @@ Two relevant directories in `~`:
 `<I depth_len><I color_len><d timestamp>`, then `depth` (lz4-compressed `.npy`) +
 `color` (JPEG). Matches `receive_data()` in the macros.
 
-## How the server is actually started (THE way to use it)
-The server is launched **manually** by double-clicking a desktop shortcut on the Jetson
-(`~/Desktop/*.desktop`). Two variants, both run the venv Python
-(`~/EtherSenseServer/ethenv/bin/python`) against a script in `~/realsense-ethernet/`:
+## How the server is started — NOW a systemd service (2026-06-19)
+The camera server runs as a **systemd service** `realsense-camera` (auto-start on boot,
+auto-restart on crash). It runs `server/server_unicast_syncronous.py` from the monorepo
+clone at `~/robodk` under the Python 3.10 venv, and sets the fan to max on start.
+
+```bash
+# from the workstation (uses tools/jetson_deploy.py):
+python tools/jetson_deploy.py status     # active? listening on 1024? recent logs
+python tools/jetson_deploy.py deploy      # git pull ~/robodk + restart service
+python tools/jetson_deploy.py restart     # bounce the service
+python tools/jetson_deploy.py bootstrap   # (re)install the service (idempotent)
+
+# on the Jetson directly:
+sudo systemctl status realsense-camera
+journalctl -u realsense-camera -f
+```
+Unit file: `server/realsense-camera.service` (installed to
+`/etc/systemd/system/`). The Jetson tracks this repo's `main`; server code is in `server/`.
+The legacy `/etc/crontab` autostart (39 broken lines) has been removed
+(backup: `/etc/crontab.pre-cleanup.bak`).
+
+### Legacy manual start (fallback only — don't run alongside the service)
+The old desktop shortcuts still exist; both run the venv Python against a script in
+`~/realsense-ethernet/`. Don't use them while the systemd service is active — they'd fight
+over port 1024.
 
 - **"Jetson-Realsense Async Server"**
   ```
@@ -90,14 +111,15 @@ Jetson, or run the equivalent over SSH). The sync variant also force-cools the b
 `git pull`s the newest server code first.
 
 ## ⚠️ Things to know (affect scanning)
-1. **Server runs on-demand, not at boot.** Port 1024 is only open while a shortcut's
-   process is running. If nobody started it, scans fail to connect. (It was down during
-   the probe.)
-2. **Legacy autostart is dead — ignore it.** root's crontab + `AlwaysRunningServer.bash`
-   point at a non-existent `~/EtherSense` dir and a Python-2.7 path. If you ever want true
-   boot autostart, base it on the desktop-shortcut command above instead.
-3. **Flaky connectivity** — SSH to `10.12.171.70` timed out intermittently during probing
-   (needed retries). Scans depend on a stable link.
+1. **Server now auto-starts at boot** via systemd (`realsense-camera`) and restarts on
+   crash. Port 1024 should be open whenever the Jetson is up. ✅ (fixed 2026-06-19)
+2. **Legacy `/etc/crontab` autostart removed** — it was 39 broken lines pointing at a
+   non-existent `~/EtherSense` dir, spawning failing processes every minute. Gone.
+3. **Flaky connectivity** — SSH to `10.12.171.70` times out intermittently (the tooling
+   auto-reconnects/retries). Scans depend on a stable link — worth investigating the
+   physical/Wi-Fi link as a separate reliability item.
+4. **sudo password = login password** (`JETSON_SUDO_PASSWORD` in secrets); the `akuk` in
+   the old desktop shortcut was stale/wrong.
 4. **Two server variants** — async vs sync; both emit the same port-1024 frame format.
    Confirm which one your macros were validated against.
 
