@@ -78,6 +78,7 @@ def _build_fakes():
                                    depth=None, timestamp=0.0)
 
     class FakeBoard:
+        board_center = np.zeros(3)        # synthetic board points are centred at origin
         def __init__(self, cfg): pass
         def detect(self, image, K, dist, *, min_corners=6):
             from tasni.modules.calibration.handeye import reproject

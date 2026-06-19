@@ -11,6 +11,7 @@ so importing this module never hard-requires the native libjpeg-turbo build.
 """
 from __future__ import annotations
 
+import select
 import socket
 import struct
 from contextlib import contextmanager
@@ -77,12 +78,11 @@ class CameraClient:
             buf.extend(packet)
         return bytes(buf)
 
-    def _read_frame(self, sock: socket.socket, with_depth: bool) -> Frame:
-        """Read + decode exactly one frame from an already-connected socket.
-
-        The server always sends depth then color (depth precedes color in the
-        wire order), so we must receive the depth bytes even when we only want
-        color — we just skip *decoding* them."""
+    def _read_raw(self, sock: socket.socket) -> "tuple[bytes, bytes, float]":
+        """Read one frame's raw bytes (depth_raw, color_raw, timestamp) from an
+        already-connected socket, without decoding. The server always sends depth
+        then color, so we must receive the depth bytes even when discarding them
+        (for color-only the server sends depth_len=0)."""
         cfg = self.config
         try:
             header = self._recv_exact(sock, _HEADER.size)
@@ -93,6 +93,11 @@ class CameraClient:
             raise CameraError(f"camera timeout ({cfg.ip}:{cfg.port})") from e
         except OSError as e:
             raise CameraError(f"camera socket error: {e}") from e
+        return depth_raw, color_raw, timestamp
+
+    def _read_frame(self, sock: socket.socket, with_depth: bool) -> Frame:
+        """Read + decode exactly one frame from an already-connected socket."""
+        depth_raw, color_raw, timestamp = self._read_raw(sock)
         color = self._decode_color(color_raw)
         depth = self._decode_depth(depth_raw) if with_depth else None
         return Frame(color=color, depth=depth, timestamp=timestamp)
@@ -182,5 +187,19 @@ class _CameraStream:
         self._client = client
         self._sock = sock
 
-    def read(self, *, with_depth: bool = False) -> Frame:
-        return self._client._read_frame(self._sock, with_depth)
+    def read(self, *, with_depth: bool = False, drain: bool = False) -> Frame:
+        """Return the next frame. With ``drain=True``, first skip any frames
+        already buffered in the socket (reading their bytes but not decoding) and
+        return only the newest — this keeps the live preview at the live edge
+        instead of falling behind when the producer outruns the consumer."""
+        raw = self._client._read_raw(self._sock)
+        if drain:
+            for _ in range(64):     # safety cap; normally drains a few frames
+                ready, _, _ = select.select([self._sock], [], [], 0)
+                if not ready:
+                    break
+                raw = self._client._read_raw(self._sock)
+        depth_raw, color_raw, ts = raw
+        color = self._client._decode_color(color_raw)
+        depth = self._client._decode_depth(depth_raw) if with_depth else None
+        return Frame(color=color, depth=depth, timestamp=ts)

@@ -54,6 +54,10 @@ class CharucoTarget:
         )
         # All inner chessboard corners in board frame (mm), indexed by charuco id.
         self._all_obj = np.asarray(self.board.getChessboardCorners(), dtype=np.float32)
+        # Geometric centre of the board (board frame, mm). The board origin is a
+        # corner, so distance/aiming should reference this instead. Using the mean
+        # of all corners is robust to the origin convention.
+        self.board_center = self._all_obj.mean(axis=0).astype(np.float64)
 
     def detect(self, image: np.ndarray, K: np.ndarray, dist: np.ndarray,
                *, min_corners: int = 6) -> ViewDetection | None:
@@ -88,7 +92,11 @@ class CharucoTarget:
         out = image_bgr.copy()
         cv2.aruco.drawDetectedCornersCharuco(out, det.corners, det.ids)
         axis_len = max(1.5 * self.config.square_size_mm, 5.0)
-        cv2.drawFrameAxes(out, K, dist, det.rvec, det.tvec, axis_len)
+        # Draw the axes at the board CENTRE (not the corner origin) so the visual
+        # reference matches what the aiming gate measures.
+        R, _ = cv2.Rodrigues(det.rvec)
+        center_tvec = (R @ self.board_center + det.tvec.reshape(3)).reshape(3, 1)
+        cv2.drawFrameAxes(out, K, dist, det.rvec, center_tvec, axis_len)
         if label:
             cv2.putText(out, label, (40, 60), cv2.FONT_HERSHEY_SIMPLEX,
                         1.5, (0, 255, 0), 2, cv2.LINE_AA)

@@ -79,6 +79,20 @@ def test_offset_sign():
     assert g.offset[0] > 0.05 and abs(g.offset[1]) < 1e-3
 
 
+def test_board_center_reference():
+    # Board fronto-parallel with its CORNER origin on the optical axis at 450 mm.
+    det = _det(distance=450, tilt_deg=0)             # tvec = [0,0,450]
+    center = np.array([120.0, 90.0, 0.0])            # centre is 120mm right, 90mm down
+    g0 = evaluate_gate(det, K, (H, W), TH)                          # corner reference
+    gc = evaluate_gate(det, K, (H, W), TH, board_center_mm=center)  # centre reference
+    # corner sits on-axis -> centred; the centre is offset right + down
+    assert abs(g0.offset[0]) < 1e-6 and abs(g0.offset[1]) < 1e-6
+    assert gc.offset[0] > 0.05 and gc.offset[1] > 0.05
+    # jog deltas point at the centre; distance is to the centre (slightly > 450)
+    assert abs(gc.move_cam[0] - 120) < 1e-6 and abs(gc.move_cam[1] - 90) < 1e-6
+    assert gc.distance_mm > 450 and g0.distance_mm == 450
+
+
 if __name__ == "__main__":
     test_tilt_metric()
     test_all_green_when_ideal()
@@ -86,4 +100,5 @@ if __name__ == "__main__":
     test_angle_gate()
     test_corner_and_none_gates()
     test_offset_sign()
+    test_board_center_reference()
     print("All aiming-gate checks passed.")

@@ -105,24 +105,33 @@ def board_offset(t_target2cam: np.ndarray, K: np.ndarray,
 
 
 def evaluate_gate(det: ViewDetection | None, K: np.ndarray, image_shape: tuple,
-                  th: GateThresholds) -> GateReading:
+                  th: GateThresholds, board_center_mm: np.ndarray | None = None) -> GateReading:
     """Build the :class:`GateReading` for one frame (``det`` is ``None`` if the
-    board was not found)."""
+    board was not found).
+
+    ``board_center_mm`` is the board centre in the board frame; when given,
+    distance / centring / jog all reference the board CENTRE instead of the corner
+    origin (so aiming targets the middle of the board)."""
     if det is None:
         gates = {"detected": False, "distance": False, "angle": False}
         return GateReading(False, 0, None, None, None, gates, False,
                            th.ideal_distance_mm, th.distance_tol_mm, th.max_tilt_deg,
                            None, th.center_tol_mm)
 
+    R = np.asarray(det.R_target2cam, dtype=float)
     t = np.asarray(det.t_target2cam, dtype=float).reshape(3)
-    distance = float(np.linalg.norm(t))
-    tilt = board_tilt_deg(det.R_target2cam)
-    offset = board_offset(t, K, image_shape)
+    # Reference the board centre, not the corner origin, in the camera frame.
+    center = (R @ np.asarray(board_center_mm, dtype=float).reshape(3) + t
+              if board_center_mm is not None else t)
+    distance = float(np.linalg.norm(center))
+    tilt = board_tilt_deg(R)
+    offset = board_offset(center, K, image_shape)
 
-    # Translation to bring the board to (0, 0, ideal) in the camera frame, with
-    # optional per-axis sign flips to match the pendant's TOOL convention.
+    # Translation to bring the board centre to (0, 0, ideal) in the camera frame,
+    # with optional per-axis sign flips to match the pendant's TOOL convention.
     sx, sy, sz = (-1 if th.invert_x else 1), (-1 if th.invert_y else 1), (-1 if th.invert_z else 1)
-    move_cam = (sx * float(t[0]), sy * float(t[1]), sz * float(t[2] - th.ideal_distance_mm))
+    move_cam = (sx * float(center[0]), sy * float(center[1]),
+                sz * float(center[2] - th.ideal_distance_mm))
 
     gates = {
         "detected": det.n_corners >= th.min_corners,

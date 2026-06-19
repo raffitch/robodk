@@ -83,7 +83,8 @@ def generate_calibration_targets(services) -> dict:
     board = CharucoTarget(cfg.board)
     frame = cam.grab(color_only=True)
     det = board.detect(frame.color, K, dist, min_corners=ccfg.min_charuco_corners)
-    reading = evaluate_gate(det, K, frame.color.shape, gate_thresholds(ccfg))
+    reading = evaluate_gate(det, K, frame.color.shape, gate_thresholds(ccfg),
+                            board_center_mm=board.board_center)
 
     # Show the operator exactly the frame we judged.
     img = (board.annotate(frame.color, det, K, dist, "TARGET CREATION")

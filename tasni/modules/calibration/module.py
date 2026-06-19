@@ -122,7 +122,8 @@ class CalibrationModule(WorkflowModule):
 
             def analyze(frame):
                 det = board.detect(frame.color, K, dist, min_corners=cc.min_charuco_corners)
-                reading = evaluate_gate(det, K, frame.color.shape, th)
+                reading = evaluate_gate(det, K, frame.color.shape, th,
+                                        board_center_mm=board.board_center)
                 # corners + axes confirm detection; the HUD draws the status text.
                 img = (board.annotate(frame.color, det, K, dist, "")
                        if det is not None else frame.color)

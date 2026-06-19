@@ -69,7 +69,9 @@ class LivePreview:
             try:
                 with self.camera.stream(timeout=timeout_s, color_only=color_only) as stream:
                     while not self._stop.is_set():
-                        frame = stream.read()
+                        # drain to the newest buffered frame so the preview stays
+                        # at the live edge even if detection can't keep up
+                        frame = stream.read(drain=True)
                         jpeg, metrics = analyze(frame)
                         self.last = metrics
                         self.bus.publish(JobEvent("frame",
