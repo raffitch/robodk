@@ -54,6 +54,28 @@ repo, and known operational issues are in **[docs/jetson-scanner.md](docs/jetson
 - Re-probe the device: `python tools/jetson_probe.py`
 - Credentials live in `secrets/jetson.env` (**git-ignored — never commit**).
 
+### Jetson camera server (now a monorepo + systemd service)
+The Jetson server code is vendored here in **[server/](server/)** (was a separate repo).
+It runs as a systemd service `realsense-camera` (auto-start on boot). Manage from here:
+```
+python tools/jetson_deploy.py status     # active? listening on 1024? logs
+python tools/jetson_deploy.py deploy      # push, then this: git pull on Jetson + restart
+python tools/jetson_deploy.py bootstrap   # (re)install the service (idempotent)
+```
+The Jetson clones THIS repo to `~/robodk` and tracks `main`. So: **one repo** — push here,
+then `deploy`. See [docs/jetson-scanner.md](docs/jetson-scanner.md).
+
+## Roadmap / status (updated 2026-06-19)
+- ✅ Extract macros → monorepo → GitHub (private: `raffitch/robodk`)
+- ✅ Best-practices research → [docs/best-practices-review.md](docs/best-practices-review.md)
+- ✅ **#2 Jetson hardening**: monorepo, systemd service, deploy tool, cron cleanup
+- ⏭️ **#1 NEXT: calibration app** — refactor `macros/AutoCalibrate.py` into an `rdkscan/`
+  shared library (camera client, ChArUco, RoboDK I/O) + a GUI, and **add calibration
+  quality metrics** (reprojection error + held-out validation poses) per the research.
+  Keep TSAI solver; do NOT switch to PARK. This is the seed the scan app reuses later.
+- Deferred: TSDF fusion (biggest scan-quality win), RealSense High-Accuracy preset +
+  filter order (both in `server/server_unicast_syncronous.py`), Tailscale for off-LAN.
+
 ## Notes
 - Requires the `robodk` package (installed under Python 3.10) and RoboDK at `C:\RoboDK`.
 - Loading the 117 MB station takes a minute or two per script run — expected.
