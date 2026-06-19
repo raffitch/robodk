@@ -10,6 +10,11 @@ secrets/
 __pycache__/
 *.pyc
 .venv/
+*.egg-info/
+
+# tasni app: per-run calibration/scan artifacts + local config overrides
+runs/
+tasni.config.json
 
 # RoboDK temp
 *.rdk.bak

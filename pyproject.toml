@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tasni"
+version = "0.1.0"
+description = "Robotic-fabrication control platform on RoboDK — pluggable workflow modules on a shared core (calibration is module #1)."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-contrib-python",   # cv2.aruco (ChArUco) lives in contrib
+    "scipy",                   # post-solve reprojection refinement
+    "robodk",                  # RoboDK Python API (robolink + robomath)
+    "fastapi",
+    "uvicorn[standard]",
+    "lz4",                     # depth frame decompression (scan module)
+    "PyTurboJPEG",             # fast JPEG decode (optional; falls back to cv2)
+]
+
+[project.scripts]
+tasni = "tasni.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["tasni*"]
