@@ -118,8 +118,8 @@ Jetson, or run the equivalent over SSH). The sync variant also force-cools the b
 3. **Flaky connectivity** — SSH to `10.12.171.70` times out intermittently (the tooling
    auto-reconnects/retries). Scans depend on a stable link — worth investigating the
    physical/Wi-Fi link as a separate reliability item.
-4. **sudo password = login password** (`JETSON_SUDO_PASSWORD` in secrets); the `akuk` in
-   the old desktop shortcut was stale/wrong.
+4. **sudo password = login password** (`JETSON_SUDO_PASSWORD` in secrets); the password
+   hardcoded in the old desktop shortcut was stale/wrong.
 4. **Two server variants** — async vs sync; both emit the same port-1024 frame format.
    Confirm which one your macros were validated against.
 
