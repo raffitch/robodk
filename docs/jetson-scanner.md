@@ -67,27 +67,39 @@ Two relevant directories in `~`:
 `<I depth_len><I color_len><d timestamp>`, then `depth` (lz4-compressed `.npy`) +
 `color` (JPEG). Matches `receive_data()` in the macros.
 
-## ⚠️ Operational issues found (affect scanning today)
-1. **Server is NOT running** — nothing was listening on port 1024 during the probe.
-   A scan/calibration would fail to connect until the server is started.
-2. **Autostart is likely broken** — root's crontab launches
-   `cd /home/jetson/EtherSense; ./AlwaysRunningServer.bash`, but the directory is
-   `EtherSense**Server**` (no `~/EtherSense` exists), so the `cd` fails.
-3. **`AlwaysRunningServer.bash` is stale** — it runs `python EtherSenseServer.py` with a
-   **Python 2.7** `PYTHONPATH`, but the working stack is Python 3.10 + librealsense 2.55.
-   The real production server is almost certainly one of the `server_unicast_*` scripts
-   in `~/realsense-ethernet/`, started another way (or manually).
-4. **Flaky connectivity** — one SSH attempt timed out during probing; scans depend on a
-   stable link to `10.12.171.70`.
+## How the server is actually started (THE way to use it)
+The server is launched **manually** by double-clicking a desktop shortcut on the Jetson
+(`~/Desktop/*.desktop`). Two variants, both run the venv Python
+(`~/EtherSenseServer/ethenv/bin/python`) against a script in `~/realsense-ethernet/`:
 
-### To start the server manually (until autostart is fixed)
-```bash
-ssh -i ~/.ssh/jetson_robodk jetson@10.12.171.70
-cd ~/realsense-ethernet
-# identify the live server variant, then run it under the py3.10 venv, e.g.:
-# source ~/EtherSenseServer/ethenv/bin/activate && python server_unicast_syncronous_dynamicRes.py
-```
-(Exact command TBD — needs confirming which variant is the production one.)
+- **"Jetson-Realsense Async Server"**
+  ```
+  ~/EtherSenseServer/ethenv/bin/python ~/realsense-ethernet/server_unicast_asyncio.py
+  ```
+- **"Jetson-Realsense Sync Server"** (the fuller / primary one):
+  ```bash
+  echo '<sudo-pw>' | sudo -S sh -c 'echo 255 > /sys/devices/pwm-fan/target_pwm' \  # fan -> 100%
+    && cd ~/realsense-ethernet && git pull \                                        # pull latest server code
+    && ~/EtherSenseServer/ethenv/bin/python ~/realsense-ethernet/server_unicast_syncronous.py
+  ```
+  (sudo password embedded in the shortcut; stored in `secrets/jetson.env` as
+  `JETSON_SUDO_PASSWORD`.)
+
+So before any scan/calibration: **start the server** (double-click the shortcut on the
+Jetson, or run the equivalent over SSH). The sync variant also force-cools the board and
+`git pull`s the newest server code first.
+
+## ⚠️ Things to know (affect scanning)
+1. **Server runs on-demand, not at boot.** Port 1024 is only open while a shortcut's
+   process is running. If nobody started it, scans fail to connect. (It was down during
+   the probe.)
+2. **Legacy autostart is dead — ignore it.** root's crontab + `AlwaysRunningServer.bash`
+   point at a non-existent `~/EtherSense` dir and a Python-2.7 path. If you ever want true
+   boot autostart, base it on the desktop-shortcut command above instead.
+3. **Flaky connectivity** — SSH to `10.12.171.70` timed out intermittently during probing
+   (needed retries). Scans depend on a stable link.
+4. **Two server variants** — async vs sync; both emit the same port-1024 frame format.
+   Confirm which one your macros were validated against.
 
 ## How to re-probe
 ```bash
