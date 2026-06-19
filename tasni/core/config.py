@@ -76,14 +76,18 @@ class RoboDKConfig:
     """How tasni talks to RoboDK and which cell items it drives."""
 
     robot_name: str = "KUKA KR150 R2700"
-    # "attach": use the running RoboDK GUI instance (default — it already has the
-    # station, targets and tool loaded). "isolated": private headless instance
-    # (used by tests / when no GUI is open) — see core.session.
+    # "attach": use the running RoboDK GUI instance (default). If it has no
+    # station with this robot loaded, the app opens `station_path` into it (so
+    # you don't end up driving an empty RoboDK). "isolated": private headless
+    # instance that loads station_path — used by tests / when no GUI is open.
     connection: str = "attach"
-    station_path: str | None = None     # only used by "isolated"
+    # The cell's RoboDK station; relative paths resolve against the repo root.
+    station_path: str | None = "Tasni.rdk"
+    station_name: str = "Tasni"          # station display name set after loading
     target_prefix: str = "Target"
     # "simulate" keeps the robot in RoboDK only; "run_robot" drives the real arm.
-    # Default to simulate for safety; the UI makes switching an explicit action.
+    # Calibration needs the real arm to move (the camera rides on it), so the UI
+    # defaults a calibration run to run_robot; this is just the fallback default.
     run_mode: str = "simulate"
 
 

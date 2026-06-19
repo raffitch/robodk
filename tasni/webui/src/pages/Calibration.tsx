@@ -35,6 +35,7 @@ export default function Calibration() {
   const [holdout, setHoldout] = useState(3);
   const [refine, setRefine] = useState(true);
 
+  const [runMode, setRunMode] = useState("run_robot");   // calibration defaults to the real arm
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState("idle");
   const [pct, setPct] = useState(0);
@@ -90,10 +91,14 @@ export default function Calibration() {
   }, [subscribe]);
 
   const run = async () => {
+    if (runMode === "run_robot" &&
+        !window.confirm("This will physically move the real robot through every calibration "
+          + "pose. Make sure the cell is clear. Continue?")) return;
     setLogs([]); setResult(null); setCanApply(false); setPct(0);
     setStatus("starting…"); setRunning(true);
     try {
-      await api.post("/run", { tool_name: tool || null, holdout_count: holdout, refine });
+      await api.post("/run", { tool_name: tool || null, holdout_count: holdout, refine,
+                               run_mode: runMode });
     } catch (e: any) { addLog("run: " + e.message, true); setRunning(false); }
   };
   const cancel = () => api.post("/cancel").catch(() => {});
@@ -117,12 +122,6 @@ export default function Calibration() {
         {config && (
           <div className="kv">
             <div className="k">Robot</div><div className="v">{config.robot}</div>
-            <div className="k">Run mode</div>
-            <div className="v">
-              <span className={"badge " + (config.run_mode === "run_robot" ? "bad" : "good")}>
-                {config.run_mode === "run_robot" ? "real robot" : "simulate"}
-              </span>
-            </div>
             <div className="k">Camera</div>
             <div className="v">{config.camera.ip}:{config.camera.port} @ {config.camera.resolution}</div>
             <div className="k">Board</div>
@@ -136,8 +135,15 @@ export default function Calibration() {
           <div className="field">
             <label>Tool to calibrate</label>
             <select value={tool} onChange={(e) => setTool(e.target.value)}>
-              {tools.length === 0 && <option value="">(RoboDK unavailable)</option>}
+              {tools.length === 0 && <option value="">(connect to RoboDK)</option>}
               {tools.map((t) => <option key={t}>{t}</option>)}
+            </select>
+          </div>
+          <div className="field">
+            <label>Robot motion</label>
+            <select value={runMode} onChange={(e) => setRunMode(e.target.value)}>
+              <option value="run_robot">Real robot</option>
+              <option value="simulate">Simulate (dry run)</option>
             </select>
           </div>
           <div className="field">
@@ -149,6 +155,16 @@ export default function Calibration() {
             <label><input type="checkbox" checked={refine}
               onChange={(e) => setRefine(e.target.checked)} /> Reprojection refinement</label>
           </div>
+        </div>
+        {runMode === "run_robot"
+          ? <div className="warn-text" style={{ marginTop: 8, fontSize: 12 }}>
+              ⚠ Real robot: Run will physically move the KUKA through every pose. Clear the cell.
+            </div>
+          : <div className="hint">Simulate moves the robot in RoboDK only — the camera view
+              won't change, so use this only for a dry run of the flow, not a real calibration.</div>}
+        <div className="hint">
+          Held-out poses validate the fit on data the solver never saw. Typical: ~12–20 total
+          poses, hold out 3–5. (Need at least holdout + 3 to solve.)
         </div>
         <div className="btn-row">
           <button onClick={run} disabled={running}>Run calibration</button>
@@ -187,7 +203,7 @@ export default function Calibration() {
         </div>
       </div>
        </div>
-       <CalibrationGuide onConfigChanged={loadConfig} />
+       <CalibrationGuide runMode={runMode} onConfigChanged={loadConfig} />
       </div>
     </div>
   );

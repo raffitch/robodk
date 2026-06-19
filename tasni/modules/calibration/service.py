@@ -28,6 +28,7 @@ class CalibrationParams:
     tool_name: str | None = None        # tool to write the result into (apply step)
     holdout_count: int | None = None    # override config.calibration.holdout_count
     refine: bool | None = None          # override config.calibration.refine
+    run_mode: str | None = None         # "run_robot" (real) or "simulate"; UI defaults real
     save_frames: bool = True
 
 
@@ -64,8 +65,9 @@ class CalibrationJob:
         do_refine = (self.params.refine if self.params.refine is not None
                      else cfg.calibration.refine)
 
-        rdk.apply_run_mode()
-        ctx.log(f"run mode: {cfg.robodk.run_mode}")
+        applied_mode = rdk.apply_run_mode(self.params.run_mode)
+        ctx.log(f"run mode: {applied_mode}"
+                + ("  (REAL ROBOT)" if applied_mode == "run_robot" else "  (simulation)"))
         targets = rdk.list_targets()
         if not targets:
             raise RuntimeError(f"no targets found with prefix "

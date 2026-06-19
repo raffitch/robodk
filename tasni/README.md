@@ -21,9 +21,11 @@ py -3.10 tests\test_calibration_job.py         # job checks (fake hardware)
 ```
 
 The browser lands on the **Dashboard** (cell status + module cards); pick
-Calibration (or a future module) from there. Have RoboDK open with the station
-loaded (the `Target*` poses + the tool) before a real run — in `attach` mode the
-app binds your running RoboDK; the Jetson camera server must be up on TCP 1024.
+Calibration (or a future module) from there. The calibration guide's **Open Tasni
+station** button loads `Tasni.rdk` into RoboDK (so you're never driving an empty
+station); the Jetson camera server must be up on TCP 1024. Calibration defaults to
+**real-robot** motion (the camera rides on the arm, so it must move) — there's a
+confirm before it moves, and a Simulate option for a dry run of the flow.
 
 ## Architecture
 

@@ -41,12 +41,13 @@ class RdkIO:
     def robot(self):
         return self.rdk.Item(self.session.config.robot_name)
 
-    def apply_run_mode(self) -> None:
-        """Push the configured run mode (simulate vs drive the real arm)."""
-        mode = (self.RUNMODE_RUN_ROBOT
-                if self.session.config.run_mode == "run_robot"
-                else self.RUNMODE_SIMULATE)
-        self.rdk.setRunMode(mode)
+    def apply_run_mode(self, mode: str | None = None) -> str:
+        """Push the run mode (``"simulate"`` or ``"run_robot"``). ``mode`` overrides
+        the configured default. Returns the mode that was applied."""
+        mode = mode or self.session.config.run_mode
+        self.rdk.setRunMode(self.RUNMODE_RUN_ROBOT if mode == "run_robot"
+                            else self.RUNMODE_SIMULATE)
+        return mode
 
     def list_targets(self, prefix: str | None = None) -> list[str]:
         """Sorted names of TARGET items, filtered by ``prefix``."""

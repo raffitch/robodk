@@ -23,10 +23,15 @@ class RunBody(BaseModel):
     tool_name: str | None = None
     holdout_count: int | None = None
     refine: bool | None = None
+    run_mode: str | None = None        # "run_robot" (real) or "simulate"
 
 
 class BoardBody(BaseModel):
     page: str = "A4"
+
+
+class PreviewBody(BaseModel):
+    run_mode: str | None = None
 
 
 class CalibrationModule(WorkflowModule):
@@ -74,6 +79,61 @@ class CalibrationModule(WorkflowModule):
             except Exception as e:
                 raise HTTPException(503, f"RoboDK unavailable: {e}")
 
+        @router.post("/connect")
+        def connect() -> dict:
+            """Open the cell's station (loads Tasni.rdk if RoboDK came up empty)
+            and report what's there. First load of the ~117 MB station is slow."""
+            try:
+                targets = services.rdk.list_targets()
+                tools = services.rdk.list_tools()
+                robot_ok = services.rdk.robot().Valid()
+                return {"connected": True, "robot": services.config.robodk.robot_name,
+                        "robot_valid": robot_ok, "n_targets": len(targets),
+                        "targets": targets, "tools": tools}
+            except Exception as e:
+                raise HTTPException(503, f"RoboDK unavailable: {e}")
+
+        @router.post("/preview")
+        def preview(body: PreviewBody) -> dict:
+            """Move to the first calibration pose and grab one frame so the user
+            can confirm the board is in view. Publishes the annotated frame to the
+            live preview; returns whether the board was detected."""
+            if services.jobs.running:
+                raise HTTPException(409, "a calibration run is in progress")
+            import base64
+
+            import cv2
+
+            from ...core.events import JobEvent
+            from .charuco import CharucoTarget
+            try:
+                targets = services.rdk.list_targets()
+                if not targets:
+                    raise HTTPException(400, "no calibration targets in the station")
+                mode = services.rdk.apply_run_mode(body.run_mode)
+                first = targets[0]
+                services.bus.publish(JobEvent("log",
+                    {"message": f"preview: moving to {first} ({mode})"}))
+                services.rdk.move_j(first)
+                frame = services.camera.grab()
+                board = CharucoTarget(services.config.board)
+                det = board.detect(frame.color, services.config.camera.K,
+                                   services.config.camera.dist,
+                                   min_corners=services.config.calibration.min_charuco_corners)
+                img = (board.annotate(frame.color, det, services.config.camera.K,
+                                      services.config.camera.dist, f"{first} (preview)")
+                       if det is not None else frame.color)
+                ok, jpeg = cv2.imencode(".jpg", img)
+                if ok:
+                    services.bus.publish(JobEvent("frame",
+                        {"jpeg_b64": base64.b64encode(jpeg.tobytes()).decode("ascii")}))
+                return {"target": first, "detected": det is not None,
+                        "n_corners": det.n_corners if det is not None else 0}
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(503, f"preview failed: {e}")
+
         # -- calibration board (print-it-yourself) --------------------------
         @router.get("/board/spec")
         def board_spec(page: str = "A4") -> dict:
@@ -119,6 +179,7 @@ class CalibrationModule(WorkflowModule):
                 tool_name=body.tool_name,
                 holdout_count=body.holdout_count,
                 refine=body.refine,
+                run_mode=body.run_mode,
             )
             self._active_job = CalibrationJob(services, params)
             services.jobs.start(self._active_job, name="calibration")

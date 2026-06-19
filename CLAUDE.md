@@ -1,6 +1,7 @@
-# RoboDK station: 241113_AutoScan
+# RoboDK station: Tasni
 
-This folder is the editable working copy of the Python inside `241113_AutoScan.rdk`,
+This folder is the editable working copy of the Python inside `Tasni.rdk`
+(renamed from `241113_AutoScan.rdk`),
 a ~117 MB RoboDK **binary** station. The station drives a **KUKA KR150 R2700** with an
 Intel **RealSense** camera for ArUco-referenced **Open3D** 3D auto-scanning.
 
@@ -11,13 +12,13 @@ scripts below extract that Python to `macros/*.py` (editable here) and push edit
 
 1. **Extract** embedded macros to `macros/*.py` (overwrites them from the station):
    ```
-   python rdk_extract.py "241113_AutoScan.rdk"
+   python rdk_extract.py "Tasni.rdk"
    ```
 2. **Edit** the files in `macros/` (this is the real work; git tracks it).
 3. **Sync** edits back into the station:
    ```
-   python rdk_sync.py "241113_AutoScan.rdk"            # -> 241113_AutoScan.synced.rdk (safe)
-   python rdk_sync.py "241113_AutoScan.rdk" --inplace  # overwrite the source .rdk
+   python rdk_sync.py "Tasni.rdk"            # -> 241113_AutoScan.synced.rdk (safe)
+   python rdk_sync.py "Tasni.rdk" --inplace  # overwrite the source .rdk
    ```
 4. **Open the resulting `.rdk` in RoboDK yourself** to run/simulate.
 
@@ -44,7 +45,7 @@ your interactive session.
 
 - `rdk_extract.py` / `rdk_sync.py` are **read-only on the source `.rdk`** unless you pass
   `--inplace`. Default output is a separate `*.synced.rdk`.
-- Always keep a backup of `241113_AutoScan.rdk` before using `--inplace`.
+- Always keep a backup of `Tasni.rdk` before using `--inplace`.
 
 ## Hardware: the 3D scanner (Jetson + RealSense)
 The scan/calibration macros are **clients** of a RealSense D435i on a Jetson Nano that
@@ -92,7 +93,8 @@ platform. Backend = FastAPI (`tasni/webapp`, API-only + serves the build);
 frontend = **React + Vite + TypeScript** (`tasni/webui`) with a **Dashboard**
 landing and per-module pages (calibration is one module, not the front door).
 Package name: **`tasni`**. RoboDK connection mode: **`attach`** (binds the running
-GUI, which already has the station/targets/tool loaded). Run it on Windows with
+GUI; if it has no station with the robot, the app opens **`Tasni.rdk`** into it so
+you drive the real cell, not an empty station). Run it on Windows with
 **`.\start.ps1`** (or `start.bat`); dev = backend + Vite hot-reload on :5173,
 `.\start.ps1 prod` builds + serves on :8000. (`start.sh` is the Git Bash equivalent.)
 

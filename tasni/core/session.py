@@ -14,6 +14,7 @@ unit tests) import without RoboDK installed.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .config import RoboDKConfig
@@ -22,6 +23,18 @@ if TYPE_CHECKING:  # pragma: no cover
     from robolink import Robolink
 
 ISOLATED_ARGS = ["-NEWINSTANCE", "-NOUI", "-SKIPINI", "-EXIT_LAST_COM"]
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_station_path(station_path: str | None) -> Path | None:
+    """Resolve a configured station path (relative -> repo root). None if unset
+    or missing on disk."""
+    if not station_path:
+        return None
+    p = Path(station_path)
+    if not p.is_absolute():
+        p = _REPO_ROOT / p
+    return p if p.exists() else None
 
 
 class RdkSession:
@@ -33,9 +46,11 @@ class RdkSession:
 
     @property
     def rdk(self) -> "Robolink":
-        """The live ``Robolink`` handle, connecting on first access."""
+        """The live ``Robolink`` handle, connecting (and loading the station on
+        first access)."""
         if self._rdk is None:
             self._rdk = self._connect()
+            self._ensure_station(self._rdk)
         return self._rdk
 
     def _connect(self) -> "Robolink":
@@ -43,12 +58,27 @@ class RdkSession:
 
         if self.config.connection == "isolated":
             rdk = Robolink(args=ISOLATED_ARGS, quit_on_close=True)
-            if self.config.station_path:
-                rdk.AddFile(self.config.station_path)
+            station = resolve_station_path(self.config.station_path)
+            if station:
+                rdk.AddFile(str(station))
             return rdk
         # "attach": default constructor binds to a running instance (starts one
         # with a window if none is running).
         return Robolink()
+
+    def _ensure_station(self, rdk: "Robolink") -> None:
+        """If the configured robot isn't present (e.g. RoboDK opened empty),
+        open the cell's station file into this instance so the app drives the
+        real cell instead of a blank station. No-op if it's already loaded."""
+        station = resolve_station_path(self.config.station_path)
+        if station is None:
+            return
+        if rdk.Item(self.config.robot_name).Valid():
+            return  # station with our robot already loaded — don't reload
+        rdk.AddFile(str(station))
+        active = rdk.ActiveStation()
+        if active.Valid():
+            active.setName(self.config.station_name)
 
     def close(self) -> None:
         if self._rdk is not None:

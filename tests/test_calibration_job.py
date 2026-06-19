@@ -45,7 +45,7 @@ def _build_fakes():
 
     class FakeRdk:
         applied_tool = None
-        def apply_run_mode(self): pass
+        def apply_run_mode(self, mode=None): return mode or "simulate"
         def list_targets(self): return [v.name for v in views]
         def move_j(self, name): state["current"] = name
         def target_pose_T(self, name): return by_name[name].T_base_gripper
