@@ -25,10 +25,6 @@ class RunBody(BaseModel):
     refine: bool | None = None
 
 
-class BoardBody(BaseModel):
-    page: str = "A4"
-
-
 class CalibrationModule(WorkflowModule):
     id = "calibration"
     title = "Calibration"
@@ -139,16 +135,15 @@ class CalibrationModule(WorkflowModule):
         # -- calibration board (print-it-yourself) --------------------------
         @router.get("/board/spec")
         def board_spec(page: str = "A4") -> dict:
-            from .board_pdf import compute_spec
-            spec = compute_spec(services.config.board, page)
-            cur = services.config.board
-            spec_d = spec.to_dict()
-            # Does the live detection config already match this printed size?
-            spec_d["matches_config"] = (
-                abs(cur.square_size_mm - spec.square_size_mm) < 1e-6
-                and abs(cur.marker_size_mm - spec.marker_size_mm) < 1e-6)
-            spec_d["pages"] = ["A4", "A3", "Letter"]
-            return spec_d
+            from .board_pdf import board_spec as _spec
+            return _spec(services.config.board, page).to_dict()
+
+        @router.get("/board.png")
+        def board_png():
+            from .board_pdf import render_png
+            return Response(render_png(services.config.board),
+                            media_type="image/png",
+                            headers={"Cache-Control": "no-store"})
 
         @router.get("/board.pdf")
         def board_pdf(page: str = "A4", download: bool = False):
@@ -158,20 +153,6 @@ class CalibrationModule(WorkflowModule):
             fname = f"charuco_{spec.squares_x}x{spec.squares_y}_{spec.square_size_mm}mm_{page}.pdf"
             return Response(pdf, media_type="application/pdf",
                             headers={"Content-Disposition": f'{disp}; filename="{fname}"'})
-
-        @router.post("/board/use")
-        def board_use(body: BoardBody) -> dict:
-            """Sync the printed board's dimensions into the calibration config
-            (in memory + persisted) so detection matches what was printed."""
-            from .board_pdf import compute_spec
-            from ...core.config import save_overrides
-            spec = compute_spec(services.config.board, body.page)
-            b = services.config.board
-            b.square_size_mm = spec.square_size_mm
-            b.marker_size_mm = spec.marker_size_mm
-            save_overrides({"board": {"square_size_mm": b.square_size_mm,
-                                      "marker_size_mm": b.marker_size_mm}})
-            return {"applied": True, "board": vars(b)}
 
         @router.post("/run")
         def run(body: RunBody) -> dict:

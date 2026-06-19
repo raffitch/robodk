@@ -118,6 +118,8 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .check-txt { font-size: 13px; line-height: 1.45; }
 .check-txt.done { text-decoration: line-through; color: var(--muted); }
 .board-tools { margin-top: 10px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+.board-preview { display: block; width: 100%; max-width: 320px; margin: 0 auto 8px;
+  background: #fff; border: 1px solid var(--border); border-radius: 6px; padding: 6px; }
 .board-dims { font-size: 12px; line-height: 1.5; }
 .warn-text { color: var(--warn); }
 .ok-text { color: var(--ok); }

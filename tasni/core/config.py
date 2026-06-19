@@ -62,13 +62,18 @@ class CameraConfig:
 
 @dataclass
 class BoardConfig:
-    """ChArUco board geometry (eye-in-hand calibration target)."""
+    """ChArUco board geometry (eye-in-hand calibration target).
+
+    This is the single source of truth: the printable PDF renders THESE exact
+    dimensions at true physical size, so "what we print" always equals "what
+    detection expects" — no matching step. The default fits A4 (landscape) 1:1.
+    """
 
     dictionary: str = "DICT_6X6_250"
     squares_x: int = 8
     squares_y: int = 6
-    square_size_mm: float = 47.0
-    marker_size_mm: float = 35.0
+    square_size_mm: float = 30.0        # 8x30 = 240 mm wide -> fits A4 landscape
+    marker_size_mm: float = 22.0
 
 
 @dataclass

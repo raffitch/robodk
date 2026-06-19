@@ -3,6 +3,7 @@ import { moduleApi } from "../api/client";
 
 const api = moduleApi("calibration");
 const PDF_URL = "/api/modules/calibration/board.pdf";
+const PNG_URL = "/api/modules/calibration/board.png";
 
 interface BoardSpec {
   dictionary: string;
@@ -10,11 +11,11 @@ interface BoardSpec {
   squares_y: number;
   square_size_mm: number;
   marker_size_mm: number;
-  page: string;
-  landscape: boolean;
   board_w_mm: number;
   board_h_mm: number;
-  matches_config: boolean;
+  page: string;
+  landscape: boolean;
+  fits: boolean;
   pages: string[];
 }
 
@@ -33,12 +34,9 @@ interface GuideProps {
   ready: boolean;
   connState: "idle" | "connecting" | "ready" | "error";
   onConnect: () => void;
-  onConfigChanged: () => void;
 }
 
-export default function CalibrationGuide(
-  { ready, connState, onConnect, onConfigChanged }: GuideProps,
-) {
+export default function CalibrationGuide({ ready, connState, onConnect }: GuideProps) {
   const [page, setPage] = useState("A4");
   const [spec, setSpec] = useState<BoardSpec | null>(null);
   const [busy, setBusy] = useState(false);
@@ -50,15 +48,6 @@ export default function CalibrationGuide(
   useEffect(() => { loadSpec(page); }, [page]);
 
   const toggle = (i: number) => setDone((d) => d.map((v, j) => (j === i ? !v : v)));
-
-  const useDims = async () => {
-    setBusy(true);
-    try {
-      await api.post("/board/use", { page });
-      await loadSpec(page);
-      onConfigChanged();
-    } finally { setBusy(false); }
-  };
 
   const preview = async () => {
     if (!ready) return;
@@ -88,9 +77,21 @@ export default function CalibrationGuide(
 
               {i === 0 && (
                 <div className="board-tools">
-                  <div className="row" style={{ gap: 10, alignItems: "flex-end" }}>
+                  <img className="board-preview" src={PNG_URL} alt="calibration board" />
+                  {spec && (
+                    <div className="board-dims">
+                      This exact board is what detection expects <i>and</i> what prints —
+                      <b> {spec.squares_x}×{spec.squares_y}</b>, square <b>{spec.square_size_mm} mm</b>,
+                      marker <b>{spec.marker_size_mm} mm</b>, {spec.dictionary}.
+                      Printed size <b>{spec.board_w_mm}×{spec.board_h_mm} mm</b>.
+                      <span className={spec.fits ? "ok-text" : "warn-text"} style={{ marginLeft: 6 }}>
+                        {spec.fits ? `✓ fits ${page}` : `⚠ too big for ${page} — try A3`}
+                      </span>
+                    </div>
+                  )}
+                  <div className="row" style={{ gap: 10, alignItems: "flex-end", marginTop: 8 }}>
                     <div className="field">
-                      <label>Page</label>
+                      <label>Paper</label>
                       <select value={page} onChange={(e) => setPage(e.target.value)}>
                         {(spec?.pages ?? ["A4", "A3", "Letter"]).map((p) => <option key={p}>{p}</option>)}
                       </select>
@@ -98,23 +99,8 @@ export default function CalibrationGuide(
                     <a className="linkbtn" href={`${PDF_URL}?page=${page}`} target="_blank" rel="noreferrer">Open PDF</a>
                     <a className="linkbtn" href={`${PDF_URL}?page=${page}&download=true`}>Download</a>
                   </div>
-                  {spec && (
-                    <div className="board-dims" style={{ marginTop: 8 }}>
-                      {spec.squares_x}×{spec.squares_y}, square <b>{spec.square_size_mm} mm</b>,
-                      marker <b>{spec.marker_size_mm} mm</b> ({spec.landscape ? "landscape" : "portrait"}).
-                      {spec.matches_config ? (
-                        <div className="ok-text" style={{ marginTop: 6 }}>✓ matches detection config</div>
-                      ) : (
-                        <div style={{ marginTop: 6 }}>
-                          <div className="warn-text">⚠ detection config differs — sync so the solved
-                            scale is correct (a size mismatch is NOT caught by the metrics).</div>
-                          <button className="secondary" style={{ marginTop: 6 }} onClick={useDims} disabled={busy}>
-                            Match config to this board
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  )}
+                  <div className="hint">Print at 100% (Actual size). The dimensions don't change with
+                    paper size — the page just needs to be big enough; verify with the 100 mm ruler.</div>
                 </div>
               )}
 

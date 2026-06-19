@@ -75,11 +75,12 @@ ChArUco eye-in-hand hand-eye calibration, refactored from `macros/AutoCalibrate.
     noise, an open question in `docs/best-practices-review.md`).
 - **Review-then-apply**: the solved pose is shown with metrics; nothing is
   written to the tool until you click Apply.
-- **Guide pane + printable board**: a step-by-step checklist alongside the page,
-  with a one-click **ChArUco board PDF** (A4/A3/Letter) rendered at exact physical
-  size (plus a 100 mm ruler to verify print scale). "Match config to this board"
-  syncs the printed dimensions into the detection config — important because a
-  print/scale mismatch yields a wrong-scale result that the metrics can't catch.
+- **Guide pane + printable board**: a step-by-step checklist with a live **visual
+  preview** of the board and a one-click **PDF** (A4/A3/Letter) rendered at exact
+  physical size (+ a 100 mm ruler to verify print scale). The board geometry is a
+  single source of truth — the PDF prints exactly what detection expects (default
+  fits A4 1:1), so there's no "matching" step. A print/scale mismatch would scale
+  the result silently (the metrics can't catch it), which is why the print is 1:1.
 
 Artifacts (report.json, summary.txt, annotated frames) land in `runs/calibration/<stamp>/`.
 

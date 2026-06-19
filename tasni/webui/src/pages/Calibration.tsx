@@ -233,8 +233,7 @@ export default function Calibration() {
         </div>
       </div>
        </div>
-       <CalibrationGuide ready={ready} connState={conn}
-         onConnect={connect} onConfigChanged={loadConfig} />
+       <CalibrationGuide ready={ready} connState={conn} onConnect={connect} />
       </div>
     </div>
   );
