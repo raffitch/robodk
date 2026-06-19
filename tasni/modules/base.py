@@ -53,14 +53,24 @@ class ServiceContainer:
 
 
 class WorkflowModule(ABC):
-    """Base class for a pluggable workflow (calibration, scan, print, ...)."""
+    """Base class for a pluggable workflow (calibration, scan, print, ...).
 
-    #: stable url-safe id, e.g. "calibration"
+    A module is the *backend* half of a workflow: stable metadata + a REST
+    router. Its UI is a React page in ``tasni/webui`` keyed off ``id`` (the
+    frontend module registry). Adding a workflow = this class + a component +
+    one registry line.
+    """
+
+    #: stable url-safe id, e.g. "calibration" — also the frontend component key
     id: str
-    #: human title shown in the sidebar
+    #: human title shown in the sidebar / dashboard
     title: str
     #: one-line description
     description: str = ""
+    #: emoji/icon shown on the dashboard card and sidebar (optional)
+    icon: str = "•"
+    #: sidebar ordering hint (lower = higher up)
+    order: int = 100
 
     def __init__(self, services: ServiceContainer):
         self.services = services
@@ -69,15 +79,7 @@ class WorkflowModule(ABC):
     def router(self) -> "APIRouter":
         """Return the module's FastAPI router (mounted at /api/modules/<id>)."""
 
-    @abstractmethod
-    def panel_html(self) -> str:
-        """Return the HTML fragment rendered when this module's tab is active."""
-
-    def panel_js(self) -> str:
-        """Return the module's panel script. It must register an init function as
-        ``window.TasniModules['<id>'] = { init(api) {...} }``; the shell calls it
-        with an api bound to this module (get/post/onEvent/el). Default: none."""
-        return ""
-
     def meta(self) -> dict:
-        return {"id": self.id, "title": self.title, "description": self.description}
+        return {"id": self.id, "title": self.title,
+                "description": self.description, "icon": self.icon,
+                "order": self.order}

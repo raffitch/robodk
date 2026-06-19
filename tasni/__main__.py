@@ -16,7 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--reload", action="store_true", help="dev autoreload")
     args = ap.parse_args(argv)
 
-    print(f"tasni → http://{args.host}:{args.port}")
+    print(f"tasni -> http://{args.host}:{args.port}")
     if args.reload:
         uvicorn.run("tasni.webapp.server:create_app", host=args.host,
                     port=args.port, reload=True, factory=True)

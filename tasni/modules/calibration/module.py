@@ -4,7 +4,6 @@ lives in the pure library + the job in :mod:`service`.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..base import ServiceContainer, WorkflowModule
@@ -13,24 +12,17 @@ from .service import CalibrationJob, CalibrationParams
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
 
-_HERE = Path(__file__).resolve().parent
-
 
 class CalibrationModule(WorkflowModule):
     id = "calibration"
     title = "Calibration"
     description = "ChArUco eye-in-hand hand-eye calibration (TSAI) with quality metrics."
+    icon = "🎯"
+    order = 10
 
     def __init__(self, services: ServiceContainer):
         super().__init__(services)
         self._active_job: CalibrationJob | None = None
-
-    # -- UI -----------------------------------------------------------------
-    def panel_html(self) -> str:
-        return (_HERE / "panel.html").read_text(encoding="utf-8")
-
-    def panel_js(self) -> str:
-        return (_HERE / "panel.js").read_text(encoding="utf-8")
 
     # -- REST ---------------------------------------------------------------
     def router(self) -> "APIRouter":

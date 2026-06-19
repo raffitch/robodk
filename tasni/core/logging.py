@@ -9,7 +9,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = REPO_ROOT  # backward-compatible alias
 
 
 def get_logger(name: str) -> logging.Logger:

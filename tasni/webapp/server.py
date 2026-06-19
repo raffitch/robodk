@@ -1,20 +1,27 @@
-"""FastAPI shell: builds the shared services + module registry, mounts each
-module's router/panel, and bridges the job event bus to the browser over a
-WebSocket. The shell knows nothing calibration-specific — it just renders the
-registered modules, which is the whole point of the platform.
+"""FastAPI shell: builds the shared services + module registry, exposes the
+platform API (modules, health, runs, job events), and — in prod — serves the
+built React app from ``tasni/webui/dist``. The shell knows nothing
+calibration-specific; it just lists the registered modules.
+
+Dev: run Vite (``tasni/webui``) on :5173 proxying /api + /ws here. Prod:
+``npm run build`` then this serves dist/ as a single origin. See start.sh.
 """
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..core.config import AppConfig, load_config
+from ..core.health import ROBODK_API_PORT, tcp_probe
+from ..core.logging import REPO_ROOT
 from ..modules.base import ServiceContainer
 from ..modules.registry import build_registry
-from .static import STATIC_DIR
+
+DIST_DIR = Path(__file__).resolve().parents[1] / "webui" / "dist"
 
 
 def create_app(config: AppConfig | None = None) -> FastAPI:
@@ -31,26 +38,46 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         # Worker-thread job events hop onto this loop to reach the WebSocket.
         services.bus.bind_loop(asyncio.get_running_loop())
 
+    # -- platform API -------------------------------------------------------
     @app.get("/api/modules")
     def list_modules() -> dict:
-        return {"modules": [m.meta() for m in registry.all()]}
+        mods = sorted(registry.all(), key=lambda m: (m.order, m.title))
+        return {"modules": [m.meta() for m in mods]}
 
-    def _module(module_id: str):
-        try:
-            return registry.get(module_id)
-        except KeyError:
-            raise HTTPException(404, f"no such module: {module_id}")
+    @app.get("/api/health")
+    def health() -> dict:
+        cam = services.config.camera
+        robodk_ok = tcp_probe("127.0.0.1", ROBODK_API_PORT)
+        # Don't probe the camera mid-capture — the unicast server serves one
+        # client and a probe would steal the frame the job expects.
+        if services.jobs.running:
+            camera = {"ok": None, "detail": "in use by running job"}
+        else:
+            camera = {"ok": tcp_probe(cam.ip, cam.port),
+                      "detail": f"{cam.ip}:{cam.port}"}
+        return {
+            "robodk": {"ok": robodk_ok, "detail": f"API :{ROBODK_API_PORT}"},
+            "camera": camera,
+            "job": {"status": services.jobs.status, "running": services.jobs.running},
+        }
 
-    @app.get("/api/modules/{module_id}/panel.html", response_class=HTMLResponse)
-    def panel_html(module_id: str) -> str:
-        return _module(module_id).panel_html()
+    @app.get("/api/runs")
+    def runs(limit: int = 20) -> dict:
+        """Recent run-artifact folders across all modules, newest first."""
+        root = REPO_ROOT / "runs"
+        items = []
+        if root.exists():
+            for module_dir in root.iterdir():
+                if not module_dir.is_dir():
+                    continue
+                for run in module_dir.iterdir():
+                    if run.is_dir():
+                        items.append({"module": module_dir.name, "stamp": run.name,
+                                      "path": str(run)})
+        items.sort(key=lambda r: r["stamp"], reverse=True)
+        return {"runs": items[:limit]}
 
-    @app.get("/api/modules/{module_id}/panel.js")
-    def panel_js(module_id: str) -> PlainTextResponse:
-        return PlainTextResponse(_module(module_id).panel_js(),
-                                 media_type="application/javascript")
-
-    for module in registry.all():
+    for module in sorted(registry.all(), key=lambda m: m.order):
         app.include_router(module.router(), prefix=f"/api/modules/{module.id}")
 
     @app.websocket("/ws")
@@ -66,6 +93,24 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         finally:
             services.bus.unsubscribe(queue)
 
-    # The SPA shell + assets at /. (mounted last so /api/* and /ws win.)
-    app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+    # -- serve the built SPA (prod). In dev, Vite serves the UI itself. -----
+    if DIST_DIR.exists():
+        app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")),
+                  name="assets")
+
+        @app.get("/{full_path:path}")
+        def spa(full_path: str):
+            # Anything not matched above falls back to index.html (client routing).
+            candidate = DIST_DIR / full_path
+            if full_path and candidate.is_file():
+                return FileResponse(candidate)
+            return FileResponse(DIST_DIR / "index.html")
+    else:
+        @app.get("/")
+        def no_build():
+            return JSONResponse(
+                {"detail": "UI not built. Run `start.sh` (dev) or "
+                           "`cd tasni/webui && npm run build` (prod)."},
+                status_code=200)
+
     return app
