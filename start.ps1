@@ -1,4 +1,4 @@
-<#
+﻿<#
   Start the Tasni control panel as a standalone app window (Windows / PowerShell).
 
     .\start.ps1          dev  - FastAPI (:8000) + Vite (:5173, hot reload)
@@ -92,9 +92,26 @@ try {
     $browser = Find-Browser
     if ($browser) {
         Write-Host "[tasni] Tasni is running. Close the app window to stop." -ForegroundColor Green
-        $app = Start-Process -FilePath $browser -PassThru -ArgumentList `
-            "--app=$url --user-data-dir=`"$appProfile`" --no-first-run --no-default-browser-check"
-        $app.WaitForExit()
+        Start-Process -FilePath $browser -ArgumentList `
+            "--app=$url --user-data-dir=`"$appProfile`" --no-first-run --no-default-browser-check" | Out-Null
+        # Chrome/Edge fork a child and the launched process exits within ~1s, so we
+        # can't WaitForExit on it (doing so tore the app window down instantly).
+        # Track the real app window by its dedicated profile dir instead: wait for
+        # it to appear, then block until every such process is gone.
+        $appName = Split-Path $browser -Leaf
+        $isAppWindow = {
+            Get-CimInstance Win32_Process -Filter "Name='$appName'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -like '*tasni-appwin*' }
+        }
+        $deadline = (Get-Date).AddSeconds(20)
+        do { Start-Sleep -Milliseconds 500 }
+        while (-not (& $isAppWindow) -and (Get-Date) -lt $deadline)
+        if (& $isAppWindow) {
+            while (& $isAppWindow) { Start-Sleep -Seconds 1 }
+        } else {
+            Write-Warning "app window didn't appear — servers are still running at $url. Close this window (Ctrl-C) to stop."
+            $servers[0].WaitForExit()
+        }
     } else {
         Start-Process $url
         Write-Host "[tasni] No Chrome/Edge found — opened in your default browser." -ForegroundColor Yellow
