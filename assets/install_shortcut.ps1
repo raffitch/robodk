@@ -18,7 +18,7 @@ $sc.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$repo\start.ps1`""
 $sc.WorkingDirectory = $repo
 $sc.IconLocation = "$ico,0"
 $sc.Description = 'Tasni - robotic fabrication control panel'
-$sc.WindowStyle = 1
+$sc.WindowStyle = 7      # minimized — the Chromium app window is the real UI
 $sc.Save()
 
 Write-Host "Created shortcut: $lnk" -ForegroundColor Green

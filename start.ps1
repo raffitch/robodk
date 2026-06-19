@@ -1,13 +1,12 @@
 <#
-  Start the tasni control panel (Windows / PowerShell).
+  Start the Tasni control panel as a standalone app window (Windows / PowerShell).
 
-    .\start.ps1          dev  - FastAPI (:8000) + Vite (:5173, hot reload). Opens :5173
+    .\start.ps1          dev  - FastAPI (:8000) + Vite (:5173, hot reload)
     .\start.ps1 prod     build the React app, then serve everything from FastAPI (:8000)
 
-  On start it kills any previous tasni backend/Vite still running, then launches
-  fresh and opens the browser automatically. (RoboDK is left alone — reusing a
-  running RoboDK avoids the slow 117 MB station reload.) Requires `py -3.10` and
-  node/npm on PATH. Closing Vite (Ctrl-C) stops the backend.
+  Servers run hidden in the background; the UI opens in a Chromium app-mode window
+  (no tabs/address bar). CLOSING THE APP WINDOW STOPS EVERYTHING. On start it also
+  kills any previous Tasni run. Requires `py -3.10`, node/npm, and Chrome or Edge.
 #>
 [CmdletBinding()]
 param([ValidateSet('dev', 'prod')][string]$Mode = 'dev')
@@ -15,81 +14,98 @@ param([ValidateSet('dev', 'prod')][string]$Mode = 'dev')
 $ErrorActionPreference = 'Stop'
 Set-Location -Path $PSScriptRoot
 $webui = Join-Path $PSScriptRoot 'tasni\webui'
+$appProfile = Join-Path $env:TEMP 'tasni-appwin'
 
 function Initialize-WebDeps {
     if (-not (Test-Path (Join-Path $webui 'node_modules'))) {
-        Write-Host '[start] installing web UI deps...' -ForegroundColor Cyan
-        Push-Location $webui
-        try { npm install } finally { Pop-Location }
+        Write-Host '[tasni] installing web UI deps...' -ForegroundColor Cyan
+        Push-Location $webui; try { npm install } finally { Pop-Location }
     }
 }
 
 function Stop-PriorInstances {
-    # Vite / esbuild
     Get-Process node, esbuild -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    # our backend (python running `-m tasni`)
     Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='py.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -like '*tasni*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    # anything still holding our ports
+    # any previous Tasni app window (matched by its dedicated profile dir)
+    Get-CimInstance Win32_Process -Filter "Name='chrome.exe' OR Name='msedge.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*tasni-appwin*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     $owners = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
         Where-Object { $_.LocalPort -in 8000, 5173 } |
         Select-Object -ExpandProperty OwningProcess -Unique
     foreach ($procId in $owners) { Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }
 }
 
-function Open-Browser($url) {
-    # Wait (in the background) for the port to accept connections, then open the
-    # default browser — so we don't open before the server is listening. Tries
-    # both IPv4/IPv6 localhost, waits up to ~60s, and falls back to explorer.
-    $port = ([uri]$url).Port
-    Start-Job -ArgumentList $url, $port -ScriptBlock {
-        param($url, $port)
-        function Test-Up($p) {
-            foreach ($h in @('127.0.0.1', 'localhost')) {
-                try { $c = New-Object Net.Sockets.TcpClient; $c.Connect($h, $p); $u = $c.Connected; $c.Close()
-                      if ($u) { return $true } } catch {}
-            }
-            return $false
+function Find-Browser {
+    foreach ($c in @(
+            "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+            "$env:LocalAppData\Google\Chrome\Application\chrome.exe",
+            "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+            "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe")) {
+        if ($c -and (Test-Path $c)) { return $c }
+    }
+    return $null
+}
+
+function Wait-Port($port, $timeoutSec = 90) {
+    for ($i = 0; $i -lt ($timeoutSec * 2); $i++) {
+        foreach ($h in @('127.0.0.1', 'localhost')) {
+            try { $c = New-Object Net.Sockets.TcpClient; $c.Connect($h, $port); $u = $c.Connected; $c.Close()
+                  if ($u) { return $true } } catch {}
         }
-        for ($i = 0; $i -lt 120; $i++) {
-            if (Test-Up $port) {
-                Start-Sleep -Milliseconds 600   # let the server finish standing up
-                try { Start-Process $url } catch { try { Start-Process explorer.exe $url } catch {} }
-                return
-            }
-            Start-Sleep -Milliseconds 500
-        }
-    } | Out-Null
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
 }
 
 Stop-PriorInstances
 Initialize-WebDeps
-
 if ($Mode -eq 'prod') {
-    Write-Host '[start] building web UI...' -ForegroundColor Cyan
-    Push-Location $webui
-    try { npm run build } finally { Pop-Location }
-    Write-Host '[start] serving on http://localhost:8000' -ForegroundColor Green
-    Open-Browser 'http://localhost:8000'
-    py -3.10 -m tasni --port 8000
-    return
+    Write-Host '[tasni] building web UI...' -ForegroundColor Cyan
+    Push-Location $webui; try { npm run build } finally { Pop-Location }
 }
 
-# dev: backend in its own window + Vite in this one; kill the backend on exit.
-Write-Host '[start] backend  -> http://localhost:8000' -ForegroundColor Green
-$backend = Start-Process -FilePath 'py' `
-    -ArgumentList '-3.10', '-m', 'tasni', '--port', '8000' -PassThru
-Open-Browser 'http://localhost:5173'
+$port = if ($Mode -eq 'prod') { 8000 } else { 5173 }
+$servers = @()
+Write-Host '[tasni] starting backend...' -ForegroundColor Green
+$servers += Start-Process -FilePath 'py' -ArgumentList '-3.10', '-m', 'tasni', '--port', '8000' `
+    -WindowStyle Hidden -PassThru `
+    -RedirectStandardOutput "$env:TEMP\tasni-backend.out.log" `
+    -RedirectStandardError "$env:TEMP\tasni-backend.err.log"
+if ($Mode -eq 'dev') {
+    Write-Host '[tasni] starting web UI (dev)...' -ForegroundColor Green
+    $servers += Start-Process -FilePath $env:ComSpec -ArgumentList '/c', 'npm run dev' `
+        -WorkingDirectory $webui -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput "$env:TEMP\tasni-vite.out.log" `
+        -RedirectStandardError "$env:TEMP\tasni-vite.err.log"
+}
+
 try {
-    Write-Host '[start] UI (dev) -> http://localhost:5173  (opening in your browser)' -ForegroundColor Green
-    Push-Location $webui
-    npm run dev
-} finally {
-    Pop-Location
-    if ($backend -and -not $backend.HasExited) {
-        Write-Host '[start] stopping backend...' -ForegroundColor Cyan
-        taskkill /PID $backend.Id /T /F | Out-Null
+    if (-not (Wait-Port $port)) {
+        Write-Warning "server didn't come up on :$port — see $env:TEMP\tasni-*.log"
     }
-    Get-Job -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue
+    $url = "http://localhost:$port"
+    $browser = Find-Browser
+    if ($browser) {
+        Write-Host "[tasni] Tasni is running. Close the app window to stop." -ForegroundColor Green
+        $app = Start-Process -FilePath $browser -PassThru -ArgumentList `
+            "--app=$url --user-data-dir=`"$appProfile`" --no-first-run --no-default-browser-check"
+        $app.WaitForExit()
+    } else {
+        Start-Process $url
+        Write-Host "[tasni] No Chrome/Edge found — opened in your default browser." -ForegroundColor Yellow
+        Write-Host "[tasni] Close this window (Ctrl-C) to stop the servers." -ForegroundColor Yellow
+        $servers[0].WaitForExit()
+    }
+} finally {
+    Write-Host "[tasni] stopping servers..." -ForegroundColor Cyan
+    foreach ($p in $servers) {
+        try { if (-not $p.HasExited) { taskkill /PID $p.Id /T /F | Out-Null } } catch {}
+    }
+    # Robust fallback (also covers child processes if taskkill is unavailable):
+    # kill whatever still owns our ports + any tasni-tagged node/python.
+    Stop-PriorInstances
 }

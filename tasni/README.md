@@ -9,7 +9,7 @@ is module #1 and the proof-of-pattern; scan / ArUco-to-plane / define-targets /
 
 ```powershell
 # Windows (PowerShell) — the normal way to run it:
-.\start.ps1                 # dev: FastAPI (:8000) + Vite (:5173). Kills any prior run, opens the browser
+.\start.ps1                 # dev: opens a standalone app window (Chrome/Edge --app). Close it to stop everything
 .\start.ps1 prod            # build the React app, then serve it all from FastAPI (:8000)
 #   or just run / double-click  start.bat   (start.bat prod for prod) — no execution-policy fuss
 #   Git Bash users:  ./start.sh
