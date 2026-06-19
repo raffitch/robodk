@@ -22,10 +22,11 @@ interface BoardSpec {
 const STEPS = [
   "Print the ChArUco board (below) at 100% scale and verify the ruler.",
   "Mount it rigidly where the camera can see it — flat, no glare.",
-  "Open the Tasni station — checks the robot, the Realsense tool and NEUTRAL.",
+  "Open the Tasni station — checks the robot and the Realsense tool.",
   "Make sure the Jetson camera server is up (the Camera pill turns green).",
-  "Check framing — move to NEUTRAL and confirm the board is detected.",
-  "Run — auto-generates poses around NEUTRAL, visits each on the real robot.",
+  "Start the camera and jog the robot until the aiming HUD locks green.",
+  "Create targets — reachable poses around the current view; inspect in RoboDK.",
+  "Run — visits each target on the real robot and solves.",
   "Review the metrics: reprojection px, held-out validation, board consistency.",
   "Apply to the Realsense tool once the numbers look good.",
 ];
@@ -39,29 +40,13 @@ interface GuideProps {
 export default function CalibrationGuide({ ready, connState, onConnect }: GuideProps) {
   const [page, setPage] = useState("A4");
   const [spec, setSpec] = useState<BoardSpec | null>(null);
-  const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<boolean[]>(() => STEPS.map(() => false));
-  const [previewMsg, setPreviewMsg] = useState<string>("");
 
   const loadSpec = (p: string) =>
     api.get<BoardSpec>(`/board/spec?page=${p}`).then(setSpec).catch(() => setSpec(null));
   useEffect(() => { loadSpec(page); }, [page]);
 
   const toggle = (i: number) => setDone((d) => d.map((v, j) => (j === i ? !v : v)));
-
-  const preview = async () => {
-    if (!ready) return;
-    if (!window.confirm("This moves the real robot to NEUTRAL. Cell clear?")) return;
-    setBusy(true); setPreviewMsg("Moving to NEUTRAL…");
-    try {
-      const r = await api.post<{ target: string; detected: boolean; n_corners: number }>("/preview");
-      setPreviewMsg(r.detected
-        ? `✓ board detected at ${r.target} (${r.n_corners} corners) — see Live preview.`
-        : `✗ no board at ${r.target} — reposition the board or NEUTRAL and retry.`);
-    } catch (e: any) {
-      setPreviewMsg("✗ " + e.message);
-    } finally { setBusy(false); }
-  };
 
   return (
     <div className="card calib-guide">
@@ -120,11 +105,11 @@ export default function CalibrationGuide({ ready, connState, onConnect }: GuideP
 
               {i === 4 && (
                 <div className="board-tools">
-                  <button className="secondary" onClick={preview} disabled={busy || !ready}>
-                    Move to NEUTRAL &amp; check the board
-                  </button>
-                  {!ready && <span className="hint" style={{ marginLeft: 10 }}>connect first</span>}
-                  {previewMsg && <div className="board-dims" style={{ marginTop: 6 }}>{previewMsg}</div>}
+                  <div className="board-dims">
+                    Use the <b>Aim the camera</b> panel on the left: <b>Start camera</b>, then jog the
+                    robot (RoboDK or pendant) until the <b>DETECT · DISTANCE · ANGLE</b> lamps are all
+                    green and the HUD shows <b>● LOCK</b>. Only then does Create targets unlock.
+                  </div>
                 </div>
               )}
             </div>

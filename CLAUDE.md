@@ -107,14 +107,16 @@ you drive the real cell, not an empty station). Run it on Windows with
   core + a React web app, with the missing **quality metrics** (reprojection px,
   held-out validation px, board-consistency mm). Kept TSAI (no PARK) + optional
   reprojection refinement. Now **RealSense-only + real-robot**: forced `Realsense`
-  tool, `NEUTRAL` home pose, **auto-generated** reachable poses (cone+roll, IK-filtered,
-  temp `TasniCalib_*` deleted after) — **Preview poses** to inspect them first.
+  tool, **no taught pose** — a **live aiming HUD** (DETECT·DISTANCE·ANGLE lamps over the
+  live camera; `core/livepreview.py` + `calibration/gate.py`) gates **Create targets**,
+  which **auto-generates** reachable poses (cone+roll, IK-filtered) around the robot's
+  *current* pose and leaves `TasniCalib_*` in RoboDK to inspect.
   Single-source-of-truth **printable board** (default 8×6 @ 30 mm fits A4 1:1) + visual
   preview, no "matching" step. Launches as a **standalone app window** (`.\start.ps1`).
   - ⚠️ Robot-moving paths NOT yet hardware-tested. Finding: OpenCV's TSAI is fragile
     near a ~180° camera→flange mount (PARK/HORAUD/ANDREFF stay exact); the metrics make
     a bad solve visible. See [tasni/README.md](tasni/README.md).
-  - Next ideas: dry "tour" through preview poses; return-to-NEUTRAL/collision checks
+  - Next ideas: dry "tour" through the created targets; return-to-start/collision checks
     before real motion; live 3D viewport.
 - Then integrate the rest into the same app: scan (with **TSDF fusion** — biggest quality
   win), ArUco-to-plane, target generation. RealSense High-Accuracy preset + filter order

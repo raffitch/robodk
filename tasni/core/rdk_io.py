@@ -68,10 +68,40 @@ class RdkIO:
                     self._frame = frame
         return pose_to_T(tool.PoseTool())
 
+    def use_camera_tool(self, tool_name: str) -> np.ndarray:
+        """Activate ``tool_name`` and adopt the robot's base reference frame.
+
+        With no taught NEUTRAL target, the live-gate seed is read from — and the
+        generated calibration targets are written into — the robot's base frame,
+        so seed pose, generated poses, IK checks and target creation all share one
+        unambiguous frame. Returns the tool mounting pose (flange->tool) as 4x4."""
+        import robolink
+
+        tool = self.rdk.Item(tool_name, robolink.ITEM_TYPE_TOOL)
+        if not tool.Valid():
+            raise RuntimeError(f"tool {tool_name!r} not found in the station")
+        robot = self.robot()
+        robot.setPoseTool(tool)
+        base = robot.Parent()       # the reference frame the robot is attached to
+        if base.Valid() and base.Type() == robolink.ITEM_TYPE_FRAME:
+            robot.setPoseFrame(base)
+            self._frame = base
+        else:
+            self._frame = None      # AddTarget(None) / Pose() then use the base frame
+        return pose_to_T(tool.PoseTool())
+
     # -- poses --------------------------------------------------------------
     def tcp_pose_T(self) -> np.ndarray:
         """Current TCP pose in the active reference frame (numpy 4x4)."""
         return pose_to_T(self.robot().Pose())
+
+    def current_joints(self):
+        """Current joint vector (RoboDK ``Mat``) — snapshot for a safe return."""
+        return self.robot().Joints()
+
+    def move_j_joints(self, joints) -> None:
+        """MoveJ to a joint vector (avoids IK/elbow ambiguity of a cartesian move)."""
+        self.robot().MoveJ(joints)
 
     def move_j_pose(self, T: np.ndarray) -> None:
         self.robot().MoveJ(T_to_pose(T))

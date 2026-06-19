@@ -139,3 +139,21 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .req-note { margin-top: 12px; font-size: 12px; line-height: 1.5; color: var(--text);
   background: rgba(76,154,255,.08); border: 1px solid var(--border);
   border-left: 3px solid var(--accent); border-radius: 8px; padding: 10px 12px; }
+
+/* live aiming gate: HUD overlay on the camera frame */
+.aim-wrap { position: relative; max-width: 760px; line-height: 0; }
+.aim-wrap .preview { display: block; }
+.aim-hud { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.aim-off { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--muted); font-family: var(--mono); font-size: 13px; line-height: 1.4; }
+
+.lamps { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
+.lamp { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 12px;
+  font-weight: 700; letter-spacing: .5px; padding: 5px 11px; border-radius: 12px;
+  border: 1px solid var(--border); background: var(--panel-2); color: var(--muted); }
+.lamp .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--err); box-shadow: none; }
+.lamp.on { color: var(--ok); border-color: rgba(63,185,80,.5); background: rgba(63,185,80,.10); }
+.lamp.on .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+.lamp.off { color: var(--err); border-color: rgba(248,81,73,.4); background: rgba(248,81,73,.08); }
+.lamp.lock { margin-left: auto; font-size: 13px; }
+.lamp.lock.on { box-shadow: 0 0 12px rgba(63,185,80,.35) inset; }

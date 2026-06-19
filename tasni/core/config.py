@@ -35,9 +35,15 @@ _DEFAULT_INTRINSICS: dict[str, list[list[float]]] = {
 class CameraConfig:
     """RealSense-over-TCP client settings (the Jetson camera server)."""
 
-    ip: str = "10.5.5.19"           # subnet used by AutoCalibrate/ArucoToPlane
+    # The Jetson camera host. The server binds 0.0.0.0:1024 (all interfaces), so
+    # this is just whichever Jetson IP the workstation can reach — confirmed
+    # 10.12.171.70 (the old 10.5.5.19 subnet is gone). Override per-machine in
+    # tasni.config.json if the IP changes.
+    ip: str = "10.12.171.70"
     port: int = 1024
-    resolution: str = "1920x1080"
+    # The server streams color at 1280x720 (server_unicast_syncronous.py), so the
+    # intrinsics must be the 720p K — a 1080p setting would skew distance/tilt.
+    resolution: str = "1280x720"
     timeout_s: float = 10.0
     # resolution -> 3x3 color intrinsics K
     intrinsics: dict[str, list[list[float]]] = field(
@@ -94,9 +100,9 @@ class RoboDKConfig:
     # (with its 3D model) in Tasni.rdk. Calibration solves THIS tool's pose; it is
     # fixed, not user-selectable.
     camera_tool: str = "Realsense"
-    # A pose that already frames the calibration board — the home/seed pose the
-    # auto-generated calibration poses orbit around.
-    neutral_target: str = "NEUTRAL"
+    # No taught home pose: the operator jogs the robot until the live aiming gate
+    # is green, and the robot's *current* pose becomes the seed the calibration
+    # poses orbit around (see CalibrationConfig gate knobs below).
     # "simulate" keeps the robot in RoboDK only; "run_robot" drives the real arm.
     # Calibration only makes sense on the real arm (the camera rides on it).
     run_mode: str = "run_robot"
@@ -104,22 +110,36 @@ class RoboDKConfig:
 
 @dataclass
 class CalibrationConfig:
-    """Calibration-module knobs (pose generation + capture + solve + split)."""
+    """Calibration-module knobs (live gate + pose generation + capture + solve)."""
 
     settle_s: float = 0.4               # pause after MoveJ before grabbing a frame
     holdout_count: int = 3              # poses held out of the solve for validation
     refine: bool = True                 # post-TSAI reprojection-minimizing refinement
     min_charuco_corners: int = 6        # reject a view with fewer detected corners
 
-    # Auto pose generation: orbit the NEUTRAL view in a cone (not a full dome) so
-    # the board stays visible, with roll + distance variation for hand-eye
-    # conditioning. Temp targets are created, used, then deleted.
-    auto_generate: bool = True
+    # Live aiming gate: before any targets are created, the operator jogs the
+    # robot until the board sits at the ideal distance and angle. These bands
+    # define when each HUD lamp goes green; all must be green to create targets.
+    ideal_distance_mm: float = 450.0    # target working distance (board <-> camera)
+    distance_tol_mm: float = 80.0       # +/- band around ideal_distance_mm
+    max_tilt_deg: float = 25.0          # board may be off fronto-parallel by this much
+    center_tol_mm: float = 40.0         # |x|,|y| under this counts as centred (advisory)
+    preview_fps: float = 6.0            # max live-gate publish rate
+    preview_timeout_s: float = 4.0      # per-frame camera timeout while streaming
+    # HUD X/Y/Z jog hints are in the camera optical frame (X right, Y down, Z
+    # forward). Flip an axis here if the pendant's TOOL axis runs the other way.
+    jog_invert_x: bool = False
+    jog_invert_y: bool = False
+    jog_invert_z: bool = False
+
+    # Auto pose generation: orbit the (gated) seed view in a cone (not a full dome)
+    # so the board stays visible, with roll + distance variation for hand-eye
+    # conditioning. The TasniCalib_* targets are left in the station to inspect.
     pose_count: int = 15                # reachable poses to capture
-    cone_half_angle_deg: float = 32.0   # max view-angle change from NEUTRAL
+    cone_half_angle_deg: float = 32.0   # max view-angle change from the seed view
     roll_max_deg: float = 75.0          # roll spread about the optical axis
     distance_jitter: float = 0.12       # +/- fraction of working distance
-    look_distance_mm: float = 500.0     # fallback if NEUTRAL board distance unknown
+    look_distance_mm: float = 500.0     # fallback if the seed board distance unknown
 
 
 @dataclass

@@ -53,18 +53,37 @@ def openPipeline():
     return pipeline, align
 
 def handle_client(conn, addr):
-    print(f"Connection from {addr}")
     jpeg = turbojpeg.TurboJPEG('/usr/lib/aarch64-linux-gnu/libturbojpeg.so.0')
+
+    # Optional, backward-compatible mode negotiation: a client may send a single
+    # byte right after connecting. b'C' => COLOR-ONLY (we send depth_len=0 and
+    # skip the lz4 depth compression entirely). No byte (timeout) => the original
+    # full depth+color stream, so existing clients are unaffected. Color-only is
+    # used for the live aiming preview + calibration, which never use depth — it
+    # cuts ~80-90% of the per-frame bytes (and the Nano's lz4 CPU), which is the
+    # difference between a slow preview and a realtime one over Wi-Fi.
+    color_only = False
+    try:
+        conn.settimeout(0.4)
+        first = conn.recv(1)
+        if first == b'C':
+            color_only = True
+    except (socket.timeout, OSError):
+        pass
+    finally:
+        conn.settimeout(None)
+    print(f"Connection from {addr} (color_only={color_only})")
 
     while True:
         depth, color, timestamp = getFrames(pipeline, align, depth_filters)
-        if depth is not None and color is not None:
-            depth_buffer = io.BytesIO()
-            np.save(depth_buffer, depth)
-            depth_buffer.seek(0)
-            data_depth = depth_buffer.read()
-
-            depth_compressed = lz4f.compress(data_depth)
+        if color is not None and (color_only or depth is not None):
+            if color_only:
+                depth_compressed = b''
+            else:
+                depth_buffer = io.BytesIO()
+                np.save(depth_buffer, depth)
+                depth_buffer.seek(0)
+                depth_compressed = lz4f.compress(depth_buffer.read())
             length_depth = struct.pack('<I', len(depth_compressed))
 
             data_color = jpeg.encode(color)

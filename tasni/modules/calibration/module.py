@@ -9,7 +9,9 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 from ..base import ServiceContainer, WorkflowModule
-from .service import CalibrationJob, CalibrationParams
+from .service import (
+    CalibrationJob, CalibrationParams, TARGET_PREFIX, gate_thresholds,
+    generate_calibration_targets)
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
@@ -46,14 +48,17 @@ class CalibrationModule(WorkflowModule):
         @router.get("/config")
         def get_config() -> dict:
             c = services.config
+            cc = c.calibration
             return {
                 "robot": c.robodk.robot_name,
                 "camera_tool": c.robodk.camera_tool,
-                "neutral_target": c.robodk.neutral_target,
                 "board": vars(c.board),
                 "camera": {"ip": c.camera.ip, "port": c.camera.port,
                            "resolution": c.camera.resolution},
-                "calibration": vars(c.calibration),
+                "calibration": vars(cc),
+                "gate": {"ideal_distance_mm": cc.ideal_distance_mm,
+                         "distance_tol_mm": cc.distance_tol_mm,
+                         "max_tilt_deg": cc.max_tilt_deg},
             }
 
         @router.get("/targets")
@@ -79,58 +84,63 @@ class CalibrationModule(WorkflowModule):
             try:
                 robot_ok = services.rdk.robot().Valid()
                 tool_ok = services.rdk.item_exists(c.camera_tool)
-                neutral_ok = services.rdk.item_exists(c.neutral_target)
-                ready = robot_ok and tool_ok and neutral_ok
+                ready = robot_ok and tool_ok
                 missing = [n for n, ok in (
-                    (c.robot_name, robot_ok), (f"tool {c.camera_tool!r}", tool_ok),
-                    (f"target {c.neutral_target!r}", neutral_ok)) if not ok]
+                    (c.robot_name, robot_ok), (f"tool {c.camera_tool!r}", tool_ok))
+                    if not ok]
                 return {"connected": True, "ready": ready,
                         "robot": c.robot_name, "robot_valid": robot_ok,
                         "tool": c.camera_tool, "tool_present": tool_ok,
-                        "neutral": c.neutral_target, "neutral_present": neutral_ok,
                         "missing": missing}
             except Exception as e:
                 raise HTTPException(503, f"RoboDK unavailable: {e}")
 
-        @router.post("/preview")
-        def preview() -> dict:
-            """Move to NEUTRAL and grab one frame so the user can confirm the
-            board is framed before a run. Publishes the annotated frame to the
-            live preview; returns whether the board was detected."""
+        @router.post("/live/start")
+        def live_start() -> dict:
+            """Start the live aiming gate: stream annotated frames + gate readings
+            over the WebSocket so the operator can jog the board into the ideal
+            distance/angle band. Camera-only (no robot motion)."""
             if services.jobs.running:
                 raise HTTPException(409, "a calibration run is in progress")
-            import base64
+            if services.live.running:
+                return {"status": "already running"}
 
             import cv2
 
-            from ...core.events import JobEvent
             from .charuco import CharucoTarget
+            from .gate import evaluate_gate
             c = services.config
-            neutral = c.robodk.neutral_target
-            try:
-                if not services.rdk.item_exists(neutral):
-                    raise HTTPException(400, f"target {neutral!r} not found in the station")
-                services.rdk.apply_run_mode("run_robot")
-                services.rdk.use_tool_and_frame(c.robodk.camera_tool, neutral)
-                services.bus.publish(JobEvent("log", {"message": f"preview: moving to {neutral}"}))
-                services.rdk.move_j(neutral)
-                frame = services.camera.grab()
-                board = CharucoTarget(c.board)
-                det = board.detect(frame.color, c.camera.K, c.camera.dist,
-                                   min_corners=c.calibration.min_charuco_corners)
-                img = (board.annotate(frame.color, det, c.camera.K, c.camera.dist,
-                                      f"{neutral} (board OK)")
+            cc = c.calibration
+            K, dist = c.camera.K, c.camera.dist
+            board = CharucoTarget(c.board)
+            th = gate_thresholds(cc)
+            # Detection runs on the full-res frame; the transported image is
+            # downscaled (the SVG HUD is drawn client-side, so this costs no
+            # overlay sharpness) to keep the WebSocket light.
+            PREVIEW_W = 960
+            enc = [cv2.IMWRITE_JPEG_QUALITY, 75]
+
+            def analyze(frame):
+                det = board.detect(frame.color, K, dist, min_corners=cc.min_charuco_corners)
+                reading = evaluate_gate(det, K, frame.color.shape, th)
+                # corners + axes confirm detection; the HUD draws the status text.
+                img = (board.annotate(frame.color, det, K, dist, "")
                        if det is not None else frame.color)
-                ok, jpeg = cv2.imencode(".jpg", img)
-                if ok:
-                    services.bus.publish(JobEvent("frame",
-                        {"jpeg_b64": base64.b64encode(jpeg.tobytes()).decode("ascii")}))
-                return {"target": neutral, "detected": det is not None,
-                        "n_corners": det.n_corners if det is not None else 0}
-            except HTTPException:
-                raise
-            except Exception as e:
-                raise HTTPException(503, f"preview failed: {e}")
+                h, w = img.shape[:2]
+                if w > PREVIEW_W:
+                    img = cv2.resize(img, (PREVIEW_W, int(h * PREVIEW_W / w)),
+                                     interpolation=cv2.INTER_AREA)
+                ok, jpeg = cv2.imencode(".jpg", img, enc)
+                return (jpeg.tobytes() if ok else b""), reading.to_dict()
+
+            services.live.start(analyze, fps=cc.preview_fps,
+                                timeout_s=cc.preview_timeout_s, color_only=True)
+            return {"status": "started"}
+
+        @router.post("/live/stop")
+        def live_stop() -> dict:
+            services.live.stop()
+            return {"status": "stopped"}
 
         # -- calibration board (print-it-yourself) --------------------------
         @router.get("/board/spec")
@@ -154,32 +164,39 @@ class CalibrationModule(WorkflowModule):
             return Response(pdf, media_type="application/pdf",
                             headers={"Content-Disposition": f'{disp}; filename="{fname}"'})
 
+        @router.post("/poses/generate")
+        def poses_generate() -> dict:
+            """Gate-gated target creation: confirm the board is in the ideal band
+            (one authoritative grab), then generate reachable poses around the
+            robot's CURRENT pose and leave them as TasniCalib_* to inspect. Refuses
+            with 400 if the gate isn't green. No robot motion."""
+            if services.jobs.running:
+                raise HTTPException(409, "a job is already running")
+            try:
+                return generate_calibration_targets(services)
+            except RuntimeError as e:
+                raise HTTPException(400, str(e))
+            except Exception as e:
+                raise HTTPException(503, f"RoboDK/camera unavailable: {e}")
+
         @router.post("/run")
         def run(body: RunBody) -> dict:
             if services.jobs.running:
                 raise HTTPException(409, "a job is already running")
-            params = CalibrationParams(holdout_count=body.holdout_count,
-                                       refine=body.refine, mode="calibrate")
+            if len(services.rdk.list_targets(TARGET_PREFIX)) == 0:
+                raise HTTPException(400, "no calibration targets — aim the camera "
+                                    "until the gate is green and Create targets first")
+            services.live.stop()    # release the camera for the capture grabs
+            params = CalibrationParams(holdout_count=body.holdout_count, refine=body.refine)
             self._active_job = CalibrationJob(services, params)
             services.jobs.start(self._active_job, name="calibration")
-            return {"status": "started"}
-
-        @router.post("/poses/preview")
-        def poses_preview() -> dict:
-            """Generate the calibration poses and leave them in RoboDK as
-            TasniCalib_* targets to inspect — moves to NEUTRAL but does NOT
-            capture or solve."""
-            if services.jobs.running:
-                raise HTTPException(409, "a job is already running")
-            self._active_job = CalibrationJob(services, CalibrationParams(mode="preview"))
-            services.jobs.start(self._active_job, name="pose-preview")
             return {"status": "started"}
 
         @router.post("/poses/clear")
         def poses_clear() -> dict:
             """Delete the generated TasniCalib_* targets from the station."""
             try:
-                existing = services.rdk.list_targets("TasniCalib_")
+                existing = services.rdk.list_targets(TARGET_PREFIX)
                 services.rdk.delete_items(existing)
                 return {"cleared": len(existing)}
             except Exception as e:

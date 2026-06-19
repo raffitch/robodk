@@ -1,11 +1,13 @@
-"""Auto-generate calibration viewpoints around a seed (NEUTRAL) camera pose.
+"""Auto-generate calibration viewpoints around a seed camera pose.
 
-Why not the old dome macro: it aligned every pose's Z to a look-at point but
-added NO roll and swept a full 360deg azimuth — which (a) under-constrains the
-hand-eye rotation solve (rotation axes end up near-coplanar) and (b) orbits the
-camera to the board's unprintable back. Here we instead sample a CONE around the
-NEUTRAL viewing direction (board stays visible), with deliberate ROLL about the
-optical axis and DISTANCE variation — the diversity hand-eye actually needs.
+The seed is the robot's current (live-gated) pose — the operator jogs until the
+aiming HUD locks green, and these poses orbit that view. Why not the old dome
+macro: it aligned every pose's Z to a look-at point but added NO roll and swept a
+full 360deg azimuth — which (a) under-constrains the hand-eye rotation solve
+(rotation axes end up near-coplanar) and (b) orbits the camera to the board's
+unprintable back. Here we instead sample a CONE around the seed viewing direction
+(board stays visible), with deliberate ROLL about the optical axis and DISTANCE
+variation — the diversity hand-eye actually needs.
 
 Pure numpy + reproducible (deterministic spiral, no RNG). Poses are TCP/camera
 poses in the same frame as ``seed_T``; the caller filters them by reachability.

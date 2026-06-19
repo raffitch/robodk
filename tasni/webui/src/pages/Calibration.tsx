@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { moduleApi } from "../api/client";
 import { useEvents, type JobEvent } from "../api/events";
+import AimHud, { type GateReading } from "./AimHud";
 import CalibrationGuide from "./CalibrationGuide";
 
 const api = moduleApi("calibration");
@@ -8,10 +9,10 @@ const api = moduleApi("calibration");
 interface CalibConfig {
   robot: string;
   camera_tool: string;
-  neutral_target: string;
   board: { squares_x: number; squares_y: number; square_size_mm: number; marker_size_mm: number; dictionary: string };
   camera: { ip: string; port: number; resolution: string };
   calibration: { holdout_count: number; refine: boolean; pose_count: number };
+  gate: { ideal_distance_mm: number; distance_tol_mm: number; max_tilt_deg: number };
 }
 interface Split { rms_px: number; max_px: number; n_views: number; }
 interface Report {
@@ -21,13 +22,11 @@ interface Report {
   board_consistency_mm: { rms: number; max: number };
 }
 interface RunResult {
-  mode?: string;
   summary: string;
   report?: Report;
   run_dir?: string;
   tool_name?: string;
   n_captured?: number;
-  n_poses?: number;
   n_skipped?: string[];
   can_apply: boolean;
 }
@@ -50,6 +49,11 @@ export default function Calibration() {
   const [frame, setFrame] = useState<string | null>(null);
   const [result, setResult] = useState<RunResult | null>(null);
   const [canApply, setCanApply] = useState(false);
+
+  const [live, setLive] = useState(false);
+  const [gate, setGate] = useState<GateReading | null>(null);
+  const [targets, setTargets] = useState<number | null>(null);   // null = none created
+  const [generating, setGenerating] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   const addLog = (msg: string, err = false) =>
@@ -63,23 +67,23 @@ export default function Calibration() {
     }).catch((e) => addLog(e.message, true));
   }, []);
 
-  // Config is RoboDK-free, so it loads immediately. Tools/targets require a
-  // connection — fetched by connect(), not on mount, so visiting the page never
-  // throws "RoboDK unavailable". Nothing robot-related is enabled until ready.
   useEffect(() => { loadConfig(); }, [loadConfig]);
+
+  // Stop the live gate if we leave the page (frees the unicast camera).
+  useEffect(() => () => { api.post("/live/stop").catch(() => {}); }, []);
 
   const connect = useCallback(async () => {
     setConn("connecting");
     setConnInfo("Opening the Tasni station… first load of the 117 MB station can take 1–2 min.");
     try {
-      const r = await api.post<{ ready: boolean; tool: string; neutral: string; missing: string[] }>("/connect");
+      const r = await api.post<{ ready: boolean; tool: string; missing: string[] }>("/connect");
       if (r.ready) {
         setConn("ready");
-        setConnInfo(`Ready — robot, the '${r.tool}' camera tool and the '${r.neutral}' pose are all present.`);
+        setConnInfo(`Ready — robot and the '${r.tool}' camera tool are present.`);
       } else {
         setConn("error");
         setConnInfo("Station opened but missing: " + r.missing.join(", ")
-          + ". Mount the RealSense camera tool and add the NEUTRAL pose in RoboDK.");
+          + ". Mount the RealSense camera tool in RoboDK.");
       }
     } catch (e: any) {
       setConn("error");
@@ -101,6 +105,8 @@ export default function Calibration() {
         addLog(ev.payload.message);
       } else if (ev.type === "frame") {
         setFrame("data:image/jpeg;base64," + ev.payload.jpeg_b64);
+      } else if (ev.type === "gate") {
+        setGate(ev.payload as GateReading);
       } else if (ev.type === "result") {
         setResult(ev.payload.result as RunResult);
         setCanApply(!!ev.payload.result?.can_apply);
@@ -113,29 +119,44 @@ export default function Calibration() {
     });
   }, [subscribe]);
 
+  const startLive = async () => {
+    try {
+      await api.post("/live/start");
+      setLive(true);
+      addLog("live aiming gate started — jog the robot until all lamps are green.");
+    } catch (e: any) { addLog("live: " + e.message, true); }
+  };
+  const stopLive = async () => {
+    try { await api.post("/live/stop"); } catch { /* ignore */ }
+    setLive(false);
+  };
+
+  const generateTargets = async () => {
+    setGenerating(true);
+    try {
+      const r = await api.post<{ created: number; look_distance_mm: number }>("/poses/generate");
+      setTargets(r.created);
+      setLive(false);   // generate stops the live gate server-side
+      addLog(`created ${r.created} targets (working distance ~${Math.round(r.look_distance_mm)} mm)`
+        + " — inspect them in RoboDK, then Run calibration.");
+    } catch (e: any) { addLog("create targets: " + e.message, true); }
+    finally { setGenerating(false); }
+  };
+
   const run = async () => {
-    if (!window.confirm("This will physically move the real robot through ~"
-        + (config?.calibration.pose_count ?? 15)
-        + " auto-generated calibration poses. Make sure the cell is clear. Continue?")) return;
+    if (!window.confirm("This will physically move the real robot through the "
+        + (targets ?? "generated") + " calibration targets. Make sure the cell is clear. Continue?")) return;
     setLogs([]); setResult(null); setCanApply(false); setPct(0);
-    setStatus("starting…"); setRunning(true);
+    setStatus("starting…"); setRunning(true); setLive(false);
     try {
       await api.post("/run", { holdout_count: holdout, refine });
     } catch (e: any) { addLog("run: " + e.message, true); setRunning(false); }
   };
-  const previewPoses = async () => {
-    if (!window.confirm("This moves the real robot to NEUTRAL and generates the calibration "
-        + "poses in RoboDK (no capture, no solve) so you can inspect them. Cell clear?")) return;
-    setLogs([]); setResult(null); setCanApply(false); setPct(0);
-    setStatus("generating poses…"); setRunning(true);
-    try {
-      await api.post("/poses/preview");
-    } catch (e: any) { addLog("preview: " + e.message, true); setRunning(false); }
-  };
   const clearPoses = async () => {
     try {
       const r = await api.post<{ cleared: number }>("/poses/clear");
-      addLog(`cleared ${r.cleared} generated poses from RoboDK.`);
+      setTargets(null);
+      addLog(`cleared ${r.cleared} generated targets from RoboDK.`);
     } catch (e: any) { addLog("clear: " + e.message, true); }
   };
   const cancel = () => api.post("/cancel").catch(() => {});
@@ -146,6 +167,13 @@ export default function Calibration() {
       setCanApply(false);
     } catch (e: any) { addLog("apply: " + e.message, true); }
   };
+
+  const g = config?.gate;
+  const lamps: [string, boolean | undefined][] = [
+    ["DETECT", gate?.gates?.detected],
+    ["DISTANCE", gate?.gates?.distance],
+    ["ANGLE", gate?.gates?.angle],
+  ];
 
   return (
     <div>
@@ -170,19 +198,63 @@ export default function Calibration() {
         </div>
         {connInfo && <div className="hint">{connInfo}</div>}
         {!ready && conn !== "connecting" &&
-          <div className="hint">Calibration actions stay disabled until the station, robot and
-            tools are loaded. (Connecting opens RoboDK if it isn't already running.)</div>}
+          <div className="hint">Connecting opens RoboDK (if needed) and checks the robot + camera tool.
+            You jog the robot yourself; creating targets stays locked until the gate is green.</div>}
       </div>
 
+      {/* ---- Aiming gate ------------------------------------------------- */}
       <div className="card">
-        <h2>Setup</h2>
+        <h2>Aim the camera</h2>
+        <div className="hint" style={{ marginTop: 0, marginBottom: 10 }}>
+          Start the camera and jog the robot until the board sits in the green band — ideal range
+          <b> {g ? g.ideal_distance_mm : 450} ± {g ? g.distance_tol_mm : 80} mm</b>, tilt
+          <b> ≤ {g ? g.max_tilt_deg : 25}°</b>. When all three lamps lock green, Create targets unlocks.
+        </div>
+        <div className="aim-wrap">
+          {frame ? <img className="preview" src={frame} alt="camera" />
+                 : <div className="preview" />}
+          {live && <AimHud gate={gate} />}
+          {!live && <div className="aim-off">camera off — press “Start camera”</div>}
+        </div>
+
+        <div className="lamps">
+          {lamps.map(([name, on]) => (
+            <span key={name} className={"lamp " + (on ? "on" : "off")}>
+              <span className="dot" /> {name}
+            </span>
+          ))}
+          <span className={"lamp lock " + (gate?.ok ? "on" : "off")}>
+            {gate?.ok ? "● LOCK" : "○ NO LOCK"}
+          </span>
+        </div>
+
+        <div className="btn-row">
+          {!live
+            ? <button onClick={startLive} disabled={running}>Start camera</button>
+            : <button className="secondary" onClick={stopLive}>Stop camera</button>}
+          <button onClick={generateTargets}
+                  disabled={!ready || running || generating || !gate?.ok}>
+            {generating ? "Creating…" : "Create targets"}
+          </button>
+          {targets != null &&
+            <button className="secondary" onClick={clearPoses} disabled={running}>Clear targets</button>}
+        </div>
+        {targets != null
+          ? <div className="ok-text" style={{ marginTop: 8, fontSize: 13 }}>
+              ✓ {targets} targets created (TasniCalib_*). Inspect them in RoboDK, then Run calibration below.
+            </div>
+          : <div className="hint">Create targets needs the connection ready <i>and</i> a green lock.
+              The robot's current pose becomes the seed; nothing is created until then.</div>}
+      </div>
+
+      {/* ---- Run -------------------------------------------------------- */}
+      <div className="card">
+        <h2>Run calibration</h2>
         {config && (
           <div className="kv">
             <div className="k">Robot</div><div className="v">{config.robot}</div>
             <div className="k">Camera tool</div>
             <div className="v">{config.camera_tool} <span className="hint">(RealSense, fixed)</span></div>
-            <div className="k">Home pose</div>
-            <div className="v">{config.neutral_target}</div>
             <div className="k">Camera</div>
             <div className="v">{config.camera.ip}:{config.camera.port} @ {config.camera.resolution}</div>
             <div className="k">Board</div>
@@ -192,12 +264,6 @@ export default function Calibration() {
             </div>
           </div>
         )}
-        <div className="req-note">
-          Requires the RealSense camera (3D model + a tool named
-          <b> {config?.camera_tool ?? "Realsense"}</b>) mounted on the flange, and a
-          <b> {config?.neutral_target ?? "NEUTRAL"}</b> pose that frames the board, in
-          <code> Tasni.rdk</code>. The tool is fixed — calibration solves its pose.
-        </div>
         <div className="row" style={{ marginTop: 14 }}>
           <div className="field">
             <label>Validation poses (held out)</label>
@@ -210,34 +276,13 @@ export default function Calibration() {
           </div>
         </div>
         <div className="warn-text" style={{ marginTop: 8, fontSize: 12 }}>
-          ⚠ Real robot: Run auto-generates {config?.calibration.pose_count ?? 15} poses around
-          {" "}{config?.neutral_target ?? "NEUTRAL"} and physically moves the KUKA through them. Clear the cell.
-        </div>
-        <div className="hint">
-          Held-out poses validate the fit on data the solver never saw. ~{config?.calibration.pose_count ?? 15}
-          {" "}poses are generated; holding out 3–5 is typical. (Need at least holdout + 3 to solve.)
+          ⚠ Real robot: Run physically moves the KUKA through the created targets. Clear the cell.
         </div>
         <div className="btn-row">
-          <button onClick={run} disabled={running || !ready}>Run calibration</button>
-          <button className="secondary" onClick={previewPoses} disabled={running || !ready}>Preview poses</button>
-          <button className="secondary" onClick={clearPoses} disabled={running || !ready}>Clear poses</button>
+          <button onClick={run} disabled={running || !ready || targets == null}>Run calibration</button>
           <button className="secondary" onClick={cancel} disabled={!running}>Cancel</button>
         </div>
-        {!ready && <div className="hint">Connect to RoboDK (top of page) to enable Run.</div>}
-        <div className="hint"><b>Preview poses</b> generates the {config?.calibration.pose_count ?? 15}
-          {" "}poses and shows them in RoboDK (as <code>TasniCalib_*</code>) so you can check them
-          before committing — no capture. <b>Clear poses</b> removes them.</div>
-        <div className="hint">
-          Moves to {config?.neutral_target ?? "NEUTRAL"}, auto-generates reachable poses around that
-          view, captures + detects the board at each, solves TSAI, reports quality, then deletes the
-          temp poses. Nothing is written to the tool until you review the metrics and click Apply.
-        </div>
-      </div>
-
-      <div className="card">
-        <h2>Live preview</h2>
-        {frame ? <img className="preview" src={frame} alt="camera preview" />
-               : <div className="preview" />}
+        {targets == null && <div className="hint">Create targets (above) to enable Run.</div>}
         <div className="progress"><div style={{ width: `${pct}%` }} /></div>
         <div className="status-line">{status}</div>
       </div>

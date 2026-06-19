@@ -17,6 +17,7 @@ from ..core.camera import CameraClient
 from ..core.config import AppConfig
 from ..core.events import EventBus
 from ..core.jobrunner import JobRunner
+from ..core.livepreview import LivePreview
 from ..core.rdk_io import RdkIO
 from ..core.session import RdkSession
 
@@ -34,6 +35,7 @@ class ServiceContainer:
     camera: CameraClient
     bus: EventBus
     jobs: JobRunner
+    live: LivePreview
 
     @classmethod
     def build(cls, config: AppConfig | None = None) -> "ServiceContainer":
@@ -42,13 +44,15 @@ class ServiceContainer:
         config = config or load_config()
         session = RdkSession(config.robodk)
         bus = EventBus()
+        camera = CameraClient(config.camera)
         return cls(
             config=config,
             session=session,
             rdk=RdkIO(session),
-            camera=CameraClient(config.camera),
+            camera=camera,
             bus=bus,
             jobs=JobRunner(bus),
+            live=LivePreview(camera, bus),
         )
 
 

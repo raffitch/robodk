@@ -29,10 +29,12 @@ The browser lands on the **Dashboard** (cell status + module cards); pick
 Calibration from there. The guide's **Open Tasni station** button loads `Tasni.rdk`
 and checks the cell is calibration-ready. Calibration is **RealSense-only and
 real-robot**: it requires the camera mounted as a tool named **`Realsense`** (3D
-model included) and a **`NEUTRAL`** pose that frames the board. Run **auto-generates
-~15 reachable poses around NEUTRAL**, drives the real robot through them, solves,
-then **deletes the temp poses** — no manual `Target*` setup needed. The Jetson
-camera server must be up on TCP 1024.
+model included). There is **no taught pose** — you **Start the camera** and jog the
+robot while a **live aiming HUD** shows the board's distance + angle; when the
+**DETECT · DISTANCE · ANGLE** lamps lock green, **Create targets** generates ~15
+reachable poses around the robot's *current* pose (left as `TasniCalib_*` to inspect
+in RoboDK), then **Run** drives the robot through them and solves. The Jetson camera
+server must be up on TCP 1024.
 
 ## Architecture
 
@@ -64,6 +66,12 @@ workflow = a backend `WorkflowModule` + a React page + one registry line.
 
 ChArUco eye-in-hand hand-eye calibration, refactored from `macros/AutoCalibrate.py`:
 
+- **Live aiming gate (HUD) — the seed, no taught pose:** a fighter-jet-style HUD
+  over the live camera (`core/livepreview.py` streams frames + a `gate` event;
+  `calibration/gate.py` computes board distance + tilt) shows **DETECT · DISTANCE ·
+  ANGLE** lamps. **Create targets** unlocks only when all three are green, and seeds
+  pose generation from the robot's *current* pose — so the operator jogs to a good
+  view instead of teaching a `NEUTRAL`. Generation re-checks the gate server-side.
 - **Solver: OpenCV `calibrateHandEye` TSAI** (kept per the research review), on a
   clean, explicit frame chain (replacing the macro's mixed-convention
   `pose_2_Rt`). Optional **post-solve refinement** minimizing reprojection error.

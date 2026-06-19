@@ -49,9 +49,11 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         cam = services.config.camera
         robodk_ok = tcp_probe("127.0.0.1", ROBODK_API_PORT)
         # Don't probe the camera mid-capture — the unicast server serves one
-        # client and a probe would steal the frame the job expects.
+        # client and a probe would steal the frame the job (or live gate) expects.
         if services.jobs.running:
             camera = {"ok": None, "detail": "in use by running job"}
+        elif services.live.running:
+            camera = {"ok": None, "detail": "in use by live preview"}
         else:
             camera = {"ok": tcp_probe(cam.ip, cam.port),
                       "detail": f"{cam.ip}:{cam.port}"}

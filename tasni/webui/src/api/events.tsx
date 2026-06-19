@@ -5,7 +5,7 @@ import {
 } from "react";
 
 export interface JobEvent {
-  type: "progress" | "log" | "frame" | "result" | "error" | "status" | string;
+  type: "progress" | "log" | "frame" | "gate" | "result" | "error" | "status" | string;
   payload: any;
 }
 type Handler = (e: JobEvent) => void;
