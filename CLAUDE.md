@@ -65,16 +65,27 @@ python tools/jetson_deploy.py bootstrap   # (re)install the service (idempotent)
 The Jetson clones THIS repo to `~/robodk` and tracks `main`. So: **one repo** — push here,
 then `deploy`. See [docs/jetson-scanner.md](docs/jetson-scanner.md).
 
+## North star (the actual goal)
+Build **ONE external control-panel app** (Python, drives RoboDK over its API) with a clean
+interface where the user picks what to do — **calibrate / scan / locate-ArUco / define
+targets** — replacing today's scattered embedded macros, OpenCV windows and tkinter popups.
+The app sits on a shared **`rdkscan/`** library (camera client, ChArUco, RoboDK I/O, config)
+that every action reuses. RoboDK stays the orchestrator; the Jetson stays the camera server.
+**We build it one module at a time, starting with calibration — but design for expansion
+from the start** (the calibration module must not be a one-off; its library + GUI shell are
+the foundation the scan/aruco/target modules plug into).
+
 ## Roadmap / status (updated 2026-06-19)
 - ✅ Extract macros → monorepo → GitHub (private: `raffitch/robodk`)
 - ✅ Best-practices research → [docs/best-practices-review.md](docs/best-practices-review.md)
 - ✅ **#2 Jetson hardening**: monorepo, systemd service, deploy tool, cron cleanup
-- ⏭️ **#1 NEXT: calibration app** — refactor `macros/AutoCalibrate.py` into an `rdkscan/`
-  shared library (camera client, ChArUco, RoboDK I/O) + a GUI, and **add calibration
-  quality metrics** (reprojection error + held-out validation poses) per the research.
-  Keep TSAI solver; do NOT switch to PARK. This is the seed the scan app reuses later.
-- Deferred: TSDF fusion (biggest scan-quality win), RealSense High-Accuracy preset +
-  filter order (both in `server/server_unicast_syncronous.py`), Tailscale for off-LAN.
+- ⏭️ **#1 NEXT: calibration module = the app's first slice.** Refactor
+  `macros/AutoCalibrate.py` into the `rdkscan/` shared library + the GUI shell (built to
+  hold future modules), and **add calibration quality metrics** (reprojection error +
+  held-out validation poses) per the research. Keep TSAI; do NOT switch to PARK.
+- Then integrate the rest into the same app: scan (with **TSDF fusion** — biggest quality
+  win), ArUco-to-plane, target generation. RealSense High-Accuracy preset + filter order
+  live in `server/server_unicast_syncronous.py`. Tailscale (off-LAN) deferred.
 
 ## Notes
 - Requires the `robodk` package (installed under Python 3.10) and RoboDK at `C:\RoboDK`.
