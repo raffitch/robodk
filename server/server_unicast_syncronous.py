@@ -75,29 +75,38 @@ def handle_client(conn, addr):
     print(f"Connection from {addr} (color_only={color_only})")
 
     while True:
-        depth, color, timestamp = getFrames(pipeline, align, depth_filters)
-        if color is not None and (color_only or depth is not None):
-            if color_only:
-                depth_compressed = b''
-            else:
-                depth_buffer = io.BytesIO()
-                np.save(depth_buffer, depth)
-                depth_buffer.seek(0)
-                depth_compressed = lz4f.compress(depth_buffer.read())
-            length_depth = struct.pack('<I', len(depth_compressed))
+        if color_only:
+            # Fast path: skip align (depth->color) AND the spatial depth filter
+            # entirely — they cost the Nano ~a second per frame and we're throwing
+            # depth away anyway. Just grab the raw color frame. (align leaves color
+            # unchanged, so intrinsics/detection are identical to the full path.)
+            frames = pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                continue
+            color = np.asanyarray(color_frame.get_data())
+            timestamp = frames.get_timestamp()
+            depth_compressed = b''
+        else:
+            depth, color, timestamp = getFrames(pipeline, align, depth_filters)
+            if depth is None or color is None:
+                continue
+            depth_buffer = io.BytesIO()
+            np.save(depth_buffer, depth)
+            depth_buffer.seek(0)
+            depth_compressed = lz4f.compress(depth_buffer.read())
 
-            data_color = jpeg.encode(color)
-            length_color = struct.pack('<I', len(data_color))
+        length_depth = struct.pack('<I', len(depth_compressed))
+        data_color = jpeg.encode(color)
+        length_color = struct.pack('<I', len(data_color))
+        ts = struct.pack('<d', timestamp)
 
-            ts = struct.pack('<d', timestamp)
-
-            frame_data = length_depth + length_color + ts + depth_compressed + data_color
-
-            try:
-                conn.sendall(frame_data)
-            except (ConnectionResetError, BrokenPipeError):
-                print(f"Lost connection to {addr}")
-                break
+        frame_data = length_depth + length_color + ts + depth_compressed + data_color
+        try:
+            conn.sendall(frame_data)
+        except (ConnectionResetError, BrokenPipeError):
+            print(f"Lost connection to {addr}")
+            break
 
     conn.close()
 
