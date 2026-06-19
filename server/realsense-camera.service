@@ -3,6 +3,10 @@ Description=RealSense D435i EtherSense camera server (RoboDK scan cell)
 Documentation=https://github.com/raffitch/robodk
 After=network-online.target
 Wants=network-online.target
+# Never give up restarting (camera/USB may be slow to enumerate at boot).
+# NOTE: on systemd 237 (Ubuntu 18.04) these belong in [Unit], not [Service].
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple
@@ -18,8 +22,6 @@ ExecStart=/home/jetson/EtherSenseServer/ethenv/bin/python /home/jetson/robodk/se
 
 Restart=always
 RestartSec=3
-# If the camera/USB isn't ready yet at boot, keep retrying rather than giving up
-StartLimitIntervalSec=0
 
 StandardOutput=journal
 StandardError=journal
