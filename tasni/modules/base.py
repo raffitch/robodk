@@ -73,5 +73,11 @@ class WorkflowModule(ABC):
     def panel_html(self) -> str:
         """Return the HTML fragment rendered when this module's tab is active."""
 
+    def panel_js(self) -> str:
+        """Return the module's panel script. It must register an init function as
+        ``window.TasniModules['<id>'] = { init(api) {...} }``; the shell calls it
+        with an api bound to this module (get/post/onEvent/el). Default: none."""
+        return ""
+
     def meta(self) -> dict:
         return {"id": self.id, "title": self.title, "description": self.description}

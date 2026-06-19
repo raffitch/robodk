@@ -1,0 +1,84 @@
+:root {
+  --bg: #0e1116;
+  --panel: #161b22;
+  --panel-2: #1c232d;
+  --border: #2b3340;
+  --text: #d7dee8;
+  --muted: #8a96a6;
+  --accent: #4c9aff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+  --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  height: 100vh; display: flex; flex-direction: column;
+}
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 18px; border-bottom: 1px solid var(--border); background: var(--panel);
+}
+.brand { font-weight: 700; font-size: 18px; letter-spacing: .5px; }
+.brand-sub { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 10px; }
+.conn { font-size: 12px; font-family: var(--mono); padding: 3px 10px; border-radius: 12px; }
+.conn--off { background: rgba(248,81,73,.15); color: var(--err); }
+.conn--on  { background: rgba(63,185,80,.15); color: var(--ok); }
+
+.layout { flex: 1; display: flex; min-height: 0; }
+.sidebar { width: 220px; border-right: 1px solid var(--border); background: var(--panel); padding: 12px; }
+.sidebar-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin: 4px 6px 10px; }
+.module-list { list-style: none; margin: 0; padding: 0; }
+.module-list li {
+  padding: 9px 12px; border-radius: 7px; cursor: pointer; margin-bottom: 4px;
+}
+.module-list li:hover { background: var(--panel-2); }
+.module-list li.active { background: var(--accent); color: #fff; }
+.module-list li .m-title { font-weight: 600; font-size: 14px; }
+.module-list li .m-desc { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.module-list li.active .m-desc { color: #e7eefc; }
+
+.panel { flex: 1; overflow: auto; padding: 22px; min-width: 0; }
+.empty { color: var(--muted); }
+
+/* shared module-panel primitives */
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+.card h2 { margin: 0 0 12px; font-size: 15px; }
+.row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label { font-size: 12px; color: var(--muted); }
+select, input { background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px; }
+button {
+  background: var(--accent); color: #fff; border: 0; border-radius: 6px;
+  padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+.btn-row { display: flex; gap: 10px; margin-top: 6px; }
+
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 18px; font-size: 13px; }
+.kv .k { color: var(--muted); }
+.kv .v { font-family: var(--mono); }
+
+.preview { width: 100%; max-width: 760px; background: #000; border: 1px solid var(--border);
+  border-radius: 8px; aspect-ratio: 16/9; object-fit: contain; }
+.progress { height: 8px; background: var(--panel-2); border-radius: 5px; overflow: hidden; margin: 10px 0; }
+.progress > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+.status-line { font-size: 13px; color: var(--muted); font-family: var(--mono); }
+
+.log { background: #0b0e13; border: 1px solid var(--border); border-radius: 8px; padding: 10px;
+  font-family: var(--mono); font-size: 12px; height: 180px; overflow: auto; white-space: pre-wrap; }
+.log .err { color: var(--err); }
+
+table.metrics { border-collapse: collapse; width: 100%; font-size: 13px; }
+table.metrics th, table.metrics td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+table.metrics th { color: var(--muted); font-weight: 500; }
+table.metrics td.num { font-family: var(--mono); text-align: right; }
+.badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; font-family: var(--mono); }
+.badge.good { background: rgba(63,185,80,.15); color: var(--ok); }
+.badge.warn { background: rgba(210,153,34,.15); color: var(--warn); }
+.badge.bad  { background: rgba(248,81,73,.15); color: var(--err); }
+.hint { font-size: 12px; color: var(--muted); margin-top: 8px; }

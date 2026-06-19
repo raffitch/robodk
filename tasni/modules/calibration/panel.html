@@ -1,0 +1,47 @@
+<div class="calib">
+  <div class="card">
+    <h2>Eye-in-hand calibration</h2>
+    <div id="cfg" class="kv"></div>
+    <div class="row" style="margin-top:14px">
+      <div class="field">
+        <label for="tool">Tool to calibrate</label>
+        <select id="tool"><option>loading…</option></select>
+      </div>
+      <div class="field">
+        <label for="holdout">Validation poses (held out)</label>
+        <input id="holdout" type="number" min="0" max="20" style="width:80px" />
+      </div>
+      <div class="field">
+        <label><input id="refine" type="checkbox" /> Reprojection refinement</label>
+      </div>
+    </div>
+    <div class="btn-row">
+      <button id="run">Run calibration</button>
+      <button id="cancel" class="secondary" disabled>Cancel</button>
+    </div>
+    <div class="hint">Drives the robot through every <code id="prefix">Target*</code>
+      pose, detects the ChArUco board, solves TSAI, then reports quality. Nothing
+      is written to the tool until you review the metrics and click Apply.</div>
+  </div>
+
+  <div class="card">
+    <h2>Live preview</h2>
+    <img id="preview" class="preview" alt="camera preview" />
+    <div class="progress"><div id="bar"></div></div>
+    <div id="status" class="status-line">idle</div>
+  </div>
+
+  <div class="card">
+    <h2>Quality metrics</h2>
+    <div id="metrics"><div class="hint">Run a calibration to see reprojection
+      and held-out validation errors.</div></div>
+    <div class="btn-row">
+      <button id="apply" disabled>Apply to tool</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Log</h2>
+    <div id="log" class="log"></div>
+  </div>
+</div>
