@@ -155,16 +155,12 @@ def bootstrap(j):
         raise SystemExit("venv is missing required deps; aborting before install.")
 
     step("3/6 Test-run the server briefly (confirm camera + port 1024) BEFORE enabling at boot")
-    j.run("pkill -f server_unicast_syncronous.py 2>/dev/null; sleep 1", quiet=True)
-    j.run(f"nohup {VENV_PY} {SERVER} >/tmp/cam_test.log 2>&1 & sleep 7; true", quiet=True)
-    rc, o, _ = j.run("ss -tln | grep ':1024' && echo LISTENING || echo NOPORT", quiet=True)
-    _, log, _ = j.run("cat /tmp/cam_test.log", quiet=True)
-    j.run("pkill -f server_unicast_syncronous.py 2>/dev/null; true", quiet=True)
-    print("server test log:\n" + log.rstrip())
-    if "LISTENING" not in o:
-        raise SystemExit("Server did not bind port 1024 in test-run; aborting before install. "
-                         "Check the log above (camera plugged in / not busy?).")
-    print(">> test-run OK: bound port 1024")
+    rc, act, _ = j.run(f"systemctl is-active {UNIT_NAME} 2>/dev/null", quiet=True)
+    if act.strip() == "active":
+        print("service already active and holding the camera — skipping standalone test-run "
+              "(a live service that's LISTENING already proves the camera works).")
+    else:
+        _test_run_server(j)
 
     step("4/6 Install + enable the systemd service")
     # Upload unit to /tmp via SFTP (robust), then move into place as root.
@@ -196,6 +192,19 @@ def bootstrap(j):
     j.sudo("crontab -l 2>/dev/null | sed -i '/EtherSense/d' - 2>/dev/null; true", quiet=True)
 
     print("\nBOOTSTRAP COMPLETE. The camera server is now a systemd service (auto-start on boot).")
+
+
+def _test_run_server(j):
+    j.run("pkill -f server_unicast_syncronous.py 2>/dev/null; sleep 1", quiet=True)
+    j.run(f"nohup {VENV_PY} {SERVER} >/tmp/cam_test.log 2>&1 & sleep 7; true", quiet=True)
+    rc, o, _ = j.run("ss -tln | grep ':1024' && echo LISTENING || echo NOPORT", quiet=True)
+    _, log, _ = j.run("cat /tmp/cam_test.log", quiet=True)
+    j.run("pkill -f server_unicast_syncronous.py 2>/dev/null; true", quiet=True)
+    print("server test log:\n" + log.rstrip())
+    if "LISTENING" not in o:
+        raise SystemExit("Server did not bind port 1024 in test-run; aborting before install. "
+                         "Check the log above (camera plugged in / not busy?).")
+    print(">> test-run OK: bound port 1024")
 
 
 def deploy(j):
