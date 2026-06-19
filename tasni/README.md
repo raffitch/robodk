@@ -8,16 +8,19 @@ is module #1 and the proof-of-pattern; scan / ArUco-to-plane / define-targets /
 ## Run
 
 ```bash
-py -3.10 -m tasni                 # web app -> http://127.0.0.1:8000
-py -3.10 -m tasni.cli             # headless calibration (prints metrics)
+./start.sh                 # dev: FastAPI (:8000) + Vite hot-reload (:5173) — open :5173
+./start.sh prod            # build the React app, then serve it all from FastAPI (:8000)
+
+py -3.10 -m tasni.cli              # headless calibration (prints metrics, no UI)
 py -3.10 -m tasni.cli --apply "TOOL"   # ...and write the result into a tool
 py -3.10 tests/test_calibration_synthetic.py   # math checks (no hardware)
 py -3.10 tests/test_calibration_job.py         # job checks (fake hardware)
 ```
 
-Have RoboDK open with the station loaded (the `Target*` poses + the tool to
-calibrate) before a real run — in `attach` mode the app binds your running
-RoboDK; the Jetson camera server must be up on TCP 1024.
+The browser lands on the **Dashboard** (cell status + module cards); pick
+Calibration (or a future module) from there. Have RoboDK open with the station
+loaded (the `Target*` poses + the tool) before a real run — in `attach` mode the
+app binds your running RoboDK; the Jetson camera server must be up on TCP 1024.
 
 ## Architecture
 
@@ -29,17 +32,21 @@ tasni/
     config             layered dataclass config (+ optional tasni.config.json)
     jobrunner, events  run long robot jobs off-thread; stream progress/frames
     geometry, logging  rigid-transform helpers; per-run artifact dirs
+    health             bare TCP reachability probes for the dashboard
   modules/
     base, registry     WorkflowModule ABC + ServiceContainer (DI) + registry
     calibration/       module #1 (see below)
-  webapp/              FastAPI shell + static SPA that hosts the modules
+  webapp/              FastAPI: platform API + serves the built SPA
+  webui/               React + Vite + TS app (Dashboard + per-module pages)
   cli, __main__        headless + web entrypoints
 ```
 
-**The module contract.** A module gets the core via a `ServiceContainer` and
-contributes (a) a FastAPI `router()` and (b) a UI `panel_html()`/`panel_js()`.
-It must not open sockets, import `robolink`, or spawn threads — those are the
-core's job. That boundary is what lets new modules drop in as pure leaves.
+**The module contract.** A module is the *backend* half of a workflow: it gets
+the core via a `ServiceContainer` and contributes a FastAPI `router()` + metadata
+(`id/title/description/icon/order`). It must not open sockets, import `robolink`,
+or spawn threads — those are the core's job. Its UI is a React page in
+`webui/src/pages` keyed off `id` in `webui/src/modules/registry.ts`. So a new
+workflow = a backend `WorkflowModule` + a React page + one registry line.
 
 ## Calibration module (#1)
 

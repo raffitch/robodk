@@ -88,9 +88,12 @@ The shared core (`rdkscan/` + the GUI shell + config) IS the platform; modules p
 
 ## The app: `tasni/` (platform) — see [tasni/README.md](tasni/README.md)
 The control-panel app lives in **`tasni/`**: a module-registry + shared-services
-platform with a **web** UI (FastAPI + browser). Package name chosen: **`tasni`**.
-RoboDK connection mode: **`attach`** (binds the running GUI, which already has the
-station/targets/tool loaded). Run it with `py -3.10 -m tasni`.
+platform. Backend = FastAPI (`tasni/webapp`, API-only + serves the build);
+frontend = **React + Vite + TypeScript** (`tasni/webui`) with a **Dashboard**
+landing and per-module pages (calibration is one module, not the front door).
+Package name: **`tasni`**. RoboDK connection mode: **`attach`** (binds the running
+GUI, which already has the station/targets/tool loaded). Run it with **`./start.sh`**
+(dev: backend + Vite hot-reload on :5173; `./start.sh prod` builds + serves on :8000).
 
 ## Roadmap / status (updated 2026-06-19)
 - ✅ Extract macros → monorepo → GitHub (private: `raffitch/robodk`)
