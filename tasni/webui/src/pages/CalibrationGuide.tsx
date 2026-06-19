@@ -21,17 +21,15 @@ interface BoardSpec {
 const STEPS = [
   "Print the ChArUco board (below) at 100% scale and verify the ruler.",
   "Mount it rigidly where the camera can see it — flat, no glare.",
-  "Open the Tasni station in RoboDK (loads the robot, poses and tool).",
+  "Open the Tasni station — checks the robot, the Realsense tool and NEUTRAL.",
   "Make sure the Jetson camera server is up (the Camera pill turns green).",
-  "Position the board in view — move to the first pose and check framing.",
-  "Choose robot motion — calibration needs the real robot to move.",
-  "Run — the robot visits each pose; watch the preview detect the board.",
+  "Check framing — move to NEUTRAL and confirm the board is detected.",
+  "Run — auto-generates poses around NEUTRAL, visits each on the real robot.",
   "Review the metrics: reprojection px, held-out validation, board consistency.",
-  "Apply to the tool once the numbers look good.",
+  "Apply to the Realsense tool once the numbers look good.",
 ];
 
 interface GuideProps {
-  runMode: string;
   ready: boolean;
   connState: "idle" | "connecting" | "ready" | "error";
   onConnect: () => void;
@@ -39,7 +37,7 @@ interface GuideProps {
 }
 
 export default function CalibrationGuide(
-  { runMode, ready, connState, onConnect, onConfigChanged }: GuideProps,
+  { ready, connState, onConnect, onConfigChanged }: GuideProps,
 ) {
   const [page, setPage] = useState("A4");
   const [spec, setSpec] = useState<BoardSpec | null>(null);
@@ -64,15 +62,13 @@ export default function CalibrationGuide(
 
   const preview = async () => {
     if (!ready) return;
-    if (runMode === "run_robot" &&
-        !window.confirm("This moves the real robot to the first pose. Cell clear?")) return;
-    setBusy(true); setPreviewMsg("Moving to first pose…");
+    if (!window.confirm("This moves the real robot to NEUTRAL. Cell clear?")) return;
+    setBusy(true); setPreviewMsg("Moving to NEUTRAL…");
     try {
-      const r = await api.post<{ target: string; detected: boolean; n_corners: number }>(
-        "/preview", { run_mode: runMode });
+      const r = await api.post<{ target: string; detected: boolean; n_corners: number }>("/preview");
       setPreviewMsg(r.detected
         ? `✓ board detected at ${r.target} (${r.n_corners} corners) — see Live preview.`
-        : `✗ no board at ${r.target} — reposition the board and retry.`);
+        : `✗ no board at ${r.target} — reposition the board or NEUTRAL and retry.`);
     } catch (e: any) {
       setPreviewMsg("✗ " + e.message);
     } finally { setBusy(false); }
@@ -139,7 +135,7 @@ export default function CalibrationGuide(
               {i === 4 && (
                 <div className="board-tools">
                   <button className="secondary" onClick={preview} disabled={busy || !ready}>
-                    Move to first pose &amp; check framing
+                    Move to NEUTRAL &amp; check the board
                   </button>
                   {!ready && <span className="hint" style={{ marginLeft: 10 }}>connect first</span>}
                   {previewMsg && <div className="board-dims" style={{ marginTop: 6 }}>{previewMsg}</div>}

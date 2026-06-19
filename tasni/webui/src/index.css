@@ -132,3 +132,8 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .conn-banner.connecting { border-left-color: var(--warn); }
 .conn-row { display: flex; align-items: center; gap: 10px; }
 .conn-label { font-weight: 600; }
+
+/* requirement note (RealSense mounting) */
+.req-note { margin-top: 12px; font-size: 12px; line-height: 1.5; color: var(--text);
+  background: rgba(76,154,255,.08); border: 1px solid var(--border);
+  border-left: 3px solid var(--accent); border-radius: 8px; padding: 10px 12px; }

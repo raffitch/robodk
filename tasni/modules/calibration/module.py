@@ -20,18 +20,13 @@ if TYPE_CHECKING:  # pragma: no cover
 # via get_type_hints in module globals — a class defined inside router() can't
 # be found there (it would be misread as a query param).
 class RunBody(BaseModel):
-    tool_name: str | None = None
+    # Tool is forced to the Realsense camera; motion is forced to the real robot.
     holdout_count: int | None = None
     refine: bool | None = None
-    run_mode: str | None = None        # "run_robot" (real) or "simulate"
 
 
 class BoardBody(BaseModel):
     page: str = "A4"
-
-
-class PreviewBody(BaseModel):
-    run_mode: str | None = None
 
 
 class CalibrationModule(WorkflowModule):
@@ -57,8 +52,8 @@ class CalibrationModule(WorkflowModule):
             c = services.config
             return {
                 "robot": c.robodk.robot_name,
-                "run_mode": c.robodk.run_mode,
-                "target_prefix": c.robodk.target_prefix,
+                "camera_tool": c.robodk.camera_tool,
+                "neutral_target": c.robodk.neutral_target,
                 "board": vars(c.board),
                 "camera": {"ip": c.camera.ip, "port": c.camera.port,
                            "resolution": c.camera.resolution},
@@ -82,21 +77,29 @@ class CalibrationModule(WorkflowModule):
         @router.post("/connect")
         def connect() -> dict:
             """Open the cell's station (loads Tasni.rdk if RoboDK came up empty)
-            and report what's there. First load of the ~117 MB station is slow."""
+            and verify it's set up for RealSense calibration. First load of the
+            ~117 MB station is slow."""
+            c = services.config.robodk
             try:
-                targets = services.rdk.list_targets()
-                tools = services.rdk.list_tools()
                 robot_ok = services.rdk.robot().Valid()
-                return {"connected": True, "robot": services.config.robodk.robot_name,
-                        "robot_valid": robot_ok, "n_targets": len(targets),
-                        "targets": targets, "tools": tools}
+                tool_ok = services.rdk.item_exists(c.camera_tool)
+                neutral_ok = services.rdk.item_exists(c.neutral_target)
+                ready = robot_ok and tool_ok and neutral_ok
+                missing = [n for n, ok in (
+                    (c.robot_name, robot_ok), (f"tool {c.camera_tool!r}", tool_ok),
+                    (f"target {c.neutral_target!r}", neutral_ok)) if not ok]
+                return {"connected": True, "ready": ready,
+                        "robot": c.robot_name, "robot_valid": robot_ok,
+                        "tool": c.camera_tool, "tool_present": tool_ok,
+                        "neutral": c.neutral_target, "neutral_present": neutral_ok,
+                        "missing": missing}
             except Exception as e:
                 raise HTTPException(503, f"RoboDK unavailable: {e}")
 
         @router.post("/preview")
-        def preview(body: PreviewBody) -> dict:
-            """Move to the first calibration pose and grab one frame so the user
-            can confirm the board is in view. Publishes the annotated frame to the
+        def preview() -> dict:
+            """Move to NEUTRAL and grab one frame so the user can confirm the
+            board is framed before a run. Publishes the annotated frame to the
             live preview; returns whether the board was detected."""
             if services.jobs.running:
                 raise HTTPException(409, "a calibration run is in progress")
@@ -106,28 +109,27 @@ class CalibrationModule(WorkflowModule):
 
             from ...core.events import JobEvent
             from .charuco import CharucoTarget
+            c = services.config
+            neutral = c.robodk.neutral_target
             try:
-                targets = services.rdk.list_targets()
-                if not targets:
-                    raise HTTPException(400, "no calibration targets in the station")
-                mode = services.rdk.apply_run_mode(body.run_mode)
-                first = targets[0]
-                services.bus.publish(JobEvent("log",
-                    {"message": f"preview: moving to {first} ({mode})"}))
-                services.rdk.move_j(first)
+                if not services.rdk.item_exists(neutral):
+                    raise HTTPException(400, f"target {neutral!r} not found in the station")
+                services.rdk.apply_run_mode("run_robot")
+                services.rdk.use_tool_and_frame(c.robodk.camera_tool, neutral)
+                services.bus.publish(JobEvent("log", {"message": f"preview: moving to {neutral}"}))
+                services.rdk.move_j(neutral)
                 frame = services.camera.grab()
-                board = CharucoTarget(services.config.board)
-                det = board.detect(frame.color, services.config.camera.K,
-                                   services.config.camera.dist,
-                                   min_corners=services.config.calibration.min_charuco_corners)
-                img = (board.annotate(frame.color, det, services.config.camera.K,
-                                      services.config.camera.dist, f"{first} (preview)")
+                board = CharucoTarget(c.board)
+                det = board.detect(frame.color, c.camera.K, c.camera.dist,
+                                   min_corners=c.calibration.min_charuco_corners)
+                img = (board.annotate(frame.color, det, c.camera.K, c.camera.dist,
+                                      f"{neutral} (board OK)")
                        if det is not None else frame.color)
                 ok, jpeg = cv2.imencode(".jpg", img)
                 if ok:
                     services.bus.publish(JobEvent("frame",
                         {"jpeg_b64": base64.b64encode(jpeg.tobytes()).decode("ascii")}))
-                return {"target": first, "detected": det is not None,
+                return {"target": neutral, "detected": det is not None,
                         "n_corners": det.n_corners if det is not None else 0}
             except HTTPException:
                 raise
@@ -176,10 +178,8 @@ class CalibrationModule(WorkflowModule):
             if services.jobs.running:
                 raise HTTPException(409, "a job is already running")
             params = CalibrationParams(
-                tool_name=body.tool_name,
                 holdout_count=body.holdout_count,
                 refine=body.refine,
-                run_mode=body.run_mode,
             )
             self._active_job = CalibrationJob(services, params)
             services.jobs.start(self._active_job, name="calibration")

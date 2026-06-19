@@ -33,6 +33,7 @@ class RdkIO:
 
     def __init__(self, session: RdkSession):
         self.session = session
+        self._frame = None        # active reference frame item (set by use_tool_and_frame)
 
     @property
     def rdk(self):
@@ -40,6 +41,65 @@ class RdkIO:
 
     def robot(self):
         return self.rdk.Item(self.session.config.robot_name)
+
+    # -- items / existence --------------------------------------------------
+    def item_exists(self, name: str) -> bool:
+        return self.rdk.Item(name).Valid()
+
+    def use_tool_and_frame(self, tool_name: str, frame_of_target: str | None = None
+                           ) -> np.ndarray:
+        """Make ``tool_name`` the active tool (and, if given, adopt the reference
+        frame that ``frame_of_target`` is defined in). Returns the tool's mounting
+        pose (flange->tool) as numpy 4x4. Raises if the tool is missing."""
+        import robolink
+
+        tool = self.rdk.Item(tool_name, robolink.ITEM_TYPE_TOOL)
+        if not tool.Valid():
+            raise RuntimeError(f"tool {tool_name!r} not found in the station")
+        robot = self.robot()
+        robot.setPoseTool(tool)
+        self._frame = None
+        if frame_of_target:
+            target = self.rdk.Item(frame_of_target, robolink.ITEM_TYPE_TARGET)
+            if target.Valid():
+                frame = target.Parent()
+                if frame.Valid() and frame.Type() == robolink.ITEM_TYPE_FRAME:
+                    robot.setPoseFrame(frame)
+                    self._frame = frame
+        return pose_to_T(tool.PoseTool())
+
+    # -- poses --------------------------------------------------------------
+    def tcp_pose_T(self) -> np.ndarray:
+        """Current TCP pose in the active reference frame (numpy 4x4)."""
+        return pose_to_T(self.robot().Pose())
+
+    def move_j_pose(self, T: np.ndarray) -> None:
+        self.robot().MoveJ(T_to_pose(T))
+
+    def is_reachable(self, T: np.ndarray) -> bool:
+        """True if the robot has an IK solution for this TCP pose (active tool/frame)."""
+        try:
+            sol = self.robot().SolveIK(T_to_pose(T))
+        except Exception:
+            return False
+        try:
+            return len(list(sol)) >= 6 or np.asarray(sol.list()).size >= 6
+        except Exception:
+            return np.asarray(sol).size >= 6
+
+    # -- temporary targets (auto pose generation) ---------------------------
+    def add_target(self, name: str, T: np.ndarray):
+        """Create a cartesian target at pose ``T`` in the active frame; return it."""
+        frame = getattr(self, "_frame", None)
+        target = self.rdk.AddTarget(name, frame, self.robot())
+        target.setPose(T_to_pose(T))
+        return target
+
+    def delete_items(self, names: list[str]) -> None:
+        for name in names:
+            item = self.rdk.Item(name)
+            if item.Valid():
+                item.Delete()
 
     def apply_run_mode(self, mode: str | None = None) -> str:
         """Push the run mode (``"simulate"`` or ``"run_robot"``). ``mode`` overrides

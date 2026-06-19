@@ -85,20 +85,36 @@ class RoboDKConfig:
     station_path: str | None = "Tasni.rdk"
     station_name: str = "Tasni"          # station display name set after loading
     target_prefix: str = "Target"
+    # The RealSense camera is mounted on the flange as a tool named "Realsense"
+    # (with its 3D model) in Tasni.rdk. Calibration solves THIS tool's pose; it is
+    # fixed, not user-selectable.
+    camera_tool: str = "Realsense"
+    # A pose that already frames the calibration board — the home/seed pose the
+    # auto-generated calibration poses orbit around.
+    neutral_target: str = "NEUTRAL"
     # "simulate" keeps the robot in RoboDK only; "run_robot" drives the real arm.
-    # Calibration needs the real arm to move (the camera rides on it), so the UI
-    # defaults a calibration run to run_robot; this is just the fallback default.
-    run_mode: str = "simulate"
+    # Calibration only makes sense on the real arm (the camera rides on it).
+    run_mode: str = "run_robot"
 
 
 @dataclass
 class CalibrationConfig:
-    """Calibration-module knobs (capture + solve + validation split)."""
+    """Calibration-module knobs (pose generation + capture + solve + split)."""
 
     settle_s: float = 0.4               # pause after MoveJ before grabbing a frame
     holdout_count: int = 3              # poses held out of the solve for validation
     refine: bool = True                 # post-TSAI reprojection-minimizing refinement
     min_charuco_corners: int = 6        # reject a view with fewer detected corners
+
+    # Auto pose generation: orbit the NEUTRAL view in a cone (not a full dome) so
+    # the board stays visible, with roll + distance variation for hand-eye
+    # conditioning. Temp targets are created, used, then deleted.
+    auto_generate: bool = True
+    pose_count: int = 15                # reachable poses to capture
+    cone_half_angle_deg: float = 32.0   # max view-angle change from NEUTRAL
+    roll_max_deg: float = 75.0          # roll spread about the optical axis
+    distance_jitter: float = 0.12       # +/- fraction of working distance
+    look_distance_mm: float = 500.0     # fallback if NEUTRAL board distance unknown
 
 
 @dataclass
