@@ -36,8 +36,11 @@ export default function Calibration() {
   const [refine, setRefine] = useState(true);
 
   const [runMode, setRunMode] = useState("run_robot");   // calibration defaults to the real arm
+  const [conn, setConn] = useState<"idle" | "connecting" | "ready" | "error">("idle");
+  const [connInfo, setConnInfo] = useState("");
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState("idle");
+  const ready = conn === "ready";
   const [pct, setPct] = useState(0);
   const [logs, setLogs] = useState<string[]>([]);
   const [frame, setFrame] = useState<string | null>(null);
@@ -56,13 +59,30 @@ export default function Calibration() {
     }).catch((e) => addLog(e.message, true));
   }, []);
 
-  useEffect(() => {
-    loadConfig();
-    api.get<{ tools: string[] }>("/tools").then((d) => {
-      setTools(d.tools);
-      if (d.tools.length) setTool(d.tools[0]);
-    }).catch((e) => addLog("tools: " + e.message, true));
-  }, [loadConfig]);
+  // Config is RoboDK-free, so it loads immediately. Tools/targets require a
+  // connection — fetched by connect(), not on mount, so visiting the page never
+  // throws "RoboDK unavailable". Nothing robot-related is enabled until ready.
+  useEffect(() => { loadConfig(); }, [loadConfig]);
+
+  const connect = useCallback(async () => {
+    setConn("connecting");
+    setConnInfo("Opening the Tasni station… first load of the 117 MB station can take 1–2 min.");
+    try {
+      const r = await api.post<{ robot_valid: boolean; n_targets: number; tools: string[] }>("/connect");
+      setTools(r.tools);
+      if (r.tools.length) setTool(r.tools[0]);
+      if (r.robot_valid) {
+        setConn("ready");
+        setConnInfo(`Ready — robot found, ${r.n_targets} calibration poses, ${r.tools.length} tools.`);
+      } else {
+        setConn("error");
+        setConnInfo("Station opened but the robot wasn't found — check the station / robot name.");
+      }
+    } catch (e: any) {
+      setConn("error");
+      setConnInfo(e.message);
+    }
+  }, []);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -117,6 +137,26 @@ export default function Calibration() {
 
       <div className="calib-layout">
        <div className="calib-main">
+
+      <div className={"card conn-banner " + conn}>
+        <div className="conn-row">
+          <span className={"dot " + (ready ? "ok" : conn === "error" ? "bad" : "unknown")} />
+          <span className="conn-label">
+            {conn === "idle" && "Not connected to RoboDK"}
+            {conn === "connecting" && "Connecting…"}
+            {conn === "ready" && "Connected — cell ready"}
+            {conn === "error" && "Connection problem"}
+          </span>
+          <button onClick={connect} disabled={conn === "connecting"} style={{ marginLeft: "auto" }}>
+            {ready ? "Reconnect" : "Connect & open Tasni station"}
+          </button>
+        </div>
+        {connInfo && <div className="hint">{connInfo}</div>}
+        {!ready && conn !== "connecting" &&
+          <div className="hint">Calibration actions stay disabled until the station, robot and
+            tools are loaded. (Connecting opens RoboDK if it isn't already running.)</div>}
+      </div>
+
       <div className="card">
         <h2>Setup</h2>
         {config && (
@@ -167,9 +207,10 @@ export default function Calibration() {
           poses, hold out 3–5. (Need at least holdout + 3 to solve.)
         </div>
         <div className="btn-row">
-          <button onClick={run} disabled={running}>Run calibration</button>
+          <button onClick={run} disabled={running || !ready}>Run calibration</button>
           <button className="secondary" onClick={cancel} disabled={!running}>Cancel</button>
         </div>
+        {!ready && <div className="hint">Connect to RoboDK (top of page) to enable Run.</div>}
         <div className="hint">
           Drives the robot through every <code>{config?.target_prefix ?? "Target"}*</code> pose,
           detects the ChArUco board, solves TSAI, then reports quality. Nothing is written to the
@@ -203,7 +244,8 @@ export default function Calibration() {
         </div>
       </div>
        </div>
-       <CalibrationGuide runMode={runMode} onConfigChanged={loadConfig} />
+       <CalibrationGuide runMode={runMode} ready={ready} connState={conn}
+         onConnect={connect} onConfigChanged={loadConfig} />
       </div>
     </div>
   );

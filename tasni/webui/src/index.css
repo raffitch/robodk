@@ -124,3 +124,11 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .linkbtn { display: inline-block; background: var(--panel); border: 1px solid var(--border); color: var(--text);
   border-radius: 6px; padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer; }
 .linkbtn:hover { border-color: var(--accent); }
+
+/* connection gate banner */
+.conn-banner { border-left: 3px solid var(--muted); }
+.conn-banner.ready { border-left-color: var(--ok); }
+.conn-banner.error { border-left-color: var(--err); }
+.conn-banner.connecting { border-left-color: var(--warn); }
+.conn-row { display: flex; align-items: center; gap: 10px; }
+.conn-label { font-weight: 600; }

@@ -30,14 +30,21 @@ const STEPS = [
   "Apply to the tool once the numbers look good.",
 ];
 
+interface GuideProps {
+  runMode: string;
+  ready: boolean;
+  connState: "idle" | "connecting" | "ready" | "error";
+  onConnect: () => void;
+  onConfigChanged: () => void;
+}
+
 export default function CalibrationGuide(
-  { runMode, onConfigChanged }: { runMode: string; onConfigChanged: () => void },
+  { runMode, ready, connState, onConnect, onConfigChanged }: GuideProps,
 ) {
   const [page, setPage] = useState("A4");
   const [spec, setSpec] = useState<BoardSpec | null>(null);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<boolean[]>(() => STEPS.map(() => false));
-  const [connectMsg, setConnectMsg] = useState<string>("");
   const [previewMsg, setPreviewMsg] = useState<string>("");
 
   const loadSpec = (p: string) =>
@@ -55,19 +62,8 @@ export default function CalibrationGuide(
     } finally { setBusy(false); }
   };
 
-  const connect = async () => {
-    setBusy(true); setConnectMsg("Opening station… (first load of the 117 MB station is slow)");
-    try {
-      const r = await api.post<{ robot_valid: boolean; n_targets: number; tools: string[] }>("/connect");
-      setConnectMsg(`✓ station open — robot ${r.robot_valid ? "found" : "MISSING"}, `
-        + `${r.n_targets} poses, ${r.tools.length} tools.`);
-      onConfigChanged();
-    } catch (e: any) {
-      setConnectMsg("✗ " + e.message);
-    } finally { setBusy(false); }
-  };
-
   const preview = async () => {
+    if (!ready) return;
     if (runMode === "run_robot" &&
         !window.confirm("This moves the real robot to the first pose. Cell clear?")) return;
     setBusy(true); setPreviewMsg("Moving to first pose…");
@@ -128,16 +124,24 @@ export default function CalibrationGuide(
 
               {i === 2 && (
                 <div className="board-tools">
-                  <button className="secondary" onClick={connect} disabled={busy}>Open Tasni station</button>
-                  {connectMsg && <div className="board-dims" style={{ marginTop: 6 }}>{connectMsg}</div>}
+                  <button className="secondary" onClick={onConnect} disabled={connState === "connecting"}>
+                    {ready ? "Reconnect" : "Open Tasni station"}
+                  </button>
+                  <span style={{ marginLeft: 10 }}
+                    className={ready ? "ok-text" : connState === "error" ? "warn-text" : ""}>
+                    {connState === "connecting" ? "connecting…"
+                      : ready ? "✓ connected"
+                      : connState === "error" ? "✗ not connected" : "not connected"}
+                  </span>
                 </div>
               )}
 
               {i === 4 && (
                 <div className="board-tools">
-                  <button className="secondary" onClick={preview} disabled={busy}>
+                  <button className="secondary" onClick={preview} disabled={busy || !ready}>
                     Move to first pose &amp; check framing
                   </button>
+                  {!ready && <span className="hint" style={{ marginLeft: 10 }}>connect first</span>}
                   {previewMsg && <div className="board-dims" style={{ marginTop: 6 }}>{previewMsg}</div>}
                 </div>
               )}
