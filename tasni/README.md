@@ -7,14 +7,17 @@ is module #1 and the proof-of-pattern; scan / ArUco-to-plane / define-targets /
 
 ## Run
 
-```bash
-./start.sh                 # dev: FastAPI (:8000) + Vite hot-reload (:5173) — open :5173
-./start.sh prod            # build the React app, then serve it all from FastAPI (:8000)
+```powershell
+# Windows (PowerShell) — the normal way to run it:
+.\start.ps1                 # dev: FastAPI (:8000) + Vite hot-reload (:5173) — open http://localhost:5173
+.\start.ps1 prod            # build the React app, then serve it all from FastAPI (:8000)
+#   or just run / double-click  start.bat   (start.bat prod for prod) — no execution-policy fuss
+#   Git Bash users:  ./start.sh
 
 py -3.10 -m tasni.cli              # headless calibration (prints metrics, no UI)
 py -3.10 -m tasni.cli --apply "TOOL"   # ...and write the result into a tool
-py -3.10 tests/test_calibration_synthetic.py   # math checks (no hardware)
-py -3.10 tests/test_calibration_job.py         # job checks (fake hardware)
+py -3.10 tests\test_calibration_synthetic.py   # math checks (no hardware)
+py -3.10 tests\test_calibration_job.py         # job checks (fake hardware)
 ```
 
 The browser lands on the **Dashboard** (cell status + module cards); pick

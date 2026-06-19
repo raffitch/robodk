@@ -92,8 +92,9 @@ platform. Backend = FastAPI (`tasni/webapp`, API-only + serves the build);
 frontend = **React + Vite + TypeScript** (`tasni/webui`) with a **Dashboard**
 landing and per-module pages (calibration is one module, not the front door).
 Package name: **`tasni`**. RoboDK connection mode: **`attach`** (binds the running
-GUI, which already has the station/targets/tool loaded). Run it with **`./start.sh`**
-(dev: backend + Vite hot-reload on :5173; `./start.sh prod` builds + serves on :8000).
+GUI, which already has the station/targets/tool loaded). Run it on Windows with
+**`.\start.ps1`** (or `start.bat`); dev = backend + Vite hot-reload on :5173,
+`.\start.ps1 prod` builds + serves on :8000. (`start.sh` is the Git Bash equivalent.)
 
 ## Roadmap / status (updated 2026-06-19)
 - ✅ Extract macros → monorepo → GitHub (private: `raffitch/robodk`)
