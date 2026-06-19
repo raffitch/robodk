@@ -33,6 +33,20 @@ authoritative server.
 16-byte header `<I depth_len><I color_len><d timestamp>`, then lz4-compressed depth
 (`np.save` buffer) + JPEG color (TurboJPEG). Single client, continuous stream.
 
+### Optional stream-mode handshake (backward compatible)
+Right after connecting, a client *may* send one line to pick the stream:
+
+| Client sends | Server streams |
+|---|---|
+| *(nothing)* / `MODE FULL` / unrecognized | **full depth+color** (default — legacy + scan clients are unaffected) |
+| `MODE COLOR` (or a bare `C`) | **color-only**: `depth_len=0`, and the server skips depth align + spatial filter + lz4 entirely |
+
+Color-only is for the live aiming preview + calibration (which never use depth). On the
+Nano that path is the difference between ~0.5 fps and realtime (~30+ fps) — the cost was
+per-frame **align+filter CPU**, not bandwidth. Depth/scan clients that just connect and
+read keep getting byte-identical full frames. (`tasni.core.camera.CameraClient` sends
+`MODE COLOR` only when `color_only=True`.)
+
 ## Known improvement targets (from docs/best-practices-review.md)
 - No visual preset is set — apply **High Accuracy** for object scanning.
 - Only `spatial` is enabled; decimation/temporal/hole-filling are commented out — adopt

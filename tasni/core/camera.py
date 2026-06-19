@@ -99,11 +99,13 @@ class CameraClient:
 
     @staticmethod
     def _request_color_only(sock: socket.socket) -> None:
-        """Ask the server for a color-only stream (it replies depth_len=0). A
-        server that predates this just ignores the byte and sends full frames —
-        the decoder handles both, so this is always safe to send."""
+        """Send the color-only handshake (``MODE COLOR``). Full clients send
+        nothing — the server defaults to the full depth+color stream — so this is
+        the only explicit request needed and existing depth clients are untouched.
+        A server that predates the handshake falls back to full frames, which the
+        decoder still handles, so sending this is always safe."""
         try:
-            sock.sendall(b"C")
+            sock.sendall(b"MODE COLOR\n")
         except OSError:
             pass
 

@@ -55,19 +55,21 @@ def openPipeline():
 def handle_client(conn, addr):
     jpeg = turbojpeg.TurboJPEG('/usr/lib/aarch64-linux-gnu/libturbojpeg.so.0')
 
-    # Optional, backward-compatible mode negotiation: a client may send a single
-    # byte right after connecting. b'C' => COLOR-ONLY (we send depth_len=0 and
-    # skip the lz4 depth compression entirely). No byte (timeout) => the original
-    # full depth+color stream, so existing clients are unaffected. Color-only is
-    # used for the live aiming preview + calibration, which never use depth — it
-    # cuts ~80-90% of the per-frame bytes (and the Nano's lz4 CPU), which is the
-    # difference between a slow preview and a realtime one over Wi-Fi.
+    # Optional, backward-compatible handshake. Right after connecting a client may
+    # send ONE line declaring the stream it wants:
+    #     "MODE COLOR"  -> lightweight COLOR-ONLY (depth_len=0, no align/filter/lz4)
+    #     "MODE FULL"   -> the full depth+color stream
+    # No line (timeout) / anything unrecognized => FULL, so existing depth/scan
+    # clients are unaffected (they just connect and read). A bare 'C' is also
+    # accepted, for the first color-only client. Color-only is used by the live
+    # aiming preview + calibration (which never use depth); it cuts ~75% of the
+    # per-frame bytes AND the Nano's align+filter CPU — the difference between a
+    # ~0.5 fps preview and a realtime one.
     color_only = False
     try:
-        conn.settimeout(0.4)
-        first = conn.recv(1)
-        if first == b'C':
-            color_only = True
+        conn.settimeout(0.5)
+        req = conn.recv(64).strip().upper()
+        color_only = req.startswith(b'MODE COLOR') or req == b'C'
     except (socket.timeout, OSError):
         pass
     finally:
