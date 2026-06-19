@@ -1,0 +1,12 @@
+# The RoboDK station is a ~117 MB binary. We version the extracted Python, NOT the blob.
+# (If you DO want the station in history, use Git LFS and remove the line below.)
+241113_AutoScan.rdk
+*.synced.rdk
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# RoboDK temp
+*.rdk.bak
