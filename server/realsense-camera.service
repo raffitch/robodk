@@ -1,0 +1,29 @@
+[Unit]
+Description=RealSense D435i EtherSense camera server (RoboDK scan cell)
+Documentation=https://github.com/raffitch/robodk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root so it can (a) set the cooling fan to max and (b) access the camera
+# without relying on the login session. Matches the prior root-cron precedent.
+WorkingDirectory=/home/jetson/robodk/server
+
+# Cooling fan -> 100% for sustained scanning (was done via sudo in the old shortcut)
+ExecStartPre=-/bin/sh -c 'echo 255 > /sys/devices/pwm-fan/target_pwm'
+
+# Production server under the Python 3.10 venv that holds pyrealsense2/turbojpeg/lz4
+ExecStart=/home/jetson/EtherSenseServer/ethenv/bin/python /home/jetson/robodk/server/server_unicast_syncronous.py
+
+Restart=always
+RestartSec=3
+# If the camera/USB isn't ready yet at boot, keep retrying rather than giving up
+StartLimitIntervalSec=0
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=realsense-camera
+
+[Install]
+WantedBy=multi-user.target
