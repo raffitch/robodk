@@ -86,17 +86,26 @@ trending toward more automation/AI. So architect the app as a **module registry 
 services**, not a calibration tool with a few add-ons. The calibration module is module #1.
 The shared core (`rdkscan/` + the GUI shell + config) IS the platform; modules plug in.
 
+## The app: `tasni/` (platform) — see [tasni/README.md](tasni/README.md)
+The control-panel app lives in **`tasni/`**: a module-registry + shared-services
+platform with a **web** UI (FastAPI + browser). Package name chosen: **`tasni`**.
+RoboDK connection mode: **`attach`** (binds the running GUI, which already has the
+station/targets/tool loaded). Run it with `py -3.10 -m tasni`.
+
 ## Roadmap / status (updated 2026-06-19)
 - ✅ Extract macros → monorepo → GitHub (private: `raffitch/robodk`)
 - ✅ Best-practices research → [docs/best-practices-review.md](docs/best-practices-review.md)
 - ✅ **#2 Jetson hardening**: monorepo, systemd service, deploy tool, cron cleanup
-- ⏭️ **#1 NEXT: calibration module = the app's first slice.** Refactor
-  `macros/AutoCalibrate.py` into a shared library + the GUI shell (built to hold future
-  modules), and **add calibration quality metrics** (reprojection error + held-out
-  validation poses) per the research. Keep TSAI; do NOT switch to PARK.
-  - ⚠️ **Naming:** pick a **platform-neutral** package name (the core hosts printing/other
-    workflows later, not just scanning) — `rdkscan/` was a placeholder; prefer something
-    like `robocell/` / `rdkcore/`. Decide this before the first module locks it in.
+- ✅ **#1 Calibration module = the app's first slice** (branch `calibration-module`).
+  Refactored `macros/AutoCalibrate.py` into the `tasni` core + a calibration module
+  on a web GUI shell built to hold future modules. **Added the missing quality
+  metrics**: reprojection error (px), held-out validation-pose error, board
+  consistency (mm). Kept TSAI (no PARK); added optional reprojection refinement.
+  - ⚠️ Finding: OpenCV's TSAI is numerically fragile near a ~180° camera→flange
+    mount (PARK/HORAUD/ANDREFF stay exact); the new metrics make a bad solve
+    visible instead of silently applying it. See [tasni/README.md](tasni/README.md).
+  - Next polish ideas: optional station-load on connect; live 3D viewport; seed
+    refinement from best linear solver only if metrics flag a near-singular mount.
 - Then integrate the rest into the same app: scan (with **TSDF fusion** — biggest quality
   win), ArUco-to-plane, target generation. RealSense High-Accuracy preset + filter order
   live in `server/server_unicast_syncronous.py`. Tailscale (off-LAN) deferred.
