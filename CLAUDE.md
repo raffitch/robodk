@@ -75,14 +75,28 @@ that every action reuses. RoboDK stays the orchestrator; the Jetson stays the ca
 from the start** (the calibration module must not be a one-off; its library + GUI shell are
 the foundation the scan/aruco/target modules plug into).
 
+### Long-term vision — a robotic-fabrication PLATFORM (à la Aibuild / ai-build.com)
+The end goal is bigger than scanning: a **platform that hosts ALL of the user's robot
+workflows** — scanning, calibration, **3D printing / additive**, and whatever comes next —
+each as a pluggable **workflow module** on a shared core (robot/RoboDK connection, camera,
+config, job runner, live monitoring, logging). Inspiration: **Aibuild** — software that
+*orchestrates and increasingly automates existing* robotic-manufacturing tools (they target
+KUKA arms + gantries: toolpath, printing, simulation) rather than replacing them; over time,
+trending toward more automation/AI. So architect the app as a **module registry + shared
+services**, not a calibration tool with a few add-ons. The calibration module is module #1.
+The shared core (`rdkscan/` + the GUI shell + config) IS the platform; modules plug in.
+
 ## Roadmap / status (updated 2026-06-19)
 - ✅ Extract macros → monorepo → GitHub (private: `raffitch/robodk`)
 - ✅ Best-practices research → [docs/best-practices-review.md](docs/best-practices-review.md)
 - ✅ **#2 Jetson hardening**: monorepo, systemd service, deploy tool, cron cleanup
 - ⏭️ **#1 NEXT: calibration module = the app's first slice.** Refactor
-  `macros/AutoCalibrate.py` into the `rdkscan/` shared library + the GUI shell (built to
-  hold future modules), and **add calibration quality metrics** (reprojection error +
-  held-out validation poses) per the research. Keep TSAI; do NOT switch to PARK.
+  `macros/AutoCalibrate.py` into a shared library + the GUI shell (built to hold future
+  modules), and **add calibration quality metrics** (reprojection error + held-out
+  validation poses) per the research. Keep TSAI; do NOT switch to PARK.
+  - ⚠️ **Naming:** pick a **platform-neutral** package name (the core hosts printing/other
+    workflows later, not just scanning) — `rdkscan/` was a placeholder; prefer something
+    like `robocell/` / `rdkcore/`. Decide this before the first module locks it in.
 - Then integrate the rest into the same app: scan (with **TSDF fusion** — biggest quality
   win), ArUco-to-plane, target generation. RealSense High-Accuracy preset + filter order
   live in `server/server_unicast_syncronous.py`. Tailscale (off-LAN) deferred.
