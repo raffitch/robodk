@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { moduleApi } from "../api/client";
 import { useEvents, type JobEvent } from "../api/events";
+import CalibrationGuide from "./CalibrationGuide";
 
 const api = moduleApi("calibration");
 
@@ -46,17 +47,21 @@ export default function Calibration() {
   const addLog = (msg: string, err = false) =>
     setLogs((l) => [...l, (err ? "ERROR: " : "") + msg]);
 
-  useEffect(() => {
+  const loadConfig = useCallback(() => {
     api.get<CalibConfig>("/config").then((c) => {
       setConfig(c);
       setHoldout(c.calibration.holdout_count);
       setRefine(c.calibration.refine);
     }).catch((e) => addLog(e.message, true));
+  }, []);
+
+  useEffect(() => {
+    loadConfig();
     api.get<{ tools: string[] }>("/tools").then((d) => {
       setTools(d.tools);
       if (d.tools.length) setTool(d.tools[0]);
     }).catch((e) => addLog("tools: " + e.message, true));
-  }, []);
+  }, [loadConfig]);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -105,6 +110,8 @@ export default function Calibration() {
       <h1 className="page-title">🎯 Calibration</h1>
       <p className="page-sub">ChArUco eye-in-hand hand-eye calibration (TSAI) with quality metrics.</p>
 
+      <div className="calib-layout">
+       <div className="calib-main">
       <div className="card">
         <h2>Setup</h2>
         {config && (
@@ -178,6 +185,9 @@ export default function Calibration() {
             <div key={i} className={l.startsWith("ERROR") ? "err" : ""}>{l}</div>
           ))}
         </div>
+      </div>
+       </div>
+       <CalibrationGuide onConfigChanged={loadConfig} />
       </div>
     </div>
   );

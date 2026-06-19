@@ -125,6 +125,32 @@ def _merge(obj: Any, data: dict[str, Any]) -> None:
             setattr(obj, key, value)
 
 
+def config_file_path() -> Path:
+    """Path to the user override file (``tasni.config.json`` at the repo root)."""
+    return Path(__file__).resolve().parents[2] / "tasni.config.json"
+
+
+def save_overrides(updates: dict[str, Any]) -> Path:
+    """Deep-merge ``updates`` into ``tasni.config.json`` (created if absent).
+
+    Used to persist UI-driven changes — e.g. syncing the printed board's
+    dimensions into the config so detection matches what was printed.
+    """
+    path = config_file_path()
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+    def merge(dst: dict, src: dict) -> None:
+        for key, value in src.items():
+            if isinstance(value, dict) and isinstance(dst.get(key), dict):
+                merge(dst[key], value)
+            else:
+                dst[key] = value
+
+    merge(data, updates)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return path
+
+
 def load_config(path: str | Path | None = None) -> AppConfig:
     """Build an :class:`AppConfig`, overlaying an optional JSON file.
 

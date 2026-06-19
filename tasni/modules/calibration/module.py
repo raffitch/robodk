@@ -6,11 +6,27 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from pydantic import BaseModel
+
 from ..base import ServiceContainer, WorkflowModule
 from .service import CalibrationJob, CalibrationParams
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
+
+
+# Request bodies must live at module scope: with `from __future__ import
+# annotations` the handler annotations are strings, and FastAPI resolves them
+# via get_type_hints in module globals — a class defined inside router() can't
+# be found there (it would be misread as a query param).
+class RunBody(BaseModel):
+    tool_name: str | None = None
+    holdout_count: int | None = None
+    refine: bool | None = None
+
+
+class BoardBody(BaseModel):
+    page: str = "A4"
 
 
 class CalibrationModule(WorkflowModule):
@@ -26,16 +42,10 @@ class CalibrationModule(WorkflowModule):
 
     # -- REST ---------------------------------------------------------------
     def router(self) -> "APIRouter":
-        from fastapi import APIRouter, HTTPException
-        from pydantic import BaseModel
+        from fastapi import APIRouter, HTTPException, Response
 
         router = APIRouter()
         services = self.services
-
-        class RunBody(BaseModel):
-            tool_name: str | None = None
-            holdout_count: int | None = None
-            refine: bool | None = None
 
         @router.get("/config")
         def get_config() -> dict:
@@ -63,6 +73,43 @@ class CalibrationModule(WorkflowModule):
                 return {"tools": services.rdk.list_tools()}
             except Exception as e:
                 raise HTTPException(503, f"RoboDK unavailable: {e}")
+
+        # -- calibration board (print-it-yourself) --------------------------
+        @router.get("/board/spec")
+        def board_spec(page: str = "A4") -> dict:
+            from .board_pdf import compute_spec
+            spec = compute_spec(services.config.board, page)
+            cur = services.config.board
+            spec_d = spec.to_dict()
+            # Does the live detection config already match this printed size?
+            spec_d["matches_config"] = (
+                abs(cur.square_size_mm - spec.square_size_mm) < 1e-6
+                and abs(cur.marker_size_mm - spec.marker_size_mm) < 1e-6)
+            spec_d["pages"] = ["A4", "A3", "Letter"]
+            return spec_d
+
+        @router.get("/board.pdf")
+        def board_pdf(page: str = "A4", download: bool = False):
+            from .board_pdf import render_pdf
+            pdf, spec = render_pdf(services.config.board, page)
+            disp = "attachment" if download else "inline"
+            fname = f"charuco_{spec.squares_x}x{spec.squares_y}_{spec.square_size_mm}mm_{page}.pdf"
+            return Response(pdf, media_type="application/pdf",
+                            headers={"Content-Disposition": f'{disp}; filename="{fname}"'})
+
+        @router.post("/board/use")
+        def board_use(body: BoardBody) -> dict:
+            """Sync the printed board's dimensions into the calibration config
+            (in memory + persisted) so detection matches what was printed."""
+            from .board_pdf import compute_spec
+            from ...core.config import save_overrides
+            spec = compute_spec(services.config.board, body.page)
+            b = services.config.board
+            b.square_size_mm = spec.square_size_mm
+            b.marker_size_mm = spec.marker_size_mm
+            save_overrides({"board": {"square_size_mm": b.square_size_mm,
+                                      "marker_size_mm": b.marker_size_mm}})
+            return {"applied": True, "board": vars(b)}
 
         @router.post("/run")
         def run(body: RunBody) -> dict:
