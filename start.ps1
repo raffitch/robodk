@@ -51,10 +51,12 @@ function Find-Browser {
 }
 
 function Wait-Port($port, $timeoutSec = 90) {
+    # Family-agnostic: Vite binds IPv6 ::1 on Windows, and PS 5.1's TcpClient is
+    # IPv4-only, so a raw connect test would never see it. Get-NetTCPConnection
+    # reports the listening socket regardless of IPv4/IPv6.
     for ($i = 0; $i -lt ($timeoutSec * 2); $i++) {
-        foreach ($h in @('127.0.0.1', 'localhost')) {
-            try { $c = New-Object Net.Sockets.TcpClient; $c.Connect($h, $port); $u = $c.Connected; $c.Close()
-                  if ($u) { return $true } } catch {}
+        if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) {
+            return $true
         }
         Start-Sleep -Milliseconds 500
     }
@@ -84,9 +86,8 @@ if ($Mode -eq 'dev') {
 }
 
 try {
-    if (-not (Wait-Port $port)) {
-        Write-Warning "server didn't come up on :$port — see $env:TEMP\tasni-*.log"
-    }
+    if (Wait-Port $port) { Start-Sleep -Milliseconds 700 }
+    else { Write-Warning "server didn't come up on :$port — see $env:TEMP\tasni-*.log" }
     $url = "http://localhost:$port"
     $browser = Find-Browser
     if ($browser) {
