@@ -73,7 +73,13 @@ def handle_client(conn, addr):
     except (socket.timeout, OSError):
         pass
     finally:
-        conn.settimeout(None)
+        # Send timeout: this server is single-threaded with listen(1), so a client
+        # that dies without a clean RST would otherwise leave sendall blocked
+        # forever and the server would stop accepting anyone (the "NO SIGNAL"
+        # wedge). With a timeout, a stuck/dead client just gets dropped and we go
+        # back to accept(). Generous enough that a slow-but-alive link (a full
+        # depth+color frame over slow Wi-Fi can take a few seconds) is not killed.
+        conn.settimeout(10.0)
     print(f"Connection from {addr} (color_only={color_only})")
 
     while True:
@@ -106,8 +112,8 @@ def handle_client(conn, addr):
         frame_data = length_depth + length_color + ts + depth_compressed + data_color
         try:
             conn.sendall(frame_data)
-        except (ConnectionResetError, BrokenPipeError):
-            print(f"Lost connection to {addr}")
+        except (ConnectionResetError, BrokenPipeError, socket.timeout) as e:
+            print(f"Lost connection to {addr}: {e}")
             break
 
     conn.close()
