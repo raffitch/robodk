@@ -3,6 +3,9 @@
 241113_AutoScan.rdk
 *.synced.rdk
 
+# Secrets - device passwords, tokens. NEVER commit these.
+secrets/
+
 # Python
 __pycache__/
 *.pyc

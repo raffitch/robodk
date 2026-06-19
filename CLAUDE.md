@@ -46,6 +46,14 @@ your interactive session.
   `--inplace`. Default output is a separate `*.synced.rdk`.
 - Always keep a backup of `241113_AutoScan.rdk` before using `--inplace`.
 
+## Hardware: the 3D scanner (Jetson + RealSense)
+The scan/calibration macros are **clients** of a RealSense D435i on a Jetson Nano that
+streams over TCP 1024. Full device details, software/firmware versions, the server-side
+repo, and known operational issues are in **[docs/jetson-scanner.md](docs/jetson-scanner.md)**.
+- SSH (passwordless, key installed): `ssh -i ~/.ssh/jetson_robodk jetson@10.12.171.70`
+- Re-probe the device: `python tools/jetson_probe.py`
+- Credentials live in `secrets/jetson.env` (**git-ignored — never commit**).
+
 ## Notes
 - Requires the `robodk` package (installed under Python 3.10) and RoboDK at `C:\RoboDK`.
 - Loading the 117 MB station takes a minute or two per script run — expected.
