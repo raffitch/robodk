@@ -15,9 +15,9 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from ..core import runs as runs_registry
 from ..core.config import AppConfig, load_config
 from ..core.health import ROBODK_API_PORT, tcp_probe
-from ..core.logging import REPO_ROOT
 from ..modules.base import ServiceContainer
 from ..modules.registry import build_registry
 
@@ -66,18 +66,17 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @app.get("/api/runs")
     def runs(limit: int = 20) -> dict:
         """Recent run-artifact folders across all modules, newest first."""
-        root = REPO_ROOT / "runs"
-        items = []
-        if root.exists():
-            for module_dir in root.iterdir():
-                if not module_dir.is_dir():
-                    continue
-                for run in module_dir.iterdir():
-                    if run.is_dir():
-                        items.append({"module": module_dir.name, "stamp": run.name,
-                                      "path": str(run)})
-        items.sort(key=lambda r: r["stamp"], reverse=True)
-        return {"runs": items[:limit]}
+        return {"runs": runs_registry.list_runs(limit)}
+
+    @app.get("/api/runs/active")
+    def active_run(module: str) -> dict:
+        """The currently-applied run for a module (its ``active.json`` pointer), so
+        the Dashboard can show e.g. "cell calibrated: <date> · <quality>". ``None``
+        until something has been applied."""
+        try:
+            return {"active": runs_registry.read_active(module)}
+        except ValueError as e:                 # rejected module segment
+            raise HTTPException(400, str(e))
 
     for module in sorted(registry.all(), key=lambda m: m.order):
         app.include_router(module.router(), prefix=f"/api/modules/{module.id}")

@@ -5,17 +5,37 @@ import { useHealth } from "../api/useHealth";
 import StatusPill from "../components/StatusPill";
 
 interface Run { module: string; stamp: string; path: string; }
+interface ActiveRun {
+  module: string; run_id: string | null; applied_at: string; tool: string;
+  source: string; refined?: boolean | null; method?: string | null;
+  quality?: { verdict?: string | null; train_rms_px?: number | null;
+              val_rms_px?: number | null; board_consistency_rms_mm?: number | null };
+}
 
 export default function Home() {
   const nav = useNavigate();
   const health = useHealth();
   const [modules, setModules] = useState<ModuleMeta[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
+  const [calib, setCalib] = useState<ActiveRun | null>(null);
 
   useEffect(() => {
     apiGet<{ modules: ModuleMeta[] }>("/api/modules").then((d) => setModules(d.modules)).catch(() => {});
     apiGet<{ runs: Run[] }>("/api/runs").then((d) => setRuns(d.runs)).catch(() => {});
+    apiGet<{ active: ActiveRun | null }>("/api/runs/active?module=calibration")
+      .then((d) => setCalib(d.active)).catch(() => {});
   }, []);
+
+  // "cell calibrated: <date> · <verdict>" — provenance of the live calibration.
+  const calibLine = calib
+    ? `Cell calibrated: ${calib.applied_at.replace("T", " ")}`
+      + (calib.quality?.verdict ? ` · ${calib.quality.verdict}` : "")
+      + (calib.quality?.val_rms_px != null
+          ? ` · ${calib.quality.val_rms_px.toFixed(2)} px val`
+          : calib.quality?.train_rms_px != null
+            ? ` · ${calib.quality.train_rms_px.toFixed(2)} px train` : "")
+      + ` · tool ${calib.tool}`
+    : null;
 
   return (
     <div>
@@ -31,6 +51,14 @@ export default function Home() {
             job: {health?.job.running ? "running" : (health?.job.status ?? "idle")}
           </span>
         </div>
+        {calibLine && (
+          <div className={"calib-stamp " + (calib?.quality?.verdict ?? "")}>
+            ✓ {calibLine}
+          </div>
+        )}
+        {!calibLine && (
+          <div className="hint">Cell not calibrated yet — run the Calibration module and apply.</div>
+        )}
         <div className="hint">
           RoboDK must be open with the station loaded (Target* poses + the tool) before a
           real run; the Jetson camera server listens on TCP 1024.

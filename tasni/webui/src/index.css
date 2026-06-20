@@ -119,6 +119,13 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .runs .run { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); }
 .runs .run .mono { font-family: var(--mono); color: var(--muted); }
 
+/* dashboard: provenance of the currently-applied calibration */
+.calib-stamp { margin: 8px 0 4px; font-size: 13px; font-weight: 600; color: var(--ok);
+  padding: 7px 10px; border-radius: 7px; border: 1px solid var(--border);
+  border-left: 3px solid var(--ok); background: rgba(63,185,80,.07); }
+.calib-stamp.borderline { color: var(--warn); border-left-color: var(--warn); background: rgba(210,153,34,.07); }
+.calib-stamp.fail { color: var(--err); border-left-color: var(--err); background: rgba(248,81,73,.08); }
+
 /* calibration page: main column + sticky guide pane */
 .calib-layout { display: flex; gap: 18px; align-items: flex-start; }
 .calib-main { flex: 1; min-width: 0; }

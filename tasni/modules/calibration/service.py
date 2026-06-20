@@ -19,12 +19,14 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import base64
 
 import cv2
 import numpy as np
 
+from ...core import runs
 from ...core.aiming import GateThresholds, evaluate_gate
 from ...core.events import JobEvent
 from ...core.geometry import invert_T
@@ -150,6 +152,63 @@ def _split_views(views: list, holdout: int, strategy: str, seed: int):
     val_i = set(idx[:holdout])
     return ([v for i, v in enumerate(views) if i not in val_i],
             [views[i] for i in idx[:holdout]])
+
+
+def _active_quality(report: dict) -> dict:
+    """The handful of metrics the Dashboard shows for the currently-applied run."""
+    train = report.get("train") or {}
+    val = report.get("validation") or {}
+    bc = report.get("board_consistency_mm") or {}
+    diag = report.get("diagnosis") or {}
+    return {
+        "verdict": diag.get("verdict"),
+        "train_rms_px": train.get("rms_px"),
+        "val_rms_px": val.get("rms_px"),
+        "board_consistency_rms_mm": bc.get("rms"),
+    }
+
+
+def apply_calibration(services, *, job: "CalibrationJob | None" = None,
+                      run_id: str | None = None) -> dict:
+    """Write a solved camera pose into the Realsense tool and record provenance.
+
+    Two sources of the solve:
+      * ``run_id`` — load ``report.json`` (the solved ``X_cam2gripper``) + ``meta.json``
+        from disk. This survives a server restart, when the in-memory last job is gone.
+      * else ``job`` — the in-memory last run (the fast path right after a Run).
+    On success ``runs/calibration/active.json`` records which run is now live in the
+    cell (run-id, date, tool, key metrics) so the Dashboard can show "cell calibrated".
+    Raises ``RuntimeError`` if there is nothing to apply.
+    """
+    rdk: RdkIO = services.rdk
+    if run_id is not None:
+        report = runs.load_report("calibration", run_id)
+        meta = runs.load_meta("calibration", run_id) or {}
+        tool = meta.get("tool_name") or services.config.robodk.camera_tool
+        X = np.asarray(report["X_cam2gripper"], dtype=float)
+        source, stamp_id = "run_id", run_id
+    elif job is not None and job.solved_X is not None:
+        report = job.result.report if job.result else {}
+        tool, X = job.tool_name, job.solved_X
+        source = "memory"
+        stamp_id = Path(job.result.run_dir).name if job.result else None
+    else:
+        raise RuntimeError("no solved calibration to apply")
+
+    rdk.set_tool_pose(tool, X)
+    payload = {
+        "module": "calibration",
+        "run_id": stamp_id,
+        "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),  # caller-stamped; core stays clock-free
+        "tool": tool,
+        "source": source,
+        "refined": report.get("refined"),
+        "method": report.get("method"),
+        "quality": _active_quality(report),
+    }
+    runs.write_active("calibration", payload)
+    return {"status": "applied", "tool": tool, "run_id": stamp_id,
+            "source": source, "active": payload}
 
 
 @dataclass
@@ -370,6 +429,13 @@ class CalibrationJob:
             (run_dir / "report.json").write_text(json.dumps(report.to_dict(), indent=2),
                                                  encoding="utf-8")
             (run_dir / "summary.txt").write_text(summary, encoding="utf-8")
+            # A tiny sidecar so apply-by-run-id (after a server restart, when the
+            # in-memory job is gone) knows which tool this run solved for. The
+            # solved transform itself already lives in report.json.
+            (run_dir / "meta.json").write_text(json.dumps(
+                {"module": "calibration", "stamp": stamp,
+                 "tool_name": self.tool_name, "method": method,
+                 "refined": do_refine}, indent=2), encoding="utf-8")
 
             self.result = CalibrationResult(
                 report=report.to_dict(), summary=summary, run_dir=str(run_dir),

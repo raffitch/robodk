@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from ..base import ServiceContainer, WorkflowModule
 from .service import (
     CalibrationJob, CalibrationParams, SimTourJob, TARGET_PREFIX,
-    gate_thresholds, generate_calibration_targets)
+    apply_calibration, gate_thresholds, generate_calibration_targets)
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
@@ -25,6 +25,12 @@ class RunBody(BaseModel):
     # Tool is forced to the Realsense camera; motion is forced to the real robot.
     holdout_count: int | None = None
     refine: bool | None = None
+
+
+class ApplyBody(BaseModel):
+    # Apply the in-memory last run by default; pass a run_id (a TasniCalib run
+    # stamp) to apply a past run loaded from disk — survives a server restart.
+    run_id: str | None = None
 
 
 class CalibrationModule(WorkflowModule):
@@ -224,14 +230,26 @@ class CalibrationModule(WorkflowModule):
             return {"status": "cancelling"}
 
         @router.post("/apply")
-        def apply() -> dict:
-            if self._active_job is None or self._active_job.solved_X is None:
-                raise HTTPException(400, "no solved calibration to apply")
+        def apply(body: ApplyBody) -> dict:
+            """Write the solved camera pose into the Realsense tool. With no
+            ``run_id`` this applies the in-memory last run (the fast path); with a
+            ``run_id`` it loads that past run from disk (survives a restart). Either
+            way it records runs/calibration/active.json for the Dashboard."""
+            from ...core.runs import RunNotFound
+
+            if body.run_id is None and (
+                    self._active_job is None or self._active_job.solved_X is None):
+                raise HTTPException(400, "no solved calibration to apply — run a "
+                                    "calibration first, or pass a run_id")
             try:
-                tool = self._active_job.apply_to_tool()
-            except Exception as e:
+                return apply_calibration(services, job=self._active_job,
+                                         run_id=body.run_id)
+            except RunNotFound as e:
+                raise HTTPException(404, str(e))
+            except (RuntimeError, ValueError, KeyError) as e:
                 raise HTTPException(400, str(e))
-            return {"status": "applied", "tool": tool}
+            except Exception as e:
+                raise HTTPException(503, f"RoboDK unavailable: {e}")
 
         @router.get("/status")
         def status() -> dict:
