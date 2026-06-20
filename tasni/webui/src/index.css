@@ -99,6 +99,22 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .badge.warn { background: rgba(210,153,34,.15); color: var(--warn); }
 .badge.bad  { background: rgba(248,81,73,.15); color: var(--err); }
 .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+.jog-frame code { font-family: var(--mono); font-size: 11px; background: var(--panel-2);
+  border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+
+/* metrics -> verdict banner */
+.verdict { border: 1px solid var(--border); border-radius: 8px; padding: 11px 13px; margin-bottom: 14px; }
+.verdict.pass { border-left: 3px solid var(--ok); background: rgba(63,185,80,.07); }
+.verdict.borderline { border-left: 3px solid var(--warn); background: rgba(210,153,34,.07); }
+.verdict.fail { border-left: 3px solid var(--err); background: rgba(248,81,73,.08); }
+.verdict-head { display: flex; gap: 10px; align-items: baseline; font-size: 13px; line-height: 1.45; }
+.verdict-tag { font-family: var(--mono); font-weight: 800; font-size: 12px; letter-spacing: 1px;
+  padding: 2px 8px; border-radius: 6px; flex: 0 0 auto; }
+.verdict.pass .verdict-tag { background: rgba(63,185,80,.18); color: var(--ok); }
+.verdict.borderline .verdict-tag { background: rgba(210,153,34,.18); color: var(--warn); }
+.verdict.fail .verdict-tag { background: rgba(248,81,73,.18); color: var(--err); }
+.verdict-causes { margin: 8px 0 0; padding-left: 18px; font-size: 12px; color: var(--text); line-height: 1.55; }
+.verdict-causes li { margin-bottom: 3px; }
 .runs { font-size: 13px; }
 .runs .run { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); }
 .runs .run .mono { font-family: var(--mono); color: var(--muted); }
@@ -155,6 +171,9 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .lamp.on { color: var(--ok); border-color: rgba(63,185,80,.5); background: rgba(63,185,80,.10); }
 .lamp.on .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
 .lamp.off { color: var(--err); border-color: rgba(248,81,73,.4); background: rgba(248,81,73,.08); }
+.lamp.unknown { color: var(--muted); border-color: var(--border); background: var(--panel-2); }
+.lamp .glyph { font-weight: 800; }
+.lamp .lamp-state { margin-left: 6px; font-size: 10px; opacity: .85; letter-spacing: 1px; }
 .lamp.lock { margin-left: auto; font-size: 13px; }
 .lamp.lock.on { box-shadow: 0 0 12px rgba(63,185,80,.35) inset; }
 

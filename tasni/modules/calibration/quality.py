@@ -51,6 +51,7 @@ class CalibrationReport:
     method_ranking: list | None = None
     intrinsics_check: dict | None = None
     cross_val_rms_px: float | None = None
+    diagnosis: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -79,6 +80,11 @@ class CalibrationReport:
             f"{'' if md['well_conditioned'] else '  [WEAK - re-seed]'}")
         if self.intrinsics_check and self.intrinsics_check.get("warn"):
             lines.append(f"intrinsics: WARNING - {self.intrinsics_check['note']}")
+        if self.diagnosis:
+            lines.append(f"verdict: {self.diagnosis['verdict'].upper()} - "
+                         f"{self.diagnosis['headline']}")
+            for cause in self.diagnosis.get("causes", []):
+                lines.append(f"  - {cause}")
         return "\n".join(lines)
 
 
@@ -151,12 +157,78 @@ def motion_diversity(views: list[CalibrationView]) -> dict:
     }
 
 
+# Diagnosis thresholds (px / mm). Tuned to the live-gate working distance
+# (~450 mm) and a 30 mm-square ChArUco board; deliberately conservative — a
+# marginal solve reads "borderline" rather than silently passing. The reprojection
+# bands match the UI colour bands (good <1, warn <3) in Calibration.tsx.
+REPROJ_PASS_PX = 1.0
+REPROJ_FAIL_PX = 3.0
+BOARDCONS_PASS_MM = 1.5
+BOARDCONS_FAIL_MM = 5.0
+OVERFIT_RATIO = 2.5      # validation/train reprojection above this => suspect overfit
+
+
+def diagnose(report: "CalibrationReport") -> dict:
+    """Turn the metric *pattern* into an operator verdict — a pass/borderline/fail
+    headline plus the most-likely cause(s), each a next action. Pure function of the
+    report numbers (no new measurement). Uses the honest reprojection figure (held-out
+    validation if present, else training).
+
+    The key discriminator: a high reprojection error with a *tight* board-consistency
+    spread blames the camera model (intrinsics/distortion); a large spread blames the
+    geometry (robot pose / depth noise) — the open question in the best-practices review.
+    """
+    train = report.train.rms_px
+    val = report.validation.rms_px if report.validation else None
+    reproj = val if val is not None else train
+    bc = report.board_consistency_mm["rms"]
+    well = bool(report.motion_diversity.get("well_conditioned", True))
+    intr_warn = bool(report.intrinsics_check and report.intrinsics_check.get("warn"))
+
+    mid_reproj = reproj >= REPROJ_PASS_PX
+    high_reproj = reproj >= REPROJ_FAIL_PX
+    mid_spread = bc >= BOARDCONS_PASS_MM
+    high_spread = bc >= BOARDCONS_FAIL_MM
+
+    causes: list[str] = []
+    if mid_reproj and not mid_spread:
+        causes.append("High reprojection with a tight board-consistency spread points "
+                      "at the camera model — likely intrinsics/distortion (the factory "
+                      "K or zero distortion may be wrong). Verify the camera intrinsics.")
+    if mid_spread:
+        causes.append("Large board-consistency spread points at geometry, not the lens "
+                      "— likely robot-pose accuracy or depth/marker noise. Check the "
+                      "robot's absolute accuracy and the board's rigidity.")
+    if intr_warn:
+        causes.append("The intrinsics self-check disagrees with the configured camera "
+                      "matrix — recalibrate the camera intrinsics or update the config.")
+    if not well:
+        causes.append("Weak motion diversity — poses may be near-coplanar, so the errors "
+                      "can read optimistically. Re-seed at a more varied view and recapture.")
+    if val is not None and train > 0 and val >= OVERFIT_RATIO * train and mid_reproj:
+        causes.append("Validation error is much larger than the training fit — possible "
+                      "overfit; capture more (and more varied) poses.")
+
+    if high_reproj or high_spread:
+        verdict = "fail"
+        headline = "Fail — do not apply; this calibration is not trustworthy yet."
+    elif mid_reproj or mid_spread or intr_warn or not well:
+        verdict = "borderline"
+        headline = "Borderline — usable, but address the cause below before relying on it."
+    else:
+        verdict = "pass"
+        headline = "Pass — reprojection, board-consistency and conditioning are all in band."
+        causes.append("Reprojection and board-consistency are tight and the motion set "
+                      "is well-conditioned.")
+    return {"verdict": verdict, "headline": headline, "causes": causes}
+
+
 def evaluate(train: list[CalibrationView], validation: list[CalibrationView],
              X: np.ndarray, T_base_target: np.ndarray, K: np.ndarray,
              dist: np.ndarray, *, refined: bool, method: str = "TSAI",
              method_ranking: list | None = None, intrinsics_check: dict | None = None,
              cross_val_rms_px: float | None = None) -> CalibrationReport:
-    return CalibrationReport(
+    report = CalibrationReport(
         refined=refined,
         method=method,
         X_cam2gripper=np.asarray(X).tolist(),
@@ -169,3 +241,5 @@ def evaluate(train: list[CalibrationView], validation: list[CalibrationView],
         intrinsics_check=intrinsics_check,
         cross_val_rms_px=cross_val_rms_px,
     )
+    report.diagnosis = diagnose(report)
+    return report

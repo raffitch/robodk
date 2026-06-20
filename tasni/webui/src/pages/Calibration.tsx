@@ -13,7 +13,8 @@ interface CalibConfig {
   board: { squares_x: number; squares_y: number; square_size_mm: number; marker_size_mm: number; dictionary: string };
   camera: { ip: string; port: number; resolution: string };
   calibration: { holdout_count: number; refine: boolean; pose_count: number;
-                 cone_half_angle_deg: number; roll_max_deg: number; distance_jitter: number };
+                 cone_half_angle_deg: number; roll_max_deg: number; distance_jitter: number;
+                 jog_invert_x: boolean; jog_invert_y: boolean; jog_invert_z: boolean };
   gate: { ideal_distance_mm: number; distance_tol_mm: number; max_tilt_deg: number };
 }
 interface Split { rms_px: number; max_px: number; n_views: number; }
@@ -26,6 +27,7 @@ interface Report {
   motion_diversity?: { axis_spread: number; min_pair_deg: number; max_pair_deg: number; well_conditioned: boolean; note?: string };
   intrinsics_check?: { warn: boolean; note: string } | null;
   cross_val_rms_px?: number | null;
+  diagnosis?: { verdict: "pass" | "borderline" | "fail"; headline: string; causes: string[] };
 }
 interface RunResult {
   summary: string;
@@ -267,16 +269,42 @@ export default function Calibration() {
           {!live && <div className="aim-off">camera off — press “Start camera”</div>}
         </div>
 
+        {/* Colour-blind-safe: a ✓/✗/· glyph and a state word carry the state, so
+            it isn't conveyed by red/green alone. */}
         <div className="lamps">
-          {lamps.map(([name, on]) => (
-            <span key={name} className={"lamp " + (on ? "on" : "off")}>
-              <span className="dot" /> {name}
-            </span>
-          ))}
+          {lamps.map(([name, on]) => {
+            const state = on === undefined ? "unknown" : on ? "on" : "off";
+            const glyph = on === undefined ? "·" : on ? "✓" : "✗";
+            const word = on === undefined ? "—" : on ? "OK" : "NO";
+            return (
+              <span key={name} className={"lamp " + state}>
+                <span className="glyph">{glyph}</span> {name}
+                <span className="lamp-state">{word}</span>
+              </span>
+            );
+          })}
           <span className={"lamp lock " + (gate?.ok ? "on" : "off")}>
-            {gate?.ok ? "● LOCK" : "○ NO LOCK"}
+            {gate?.ok ? "✓ ● LOCK" : "✗ ○ NO LOCK"}
           </span>
         </div>
+
+        {config && (() => {
+          const c = config.calibration;
+          const inv = [c.jog_invert_x && "X", c.jog_invert_y && "Y", c.jog_invert_z && "Z"]
+            .filter(Boolean) as string[];
+          return (
+            <div className="hint jog-frame">
+              The HUD’s jog hints are in the <b>camera / TOOL optical frame</b>:
+              {" "}<b>X→ right</b>, <b>Y↓ down</b>, <b>Z⊙ forward</b> (toward the board).
+              Jog the robot in its <b>TOOL</b> frame and the X/Y/Z hints map 1:1.
+              {" "}If a pendant TOOL axis runs the opposite way, flip it with
+              {" "}<code>jog_invert_x/y/z</code> in the config —{" "}
+              {inv.length
+                ? <span className="warn-text">currently inverted: {inv.join(", ")}.</span>
+                : <span>none currently inverted.</span>}
+            </div>
+          );
+        })()}
 
         <div className="btn-row">
           {!live
@@ -504,8 +532,22 @@ function Metrics({ result }: { result: RunResult }) {
     rows.push(["Intrinsics check", r.intrinsics_check.note,
       r.intrinsics_check.warn ? "warn" : "good"]);
 
+  const d = r.diagnosis;
   return (
     <>
+      {d && (
+        <div className={"verdict " + d.verdict}>
+          <div className="verdict-head">
+            <span className="verdict-tag">{d.verdict.toUpperCase()}</span>
+            <span>{d.headline}</span>
+          </div>
+          {d.causes.length > 0 && (
+            <ul className="verdict-causes">
+              {d.causes.map((c, i) => <li key={i}>{c}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
       <table className="metrics"><tbody>
         {rows.map(([k, v, b], i) => (
           <tr key={i}>

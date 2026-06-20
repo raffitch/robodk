@@ -82,10 +82,10 @@ function Hud({ gate }: { gate: GateReading | null }) {
         <>
           <Readout y={104} label="RANGE" value={`${r(gate.distance_mm ?? 0)}`}
             unit={`mm  target ${r(gate.ideal_distance_mm ?? 450)}`}
-            color={gate.gates?.distance ? OK : WARN} />
+            ok={!!gate.gates?.distance} />
           <Readout y={200} label="TILT" value={`${(gate.tilt_deg ?? 0).toFixed(1)}`}
             unit={`deg  max ${r(gate.max_tilt_deg ?? 25)}`}
-            color={gate.gates?.angle ? OK : WARN} />
+            ok={!!gate.gates?.angle} />
         </>
       )}
 
@@ -112,12 +112,17 @@ function Bracket({ x, y, color }: { x: number; y: number; color: string }) {
   );
 }
 
-function Readout({ y, label, value, unit, color }:
-  { y: number; label: string; value: string; unit: string; color: string }) {
+function Readout({ y, label, value, unit, ok }:
+  { y: number; label: string; value: string; unit: string; ok: boolean }) {
+  // Colour-blind-safe: the ✓/✗ glyph + IN/OUT word carry the in-band state, not
+  // just the green/amber colour.
+  const color = ok ? OK : WARN;
   return (
     <g>
       <rect x={26} y={y} width={384} height={84} rx={10} fill={INK} />
-      <text x={44} y={y + 30} fontSize={23} fill={DIM}>{label}</text>
+      <text x={44} y={y + 30} fontSize={23} fill={DIM}>
+        {label}<tspan dx="10" fill={color} fontWeight={800}>{ok ? "✓ IN" : "✗ OUT"}</tspan>
+      </text>
       <text x={44} y={y + 73} fontSize={48} fontWeight={800} fill={color}>
         {value}<tspan fontSize={25} fontWeight={500} fill={DIM} dx="12">{unit}</tspan>
       </text>
