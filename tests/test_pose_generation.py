@@ -17,6 +17,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from tasni.core.config import CalibrationConfig  # noqa: E402
 from tasni.core.geometry import Rt_to_T, compose, invert_T  # noqa: E402
 from tasni.modules.calibration import handeye, quality  # noqa: E402
 from tasni.modules.calibration.handeye import CalibrationView  # noqa: E402
@@ -34,9 +35,11 @@ def _build():
     T_base_target = syn._look_at(board_center, seed_pos, 0.0)   # board faces the cameras
     X_true = Rt_to_T(syn._rot([0.3, 0.2, 1.0], 25), [40.0, -15.0, 55.0])  # cam2flange
 
+    cc = CalibrationConfig()                          # use the production defaults
     cam_poses = generate_calibration_poses(
-        seed_T, count=15, look_distance_mm=look, cone_half_angle_deg=32,
-        roll_max_deg=75, distance_jitter=0.12)[:15]
+        seed_T, count=cc.pose_count, look_distance_mm=look,
+        cone_half_angle_deg=cc.cone_half_angle_deg, roll_max_deg=cc.roll_max_deg,
+        distance_jitter=cc.distance_jitter)[:cc.pose_count]
     obj = syn._make_board_points()
 
     views = []
@@ -67,6 +70,13 @@ def test_generated_poses_solve_well():
         cv2.Rodrigues(Xr[:3, :3].T @ X_true[:3, :3])[0]))) < 1e-2
     assert report.train.rms_px < 1e-2
     assert report.validation.rms_px < 1e-2
+
+    # The widened cone (45deg default) must keep the pose set well-conditioned;
+    # lock in the diversity gain so a narrower cone can't silently regress it.
+    md = report.motion_diversity
+    assert md["well_conditioned"], f"generated set not well-conditioned: {md}"
+    assert md["axis_spread"] > 0.15, \
+        f"widened cone should lift axis-spread, got {md['axis_spread']:.3f}"
     print("[generated poses]\n" + report.summary())
 
 

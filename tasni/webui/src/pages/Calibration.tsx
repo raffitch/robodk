@@ -3,6 +3,7 @@ import { moduleApi } from "../api/client";
 import { useEvents, type JobEvent } from "../api/events";
 import AimHud, { type GateReading } from "./AimHud";
 import CalibrationGuide from "./CalibrationGuide";
+import ConeDiagram from "./ConeDiagram";
 
 const api = moduleApi("calibration");
 
@@ -11,7 +12,8 @@ interface CalibConfig {
   camera_tool: string;
   board: { squares_x: number; squares_y: number; square_size_mm: number; marker_size_mm: number; dictionary: string };
   camera: { ip: string; port: number; resolution: string };
-  calibration: { holdout_count: number; refine: boolean; pose_count: number };
+  calibration: { holdout_count: number; refine: boolean; pose_count: number;
+                 cone_half_angle_deg: number; roll_max_deg: number; distance_jitter: number };
   gate: { ideal_distance_mm: number; distance_tol_mm: number; max_tilt_deg: number };
 }
 interface Split { rms_px: number; max_px: number; n_views: number; }
@@ -250,6 +252,25 @@ export default function Calibration() {
           : <div className="hint">Create targets needs the connection ready <i>and</i> a green lock.
               The robot's current pose becomes the seed; nothing is created until then.</div>}
       </div>
+
+      {/* ---- How targets are generated --------------------------------- */}
+      {config && (
+        <div className="card">
+          <h2>Target spread</h2>
+          <div className="hint" style={{ marginTop: 0, marginBottom: 6 }}>
+            Create targets orbits your aimed view in a cone (so the board stays in frame),
+            with roll and distance variation — the rotational diversity the hand-eye solve
+            needs. A wider cone gives a better-conditioned solve.
+          </div>
+          <ConeDiagram coneDeg={config.calibration.cone_half_angle_deg}
+                       count={config.calibration.pose_count} />
+          <div className="hint" style={{ marginTop: 6 }}>
+            {config.calibration.pose_count} viewpoints · cone ±{config.calibration.cone_half_angle_deg}° ·
+            roll ±{config.calibration.roll_max_deg}° · distance ±{Math.round(config.calibration.distance_jitter * 100)}%.
+            Schematic only — the actual poses are reachability-filtered; inspect them in RoboDK.
+          </div>
+        </div>
+      )}
 
       {/* ---- Run -------------------------------------------------------- */}
       <div className="card">

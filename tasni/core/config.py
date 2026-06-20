@@ -154,7 +154,12 @@ class CalibrationConfig:
     # so the board stays visible, with roll + distance variation for hand-eye
     # conditioning. The TasniCalib_* targets are left in the station to inspect.
     pose_count: int = 15                # reachable poses to capture
-    cone_half_angle_deg: float = 32.0   # max view-angle change from the seed view
+    # A wider cone => more diverse rotation axes => a better-conditioned hand-eye
+    # solve (measured on the generator: 32deg -> axis-spread 0.10, 45deg -> 0.17).
+    # 45deg keeps the board within reliable ChArUco detection. NOTE: roll does not
+    # help axis spread (it piles rotation onto the optical axis), so tune diversity
+    # via the cone, not the roll. The motion_diversity metric reports the result.
+    cone_half_angle_deg: float = 45.0   # max view-angle change from the seed view
     roll_max_deg: float = 75.0          # roll spread about the optical axis
     distance_jitter: float = 0.12       # +/- fraction of working distance
     look_distance_mm: float = 500.0     # fallback if the seed board distance unknown
