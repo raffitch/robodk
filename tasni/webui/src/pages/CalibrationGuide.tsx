@@ -35,18 +35,29 @@ interface GuideProps {
   ready: boolean;
   connState: "idle" | "connecting" | "ready" | "error";
   onConnect: () => void;
+  scaleOk: boolean;
+  onScaleOk: (v: boolean) => void;
+  board: { square_size_mm: number } | null;
 }
 
-export default function CalibrationGuide({ ready, connState, onConnect }: GuideProps) {
+export default function CalibrationGuide({ ready, connState, onConnect,
+                                          scaleOk, onScaleOk, board }: GuideProps) {
   const [page, setPage] = useState("A4");
   const [spec, setSpec] = useState<BoardSpec | null>(null);
   const [done, setDone] = useState<boolean[]>(() => STEPS.map(() => false));
+  const [measured, setMeasured] = useState("");   // a printed square measured with a ruler (mm)
 
   const loadSpec = (p: string) =>
     api.get<BoardSpec>(`/board/spec?page=${p}`).then(setSpec).catch(() => setSpec(null));
   useEffect(() => { loadSpec(page); }, [page]);
 
   const toggle = (i: number) => setDone((d) => d.map((v, j) => (j === i ? !v : v)));
+
+  const expectedMm = spec?.square_size_mm ?? board?.square_size_mm ?? null;
+  const measuredMm = parseFloat(measured);
+  const scaleErrPct = (expectedMm && measuredMm > 0)
+    ? ((measuredMm - expectedMm) / expectedMm) * 100 : null;
+  const scaleWithinTol = scaleErrPct != null && Math.abs(scaleErrPct) <= 2;
 
   return (
     <div className="card calib-guide">
@@ -86,6 +97,29 @@ export default function CalibrationGuide({ ready, connState, onConnect }: GuideP
                   </div>
                   <div className="hint">Print at 100% (Actual size). The dimensions don't change with
                     paper size — the page just needs to be big enough; verify with the 100 mm ruler.</div>
+
+                  {/* Measure-a-square scale check — the one error metrics can't catch. */}
+                  <div className="scale-check">
+                    <div className="row" style={{ gap: 10, alignItems: "flex-end" }}>
+                      <div className="field">
+                        <label>Measured square (mm)</label>
+                        <input type="number" min={0} step="0.5" style={{ width: 110 }}
+                          value={measured} placeholder={expectedMm ? String(expectedMm) : "30"}
+                          onChange={(e) => setMeasured(e.target.value)} />
+                      </div>
+                      {scaleErrPct != null && (
+                        <span className={scaleWithinTol ? "ok-text" : "warn-text"} style={{ paddingBottom: 7 }}>
+                          {scaleWithinTol
+                            ? `✓ within ${scaleErrPct >= 0 ? "+" : ""}${scaleErrPct.toFixed(1)}% of ${expectedMm} mm`
+                            : `⚠ off by ${scaleErrPct >= 0 ? "+" : ""}${scaleErrPct.toFixed(1)}% — reprint at 100%`}
+                        </span>
+                      )}
+                    </div>
+                    <label className="scale-ack">
+                      <input type="checkbox" checked={scaleOk} onChange={(e) => onScaleOk(e.target.checked)} />
+                      <span>I verified the print scale (100&nbsp;mm ruler = 100&nbsp;mm). Required to enable Run.</span>
+                    </label>
+                  </div>
                 </div>
               )}
 

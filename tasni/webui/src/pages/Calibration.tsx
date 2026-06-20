@@ -36,6 +36,18 @@ interface RunResult {
   n_skipped?: string[];
   can_apply: boolean;
 }
+interface TourPose { name: string; reachable: boolean; collision: boolean | null; ok: boolean; error?: string | null; }
+interface TourResult {
+  kind: "sim_tour";
+  total: number;
+  passed: number;
+  unreachable: number;
+  collisions: number;
+  collisions_checked: boolean;
+  returned_to_start: boolean;
+  all_ok: boolean;
+  poses: TourPose[];
+}
 
 const band = (px: number) => (px < 1 ? "good" : px < 3 ? "warn" : "bad");
 
@@ -61,6 +73,18 @@ export default function Calibration() {
   const [targets, setTargets] = useState<number | null>(null);   // null = none created
   const [generating, setGenerating] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
+
+  // Phase 2 — safety & operator trust.
+  const [tour, setTour] = useState<TourResult | null>(null);     // last dry-run verdict
+  const [thumbs, setThumbs] = useState<string[]>([]);            // per-pose board locks
+  const [scaleOk, setScaleOk] = useState(false);                 // print-scale hard gate
+  const [showConfirm, setShowConfirm] = useState(false);         // run confirmation dialog
+  const [cellClear, setCellClear] = useState(false);             // dialog acknowledgement
+  // Which job the shared runner is executing ("run" | "tour") — read inside the
+  // event subscription (a ref, so the closure sees the live value).
+  const runKindRef = useRef<"run" | "tour" | null>(null);
+  const [runKind, setRunKindState] = useState<"run" | "tour" | null>(null);
+  const setRunKind = (k: "run" | "tour" | null) => { runKindRef.current = k; setRunKindState(k); };
 
   const addLog = (msg: string, err = false) =>
     setLogs((l) => [...l, (err ? "ERROR: " : "") + msg]);
@@ -110,17 +134,25 @@ export default function Calibration() {
       } else if (ev.type === "log") {
         addLog(ev.payload.message);
       } else if (ev.type === "frame") {
-        setFrame("data:image/jpeg;base64," + ev.payload.jpeg_b64);
+        const src = "data:image/jpeg;base64," + ev.payload.jpeg_b64;
+        setFrame(src);
+        // During a real run each frame is one pose's board lock — keep the strip.
+        if (runKindRef.current === "run") setThumbs((t) => [...t, src]);
       } else if (ev.type === "gate") {
         setGate(ev.payload as GateReading);
       } else if (ev.type === "result") {
-        setResult(ev.payload.result as RunResult);
-        setCanApply(!!ev.payload.result?.can_apply);
-        setStatus("done"); setPct(100); setRunning(false);
+        if (ev.payload.name === "sim_tour") {
+          setTour(ev.payload.result as TourResult);
+          setStatus("dry run complete"); setPct(100); setRunning(false); setRunKind(null);
+        } else {
+          setResult(ev.payload.result as RunResult);
+          setCanApply(!!ev.payload.result?.can_apply);
+          setStatus("done"); setPct(100); setRunning(false); setRunKind(null);
+        }
       } else if (ev.type === "error") {
-        addLog(ev.payload.message, true); setStatus("error"); setRunning(false);
+        addLog(ev.payload.message, true); setStatus("error"); setRunning(false); setRunKind(null);
       } else if (ev.type === "status" && ev.payload.status === "cancelled") {
-        addLog("cancelled."); setStatus("cancelled"); setRunning(false);
+        addLog("cancelled."); setStatus("cancelled"); setRunning(false); setRunKind(null);
       }
     });
   }, [subscribe]);
@@ -142,6 +174,7 @@ export default function Calibration() {
     try {
       const r = await api.post<{ created: number; look_distance_mm: number }>("/poses/generate");
       setTargets(r.created);
+      setTour(null);    // a fresh target set invalidates any prior dry-run verdict
       setLive(false);   // generate stops the live gate server-side
       addLog(`created ${r.created} targets (working distance ~${Math.round(r.look_distance_mm)} mm)`
         + " — inspect them in RoboDK, then Run calibration.");
@@ -149,19 +182,30 @@ export default function Calibration() {
     finally { setGenerating(false); }
   };
 
-  const run = async () => {
-    if (!window.confirm("This will physically move the real robot through the "
-        + (targets ?? "generated") + " calibration targets. Make sure the cell is clear. Continue?")) return;
-    setLogs([]); setResult(null); setCanApply(false); setPct(0);
-    setStatus("starting…"); setRunning(true); setLive(false);
+  const dryRun = async () => {
+    setTour(null); setPct(0); setStatus("starting dry run…");
+    setRunning(true); setRunKind("tour"); setLive(false);
+    addLog("dry run: simulating the tour in RoboDK (no hardware motion)…");
+    try {
+      await api.post("/poses/simulate");
+    } catch (e: any) { addLog("dry run: " + e.message, true); setRunning(false); setRunKind(null); }
+  };
+
+  // The bare confirm is replaced by a dialog (pose count + return-to-start
+  // guarantee + the latest dry-run verdict + an explicit cell-clear ack).
+  const openRunConfirm = () => { setCellClear(false); setShowConfirm(true); };
+  const doRun = async () => {
+    setShowConfirm(false);
+    setLogs([]); setResult(null); setCanApply(false); setPct(0); setThumbs([]);
+    setStatus("starting…"); setRunning(true); setRunKind("run"); setLive(false);
     try {
       await api.post("/run", { holdout_count: holdout, refine });
-    } catch (e: any) { addLog("run: " + e.message, true); setRunning(false); }
+    } catch (e: any) { addLog("run: " + e.message, true); setRunning(false); setRunKind(null); }
   };
   const clearPoses = async () => {
     try {
       const r = await api.post<{ cleared: number }>("/poses/clear");
-      setTargets(null);
+      setTargets(null); setTour(null);
       addLog(`cleared ${r.cleared} generated targets from RoboDK.`);
     } catch (e: any) { addLog("clear: " + e.message, true); }
   };
@@ -302,16 +346,73 @@ export default function Calibration() {
               onChange={(e) => setRefine(e.target.checked)} /> Reprojection refinement</label>
           </div>
         </div>
-        <div className="warn-text" style={{ marginTop: 8, fontSize: 12 }}>
+        {/* Hard gate: silent print-scale error is the one fault the metrics can't
+            catch (a scaled board => a silently scaled calibration). */}
+        <div className="scale-gate">
+          <label>
+            <input type="checkbox" checked={scaleOk} onChange={(e) => setScaleOk(e.target.checked)} />
+            <span>I verified the printed board scale — the <b>100&nbsp;mm ruler</b> on the printout
+              measures <b>100&nbsp;mm</b> (printed at 100% / Actual size, not “fit to page”).</span>
+          </label>
+          <div className="hint" style={{ marginTop: 4 }}>
+            A board printed at the wrong scale calibrates silently wrong — no metric can detect it.
+            Measure a square against the guide’s ruler before running.
+          </div>
+        </div>
+
+        <div className="warn-text" style={{ marginTop: 10, fontSize: 12 }}>
           ⚠ Real robot: Run physically moves the KUKA through the created targets. Clear the cell.
         </div>
+
+        {/* Soft gate: dry-run the tour in simulation first. */}
         <div className="btn-row">
-          <button onClick={run} disabled={running || !ready || targets == null}>Run calibration</button>
+          <button className="secondary" onClick={dryRun}
+                  disabled={running || !ready || targets == null}>
+            {runKind === "tour" ? "Simulating…" : "Dry run (simulate)"}
+          </button>
+          <button onClick={openRunConfirm}
+                  disabled={running || !ready || targets == null || !scaleOk}>
+            Run calibration
+          </button>
           <button className="secondary" onClick={cancel} disabled={!running}>Cancel</button>
         </div>
         {targets == null && <div className="hint">Create targets (above) to enable Run.</div>}
+        {targets != null && !scaleOk &&
+          <div className="hint">Confirm the print scale above to enable Run.</div>}
+
+        {tour && (
+          <div className={"tour-result " + (tour.all_ok ? "ok" : "bad")}>
+            <div className="tour-head">
+              {tour.all_ok ? "✓ Dry run passed" : "⚠ Dry run found issues"} —
+              {" "}{tour.passed}/{tour.total} poses reachable{tour.collisions_checked
+                ? `, ${tour.collisions} collision${tour.collisions === 1 ? "" : "s"}`
+                : " (collisions not checked on this build)"},
+              {" "}return-to-start {tour.returned_to_start ? "ok" : "FAILED"}.
+            </div>
+            {tour.poses.some((p) => !p.ok) && (
+              <div className="tour-bad">
+                Problem poses:{" "}
+                {tour.poses.filter((p) => !p.ok)
+                  .map((p) => `${p.name} (${!p.reachable ? "unreachable" : "collision"})`)
+                  .join(", ")}
+              </div>
+            )}
+            <div className="hint" style={{ marginTop: 4 }}>
+              The dry run is advisory — you can still Run, but check the flagged poses in RoboDK first.
+            </div>
+          </div>
+        )}
+
         <div className="progress"><div style={{ width: `${pct}%` }} /></div>
         <div className="status-line">{status}</div>
+
+        {thumbs.length > 0 && (
+          <div className="thumb-strip">
+            {thumbs.map((src, i) => (
+              <img key={i} src={src} alt={`pose ${i + 1}`} title={`pose ${i + 1}`} />
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="card">
@@ -333,8 +434,47 @@ export default function Calibration() {
         </div>
       </div>
        </div>
-       <CalibrationGuide ready={ready} connState={conn} onConnect={connect} />
+       <CalibrationGuide ready={ready} connState={conn} onConnect={connect}
+                         scaleOk={scaleOk} onScaleOk={setScaleOk} board={config?.board ?? null} />
       </div>
+
+      {showConfirm && (
+        <div className="modal-backdrop" onClick={() => setShowConfirm(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2>⚠ Move the real robot?</h2>
+            <p>Run drives the <b>{config?.robot ?? "KUKA"}</b> through{" "}
+              <b>{targets ?? "the generated"}</b> calibration targets on the{" "}
+              <b>real robot</b>. It returns to the start pose when finished.</p>
+
+            <div className={"modal-tour " + (tour ? (tour.all_ok ? "ok" : "bad") : "none")}>
+              {tour
+                ? (tour.all_ok
+                    ? `✓ Dry run passed: ${tour.passed}/${tour.total} poses reachable, return-to-start ok.`
+                    : `⚠ Dry run found issues: ${tour.passed}/${tour.total} reachable`
+                      + `${tour.collisions_checked ? `, ${tour.collisions} collision(s)` : ""}`
+                      + `, return-to-start ${tour.returned_to_start ? "ok" : "FAILED"}. `
+                      + "Review the flagged poses in RoboDK before running.")
+                : "No dry run performed. A dry run (simulate) is strongly recommended before moving the real robot."}
+            </div>
+
+            <ul className="modal-checks">
+              <li>Return-to-start: the robot goes back to its current joints when the run ends.</li>
+              <li>Camera tool: <b>{config?.camera_tool ?? "Realsense"}</b> (fixed).</li>
+              <li>The cell must be clear of people and obstacles for the full tour.</li>
+            </ul>
+
+            <label className="modal-ack">
+              <input type="checkbox" checked={cellClear} onChange={(e) => setCellClear(e.target.checked)} />
+              <span>The cell is clear and I am ready to move the real robot.</span>
+            </label>
+
+            <div className="btn-row">
+              <button onClick={doRun} disabled={!cellClear}>Move robot &amp; run</button>
+              <button className="secondary" onClick={() => setShowConfirm(false)}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

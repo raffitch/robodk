@@ -10,8 +10,8 @@ from pydantic import BaseModel
 
 from ..base import ServiceContainer, WorkflowModule
 from .service import (
-    CalibrationJob, CalibrationParams, TARGET_PREFIX, gate_thresholds,
-    generate_calibration_targets)
+    CalibrationJob, CalibrationParams, SimTourJob, TARGET_PREFIX,
+    gate_thresholds, generate_calibration_targets)
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
@@ -179,6 +179,21 @@ class CalibrationModule(WorkflowModule):
                 raise HTTPException(400, str(e))
             except Exception as e:
                 raise HTTPException(503, f"RoboDK/camera unavailable: {e}")
+
+        @router.post("/poses/simulate")
+        def poses_simulate() -> dict:
+            """Dry-run the generated targets in RoboDK SIMULATE mode (no hardware):
+            per-pose reachability + collision + return-to-start. A soft safety gate
+            before the real Run; progress streams over the WebSocket and the verdict
+            arrives as the job 'result' (name=sim_tour). No real-robot motion."""
+            if services.jobs.running:
+                raise HTTPException(409, "a job is already running")
+            if len(services.rdk.list_targets(TARGET_PREFIX)) == 0:
+                raise HTTPException(400, "no calibration targets to simulate — aim the "
+                                    "camera until the gate is green and Create targets first")
+            services.live.stop()    # free the camera thread; the dry tour owns the robot
+            services.jobs.start(SimTourJob(services), name="sim_tour")
+            return {"status": "started"}
 
         @router.post("/run")
         def run(body: RunBody) -> dict:

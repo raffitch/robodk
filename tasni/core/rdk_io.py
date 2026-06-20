@@ -139,6 +139,39 @@ class RdkIO:
                             else self.RUNMODE_SIMULATE)
         return mode
 
+    def current_run_mode(self) -> int:
+        """Current RoboDK run mode (raw int) — captured before a dry run so the
+        prior mode can be restored afterwards (a dry tour must never leave the
+        station silently in RUN_ROBOT)."""
+        return int(self.rdk.RunMode())
+
+    def set_run_mode_raw(self, value: int) -> None:
+        """Restore a previously captured raw run-mode value (see
+        :meth:`current_run_mode`)."""
+        self.rdk.setRunMode(int(value))
+
+    def set_collision_checking(self, active: bool) -> bool:
+        """Best-effort toggle of RoboDK collision checking. Returns True if the
+        build accepted the call (collisions can be reported), False otherwise.
+        Never raises — collision checking is an optional bonus on the dry tour."""
+        try:
+            import robolink
+
+            flag = robolink.COLLISION_ON if active else robolink.COLLISION_OFF
+            self.rdk.setCollisionActive(flag)
+            return True
+        except Exception:
+            return False
+
+    def collisions(self) -> int | None:
+        """Number of colliding object pairs in the current (simulated) state, or
+        ``None`` if this build/station can't check collisions. Best-effort; never
+        raises so the dry tour degrades gracefully where collisions aren't set up."""
+        try:
+            return int(self.rdk.Collisions())
+        except Exception:
+            return None
+
     def list_targets(self, prefix: str | None = None) -> list[str]:
         """Sorted names of TARGET items, filtered by ``prefix``."""
         import robolink

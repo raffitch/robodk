@@ -153,6 +153,119 @@ def _split_views(views: list, holdout: int, strategy: str, seed: int):
 
 
 @dataclass
+class TourPoseResult:
+    """One pose's verdict on the simulated dry tour."""
+    name: str
+    reachable: bool
+    collision: bool | None        # None = collisions not checked on this build
+    ok: bool
+    error: str | None = None
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "reachable": self.reachable,
+                "collision": self.collision, "ok": self.ok, "error": self.error}
+
+
+class SimTourJob:
+    """Dry-run the generated ``TasniCalib_*`` targets in RoboDK **simulate** mode.
+
+    Visits each target with the robot in simulation (no hardware motion), recording
+    per-pose reachability + (if the build supports it) collision state, then returns
+    to the start joints — the same return-to-start guarantee the real run makes. It
+    is a **soft gate**: failures warn prominently but never block Run (the operator
+    may still proceed once the cell is clear). Runs through the JobRunner, so it can
+    never overlap a real calibration run. Restores the prior run mode on the way out
+    so a dry tour can't leave the station silently in RUN_ROBOT.
+    """
+
+    def __init__(self, services):
+        self.services = services
+        self.tool_name: str = services.config.robodk.camera_tool
+
+    def __call__(self, ctx: JobContext) -> dict:
+        rdk: RdkIO = self.services.rdk
+
+        if not rdk.item_exists(self.tool_name):
+            raise RuntimeError(
+                f"tool {self.tool_name!r} not found — mount the RealSense camera "
+                f"(3D model + a tool named {self.tool_name!r}) on the flange in RoboDK")
+
+        targets = rdk.list_targets(TARGET_PREFIX)
+        if not targets:
+            raise RuntimeError(
+                "no TasniCalib_* targets to simulate — aim the camera until the "
+                "gate is green and click Create targets first")
+
+        prior_mode = rdk.current_run_mode()
+        rdk.apply_run_mode("simulate")
+        ctx.log(f"dry run (SIMULATE) — visiting {len(targets)} targets, no hardware motion")
+        rdk.use_camera_tool(self.tool_name)
+        collisions_on = rdk.set_collision_checking(True)
+        try:
+            start_joints = rdk.current_joints()
+        except Exception:
+            start_joints = None
+
+        results: list[TourPoseResult] = []
+        total = len(targets)
+        try:
+            for i, name in enumerate(targets):
+                ctx.check_cancel()
+                ctx.progress(i + 1, total, f"checking {name}")
+                reachable = rdk.is_reachable(rdk.target_pose_T(name))
+                collision: bool | None = None
+                err: str | None = None
+                if reachable:
+                    try:
+                        rdk.move_j(name)
+                    except Exception as e:   # noqa: BLE001 - a sim move failure is a fail, not a crash
+                        reachable, err = False, str(e)
+                    if reachable and collisions_on:
+                        n_col = rdk.collisions()
+                        collision = None if n_col is None else bool(n_col)
+                ok = reachable and not bool(collision)
+                results.append(TourPoseResult(name, reachable, collision, ok, err))
+                flag = "OK" if ok else ("UNREACHABLE" if not reachable else "COLLISION")
+                ctx.log(f"{name}: {flag}")
+
+            # Return-to-start (the guarantee the real run makes; verify it here too).
+            returned = False
+            if start_joints is not None:
+                try:
+                    rdk.move_j_joints(start_joints)
+                    returned = True
+                except Exception:
+                    returned = False
+
+            n_pass = sum(1 for r in results if r.ok)
+            n_unreachable = sum(1 for r in results if not r.reachable)
+            n_collision = sum(1 for r in results if r.collision)
+            all_ok = n_pass == total and returned
+            ctx.log(f"dry run complete: {n_pass}/{total} poses OK; "
+                    f"return-to-start {'ok' if returned else 'FAILED'}"
+                    + ("" if collisions_on else "; collisions not checked on this build"))
+            return {
+                "kind": "sim_tour",
+                "total": total,
+                "passed": n_pass,
+                "unreachable": n_unreachable,
+                "collisions": n_collision,
+                "collisions_checked": collisions_on,
+                "returned_to_start": returned,
+                "all_ok": all_ok,
+                "poses": [r.to_dict() for r in results],
+            }
+        finally:
+            rdk.set_collision_checking(False)
+            rdk.set_run_mode_raw(prior_mode)
+            if start_joints is not None:
+                try:
+                    rdk.move_j_joints(start_joints)
+                except Exception:
+                    pass
+
+
+@dataclass
 class CalibrationParams:
     holdout_count: int | None = None    # override config.calibration.holdout_count
     refine: bool | None = None          # override config.calibration.refine
