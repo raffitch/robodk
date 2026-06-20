@@ -1,20 +1,23 @@
 """Layered configuration for the platform.
 
-Defaults live in the dataclasses below (so the app runs with zero config).
+Defaults live in the Pydantic models below (so the app runs with zero config).
 A user JSON file (``tasni.config.json`` in the repo root, or a path passed to
 :func:`load_config`) overrides any subset of fields. Secrets (Jetson password
 etc.) are NOT stored here — they stay in ``secrets/jetson.env`` (git-ignored).
 
+Pydantic (already a FastAPI dependency) gives type validation on load + on
+override (``validate_assignment``) and a JSON schema the UI can render, while
+preserving the previous JSON-override semantics (deep-merge, "unknown key" error).
 Python 3.10 has no ``tomllib``, so we use JSON to avoid an extra dependency.
 """
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from pydantic import BaseModel, ConfigDict, Field
 
 # D435i color intrinsics per stream resolution, copied from the original
 # AutoCalibrate macro (factory values read off this specific camera).
@@ -31,8 +34,14 @@ _DEFAULT_INTRINSICS: dict[str, list[list[float]]] = {
 }
 
 
-@dataclass
-class CameraConfig:
+class _Model(BaseModel):
+    """Shared base: validate on assignment (so JSON overrides are type-checked)
+    and forbid unknown keys (a typo'd config key is an error, not a silent no-op)."""
+
+    model_config = ConfigDict(validate_assignment=True, extra="forbid")
+
+
+class CameraConfig(_Model):
     """RealSense-over-TCP client settings (the Jetson camera server)."""
 
     # The Jetson camera host. The server binds 0.0.0.0:1024 (all interfaces), so
@@ -46,10 +55,10 @@ class CameraConfig:
     resolution: str = "1280x720"
     timeout_s: float = 10.0
     # resolution -> 3x3 color intrinsics K
-    intrinsics: dict[str, list[list[float]]] = field(
+    intrinsics: dict[str, list[list[float]]] = Field(
         default_factory=lambda: {k: [row[:] for row in v]
                                  for k, v in _DEFAULT_INTRINSICS.items()})
-    dist_coeffs: list[float] = field(default_factory=lambda: [0, 0, 0, 0, 0])
+    dist_coeffs: list[float] = Field(default_factory=lambda: [0, 0, 0, 0, 0])
 
     @property
     def K(self) -> np.ndarray:
@@ -66,8 +75,7 @@ class CameraConfig:
         return int(w), int(h)
 
 
-@dataclass
-class BoardConfig:
+class BoardConfig(_Model):
     """ChArUco board geometry (eye-in-hand calibration target).
 
     This is the single source of truth: the printable PDF renders THESE exact
@@ -82,8 +90,7 @@ class BoardConfig:
     marker_size_mm: float = 22.0
 
 
-@dataclass
-class RoboDKConfig:
+class RoboDKConfig(_Model):
     """How tasni talks to RoboDK and which cell items it drives."""
 
     robot_name: str = "KUKA KR150 R2700"
@@ -108,8 +115,7 @@ class RoboDKConfig:
     run_mode: str = "run_robot"
 
 
-@dataclass
-class CalibrationConfig:
+class CalibrationConfig(_Model):
     """Calibration-module knobs (live gate + pose generation + capture + solve)."""
 
     settle_s: float = 0.4               # pause after MoveJ before grabbing a frame
@@ -165,29 +171,29 @@ class CalibrationConfig:
     look_distance_mm: float = 500.0     # fallback if the seed board distance unknown
 
 
-@dataclass
-class WebConfig:
+class WebConfig(_Model):
     host: str = "127.0.0.1"
     port: int = 8000
 
 
-@dataclass
-class AppConfig:
-    camera: CameraConfig = field(default_factory=CameraConfig)
-    board: BoardConfig = field(default_factory=BoardConfig)
-    robodk: RoboDKConfig = field(default_factory=RoboDKConfig)
-    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
-    web: WebConfig = field(default_factory=WebConfig)
+class AppConfig(_Model):
+    camera: CameraConfig = Field(default_factory=CameraConfig)
+    board: BoardConfig = Field(default_factory=BoardConfig)
+    robodk: RoboDKConfig = Field(default_factory=RoboDKConfig)
+    calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
 
 
-def _merge(obj: Any, data: dict[str, Any]) -> None:
-    """Recursively overlay ``data`` onto a dataclass instance in place."""
-    valid = {f.name: f for f in fields(obj)}
+def _merge(obj: BaseModel, data: dict[str, Any]) -> None:
+    """Recursively overlay ``data`` onto a Pydantic model in place. Leaf
+    assignments are validated (``validate_assignment``); an unknown key raises a
+    clear error rather than being silently dropped."""
+    valid = set(type(obj).model_fields)
     for key, value in data.items():
         if key not in valid:
             raise KeyError(f"Unknown config key: {key!r}")
         current = getattr(obj, key)
-        if is_dataclass(current) and isinstance(value, dict):
+        if isinstance(current, BaseModel) and isinstance(value, dict):
             _merge(current, value)
         else:
             setattr(obj, key, value)

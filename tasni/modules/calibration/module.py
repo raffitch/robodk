@@ -58,10 +58,10 @@ class CalibrationModule(WorkflowModule):
             return {
                 "robot": c.robodk.robot_name,
                 "camera_tool": c.robodk.camera_tool,
-                "board": vars(c.board),
+                "board": c.board.model_dump(),
                 "camera": {"ip": c.camera.ip, "port": c.camera.port,
                            "resolution": c.camera.resolution},
-                "calibration": vars(cc),
+                "calibration": cc.model_dump(),
                 "gate": {"ideal_distance_mm": cc.ideal_distance_mm,
                          "distance_tol_mm": cc.distance_tol_mm,
                          "max_tilt_deg": cc.max_tilt_deg},
