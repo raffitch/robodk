@@ -25,13 +25,13 @@ import base64
 import cv2
 import numpy as np
 
+from ...core.aiming import GateThresholds, evaluate_gate
 from ...core.events import JobEvent
 from ...core.geometry import invert_T
 from ...core.jobrunner import JobContext
 from ...core.logging import get_logger, new_run_dir
 from ...core.rdk_io import RdkIO
 from .charuco import CharucoTarget
-from .gate import GateThresholds, evaluate_gate
 from .handeye import (CalibrationView, cross_validate, estimate_board_in_base,
                       refine, solve_best, solve_handeye)
 from .intrinsics import verify_intrinsics

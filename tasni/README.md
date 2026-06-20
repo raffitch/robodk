@@ -68,7 +68,7 @@ ChArUco eye-in-hand hand-eye calibration, refactored from `macros/AutoCalibrate.
 
 - **Live aiming gate (HUD) — the seed, no taught pose:** a fighter-jet-style HUD
   over the live camera (`core/livepreview.py` streams frames + a `gate` event;
-  `calibration/gate.py` computes board distance + tilt) shows **DETECT · DISTANCE ·
+  `core/aiming.py` computes board distance + tilt) shows **DETECT · DISTANCE ·
   ANGLE** lamps. **Create targets** unlocks only when all three are green, and seeds
   pose generation from the robot's *current* pose — so the operator jogs to a good
   view instead of teaching a `NEUTRAL`. Generation re-checks the gate server-side.

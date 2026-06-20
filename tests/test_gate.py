@@ -1,4 +1,4 @@
-"""Pure-math checks for the live aiming gate (gate.py) — no camera, no RoboDK.
+"""Pure-math checks for the live aiming gate (core/aiming.py) — no camera, no RoboDK.
 
 Builds ChArUco detections with known distance/tilt/offset and asserts the gate
 lamps light exactly when the board is in the ideal band.
@@ -15,9 +15,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tasni.modules.calibration.charuco import ViewDetection  # noqa: E402
-from tasni.modules.calibration.gate import (  # noqa: E402
+from tasni.core.aiming import (  # noqa: E402
     GateThresholds, board_tilt_deg, evaluate_gate)
+from tasni.modules.calibration.charuco import ViewDetection  # noqa: E402
 
 W, H = 1920, 1080
 K = np.array([[1362.15, 0, W / 2], [0, 1362.21, H / 2], [0, 0, 1]], dtype=float)

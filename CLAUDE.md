@@ -108,7 +108,7 @@ you drive the real cell, not an empty station). Run it on Windows with
   held-out validation px, board-consistency mm). Kept TSAI (no PARK) + optional
   reprojection refinement. Now **RealSense-only + real-robot**: forced `Realsense`
   tool, **no taught pose** — a **live aiming HUD** (DETECT·DISTANCE·ANGLE lamps over the
-  live camera; `core/livepreview.py` + `calibration/gate.py`) gates **Create targets**,
+  live camera; `core/livepreview.py` + `core/aiming.py`) gates **Create targets**,
   which **auto-generates** reachable poses (cone+roll, IK-filtered) around the robot's
   *current* pose and leaves `TasniCalib_*` in RoboDK to inspect.
   Single-source-of-truth **printable board** (default 8×6 @ 30 mm fits A4 1:1) + visual

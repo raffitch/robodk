@@ -2,14 +2,16 @@
 
 Before any calibration targets are created the operator jogs the robot until the
 board sits at the ideal working distance and roughly fronto-parallel. This module
-turns a single :class:`~tasni.modules.calibration.charuco.ViewDetection` into the
-numbers the HUD draws and the three lamps it lights:
+turns a single :class:`~tasni.core.charuco_types.ViewDetection` into the numbers
+the HUD draws and the three lamps it lights:
 
     detected   board found with enough corners
     distance   board distance within ``ideal_distance_mm ± distance_tol_mm``
     angle      board tilt off fronto-parallel within ``max_tilt_deg``
 
-Pure numpy (no RoboDK, no live camera) so it is unit-testable on any machine.
+Pure numpy (no RoboDK, no live camera, no ``modules.*``) so it is a core service
+any workflow that aims a camera at a ChArUco board can reuse, and unit-testable on
+any machine.
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .charuco import ViewDetection
+from .charuco_types import ViewDetection
 
 
 @dataclass

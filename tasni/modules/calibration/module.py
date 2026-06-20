@@ -107,8 +107,8 @@ class CalibrationModule(WorkflowModule):
 
             import cv2
 
+            from ...core.aiming import evaluate_gate
             from .charuco import CharucoTarget
-            from .gate import evaluate_gate
             c = services.config
             cc = c.calibration
             K, dist = c.camera.K, c.camera.dist
