@@ -263,7 +263,9 @@ export default function Calibration() {
             needs. A wider cone gives a better-conditioned solve.
           </div>
           <ConeDiagram coneDeg={config.calibration.cone_half_angle_deg}
-                       count={config.calibration.pose_count} />
+                       count={config.calibration.pose_count}
+                       squaresX={config.board.squares_x}
+                       squaresY={config.board.squares_y} />
           <div className="hint" style={{ marginTop: 6 }}>
             {config.calibration.pose_count} viewpoints · cone ±{config.calibration.cone_half_angle_deg}° ·
             roll ±{config.calibration.roll_max_deg}° · distance ±{Math.round(config.calibration.distance_jitter * 100)}%.
