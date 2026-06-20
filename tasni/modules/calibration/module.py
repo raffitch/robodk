@@ -140,8 +140,12 @@ class CalibrationModule(WorkflowModule):
                 ok, jpeg = cv2.imencode(".jpg", img, enc)
                 return (jpeg.tobytes() if ok else b""), reading.to_dict()
 
-            services.live.start(analyze, fps=cc.preview_fps,
-                                timeout_s=cc.preview_timeout_s, color_only=True)
+            from ...core.camera_lease import CameraBusy
+            try:
+                services.live.start(analyze, fps=cc.preview_fps,
+                                    timeout_s=cc.preview_timeout_s, color_only=True)
+            except CameraBusy as e:
+                raise HTTPException(409, str(e))
             return {"status": "started"}
 
         @router.post("/live/stop")

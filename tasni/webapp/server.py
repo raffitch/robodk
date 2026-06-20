@@ -49,8 +49,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         cam = services.config.camera
         robodk_ok = tcp_probe("127.0.0.1", ROBODK_API_PORT)
         # Don't probe the camera mid-capture — the unicast server serves one
-        # client and a probe would steal the frame the job (or live gate) expects.
-        if services.jobs.running:
+        # client and a probe would steal the frame the lease holder expects. The
+        # lease's owner label gives the precise holder ("live-preview",
+        # "calibration-run", ...); fall back to the coarse job/live flags.
+        if services.camera_lease.held:
+            camera = {"ok": None, "detail": f"in use by {services.camera_lease.owner}"}
+        elif services.jobs.running:
             camera = {"ok": None, "detail": "in use by running job"}
         elif services.live.running:
             camera = {"ok": None, "detail": "in use by live preview"}

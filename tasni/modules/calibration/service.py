@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,6 +44,15 @@ from .quality import evaluate
 log = get_logger("tasni.calibration")
 
 TARGET_PREFIX = "TasniCalib_"
+
+
+def _camera_hold(services, owner: str):
+    """Scoped camera lease for a capture grab. Non-blocking: if the camera is held
+    elsewhere (e.g. the live preview wasn't stopped), this raises ``CameraBusy``
+    with the holder's label rather than racing the unicast socket. Degrades to a
+    no-op when the container has no lease (older fakes in tests)."""
+    lease = getattr(services, "camera_lease", None)
+    return lease.hold(owner) if lease is not None else nullcontext()
 
 
 def gate_thresholds(ccfg) -> GateThresholds:
@@ -85,7 +95,8 @@ def generate_calibration_targets(services) -> dict:
 
     tool_pose = rdk.use_camera_tool(tool_name)
     board = CharucoTarget(cfg.board)
-    frame = cam.grab(color_only=True)
+    with _camera_hold(services, "target-creation"):
+        frame = cam.grab(color_only=True)
     det = board.detect(frame.color, K, dist, min_corners=ccfg.min_charuco_corners)
     reading = evaluate_gate(det, K, frame.color.shape, gate_thresholds(ccfg),
                             board_center_mm=board.board_center)
@@ -392,8 +403,11 @@ class CalibrationJob:
         run_dir = new_run_dir("calibration", stamp)
 
         try:
-            views, skipped = self._capture(ctx, rdk, cam, board, K, dist,
-                                           tool_pose, targets, run_dir)
+            # Own the camera for the whole capture so the live preview can't sneak
+            # a grab in between poses (non-blocking; fails fast if still held).
+            with _camera_hold(self.services, "calibration-run"):
+                views, skipped = self._capture(ctx, rdk, cam, board, K, dist,
+                                               tool_pose, targets, run_dir)
             do_refine = (self.params.refine if self.params.refine is not None
                          else ccfg.refine)
             if len(views) < holdout + 3:

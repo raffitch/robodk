@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ..core.camera import CameraClient
+from ..core.camera_lease import CameraLease
 from ..core.config import AppConfig
 from ..core.events import EventBus
 from ..core.jobrunner import JobRunner
@@ -33,6 +34,7 @@ class ServiceContainer:
     session: RdkSession
     rdk: RdkIO
     camera: CameraClient
+    camera_lease: CameraLease
     bus: EventBus
     jobs: JobRunner
     live: LivePreview
@@ -45,14 +47,18 @@ class ServiceContainer:
         session = RdkSession(config.robodk)
         bus = EventBus()
         camera = CameraClient(config.camera)
+        # One lease guards the unicast camera; both the live preview and the
+        # capture grabs take it, so they can never race the single-client socket.
+        lease = CameraLease()
         return cls(
             config=config,
             session=session,
             rdk=RdkIO(session),
             camera=camera,
+            camera_lease=lease,
             bus=bus,
             jobs=JobRunner(bus),
-            live=LivePreview(camera, bus),
+            live=LivePreview(camera, bus, lease=lease),
         )
 
 

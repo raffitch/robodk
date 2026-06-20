@@ -22,17 +22,22 @@ import threading
 from typing import Callable
 
 from .camera import CameraClient, CameraError
+from .camera_lease import CameraLease
 from .events import EventBus, JobEvent
 
 Analyzer = Callable[[object], "tuple[bytes, dict]"]
+
+LEASE_OWNER = "live-preview"
 
 
 class LivePreview:
     """Owns the preview thread for one camera + event bus."""
 
-    def __init__(self, camera: CameraClient, bus: EventBus):
+    def __init__(self, camera: CameraClient, bus: EventBus,
+                 lease: CameraLease | None = None):
         self.camera = camera
         self.bus = bus
+        self.lease = lease
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.last: dict | None = None      # most recent metrics (for HTTP polls)
@@ -43,8 +48,14 @@ class LivePreview:
 
     def start(self, analyze: Analyzer, *, fps: float = 6.0,
               timeout_s: float = 2.0, color_only: bool = False) -> None:
+        """Start streaming. Takes the camera lease first (raising
+        :class:`~tasni.core.camera_lease.CameraBusy` if a job holds the camera), and
+        holds it for the whole run — released in :meth:`stop` after the thread joins."""
         if self.running:
             return
+        if self.lease is not None and not self.lease.acquire(LEASE_OWNER):
+            from .camera_lease import CameraBusy
+            raise CameraBusy(self.lease.owner)
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._loop, args=(analyze, fps, timeout_s, color_only),
@@ -52,13 +63,16 @@ class LivePreview:
         self._thread.start()
 
     def stop(self) -> None:
-        """Signal the loop and wait for the in-flight grab to finish, so the
-        camera socket is free before the caller (e.g. a robot job) grabs."""
+        """Signal the loop and wait for the in-flight grab to finish, then release
+        the camera lease — so the socket is genuinely free before the caller (e.g.
+        a robot job) grabs."""
         self._stop.set()
         t = self._thread
         if t is not None and t.is_alive():
             t.join(timeout=5.0)
         self._thread = None
+        if self.lease is not None:
+            self.lease.release(LEASE_OWNER)
 
     def _loop(self, analyze: Analyzer, fps: float, timeout_s: float,
               color_only: bool) -> None:

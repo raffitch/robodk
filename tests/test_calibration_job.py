@@ -23,6 +23,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from tasni.core.camera_lease import CameraLease  # noqa: E402
 from tasni.core.config import AppConfig  # noqa: E402
 from tasni.core.geometry import Rt_to_T, compose, invert_T  # noqa: E402
 from tasni.core.jobrunner import JobContext  # noqa: E402
@@ -98,6 +99,7 @@ def _build_fakes():
     cfg.calibration.pose_count = 15
     cfg.calibration.holdout_count = 3
     services = SimpleNamespace(config=cfg, rdk=rdk, camera=FakeCamera(),
+                               camera_lease=CameraLease(),
                                bus=SimpleNamespace(publish=lambda *a, **k: None),
                                live=SimpleNamespace(running=False, stop=lambda: None))
     return services, rdk, X_true, state
