@@ -36,8 +36,8 @@ class _ConsoleBus:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="tasni headless calibration")
-    ap.add_argument("--apply", metavar="TOOL", default=None,
-                    help="apply the solved pose to this tool")
+    ap.add_argument("--apply", action="store_true",
+                    help="apply the solved pose to the camera tool after solving")
     ap.add_argument("--no-refine", action="store_true", help="skip refinement")
     ap.add_argument("--holdout", type=int, default=None, help="validation poses")
     args = ap.parse_args(argv)
@@ -45,8 +45,8 @@ def main(argv: list[str] | None = None) -> int:
     services = ServiceContainer.build()
     services.bus = _ConsoleBus()  # type: ignore[assignment]
 
+    # The camera tool is forced (RealSense-only); --apply writes the solve into it.
     params = CalibrationParams(
-        tool_name=args.apply,
         holdout_count=args.holdout,
         refine=False if args.no_refine else None,
     )

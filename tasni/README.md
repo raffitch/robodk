@@ -15,7 +15,7 @@ is module #1 and the proof-of-pattern; scan / ArUco-to-plane / define-targets /
 #   Git Bash users:  ./start.sh
 
 py -3.10 -m tasni.cli              # headless calibration (prints metrics, no UI)
-py -3.10 -m tasni.cli --apply "TOOL"   # ...and write the result into a tool
+py -3.10 -m tasni.cli --apply      # ...and write the result into the Realsense tool
 py -3.10 tests\test_calibration_synthetic.py   # math checks (no hardware)
 py -3.10 tests\test_calibration_job.py         # job checks (fake hardware)
 ```
