@@ -32,7 +32,9 @@ from ...core.logging import get_logger, new_run_dir
 from ...core.rdk_io import RdkIO
 from .charuco import CharucoTarget
 from .gate import GateThresholds, evaluate_gate
-from .handeye import CalibrationView, estimate_board_in_base, refine, solve_tsai
+from .handeye import (CalibrationView, cross_validate, estimate_board_in_base,
+                      refine, solve_best, solve_handeye)
+from .intrinsics import verify_intrinsics
 from .poses import generate_calibration_poses
 from .quality import evaluate
 
@@ -135,6 +137,21 @@ def generate_calibration_targets(services) -> dict:
             "look_distance_mm": look, "gate": reading.to_dict()}
 
 
+def _split_views(views: list, holdout: int, strategy: str, seed: int):
+    """Train/validation split. 'shuffle' (seeded, unbiased) avoids the bias of
+    'tail', where the deterministic-spiral pose order makes the last poses
+    systematically the widest-angle views."""
+    if not holdout:
+        return list(views), []
+    if strategy == "tail":
+        return views[:-holdout], views[-holdout:]
+    idx = list(range(len(views)))
+    np.random.default_rng(seed).shuffle(idx)
+    val_i = set(idx[:holdout])
+    return ([v for i, v in enumerate(views) if i not in val_i],
+            [views[i] for i in idx[:holdout]])
+
+
 @dataclass
 class CalibrationParams:
     holdout_count: int | None = None    # override config.calibration.holdout_count
@@ -212,15 +229,26 @@ class CalibrationJob:
                     f"only {len(views)} usable views; need >= {holdout + 3}. "
                     f"Skipped (no board): {skipped}")
 
-            train = views[:-holdout] if holdout else views
-            val = views[-holdout:] if holdout else []
-            ctx.progress(len(targets), len(targets),
-                         f"solving (TSAI{', refine' if do_refine else ''})")
-            X = solve_tsai(train)
+            train, val = _split_views(views, holdout, ccfg.holdout_strategy,
+                                      ccfg.split_seed)
+            ctx.progress(len(targets), len(targets), "solving")
+            if ccfg.solver_method == "best":
+                X, method, ranking = solve_best(train, K, dist)
+            else:
+                method, ranking = ccfg.solver_method, None
+                X = solve_handeye(train, method)
             T_bt = estimate_board_in_base(train, X)
             if do_refine:
                 X, T_bt = refine(train, X, T_bt, K, dist)
-            report = evaluate(train, val, X, T_bt, K, dist, refined=do_refine)
+            ctx.log(f"solver: {method}{' (+refine)' if do_refine else ''}"
+                    + (f"; ranking " + ", ".join(f"{m} {r:.2f}px" for m, r in ranking)
+                       if ranking else ""))
+            xcheck = (verify_intrinsics(train, K, dist, cfg.camera.size)
+                      if ccfg.verify_intrinsics else None)
+            cv_rms = cross_validate(train, method, K, dist, ccfg.cross_val_folds)
+            report = evaluate(train, val, X, T_bt, K, dist, refined=do_refine,
+                              method=method, method_ranking=ranking,
+                              intrinsics_check=xcheck, cross_val_rms_px=cv_rms)
             self.solved_X = X
 
             summary = report.summary()
@@ -250,6 +278,24 @@ class CalibrationJob:
                     pass
 
     # -- helpers ------------------------------------------------------------
+    def _grab_frames(self, cam, n: int):
+        """Grab ``n`` frames as fresh as possible for median detection. Uses a
+        held stream when the client supports it (no per-frame reconnect) and falls
+        back to one-shot grabs; ``n == 1`` is a single grab (the old behaviour)."""
+        if n <= 1:
+            return [cam.grab(color_only=True)]
+        stream = getattr(cam, "stream", None)
+        if stream is not None:
+            try:
+                out = []
+                with stream(color_only=True) as s:
+                    for k in range(n):
+                        out.append(s.read(drain=(k == 0)))
+                return out
+            except Exception as e:   # noqa: BLE001 - capture must go on
+                log.warning("stream burst failed (%s); using one-shot grabs", e)
+        return [cam.grab(color_only=True) for _ in range(n)]
+
     def _capture(self, ctx, rdk, cam, board, K, dist, tool_pose, targets, run_dir):
         views, skipped = [], []
         total = len(targets)
@@ -259,18 +305,22 @@ class CalibrationJob:
             ctx.progress(i + 1, total, f"capturing {name}")
             rdk.move_j(name)
             time.sleep(ccfg.settle_s)
-            frame = cam.grab(color_only=True)
-            det = board.detect(frame.color, K, dist, min_corners=ccfg.min_charuco_corners)
+            images = [f.color for f in self._grab_frames(cam, ccfg.frames_per_pose)]
+            det = board.detect_median(images, K, dist,
+                                      min_corners=ccfg.min_charuco_corners)
             if det is None:
                 ctx.log(f"{name}: no board / too few corners — skipped")
                 skipped.append(name)
                 continue
-            self._emit_frame(ctx, board.annotate(frame.color, det, K, dist, name),
+            rep = images[len(images) // 2]                 # a representative frame
+            self._emit_frame(ctx, board.annotate(rep, det, K, dist, name),
                              run_dir / f"{name}.jpg")
             flange = rdk.tcp_pose_T() @ invert_T(tool_pose)   # true flange in frame
             views.append(CalibrationView(name, flange, det.R_target2cam,
                                          det.t_target2cam, det.corners, det.obj_points))
-            ctx.log(f"{name}: {det.n_corners} corners")
+            n_frames = len(images)
+            ctx.log(f"{name}: {det.n_corners} corners"
+                    + (f" (median of {n_frames} frames)" if n_frames > 1 else ""))
         return views, skipped
 
     def _emit_frame(self, ctx, img, save_path=None) -> None:

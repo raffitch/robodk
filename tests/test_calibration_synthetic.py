@@ -145,8 +145,27 @@ def test_metrics_flag_a_bad_solve():
           f"reproj RMS {report.train.rms_px:.1f} px")
 
 
+def test_solve_best_handles_singular_mount():
+    """``solve_best`` must recover the ~180deg mount that breaks OpenCV TSAI: a
+    non-degenerate method wins on reprojection, so the multi-method default is
+    robust exactly where TSAI-only silently failed (test_metrics_flag_a_bad_solve)."""
+    X_true, _, views = _build_views(X_true=SINGULAR_X)
+    train = views[:12]
+
+    X, method, ranking = handeye.solve_best(train, K, DIST)
+    rot = _rot_err_deg(X, X_true)
+    assert rot < 1.0, f"solve_best winner {method} rot err {rot:.2f} deg"
+    assert np.linalg.norm(X[:3, 3] - X_true[:3, 3]) < 1.0
+    # TSAI is tried but must not win at this near-singular mount.
+    assert method != "TSAI", f"expected a non-TSAI method to win, got {method}"
+    assert ranking[0][0] == method and ranking[0][1] <= ranking[-1][1]
+    print(f"[solve_best @ singular] winner={method}; ranking "
+          + ", ".join(f"{m}:{r:.2f}px" for m, r in ranking))
+
+
 if __name__ == "__main__":
     test_recovers_ground_truth()
     test_noise_is_bounded_and_refine_does_not_overfit()
     test_metrics_flag_a_bad_solve()
+    test_solve_best_handles_singular_mount()
     print("\nAll synthetic calibration checks passed.")

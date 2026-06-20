@@ -72,15 +72,27 @@ ChArUco eye-in-hand hand-eye calibration, refactored from `macros/AutoCalibrate.
   ANGLE** lamps. **Create targets** unlocks only when all three are green, and seeds
   pose generation from the robot's *current* pose — so the operator jogs to a good
   view instead of teaching a `NEUTRAL`. Generation re-checks the gate server-side.
-- **Solver: OpenCV `calibrateHandEye` TSAI** (kept per the research review), on a
-  clean, explicit frame chain (replacing the macro's mixed-convention
-  `pose_2_Rt`). Optional **post-solve refinement** minimizing reprojection error.
+- **Solver: multi-method best-of-5.** Every OpenCV `calibrateHandEye` method
+  (TSAI/PARK/HORAUD/ANDREFF/DANIILIDIS) is solved on a clean, explicit frame chain
+  (replacing the macro's mixed-convention `pose_2_Rt`) and the lowest-reprojection
+  one wins (`solve_best`); optional **post-solve refinement** then minimizes
+  reprojection from that winner. The linear solves are ~free (data already
+  captured), so this *removes* TSAI's near-180° singularity instead of merely
+  flagging it (see note below).
 - **Quality metrics — the #1 research gap, previously unreported:**
   - **reprojection error (px)** on the solve poses,
-  - **held-out validation-pose error (px)**,
+  - **held-out validation-pose error (px)** — split is now a seeded **shuffle**,
+    not the biased last-N poses,
+  - **k-fold cross-validation (px)** — generalization independent of that split,
   - **board-consistency (mm)** — spread of the board's recovered base-frame
     position across views (helps separate calibration error from D435i depth
-    noise, an open question in `docs/best-practices-review.md`).
+    noise, an open question in `docs/best-practices-review.md`),
+  - **motion-diversity / conditioning** — flags a near-coplanar (degenerate) pose
+    set before the numbers are trusted,
+  - **intrinsics check (verify-and-warn)** — re-estimates K/distortion from the
+    captures and warns if the configured camera matrix looks wrong (diagnostic
+    only; never alters the solve).
+  Capture also **medians several frames per pose** to beat per-frame blur/glare.
 - **Review-then-apply**: the solved pose is shown with metrics; nothing is
   written to the tool until you click Apply.
 - **Guide pane + printable board**: a step-by-step checklist with a live **visual
@@ -92,14 +104,13 @@ ChArUco eye-in-hand hand-eye calibration, refactored from `macros/AutoCalibrate.
 
 Artifacts (report.json, summary.txt, annotated frames) land in `runs/calibration/<stamp>/`.
 
-### Solver caveat (worth knowing)
+### Solver note (resolved)
 
-OpenCV's TSAI implementation is numerically fragile as the **camera→flange mount
-rotation approaches 180°** (its rotation parameterization degenerates there);
-PARK/HORAUD/ANDREFF stay exact on identical data. We keep TSAI per the project
-decision and rely on the new reprojection metric to make a bad solve **visible**
-(it shows hundreds of px instead of silently applying a wrong calibration) and on
-refinement to sharpen good solves. If a real mount turns out to sit near that
-singularity, the cheapest robust fix is to seed the reprojection refinement from
-the best linear method rather than switch the default solver — a one-line option
-we can add if the metrics ever flag it.
+OpenCV's TSAI is numerically fragile as the **camera→flange mount rotation
+approaches 180°** (its rotation parameterization degenerates there);
+PARK/HORAUD/ANDREFF/DANIILIDIS stay exact on identical data. Rather than trust one
+method, the solver now runs **all five and keeps the lowest-reprojection winner**
+(`solve_best`), so a near-180° mount is handled automatically — on the synthetic
+singular-mount check (`tests/test_calibration_synthetic.py`) TSAI returns ~627 px
+while PARK wins at ~0 px. The reprojection metric still makes any bad solve
+**visible**; refinement sharpens the chosen winner.

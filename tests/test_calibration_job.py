@@ -89,6 +89,8 @@ def _build_fakes():
                                  np.arange(obj.shape[0]).reshape(-1, 1).astype(np.int32),
                                  obj.astype(np.float32), rvec,
                                  T_cam_target[:3, 3].reshape(3, 1))
+        def detect_median(self, images, K, dist, *, min_corners=6, min_frac=0.5):
+            return self.detect(images[0], K, dist, min_corners=min_corners)
         def annotate(self, img, det, K, dist, label=""): return img
     service_mod.CharucoTarget = FakeBoard
 
@@ -121,6 +123,16 @@ def test_generate_then_run_recovers_truth():
         assert result["report"]["validation"]["n_views"] == 3
         assert result["report"]["train"]["rms_px"] < 1.0
         assert (Path(tmp) / "report.json").exists()
+
+        # Phase-1 report additions.
+        rep = result["report"]
+        assert rep["method"] in {"TSAI", "PARK", "HORAUD", "ANDREFF", "DANIILIDIS"}
+        assert rep["cross_val_rms_px"] is not None and rep["cross_val_rms_px"] < 1.0
+        assert rep["intrinsics_check"] is not None
+        assert rep["intrinsics_check"]["warn"] is False
+        md = rep["motion_diversity"]
+        assert md["n_pairs"] > 0 and md["max_pair_deg"] > 0
+        assert md["well_conditioned"] is True
 
         rot = float(np.rad2deg(np.linalg.norm(
             cv2.Rodrigues(job.solved_X[:3, :3].T @ X_true[:3, :3])[0])))

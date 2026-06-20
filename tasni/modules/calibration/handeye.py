@@ -43,8 +43,21 @@ class CalibrationView:
         return Rt_to_T(self.R_target2cam, self.t_target2cam)
 
 
-def solve_tsai(views: list[CalibrationView]) -> np.ndarray:
-    """Run OpenCV ``calibrateHandEye`` (TSAI) and return ``X = T_gripper_cam`` (4x4)."""
+# OpenCV's linear hand-eye solvers. TSAI degenerates as the camera->flange mount
+# rotation approaches 180deg (its rotation parameterization is singular there);
+# PARK/HORAUD/ANDREFF/DANIILIDIS stay exact on identical data. So rather than
+# trust one, ``solve_best`` runs them all and keeps whichever reprojects best.
+_HANDEYE_METHODS: dict[str, int] = {
+    "TSAI": cv2.CALIB_HAND_EYE_TSAI,
+    "PARK": cv2.CALIB_HAND_EYE_PARK,
+    "HORAUD": cv2.CALIB_HAND_EYE_HORAUD,
+    "ANDREFF": cv2.CALIB_HAND_EYE_ANDREFF,
+    "DANIILIDIS": cv2.CALIB_HAND_EYE_DANIILIDIS,
+}
+
+
+def solve_handeye(views: list[CalibrationView], method: str = "TSAI") -> np.ndarray:
+    """Run OpenCV ``calibrateHandEye`` with one method, return ``X = T_gripper_cam``."""
     R_g2b, t_g2b, R_t2c, t_t2c = [], [], [], []
     for v in views:
         R, t = T_to_Rt(v.T_base_gripper)
@@ -52,9 +65,86 @@ def solve_tsai(views: list[CalibrationView]) -> np.ndarray:
         t_g2b.append(t)
         R_t2c.append(v.R_target2cam)
         t_t2c.append(v.t_target2cam)
-    R_cam2gripper, t_cam2gripper = cv2.calibrateHandEye(
-        R_g2b, t_g2b, R_t2c, t_t2c, method=cv2.CALIB_HAND_EYE_TSAI)
-    return Rt_to_T(R_cam2gripper, t_cam2gripper.reshape(3))
+    R_c2g, t_c2g = cv2.calibrateHandEye(
+        R_g2b, t_g2b, R_t2c, t_t2c, method=_HANDEYE_METHODS[method])
+    return Rt_to_T(R_c2g, t_c2g.reshape(3))
+
+
+def solve_tsai(views: list[CalibrationView]) -> np.ndarray:
+    """TSAI hand-eye solve (kept for callers/tests that pin the method)."""
+    return solve_handeye(views, "TSAI")
+
+
+def reproj_rms(views: list[CalibrationView], X: np.ndarray, T_base_target: np.ndarray,
+               K: np.ndarray, dist: np.ndarray) -> float:
+    """Aggregate reprojection RMS (px) of ``X`` over ``views`` — corner-weighted,
+    same convention as :mod:`quality`. Used to rank solvers."""
+    sq = 0.0
+    n = 0
+    for v in views:
+        T_cam_target = compose(invert_T(X), invert_T(v.T_base_gripper), T_base_target)
+        pred = reproject(v.obj_points, T_cam_target, K, dist)
+        d = np.linalg.norm(pred - v.corners.reshape(-1, 2), axis=1)
+        sq += float(np.sum(d ** 2))
+        n += int(d.shape[0])
+    return float(np.sqrt(sq / n)) if n else 0.0
+
+
+def solve_best(views: list[CalibrationView], K: np.ndarray, dist: np.ndarray,
+               methods: list[str] | None = None
+               ) -> tuple[np.ndarray, str, list[tuple[str, float]]]:
+    """Solve with every linear method and keep the lowest-reprojection one.
+
+    Returns ``(X, method_name, ranking)`` with ``ranking = [(method, rms_px), ...]``
+    sorted best-first. Cheap and robust: the linear solves cost microseconds
+    against data already captured, and letting PARK/HORAUD/ANDREFF/DANIILIDIS win
+    when TSAI degenerates removes the near-180deg-mount singularity entirely.
+    """
+    methods = methods or list(_HANDEYE_METHODS)
+    scored: list[tuple[float, str, np.ndarray]] = []
+    for m in methods:
+        try:
+            X = solve_handeye(views, m)
+            rms = reproj_rms(views, X, estimate_board_in_base(views, X), K, dist)
+        except cv2.error:
+            continue
+        if np.isfinite(rms):
+            scored.append((rms, m, X))
+    if not scored:
+        raise RuntimeError("all hand-eye solvers failed on these views")
+    scored.sort(key=lambda s: s[0])
+    rms, method, X = scored[0]
+    return X, method, [(m, r) for r, m, _ in scored]
+
+
+def cross_validate(views: list[CalibrationView], method: str, K: np.ndarray,
+                   dist: np.ndarray, folds: int = 5) -> float | None:
+    """K-fold held-out reprojection RMS (px) for ``method`` — an honest
+    generalization number independent of the single train/val split, and cheap
+    (linear solves only, no refinement). ``None`` if there are too few views."""
+    n = len(views)
+    folds = min(folds, n)
+    if folds < 2 or n < 4:
+        return None
+    sq = 0.0
+    count = 0
+    for f in range(folds):
+        test = views[f::folds]
+        train = [v for i, v in enumerate(views) if i % folds != f]
+        if len(train) < 3 or not test:
+            continue
+        try:
+            X = solve_handeye(train, method)
+            T_bt = estimate_board_in_base(train, X)
+        except cv2.error:
+            continue
+        for v in test:
+            T_cam_target = compose(invert_T(X), invert_T(v.T_base_gripper), T_bt)
+            pred = reproject(v.obj_points, T_cam_target, K, dist)
+            d = np.linalg.norm(pred - v.corners.reshape(-1, 2), axis=1)
+            sq += float(np.sum(d ** 2))
+            count += int(d.shape[0])
+    return float(np.sqrt(sq / count)) if count else None
 
 
 def average_transform(transforms: list[np.ndarray]) -> np.ndarray:

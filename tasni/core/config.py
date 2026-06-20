@@ -114,8 +114,26 @@ class CalibrationConfig:
 
     settle_s: float = 0.4               # pause after MoveJ before grabbing a frame
     holdout_count: int = 3              # poses held out of the solve for validation
-    refine: bool = True                 # post-TSAI reprojection-minimizing refinement
+    refine: bool = True                 # post-solve reprojection-minimizing refinement
     min_charuco_corners: int = 6        # reject a view with fewer detected corners
+
+    # Capture: median several frames per pose (per-corner pixel median) to beat
+    # per-frame blur/glare/sensor noise. 1 = single grab (the old behaviour).
+    frames_per_pose: int = 5
+    # Solver: "best" runs every OpenCV linear hand-eye method and keeps the one
+    # with the lowest training reprojection — robust to TSAI's ~180deg-mount
+    # singularity. Or force one of TSAI/PARK/HORAUD/ANDREFF/DANIILIDIS.
+    solver_method: str = "best"
+    # Validation split: "shuffle" (seeded, unbiased) vs "tail" (the last N poses —
+    # the old behaviour, but systematically the widest-angle views). Plus optional
+    # k-fold cross-validation RMS (cheap, linear-only; 0 disables).
+    holdout_strategy: str = "shuffle"
+    split_seed: int = 0
+    cross_val_folds: int = 5
+    # Diagnostic intrinsic check: re-estimate K/distortion from the captured board
+    # corners and WARN if they diverge from the configured camera matrix. Never
+    # feeds the solve (review-then-apply); set False to skip the extra solve.
+    verify_intrinsics: bool = True
 
     # Live aiming gate: before any targets are created, the operator jogs the
     # robot until the board sits at the ideal distance and angle. These bands

@@ -17,9 +17,13 @@ interface CalibConfig {
 interface Split { rms_px: number; max_px: number; n_views: number; }
 interface Report {
   refined: boolean;
+  method: string;
   train: Split;
   validation: Split | null;
   board_consistency_mm: { rms: number; max: number };
+  motion_diversity?: { axis_spread: number; min_pair_deg: number; max_pair_deg: number; well_conditioned: boolean; note?: string };
+  intrinsics_check?: { warn: boolean; note: string } | null;
+  cross_val_rms_px?: number | null;
 }
 interface RunResult {
   summary: string;
@@ -316,7 +320,7 @@ function Metrics({ result }: { result: RunResult }) {
   const r = result.report;
   if (!r) return null;
   const rows: [string, string, string][] = [
-    ["Solver", "TSAI" + (r.refined ? " + reprojection refinement" : ""), ""],
+    ["Solver", r.method + (r.refined ? " + reprojection refinement" : ""), ""],
     [`Train fit (${r.train.n_views} poses)`,
       `RMS ${r.train.rms_px.toFixed(3)} px · max ${r.train.max_px.toFixed(3)} px`, band(r.train.rms_px)],
   ];
@@ -324,8 +328,18 @@ function Metrics({ result }: { result: RunResult }) {
     rows.push([`Held-out validation (${r.validation.n_views} poses)`,
       `RMS ${r.validation.rms_px.toFixed(3)} px · max ${r.validation.max_px.toFixed(3)} px`,
       band(r.validation.rms_px)]);
+  if (r.cross_val_rms_px != null)
+    rows.push(["Cross-validation (k-fold)",
+      `RMS ${r.cross_val_rms_px.toFixed(3)} px`, band(r.cross_val_rms_px)]);
   rows.push(["Board consistency",
     `RMS ${r.board_consistency_mm.rms.toFixed(3)} mm · max ${r.board_consistency_mm.max.toFixed(3)} mm`, ""]);
+  if (r.motion_diversity)
+    rows.push(["Motion diversity",
+      `axis-spread ${r.motion_diversity.axis_spread.toFixed(2)} · rot ${Math.round(r.motion_diversity.min_pair_deg)}–${Math.round(r.motion_diversity.max_pair_deg)}°`,
+      r.motion_diversity.well_conditioned ? "good" : "warn"]);
+  if (r.intrinsics_check)
+    rows.push(["Intrinsics check", r.intrinsics_check.note,
+      r.intrinsics_check.warn ? "warn" : "good"]);
 
   return (
     <>
