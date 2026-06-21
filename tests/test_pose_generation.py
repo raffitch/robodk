@@ -21,7 +21,8 @@ from tasni.core.config import CalibrationConfig  # noqa: E402
 from tasni.core.geometry import Rt_to_T, compose, invert_T  # noqa: E402
 from tasni.modules.calibration import handeye, quality  # noqa: E402
 from tasni.modules.calibration.handeye import CalibrationView  # noqa: E402
-from tasni.modules.calibration.poses import generate_calibration_poses  # noqa: E402
+from tasni.modules.calibration.poses import (  # noqa: E402
+    generate_calibration_poses, select_diverse, viewing_angle_span)
 import test_calibration_synthetic as syn  # noqa: E402
 
 K, DIST = syn.K, syn.DIST
@@ -80,6 +81,53 @@ def test_generated_poses_solve_well():
     print("[generated poses]\n" + report.summary())
 
 
+def _seed_and_candidates():
+    cc = CalibrationConfig()
+    board_center = np.array([800.0, 0.0, 200.0])
+    seed_pos = np.array([300.0, 0.0, 560.0])
+    look = float(np.linalg.norm(board_center - seed_pos))
+    seed_T = syn._look_at(seed_pos, board_center, 0.0)
+    cands = generate_calibration_poses(
+        seed_T, count=cc.pose_count, look_distance_mm=look,
+        cone_half_angle_deg=cc.cone_half_angle_deg, roll_max_deg=cc.roll_max_deg,
+        distance_jitter=cc.distance_jitter)
+    return cc, seed_T, cands
+
+
+def test_select_diverse_beats_first_n():
+    """Choosing a spread (FPS) instead of the first N reachable must widen the
+    effective cone — the fix for the workspace-edge clustering finding."""
+    cc, seed_T, cands = _seed_and_candidates()
+    seed_fwd = seed_T[:3, 2]
+
+    first_n = cands[: cc.pose_count]
+    sel = select_diverse(cands, cc.pose_count, seed_fwd=seed_fwd)
+    diverse = [cands[i] for i in sel]
+
+    _, max_first, mean_first = viewing_angle_span(first_n, seed_fwd)
+    _, max_div, mean_div = viewing_angle_span(diverse, seed_fwd)
+    # FPS should reach noticeably wider than the innermost-N spiral prefix.
+    assert max_div > max_first + 5.0, (max_div, max_first)
+    assert mean_div > mean_first, (mean_div, mean_first)
+    # Anchored at the most fronto-parallel pose -> at least one easy-detect view.
+    assert min(viewing_angle_span(diverse, seed_fwd)[:1]) < 15.0
+
+
+def test_select_diverse_respects_count_and_membership():
+    cc, seed_T, cands = _seed_and_candidates()
+    # Fewer reachable than requested -> keep all, no duplication.
+    sub = cands[:4]
+    sel = select_diverse(sub, cc.pose_count, seed_fwd=seed_T[:3, 2])
+    assert sel == [0, 1, 2, 3]
+    # Indices are unique, in range, and sorted (stable target naming).
+    sel = select_diverse(cands, cc.pose_count, seed_fwd=seed_T[:3, 2])
+    assert len(sel) == cc.pose_count == len(set(sel))
+    assert sel == sorted(sel)
+    assert all(0 <= i < len(cands) for i in sel)
+
+
 if __name__ == "__main__":
     test_generated_poses_solve_well()
+    test_select_diverse_beats_first_n()
+    test_select_diverse_respects_count_and_membership()
     print("\nPose-generation conditioning check passed.")

@@ -70,3 +70,63 @@ def generate_calibration_poses(
         x, y = _apply_roll(x, y, roll)
         poses.append(Rt_to_T(np.column_stack([x, y, z / np.linalg.norm(z)]), cam_pos))
     return poses
+
+
+def select_diverse(poses: list[np.ndarray], count: int, *,
+                   seed_fwd: np.ndarray | None = None) -> list[int]:
+    """Pick ``count`` poses whose viewing directions are maximally spread.
+
+    The caller passes the *reachable* candidates (already IK-filtered). Selecting
+    the first ``count`` of them is biased: the spiral orders poses centre-outward,
+    so the innermost (narrowest-cone) poses win and the kept set clusters near the
+    seed — exactly the low rotational diversity that starves the hand-eye solve.
+    Instead we run farthest-point sampling on the camera +Z (viewing) axis, which
+    reaches the cone edges and spreads azimuth evenly. Roll is ignored on purpose:
+    it does not change +Z and does not help axis spread (see ``generate_*`` notes).
+
+    The first pick is anchored at the most fronto-parallel pose (closest to
+    ``seed_fwd``, else ``poses[0]``) so at least one easy-to-detect view survives.
+    Returns indices into ``poses``, sorted ascending for stable target naming.
+    """
+    n = len(poses)
+    if count >= n:
+        return list(range(n))
+    fwd = [np.asarray(T, float)[:3, 2] for T in poses]
+    fwd = [f / np.linalg.norm(f) for f in fwd]
+    if seed_fwd is not None:
+        sf = np.asarray(seed_fwd, float)
+        sf = sf / np.linalg.norm(sf)
+        start = int(np.argmax([float(np.dot(f, sf)) for f in fwd]))
+    else:
+        start = 0
+    chosen = [start]
+    # min angular distance (1 - cos) from each pose to the chosen set
+    d = [1.0 - float(np.dot(fwd[i], fwd[start])) for i in range(n)]
+    while len(chosen) < count:
+        nxt = int(np.argmax(d))
+        chosen.append(nxt)
+        for i in range(n):
+            di = 1.0 - float(np.dot(fwd[i], fwd[nxt]))
+            if di < d[i]:
+                d[i] = di
+    return sorted(chosen)
+
+
+def viewing_angle_span(poses: list[np.ndarray], seed_fwd: np.ndarray
+                       ) -> tuple[float, float, float]:
+    """(min, max, mean) angle in degrees between each pose's +Z and ``seed_fwd``.
+
+    Quantifies how much of the configured cone a pose set actually covers — the
+    *effective* cone, which (at a workspace-edge seed where wide poses are
+    unreachable) can be far narrower than ``cone_half_angle_deg``.
+    """
+    sf = np.asarray(seed_fwd, float)
+    sf = sf / np.linalg.norm(sf)
+    angs = []
+    for T in poses:
+        f = np.asarray(T, float)[:3, 2]
+        f = f / np.linalg.norm(f)
+        angs.append(float(np.degrees(np.arccos(np.clip(float(np.dot(f, sf)), -1, 1)))))
+    if not angs:
+        return (0.0, 0.0, 0.0)
+    return (min(angs), max(angs), sum(angs) / len(angs))

@@ -84,6 +84,10 @@ class RdkSession:
         if self._rdk is not None:
             try:
                 self._rdk.Finish()
+            except Exception:
+                # A headless instance may already have torn the socket down
+                # (e.g. a Free-license popup closing it); disconnect is best-effort.
+                pass
             finally:
                 self._rdk = None
 

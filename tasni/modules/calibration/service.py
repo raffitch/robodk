@@ -38,12 +38,16 @@ from .charuco import CharucoTarget
 from .handeye import (CalibrationView, cross_validate, estimate_board_in_base,
                       refine, reject_outliers, solve_best, solve_handeye)
 from .intrinsics import verify_intrinsics
-from .poses import generate_calibration_poses
+from .poses import generate_calibration_poses, select_diverse, viewing_angle_span
 from .quality import evaluate
 
 log = get_logger("tasni.calibration")
 
 TARGET_PREFIX = "TasniCalib_"
+
+# Hand-eye needs a minimum well-conditioned training set; below this the linear
+# solve is under-constrained regardless of how good each view's reprojection is.
+MIN_TRAIN_VIEWS = 6
 
 
 def _camera_hold(services, owner: str):
@@ -129,25 +133,54 @@ def generate_calibration_targets(services) -> dict:
         seed_T, count=ccfg.pose_count, look_distance_mm=look,
         cone_half_angle_deg=ccfg.cone_half_angle_deg,
         roll_max_deg=ccfg.roll_max_deg, distance_jitter=ccfg.distance_jitter)
-    created: list[str] = []
-    for T in candidates:
-        if len(created) >= ccfg.pose_count:
-            break
-        if rdk.is_reachable(T):
-            name = f"{TARGET_PREFIX}{len(created) + 1:02d}"
-            rdk.add_target(name, T)
-            created.append(name)
-    if len(created) < 6:
+    # IK-filter ALL candidates first, then choose a diverse spread — NOT the first
+    # N reachable (which clusters at the narrow-cone seed and starves hand-eye
+    # conditioning; see select_diverse / the workspace-edge finding in robot_probe).
+    reachable = [(i, T) for i, T in enumerate(candidates) if rdk.is_reachable(T)]
+    n_reach = len(reachable)
+    if n_reach < MIN_TRAIN_VIEWS:
         raise RuntimeError(
-            f"only {len(created)} reachable poses around this view — jog to a more "
-            f"open part of the workspace (still framing the board) and retry")
+            f"only {n_reach} reachable poses around this view (need "
+            f">= {MIN_TRAIN_VIEWS}) — jog to a more open part of the workspace "
+            f"(still framing the board) and retry")
 
+    reach_T = [T for _, T in reachable]
+    sel = select_diverse(reach_T, min(ccfg.pose_count, n_reach),
+                         seed_fwd=seed_T[:3, 2])
+    chosen = [reachable[k] for k in sel]            # index-sorted -> spiral naming
+    created: list[str] = []
+    for _, T in chosen:
+        name = f"{TARGET_PREFIX}{len(created) + 1:02d}"
+        rdk.add_target(name, T)
+        created.append(name)
+
+    # Effective cone: how much of the configured cone the kept poses actually span.
+    # At an edge-of-workspace seed the wide (diversity-rich) poses are unreachable,
+    # so this can be far narrower than cone_half_angle_deg — warn BEFORE capture
+    # rather than discovering it from motion_diversity after a full run.
+    _, eff_max, eff_mean = viewing_angle_span([T for _, T in chosen], seed_T[:3, 2])
     services.bus.publish(JobEvent("log",
         {"message": f"created {len(created)} calibration targets "
-                    f"(working distance ~{look:.0f} mm) — inspect them in RoboDK"}))
+                    f"(working distance ~{look:.0f} mm; {n_reach}/{len(candidates)} "
+                    f"candidates reachable; effective cone ~{eff_max:.0f}° of "
+                    f"{ccfg.cone_half_angle_deg:.0f}°) — inspect them in RoboDK"}))
+    if eff_max < 0.5 * ccfg.cone_half_angle_deg:
+        services.bus.publish(JobEvent("log",
+            {"message": f"WARNING: reachable poses span only ~{eff_max:.0f}° "
+                        f"(mean {eff_mean:.0f}°) — narrow rotational diversity, "
+                        f"hand-eye may be poorly conditioned. Consider re-seeding "
+                        f"at a more central, open view."}))
+    if len(created) - ccfg.holdout_count < MIN_TRAIN_VIEWS:
+        services.bus.publish(JobEvent("log",
+            {"message": f"NOTE: {len(created)} targets minus {ccfg.holdout_count} "
+                        f"holdout leaves < {MIN_TRAIN_VIEWS} training views; the "
+                        f"holdout will be auto-reduced at solve time to keep "
+                        f"{MIN_TRAIN_VIEWS} training poses."}))
     _ = tool_pose  # (kept active on the robot for the upcoming run)
     return {"created": len(created), "targets": created,
-            "look_distance_mm": look, "gate": reading.to_dict()}
+            "look_distance_mm": look, "gate": reading.to_dict(),
+            "candidates_reachable": n_reach, "candidates_total": len(candidates),
+            "effective_cone_deg": round(eff_max, 1)}
 
 
 def _split_views(views: list, holdout: int, strategy: str, seed: int):
@@ -380,10 +413,11 @@ class CalibrationJob:
         targets = rdk.list_targets(TARGET_PREFIX)
         holdout = (self.params.holdout_count if self.params.holdout_count is not None
                    else ccfg.holdout_count)
-        if len(targets) < holdout + 3:
+        if len(targets) < MIN_TRAIN_VIEWS:
             raise RuntimeError(
-                f"only {len(targets)} {TARGET_PREFIX}* targets; need >= {holdout + 3}. "
-                f"Aim the camera until the gate is green and click Create targets first.")
+                f"only {len(targets)} {TARGET_PREFIX}* targets; need >= "
+                f"{MIN_TRAIN_VIEWS}. Aim the camera until the gate is green and "
+                f"click Create targets first.")
 
         # The camera (unicast) must be ours for the capture grabs.
         if self.services.live.running:
@@ -410,10 +444,18 @@ class CalibrationJob:
                                                tool_pose, targets, run_dir)
             do_refine = (self.params.refine if self.params.refine is not None
                          else ccfg.refine)
-            if len(views) < holdout + 3:
+            if len(views) < MIN_TRAIN_VIEWS:
                 raise RuntimeError(
-                    f"only {len(views)} usable views; need >= {holdout + 3}. "
-                    f"Skipped (no board): {skipped}")
+                    f"only {len(views)} usable views; need >= {MIN_TRAIN_VIEWS} "
+                    f"training poses. Skipped (no board): {skipped}")
+            # Scale the holdout down so the training set never drops below
+            # MIN_TRAIN_VIEWS — a thin capture (poses lost to reachability /
+            # detection) should spend its views on the solve, not validation.
+            eff_holdout = min(holdout, max(0, len(views) - MIN_TRAIN_VIEWS))
+            if eff_holdout < holdout:
+                ctx.log(f"holdout reduced {holdout} -> {eff_holdout} to keep "
+                        f">= {MIN_TRAIN_VIEWS} training views ({len(views)} usable)")
+            holdout = eff_holdout
 
             train, val = _split_views(views, holdout, ccfg.holdout_strategy,
                                       ccfg.split_seed)
@@ -436,7 +478,7 @@ class CalibrationJob:
                 T_bt0 = estimate_board_in_base(train, X)
                 kept, dropped, thr = reject_outliers(
                     train, X, T_bt0, K, dist, abs_px=ccfg.outlier_px,
-                    factor=ccfg.outlier_factor, min_keep=max(6, holdout + 3))
+                    factor=ccfg.outlier_factor, min_keep=MIN_TRAIN_VIEWS)
                 if dropped and len(kept) < len(train):
                     ctx.log(f"outlier rejection: dropped {len(dropped)} view(s) over "
                             f"{thr:.2f}px ({', '.join(dropped)}); re-solving on {len(kept)}")
