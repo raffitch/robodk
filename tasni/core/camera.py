@@ -24,6 +24,15 @@ from .config import CameraConfig
 _HEADER = struct.Struct("<IId")  # depth_len, color_len, timestamp
 
 
+def _set_nodelay(sock: socket.socket) -> None:
+    """Disable Nagle so frame bytes flush immediately (lower latency); harmless if
+    the platform lacks the option."""
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+
+
 @dataclass
 class Frame:
     color: np.ndarray              # HxWx3 BGR
@@ -103,22 +112,27 @@ class CameraClient:
         return Frame(color=color, depth=depth, timestamp=timestamp)
 
     @staticmethod
-    def _request_color_only(sock: socket.socket) -> None:
-        """Send the color-only handshake (``MODE COLOR``). Full clients send
-        nothing — the server defaults to the full depth+color stream — so this is
-        the only explicit request needed and existing depth clients are untouched.
-        A server that predates the handshake falls back to full frames, which the
-        decoder still handles, so sending this is always safe."""
+    def _request_color_only(sock: socket.socket, quality: int | None = None) -> None:
+        """Send the color-only handshake (``MODE COLOR``), optionally asking the
+        server to encode at a lower JPEG ``quality`` (``MODE COLOR Q<n>``) — fewer
+        bytes over Wi-Fi, used by the live preview where a little softness is fine.
+        Full clients send nothing — the server defaults to the full depth+color
+        stream — so this is the only explicit request needed and existing depth
+        clients are untouched. A server that predates the handshake falls back to
+        full frames, which the decoder still handles, so sending this is always
+        safe (an old server ignores the trailing Q token too)."""
+        msg = b"MODE COLOR" + (f" Q{int(quality)}".encode() if quality else b"") + b"\n"
         try:
-            sock.sendall(b"MODE COLOR\n")
+            sock.sendall(msg)
         except OSError:
             pass
 
     def grab(self, *, with_depth: bool = False, timeout: float | None = None,
-             color_only: bool = False) -> Frame:
+             color_only: bool = False, quality: int | None = None) -> Frame:
         """Connect, read one frame, close. Returns a decoded :class:`Frame`.
 
-        One-shot: used for the authoritative gate grab and per-pose capture.
+        One-shot: used for the authoritative gate grab and per-pose capture (which
+        leave ``quality`` at the server default — high — for crisp ChArUco corners).
         ``timeout`` overrides the configured socket timeout. ``color_only`` asks
         the server to skip the (unused-for-calibration) depth payload. For
         continuous live preview use :meth:`stream` — re-connecting per frame is slow."""
@@ -126,6 +140,7 @@ class CameraClient:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(cfg.timeout_s if timeout is None else timeout)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            _set_nodelay(s)
             try:
                 s.connect((cfg.ip, cfg.port))
             except socket.timeout as e:
@@ -133,7 +148,7 @@ class CameraClient:
             except OSError as e:
                 raise CameraError(f"camera socket error: {e}") from e
             if color_only:
-                self._request_color_only(s)
+                self._request_color_only(s, quality)
             try:
                 return self._read_frame(s, with_depth)
             finally:
@@ -143,20 +158,23 @@ class CameraClient:
                     pass
 
     @contextmanager
-    def stream(self, *, timeout: float | None = None, color_only: bool = False):
+    def stream(self, *, timeout: float | None = None, color_only: bool = False,
+               quality: int | None = None):
         """Hold one connection open and read frames back-to-back.
 
         The Jetson server streams continuously over a single connection, so for
         live preview this avoids a TCP handshake + slow-start *per frame* (the
         dominant cost over the cell's Wi-Fi). ``color_only`` further asks the
-        server to drop the depth payload (the bulk of the bytes), which is what
-        makes the preview realtime. Yields an object with
-        ``read(with_depth=False) -> Frame``. Unicast: stop any other camera user
-        first (the platform stops the live preview before one-shot grabs)."""
+        server to drop the depth payload (the bulk of the bytes), and ``quality``
+        asks it to encode the JPEG smaller — together that is what makes the preview
+        realtime. Yields an object with ``read(with_depth=False) -> Frame``.
+        Unicast: stop any other camera user first (the platform stops the live
+        preview before one-shot grabs)."""
         cfg = self.config
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(cfg.timeout_s if timeout is None else timeout)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        _set_nodelay(s)
         try:
             s.connect((cfg.ip, cfg.port))
         except socket.timeout as e:
@@ -166,7 +184,7 @@ class CameraClient:
             s.close()
             raise CameraError(f"camera socket error: {e}") from e
         if color_only:
-            self._request_color_only(s)
+            self._request_color_only(s, quality)
         try:
             yield _CameraStream(self, s)
         finally:

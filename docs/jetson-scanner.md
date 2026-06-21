@@ -67,6 +67,53 @@ Two relevant directories in `~`:
 `<I depth_len><I color_len><d timestamp>`, then `depth` (lz4-compressed `.npy`) +
 `color` (JPEG). Matches `receive_data()` in the macros.
 
+**Handshake** (optional, backward compatible): right after connecting a client may
+send one line — `MODE COLOR` (color-only, depth_len=0) or `MODE COLOR Q<n>`
+(color-only + JPEG quality `<n>`, clamped 10–100). No line / anything else ⇒ full
+depth+color at default quality, so existing depth clients are untouched. The live
+aiming preview sends `MODE COLOR Q60`; one-shot captures send `MODE COLOR` (default
+high quality, for crisp ChArUco corners).
+
+## Streaming performance — current state & what's next (2026-06-21)
+The streaming path was reviewed for latency/throughput. **Applied** (safe, wire-
+compatible, but needs a `deploy` + on-Jetson test — they touch the live camera):
+
+- **`TCP_NODELAY`** on the server's accepted socket and both client sockets —
+  disables Nagle so each frame flushes immediately instead of being coalesced with
+  delayed-ACK (saves tens of ms/frame on a request/stream protocol).
+- **JPEG-quality handshake** (`MODE COLOR Q<n>`): the preview now streams at quality
+  60 instead of the encoder default (~85). Fewer bytes over Wi-Fi ⇒ higher preview
+  fps; captures keep full quality. Knob: `calibration.preview_jpeg_quality`.
+
+These stack on the existing color-only fast path (skips align + spatial filter +
+depth — ~75 % of the bytes and most of the Nano's per-frame CPU).
+
+**Are the libraries current in 2026?** Mostly yes — the constraint is the *hardware*,
+not the stack:
+- **librealsense 2.55.1** is recent (late 2024) and is effectively the newest the
+  Jetson Nano (EOL at JetPack 4.6.x / L4T R32.7.6) can run. Not the bottleneck.
+- **libjpeg-turbo (TurboJPEG)** and **lz4** are still the right, current tools for
+  CPU JPEG + fast lossless depth. Not outdated.
+- The **dated** part is the transport: per-frame JPEG over a hand-rolled TCP framing.
+
+**The big unrealized win — the Nano's hardware video encoder (NVENC).** The Nano has a
+dedicated H.264/H.265 encoder that this server doesn't use. A GStreamer pipeline
+(`appsrc → nvvidconv → nvv4l2h264enc → RTP/UDP`, or RTSP) would cut preview bandwidth
+~10–20× and offload the CPU, giving true realtime even over Wi-Fi. **Caveat:** H.264 is
+lossy + inter-frame, which can soften ChArUco/ArUco corners — so use it for the *live
+aiming preview* only and keep the JPEG/lossless path for authoritative captures
+(hybrid). This is a dedicated effort (Jetson multimedia stack + a client decode path),
+not a drop-in, and must be validated on the device.
+
+**Other levers, in priority order:**
+1. **Wire the link.** The flaky Wi-Fi (see below) caps everything; a wired/AP-mode
+   Ethernet link is the single biggest reliability+latency win and needs no code.
+2. **Producer/consumer on the server** (capture thread keeps only the latest raw
+   frame; sender encodes+sends the newest) so a slow link can't back up the camera.
+   Pure-Python, but threads a real-hardware loop — test on the Nano before trusting.
+3. **Newer board** (Jetson Orin Nano) if a step-change is wanted — current JetPack 6,
+   far more NVENC/CUDA headroom. The whole stack would move forward with it.
+
 ## How the server is started — NOW a systemd service (2026-06-19)
 The camera server runs as a **systemd service** `realsense-camera` (auto-start on boot,
 auto-restart on crash). It runs `server/server_unicast_syncronous.py` from the monorepo

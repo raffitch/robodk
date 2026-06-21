@@ -55,21 +55,36 @@ def openPipeline():
 def handle_client(conn, addr):
     jpeg = turbojpeg.TurboJPEG('/usr/lib/aarch64-linux-gnu/libturbojpeg.so.0')
 
+    # Latency: disable Nagle so each frame's bytes go out immediately instead of
+    # being coalesced/delayed (Nagle + delayed-ACK adds tens of ms per frame on a
+    # request/stream protocol like this). Costs nothing for our large sends.
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+
     # Optional, backward-compatible handshake. Right after connecting a client may
     # send ONE line declaring the stream it wants:
-    #     "MODE COLOR"  -> lightweight COLOR-ONLY (depth_len=0, no align/filter/lz4)
-    #     "MODE FULL"   -> the full depth+color stream
-    # No line (timeout) / anything unrecognized => FULL, so existing depth/scan
-    # clients are unaffected (they just connect and read). A bare 'C' is also
-    # accepted, for the first color-only client. Color-only is used by the live
-    # aiming preview + calibration (which never use depth); it cuts ~75% of the
-    # per-frame bytes AND the Nano's align+filter CPU — the difference between a
-    # ~0.5 fps preview and a realtime one.
+    #     "MODE COLOR"      -> lightweight COLOR-ONLY (depth_len=0, no align/filter/lz4)
+    #     "MODE COLOR Q60"  -> color-only AND encode JPEG at quality 60 (smaller =
+    #                          fewer bytes over Wi-Fi = higher preview fps)
+    #     "MODE FULL"       -> the full depth+color stream
+    # No line (timeout) / anything unrecognized => FULL at default quality, so
+    # existing depth/scan clients are unaffected (they just connect and read). A
+    # bare 'C' is also accepted. Color-only is used by the live aiming preview +
+    # calibration (which never use depth); it cuts ~75% of the per-frame bytes AND
+    # the Nano's align+filter CPU — the difference between a ~0.5 fps preview and a
+    # realtime one. The optional Q<n> lets the *preview* trade a little image
+    # quality for speed while full-res captures keep the default (high) quality.
     color_only = False
+    quality = None
     try:
         conn.settimeout(0.5)
         req = conn.recv(64).strip().upper()
         color_only = req.startswith(b'MODE COLOR') or req == b'C'
+        for tok in req.split():
+            if tok.startswith(b'Q') and tok[1:].isdigit():
+                quality = max(10, min(100, int(tok[1:])))
     except (socket.timeout, OSError):
         pass
     finally:
@@ -80,7 +95,7 @@ def handle_client(conn, addr):
         # back to accept(). Generous enough that a slow-but-alive link (a full
         # depth+color frame over slow Wi-Fi can take a few seconds) is not killed.
         conn.settimeout(10.0)
-    print(f"Connection from {addr} (color_only={color_only})")
+    print(f"Connection from {addr} (color_only={color_only}, quality={quality})")
 
     while True:
         if color_only:
@@ -105,7 +120,8 @@ def handle_client(conn, addr):
             depth_compressed = lz4f.compress(depth_buffer.read())
 
         length_depth = struct.pack('<I', len(depth_compressed))
-        data_color = jpeg.encode(color)
+        data_color = (jpeg.encode(color, quality=quality) if quality is not None
+                      else jpeg.encode(color))
         length_color = struct.pack('<I', len(data_color))
         ts = struct.pack('<d', timestamp)
 

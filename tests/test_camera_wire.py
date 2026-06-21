@@ -171,6 +171,52 @@ def test_grab_sends_mode_color_handshake():
     print("[handshake] grab(color_only=True) sent MODE COLOR, depth skipped")
 
 
+def _server_parse_handshake(req: bytes) -> "tuple[bool, int | None]":
+    """Mirror the server's handshake parse (server_unicast_syncronous.py:69-77):
+    color-only flag + optional clamped JPEG quality. Kept in lockstep with the
+    server the same way _server_encode mirrors its framing."""
+    req = req.strip().upper()
+    color_only = req.startswith(b"MODE COLOR") or req == b"C"
+    quality = None
+    for tok in req.split():
+        if tok.startswith(b"Q") and tok[1:].isdigit():
+            quality = max(10, min(100, int(tok[1:])))
+    return color_only, quality
+
+
+def test_color_only_quality_handshake_string():
+    """grab(color_only=True, quality=n) must append ` Q<n>`; with no quality it
+    stays the bare `MODE COLOR\\n` (back-compat with servers that ignore Q)."""
+    import tasni.core.camera as camera_mod
+
+    client = CameraClient(CameraConfig())
+    frame_bytes, _ = _server_encode(_make_color(), None, 1.0)
+
+    for quality, expect in ((55, b"MODE COLOR Q55\n"), (None, b"MODE COLOR\n")):
+        sock = FakeSocket(frame_bytes)
+        orig = camera_mod.socket.socket
+        camera_mod.socket.socket = lambda *a, **k: sock
+        try:
+            client.grab(color_only=True, quality=quality)
+        finally:
+            camera_mod.socket.socket = orig
+        assert bytes(sock.sent) == expect, f"q={quality}: {bytes(sock.sent)!r}"
+    print("[handshake] quality token appended only when requested")
+
+
+def test_server_parses_quality_handshake():
+    """The server contract: MODE COLOR [Q<n>] -> (color_only, clamped quality);
+    anything else -> FULL. Guards both sides of the wire."""
+    assert _server_parse_handshake(b"MODE COLOR\n") == (True, None)
+    assert _server_parse_handshake(b"MODE COLOR Q60\n") == (True, 60)
+    assert _server_parse_handshake(b"C") == (True, None)
+    assert _server_parse_handshake(b"") == (False, None)          # -> FULL
+    assert _server_parse_handshake(b"garbage") == (False, None)   # -> FULL
+    assert _server_parse_handshake(b"MODE COLOR Q5\n")[1] == 10    # clamped low
+    assert _server_parse_handshake(b"MODE COLOR Q999\n")[1] == 100 # clamped high
+    print("[handshake] server parse: color-only flag + clamped quality")
+
+
 def test_recv_exact_reassembles_across_chunks():
     """The header alone (16 bytes) must be reassembled from 7-byte recv chunks —
     a guard against a future reader that assumes one recv == one logical read."""
@@ -208,6 +254,8 @@ if __name__ == "__main__":
     test_full_frame_roundtrip()
     test_color_only_means_depth_len_zero()
     test_grab_sends_mode_color_handshake()
+    test_color_only_quality_handshake_string()
+    test_server_parses_quality_handshake()
     test_recv_exact_reassembles_across_chunks()
     test_decode_color_cv2_fallback_matches_turbojpeg_path()
     print("\nCamera wire-format round-trip tests passed.")

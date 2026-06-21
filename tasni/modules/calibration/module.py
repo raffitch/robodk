@@ -143,7 +143,8 @@ class CalibrationModule(WorkflowModule):
             from ...core.camera_lease import CameraBusy
             try:
                 services.live.start(analyze, fps=cc.preview_fps,
-                                    timeout_s=cc.preview_timeout_s, color_only=True)
+                                    timeout_s=cc.preview_timeout_s, color_only=True,
+                                    quality=cc.preview_jpeg_quality)
             except CameraBusy as e:
                 raise HTTPException(409, str(e))
             return {"status": "started"}

@@ -47,10 +47,12 @@ class LivePreview:
         return self._thread is not None and self._thread.is_alive()
 
     def start(self, analyze: Analyzer, *, fps: float = 6.0,
-              timeout_s: float = 2.0, color_only: bool = False) -> None:
+              timeout_s: float = 2.0, color_only: bool = False,
+              quality: int | None = None) -> None:
         """Start streaming. Takes the camera lease first (raising
         :class:`~tasni.core.camera_lease.CameraBusy` if a job holds the camera), and
-        holds it for the whole run — released in :meth:`stop` after the thread joins."""
+        holds it for the whole run — released in :meth:`stop` after the thread joins.
+        ``quality`` (if set) asks the server to encode the preview JPEG smaller."""
         if self.running:
             return
         if self.lease is not None and not self.lease.acquire(LEASE_OWNER):
@@ -58,7 +60,7 @@ class LivePreview:
             raise CameraBusy(self.lease.owner)
         self._stop.clear()
         self._thread = threading.Thread(
-            target=self._loop, args=(analyze, fps, timeout_s, color_only),
+            target=self._loop, args=(analyze, fps, timeout_s, color_only, quality),
             name="live-preview", daemon=True)
         self._thread.start()
 
@@ -75,13 +77,14 @@ class LivePreview:
             self.lease.release(LEASE_OWNER)
 
     def _loop(self, analyze: Analyzer, fps: float, timeout_s: float,
-              color_only: bool) -> None:
+              color_only: bool, quality: int | None = None) -> None:
         # fps caps the publish rate; reads are paced by frame arrival (the link),
         # so we stay near-realtime rather than draining a backlog.
         min_period = 1.0 / fps if fps > 0 else 0.0
         while not self._stop.is_set():
             try:
-                with self.camera.stream(timeout=timeout_s, color_only=color_only) as stream:
+                with self.camera.stream(timeout=timeout_s, color_only=color_only,
+                                        quality=quality) as stream:
                     while not self._stop.is_set():
                         # drain to the newest buffered frame so the preview stays
                         # at the live edge even if detection can't keep up
