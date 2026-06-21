@@ -4,8 +4,10 @@ import { useEvents, type JobEvent } from "../api/events";
 import AimHud, { type GateReading } from "./AimHud";
 import CalibrationGuide from "./CalibrationGuide";
 import ConeDiagram from "./ConeDiagram";
+import StreamStats, { useStreamStats } from "./StreamStats";
 
 const api = moduleApi("calibration");
+const TARGET_PREFIX = "TasniCalib_";   // must match service.py TARGET_PREFIX
 
 interface CalibConfig {
   robot: string;
@@ -27,6 +29,7 @@ interface Report {
   motion_diversity?: { axis_spread: number; min_pair_deg: number; max_pair_deg: number; well_conditioned: boolean; note?: string };
   intrinsics_check?: { warn: boolean; note: string } | null;
   cross_val_rms_px?: number | null;
+  rejected_views?: string[];
   diagnosis?: { verdict: "pass" | "borderline" | "fail"; headline: string; causes: string[] };
 }
 interface RunResult {
@@ -69,9 +72,14 @@ export default function Calibration() {
   const [frame, setFrame] = useState<string | null>(null);
   const [result, setResult] = useState<RunResult | null>(null);
   const [canApply, setCanApply] = useState(false);
+  // Last fatal error, surfaced as a prominent banner (the log alone is easy to
+  // miss — and a run that fails mid-motion is exactly when the operator needs
+  // the reason front-and-centre).
+  const [runError, setRunError] = useState<string | null>(null);
 
   const [live, setLive] = useState(false);
   const [gate, setGate] = useState<GateReading | null>(null);
+  const { mark: markFrame, reset: resetStream, stat: streamStat } = useStreamStats();
   const [targets, setTargets] = useState<number | null>(null);   // null = none created
   const [generating, setGenerating] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
@@ -99,7 +107,28 @@ export default function Calibration() {
     }).catch((e) => addLog(e.message, true));
   }, []);
 
-  useEffect(() => { loadConfig(); }, [loadConfig]);
+  // Rehydrate the last solved run from the server (so a page reload doesn't hide
+  // an applyable result). /status only reads the job runner — it does NOT touch
+  // RoboDK — so it's safe to call on mount without forcing the heavy connect.
+  const refreshJob = useCallback(async () => {
+    try {
+      const s = await api.get<{ result: RunResult | null }>("/status");
+      if (s.result?.can_apply) { setResult(s.result); setCanApply(true); }
+    } catch { /* no prior run — fine */ }
+  }, []);
+
+  // Rehydrate the TasniCalib_* target count. This hits RoboDK, so only call it
+  // once a connection is expected (after Connect) — never on mount, where it
+  // would silently trigger the 117 MB station load the Connect button gates.
+  const refreshTargets = useCallback(async () => {
+    try {
+      const r = await api.get<{ targets: string[] }>("/targets");
+      const n = r.targets.filter((t) => t.startsWith(TARGET_PREFIX)).length;
+      setTargets(n > 0 ? n : null);
+    } catch { /* RoboDK not ready — leave targets unknown */ }
+  }, []);
+
+  useEffect(() => { loadConfig(); refreshJob(); }, [loadConfig, refreshJob]);
 
   // Stop the live gate if we leave the page (frees the unicast camera).
   useEffect(() => () => { api.post("/live/stop").catch(() => {}); }, []);
@@ -112,6 +141,7 @@ export default function Calibration() {
       if (r.ready) {
         setConn("ready");
         setConnInfo(`Ready — robot and the '${r.tool}' camera tool are present.`);
+        refreshTargets(); refreshJob();   // pick up targets / solved run already in the cell
       } else {
         setConn("error");
         setConnInfo("Station opened but missing: " + r.missing.join(", ")
@@ -121,7 +151,7 @@ export default function Calibration() {
       setConn("error");
       setConnInfo(e.message);
     }
-  }, []);
+  }, [refreshTargets, refreshJob]);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -139,7 +169,9 @@ export default function Calibration() {
         const src = "data:image/jpeg;base64," + ev.payload.jpeg_b64;
         setFrame(src);
         // During a real run each frame is one pose's board lock — keep the strip.
+        // Otherwise it's the live aiming stream, so clock its rate/jitter.
         if (runKindRef.current === "run") setThumbs((t) => [...t, src]);
+        else markFrame();
       } else if (ev.type === "gate") {
         setGate(ev.payload as GateReading);
       } else if (ev.type === "result") {
@@ -152,7 +184,8 @@ export default function Calibration() {
           setStatus("done"); setPct(100); setRunning(false); setRunKind(null);
         }
       } else if (ev.type === "error") {
-        addLog(ev.payload.message, true); setStatus("error"); setRunning(false); setRunKind(null);
+        addLog(ev.payload.message, true); setRunError(ev.payload.message);
+        setStatus("error"); setRunning(false); setRunKind(null);
       } else if (ev.type === "status" && ev.payload.status === "cancelled") {
         addLog("cancelled."); setStatus("cancelled"); setRunning(false); setRunKind(null);
       }
@@ -161,6 +194,7 @@ export default function Calibration() {
 
   const startLive = async () => {
     try {
+      resetStream();
       await api.post("/live/start");
       setLive(true);
       addLog("live aiming gate started — jog the robot until all lamps are green.");
@@ -169,10 +203,11 @@ export default function Calibration() {
   const stopLive = async () => {
     try { await api.post("/live/stop"); } catch { /* ignore */ }
     setLive(false);
+    resetStream();
   };
 
   const generateTargets = async () => {
-    setGenerating(true);
+    setGenerating(true); setRunError(null);
     try {
       const r = await api.post<{ created: number; look_distance_mm: number }>("/poses/generate");
       setTargets(r.created);
@@ -180,17 +215,23 @@ export default function Calibration() {
       setLive(false);   // generate stops the live gate server-side
       addLog(`created ${r.created} targets (working distance ~${Math.round(r.look_distance_mm)} mm)`
         + " — inspect them in RoboDK, then Run calibration.");
-    } catch (e: any) { addLog("create targets: " + e.message, true); }
+    } catch (e: any) {
+      addLog("create targets: " + e.message, true);
+      setRunError("Create targets: " + e.message);
+    }
     finally { setGenerating(false); }
   };
 
   const dryRun = async () => {
-    setTour(null); setPct(0); setStatus("starting dry run…");
+    setTour(null); setPct(0); setStatus("starting dry run…"); setRunError(null);
     setRunning(true); setRunKind("tour"); setLive(false);
     addLog("dry run: simulating the tour in RoboDK (no hardware motion)…");
     try {
       await api.post("/poses/simulate");
-    } catch (e: any) { addLog("dry run: " + e.message, true); setRunning(false); setRunKind(null); }
+    } catch (e: any) {
+      addLog("dry run: " + e.message, true); setRunError("Dry run: " + e.message);
+      setRunning(false); setRunKind(null);
+    }
   };
 
   // The bare confirm is replaced by a dialog (pose count + return-to-start
@@ -199,10 +240,14 @@ export default function Calibration() {
   const doRun = async () => {
     setShowConfirm(false);
     setLogs([]); setResult(null); setCanApply(false); setPct(0); setThumbs([]);
+    setRunError(null);
     setStatus("starting…"); setRunning(true); setRunKind("run"); setLive(false);
     try {
       await api.post("/run", { holdout_count: holdout, refine });
-    } catch (e: any) { addLog("run: " + e.message, true); setRunning(false); setRunKind(null); }
+    } catch (e: any) {
+      addLog("run: " + e.message, true); setRunError("Run: " + e.message);
+      setRunning(false); setRunKind(null);
+    }
   };
   const clearPoses = async () => {
     try {
@@ -220,7 +265,20 @@ export default function Calibration() {
     } catch (e: any) { addLog("apply: " + e.message, true); }
   };
 
+  // Close the run-confirmation dialog on Escape (basic dialog a11y).
+  useEffect(() => {
+    if (!showConfirm) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setShowConfirm(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [showConfirm]);
+
   const g = config?.gate;
+  // Pre-flight the held-out split against the target count: the solve needs
+  // >= holdout + 3 views, so a too-large holdout would otherwise only fail
+  // *after* the robot has moved through capture. Block it here instead.
+  const minTargets = holdout + 3;
+  const holdoutInvalid = targets != null && targets < minTargets;
   const lamps: [string, boolean | undefined][] = [
     ["DETECT", gate?.gates?.detected],
     ["DISTANCE", gate?.gates?.distance],
@@ -266,6 +324,7 @@ export default function Calibration() {
           {frame ? <img className="preview" src={frame} alt="camera" />
                  : <div className="preview" />}
           {live && <AimHud gate={gate} />}
+          {live && <StreamStats stat={streamStat} />}
           {!live && <div className="aim-off">camera off — press “Start camera”</div>}
         </div>
 
@@ -399,7 +458,7 @@ export default function Calibration() {
             {runKind === "tour" ? "Simulating…" : "Dry run (simulate)"}
           </button>
           <button onClick={openRunConfirm}
-                  disabled={running || !ready || targets == null || !scaleOk}>
+                  disabled={running || !ready || targets == null || !scaleOk || holdoutInvalid}>
             Run calibration
           </button>
           <button className="secondary" onClick={cancel} disabled={!running}>Cancel</button>
@@ -407,6 +466,20 @@ export default function Calibration() {
         {targets == null && <div className="hint">Create targets (above) to enable Run.</div>}
         {targets != null && !scaleOk &&
           <div className="hint">Confirm the print scale above to enable Run.</div>}
+        {holdoutInvalid &&
+          <div className="warn-text" style={{ marginTop: 8, fontSize: 12 }}>
+            ⚠ {targets} targets but the solve needs ≥ {minTargets} (held-out {holdout} + 3).
+            Lower the validation poses or create more targets.
+          </div>}
+
+        {runError && (
+          <div className="run-error">
+            <span className="run-error-tag">ERROR</span>
+            <span>{runError}</span>
+            <button className="run-error-x" onClick={() => setRunError(null)}
+                    aria-label="dismiss error">✕</button>
+          </div>
+        )}
 
         {tour && (
           <div className={"tour-result " + (tour.all_ok ? "ok" : "bad")}>
@@ -468,8 +541,9 @@ export default function Calibration() {
 
       {showConfirm && (
         <div className="modal-backdrop" onClick={() => setShowConfirm(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h2>⚠ Move the real robot?</h2>
+          <div className="modal" onClick={(e) => e.stopPropagation()}
+               role="dialog" aria-modal="true" aria-labelledby="run-confirm-title">
+            <h2 id="run-confirm-title">⚠ Move the real robot?</h2>
             <p>Run drives the <b>{config?.robot ?? "KUKA"}</b> through{" "}
               <b>{targets ?? "the generated"}</b> calibration targets on the{" "}
               <b>real robot</b>. It returns to the start pose when finished.</p>
@@ -498,7 +572,9 @@ export default function Calibration() {
 
             <div className="btn-row">
               <button onClick={doRun} disabled={!cellClear}>Move robot &amp; run</button>
-              <button className="secondary" onClick={() => setShowConfirm(false)}>Cancel</button>
+              {/* Cancel is the focused default — Enter shouldn't fire robot motion. */}
+              <button className="secondary" autoFocus
+                      onClick={() => setShowConfirm(false)}>Cancel</button>
             </div>
           </div>
         </div>
@@ -531,6 +607,9 @@ function Metrics({ result }: { result: RunResult }) {
   if (r.intrinsics_check)
     rows.push(["Intrinsics check", r.intrinsics_check.note,
       r.intrinsics_check.warn ? "warn" : "good"]);
+  if (r.rejected_views && r.rejected_views.length)
+    rows.push([`Outliers rejected (${r.rejected_views.length})`,
+      r.rejected_views.join(", "), "warn"]);
 
   const d = r.diagnosis;
   return (

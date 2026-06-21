@@ -36,7 +36,7 @@ from ...core.logging import get_logger, new_run_dir
 from ...core.rdk_io import RdkIO
 from .charuco import CharucoTarget
 from .handeye import (CalibrationView, cross_validate, estimate_board_in_base,
-                      refine, solve_best, solve_handeye)
+                      refine, reject_outliers, solve_best, solve_handeye)
 from .intrinsics import verify_intrinsics
 from .poses import generate_calibration_poses
 from .quality import evaluate
@@ -418,11 +418,31 @@ class CalibrationJob:
             train, val = _split_views(views, holdout, ccfg.holdout_strategy,
                                       ccfg.split_seed)
             ctx.progress(len(targets), len(targets), "solving")
-            if ccfg.solver_method == "best":
-                X, method, ranking = solve_best(train, K, dist)
-            else:
-                method, ranking = ccfg.solver_method, None
-                X = solve_handeye(train, method)
+
+            def _solve(vs):
+                """Solve one view set, honouring solver_method ("best" tries all)."""
+                if ccfg.solver_method == "best":
+                    return solve_best(vs, K, dist)            # (X, method, ranking)
+                return solve_handeye(vs, ccfg.solver_method), ccfg.solver_method, None
+
+            X, method, ranking = _solve(train)
+
+            # Robust pass: drop training views whose reprojection is an outlier
+            # (a mis-detected board or bad pose drags the linear solve) and re-solve
+            # on the survivors. Conservative — a clean capture drops nothing. Held-out
+            # validation views are never touched (that would bias the metric).
+            rejected: list[str] = []
+            if ccfg.reject_outliers:
+                T_bt0 = estimate_board_in_base(train, X)
+                kept, dropped, thr = reject_outliers(
+                    train, X, T_bt0, K, dist, abs_px=ccfg.outlier_px,
+                    factor=ccfg.outlier_factor, min_keep=max(6, holdout + 3))
+                if dropped and len(kept) < len(train):
+                    ctx.log(f"outlier rejection: dropped {len(dropped)} view(s) over "
+                            f"{thr:.2f}px ({', '.join(dropped)}); re-solving on {len(kept)}")
+                    train, rejected = kept, dropped
+                    X, method, ranking = _solve(train)
+
             T_bt = estimate_board_in_base(train, X)
             if do_refine:
                 X, T_bt = refine(train, X, T_bt, K, dist)
@@ -431,10 +451,13 @@ class CalibrationJob:
                        if ranking else ""))
             xcheck = (verify_intrinsics(train, K, dist, cfg.camera.size)
                       if ccfg.verify_intrinsics else None)
-            cv_rms = cross_validate(train, method, K, dist, ccfg.cross_val_folds)
+            # Pass the configured strategy (not the winning method) so a "best" run
+            # re-selects per fold — an honest cross-val that prices in the selection.
+            cv_rms = cross_validate(train, ccfg.solver_method, K, dist, ccfg.cross_val_folds)
             report = evaluate(train, val, X, T_bt, K, dist, refined=do_refine,
                               method=method, method_ranking=ranking,
-                              intrinsics_check=xcheck, cross_val_rms_px=cv_rms)
+                              intrinsics_check=xcheck, cross_val_rms_px=cv_rms,
+                              rejected_views=rejected)
             self.solved_X = X
 
             summary = report.summary()

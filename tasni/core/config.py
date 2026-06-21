@@ -141,6 +141,16 @@ class CalibrationConfig(_Model):
     # feeds the solve (review-then-apply); set False to skip the extra solve.
     verify_intrinsics: bool = True
 
+    # Robust outlier rejection: after the initial solve, drop training views whose
+    # per-view reprojection RMS is an outlier (a mis-detected board / bad pose drags
+    # the linear solve), then re-solve on the survivors. Conservative by design — a
+    # view is dropped only if it exceeds BOTH ``outlier_px`` absolute AND
+    # ``outlier_factor`` x the median, so a clean capture loses nothing. Held-out
+    # validation views are never dropped (that would bias the metric optimistically).
+    reject_outliers: bool = True
+    outlier_px: float = 3.0             # absolute per-view reproj RMS (px) floor for an outlier
+    outlier_factor: float = 3.0         # ...and must also exceed this x the median view error
+
     # Live aiming gate: before any targets are created, the operator jogs the
     # robot until the board sits at the ideal distance and angle. These bands
     # define when each HUD lamp goes green; all must be green to create targets.
@@ -150,6 +160,10 @@ class CalibrationConfig(_Model):
     center_tol_mm: float = 40.0         # |x|,|y| under this counts as centred (advisory)
     preview_fps: float = 6.0            # max live-gate publish rate
     preview_timeout_s: float = 4.0      # per-frame camera timeout while streaming
+    # JPEG quality the Jetson encodes the live preview at (10-100). Lower = fewer
+    # bytes over Wi-Fi = higher fps; aiming tolerates softness. One-shot captures
+    # ignore this and use the server's default (high) quality for crisp corners.
+    preview_jpeg_quality: int = 60
     # HUD X/Y/Z jog hints are in the camera optical frame (X right, Y down, Z
     # forward). Flip an axis here if the pendant's TOOL axis runs the other way.
     jog_invert_x: bool = False

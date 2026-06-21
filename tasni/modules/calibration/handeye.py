@@ -117,11 +117,24 @@ def solve_best(views: list[CalibrationView], K: np.ndarray, dist: np.ndarray,
     return X, method, [(m, r) for r, m, _ in scored]
 
 
+def _solve_for_cv(train: list[CalibrationView], method: str,
+                  K: np.ndarray, dist: np.ndarray) -> np.ndarray:
+    """Solve one cross-val fold. ``method == "best"`` re-runs the whole
+    multi-method selection *inside* the fold, so the reported cross-val number
+    accounts for the method-selection step (otherwise it would be optimistically
+    biased toward the method already chosen on the full set)."""
+    if method == "best":
+        X, _, _ = solve_best(train, K, dist)
+        return X
+    return solve_handeye(train, method)
+
+
 def cross_validate(views: list[CalibrationView], method: str, K: np.ndarray,
                    dist: np.ndarray, folds: int = 5) -> float | None:
     """K-fold held-out reprojection RMS (px) for ``method`` — an honest
     generalization number independent of the single train/val split, and cheap
-    (linear solves only, no refinement). ``None`` if there are too few views."""
+    (linear solves only, no refinement). ``None`` if there are too few views.
+    ``method == "best"`` selects the best solver per fold (see :func:`_solve_for_cv`)."""
     n = len(views)
     folds = min(folds, n)
     if folds < 2 or n < 4:
@@ -134,9 +147,9 @@ def cross_validate(views: list[CalibrationView], method: str, K: np.ndarray,
         if len(train) < 3 or not test:
             continue
         try:
-            X = solve_handeye(train, method)
+            X = _solve_for_cv(train, method, K, dist)
             T_bt = estimate_board_in_base(train, X)
-        except cv2.error:
+        except (cv2.error, RuntimeError):
             continue
         for v in test:
             T_cam_target = compose(invert_T(X), invert_T(v.T_base_gripper), T_bt)
@@ -145,6 +158,49 @@ def cross_validate(views: list[CalibrationView], method: str, K: np.ndarray,
             sq += float(np.sum(d ** 2))
             count += int(d.shape[0])
     return float(np.sqrt(sq / count)) if count else None
+
+
+def per_view_reproj_px(views: list[CalibrationView], X: np.ndarray,
+                       T_base_target: np.ndarray, K: np.ndarray,
+                       dist: np.ndarray) -> np.ndarray:
+    """Per-view reprojection RMS (px) of ``X`` — one number per view, in order."""
+    out = []
+    for v in views:
+        T_cam_target = compose(invert_T(X), invert_T(v.T_base_gripper), T_base_target)
+        pred = reproject(v.obj_points, T_cam_target, K, dist)
+        d = np.linalg.norm(pred - v.corners.reshape(-1, 2), axis=1)
+        out.append(float(np.sqrt(np.mean(d ** 2))))
+    return np.asarray(out)
+
+
+def reject_outliers(views: list[CalibrationView], X: np.ndarray,
+                    T_base_target: np.ndarray, K: np.ndarray, dist: np.ndarray,
+                    *, abs_px: float = 3.0, factor: float = 3.0, min_keep: int = 6
+                    ) -> tuple[list[CalibrationView], list[str], float]:
+    """Drop views whose reprojection RMS is an outlier, returning
+    ``(kept_views, dropped_names, threshold_px)``.
+
+    A view is an outlier only if it exceeds ``max(abs_px, factor * median)`` — i.e.
+    it must be both large in absolute terms *and* large relative to the rest. This
+    is deliberately conservative (a clean capture drops nothing) and robust to the
+    overall noise floor (a noisy-but-consistent set isn't decimated). Refuses to cut
+    below ``min_keep`` survivors, so rejection can never starve the solve.
+    """
+    if not views:
+        return list(views), [], float("inf")
+    errs = per_view_reproj_px(views, X, T_base_target, K, dist)
+    thresh = max(abs_px, factor * float(np.median(errs)))
+    under = errs <= thresh
+    if under.sum() >= min_keep:
+        keep_mask = under
+    else:
+        # Too few survivors under the threshold — keep the min_keep lowest-error
+        # views instead (if there are fewer than min_keep total, keep them all).
+        keep_mask = np.zeros(len(errs), dtype=bool)
+        keep_mask[np.argsort(errs)[:min_keep]] = True
+    kept = [v for v, k in zip(views, keep_mask) if k]
+    dropped = [v.name for v, k in zip(views, keep_mask) if not k]
+    return kept, dropped, thresh
 
 
 def average_transform(transforms: list[np.ndarray]) -> np.ndarray:

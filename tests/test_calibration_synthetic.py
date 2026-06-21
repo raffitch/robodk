@@ -163,9 +163,52 @@ def test_solve_best_handles_singular_mount():
           + ", ".join(f"{m}:{r:.2f}px" for m, r in ranking))
 
 
+def test_outlier_rejection_drops_a_bad_pose_and_improves_solve():
+    """A single corrupted robot pose (a glitch) drags the linear solve; the robust
+    pass must flag that view as an outlier and re-solving without it must be at
+    least as accurate. Clean views are never dropped (conservative threshold)."""
+    X_true, _, views = _build_views(n=15, noise_px=0.3, seed=7)
+
+    # Clean data: nothing should be rejected.
+    Xk = handeye.solve_handeye(views, "PARK")
+    T_btk = handeye.estimate_board_in_base(views, Xk)
+    kept0, dropped0, _ = handeye.reject_outliers(views, Xk, T_btk, K, DIST)
+    assert dropped0 == [] and len(kept0) == len(views), "clean capture lost views"
+
+    # Corrupt one view's flange pose by ~12 deg (a robot-pose glitch / mis-tag).
+    bad = views[5]
+    bad.T_base_gripper = Rt_to_T(_rot([0, 1, 0], 12) @ bad.T_base_gripper[:3, :3],
+                                 bad.T_base_gripper[:3, 3])
+
+    X0 = handeye.solve_handeye(views, "PARK")
+    T_bt0 = handeye.estimate_board_in_base(views, X0)
+    kept, dropped, thr = handeye.reject_outliers(views, X0, T_bt0, K, DIST)
+    assert "Target 5" in dropped, f"expected the corrupted view dropped; got {dropped}"
+    assert len(kept) == len(views) - len(dropped)
+
+    Xc = handeye.solve_handeye(kept, "PARK")
+    assert _rot_err_deg(Xc, X_true) <= _rot_err_deg(X0, X_true) + 1e-9
+    print(f"[outlier] dropped {dropped} over {thr:.2f}px; "
+          f"rot err {_rot_err_deg(X0, X_true):.2f} -> {_rot_err_deg(Xc, X_true):.2f} deg")
+
+
+def test_cross_validate_best_selects_per_fold_at_singular_mount():
+    """cross_validate(method='best') must stay sane at the ~180deg mount where
+    TSAI degenerates — each fold re-selects a good solver, so the k-fold RMS is
+    small (a fixed-TSAI cross-val would be huge)."""
+    _Xt, _, views = _build_views(X_true=SINGULAR_X, n=15, noise_px=0.3, seed=3)
+    cv_best = handeye.cross_validate(views, "best", K, DIST, folds=5)
+    cv_tsai = handeye.cross_validate(views, "TSAI", K, DIST, folds=5)
+    assert cv_best is not None and cv_best < 3.0, f"best cross-val too high: {cv_best}"
+    assert cv_tsai is not None and cv_tsai > cv_best
+    print(f"[cross-val best @ singular] best={cv_best:.2f}px vs TSAI={cv_tsai:.1f}px")
+
+
 if __name__ == "__main__":
     test_recovers_ground_truth()
     test_noise_is_bounded_and_refine_does_not_overfit()
     test_metrics_flag_a_bad_solve()
     test_solve_best_handles_singular_mount()
+    test_outlier_rejection_drops_a_bad_pose_and_improves_solve()
+    test_cross_validate_best_selects_per_fold_at_singular_mount()
     print("\nAll synthetic calibration checks passed.")

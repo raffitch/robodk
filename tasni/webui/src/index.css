@@ -170,6 +170,26 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .aim-off { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   color: var(--muted); font-family: var(--mono); font-size: 13px; line-height: 1.4; }
 
+/* live stream health badge (top-right of the camera frame): fps + jitter + spark */
+.stream-stat { position: absolute; top: 10px; right: 10px; z-index: 2; pointer-events: none;
+  display: flex; align-items: center; gap: 8px; line-height: 1;
+  font-family: var(--mono); font-size: 12px; font-weight: 700; letter-spacing: .3px;
+  padding: 5px 9px; border-radius: 8px; color: #e8f3ea;
+  background: rgba(6,11,8,.62); border: 1px solid rgba(255,255,255,.10);
+  backdrop-filter: blur(2px); }
+.stream-stat .ss-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: 0 0 auto; }
+.stream-stat .ss-fps { font-weight: 800; }
+.stream-stat .ss-unit { margin-left: 2px; font-size: 9px; opacity: .7; font-weight: 600; }
+.stream-stat .ss-jit { font-size: 10px; opacity: .75; font-weight: 600; }
+.stream-stat .ss-spark { display: flex; align-items: flex-end; gap: 1px; height: 14px; width: 58px; }
+.stream-stat .ss-spark i { flex: 1 1 0; min-width: 1px; background: currentColor; opacity: .55;
+  border-radius: 1px; align-self: flex-end; }
+.stream-stat .ss-spark i.hot { background: var(--warn); opacity: .95; }
+.stream-stat.good  { color: #cdeed6; } .stream-stat.good  .ss-dot { background: var(--ok); box-shadow: 0 0 7px var(--ok); }
+.stream-stat.fair  .ss-dot { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
+.stream-stat.poor  .ss-dot { background: var(--warn); }
+.stream-stat.stalled { color: #f3c9c6; } .stream-stat.stalled .ss-dot { background: var(--err); box-shadow: 0 0 7px var(--err); }
+
 .lamps { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
 .lamp { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 12px;
   font-weight: 700; letter-spacing: .5px; padding: 5px 11px; border-radius: 12px;
@@ -218,3 +238,14 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .modal-checks { margin: 0 0 12px; padding-left: 18px; font-size: 12px; color: var(--muted); line-height: 1.6; }
 .modal-ack { display: flex; gap: 9px; align-items: flex-start; font-size: 13px; cursor: pointer; margin-bottom: 4px; }
 .modal-ack input[type="checkbox"] { margin-top: 3px; }
+
+/* prominent run/connect error banner (so a failure isn't lost in the log) */
+.run-error { display: flex; align-items: center; gap: 10px; margin-top: 12px;
+  background: rgba(248,81,73,.10); border: 1px solid var(--err);
+  border-left: 3px solid var(--err); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+.run-error span:not(.run-error-tag) { flex: 1; }
+.run-error-tag { font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--err);
+  background: rgba(248,81,73,.15); border-radius: 6px; padding: 2px 8px; }
+.run-error-x { background: transparent; border: 0; color: var(--muted); font-size: 13px;
+  padding: 2px 6px; cursor: pointer; }
+.run-error-x:hover { color: var(--text); }

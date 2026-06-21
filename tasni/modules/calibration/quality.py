@@ -51,6 +51,7 @@ class CalibrationReport:
     method_ranking: list | None = None
     intrinsics_check: dict | None = None
     cross_val_rms_px: float | None = None
+    rejected_views: list = field(default_factory=list)
     diagnosis: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -78,6 +79,9 @@ class CalibrationReport:
             f"motion diversity: axis-spread {md['axis_spread']:.2f}, "
             f"rot {md['min_pair_deg']:.0f}-{md['max_pair_deg']:.0f} deg"
             f"{'' if md['well_conditioned'] else '  [WEAK - re-seed]'}")
+        if self.rejected_views:
+            lines.append(f"outliers rejected ({len(self.rejected_views)}): "
+                         f"{', '.join(self.rejected_views)}")
         if self.intrinsics_check and self.intrinsics_check.get("warn"):
             lines.append(f"intrinsics: WARNING - {self.intrinsics_check['note']}")
         if self.diagnosis:
@@ -227,7 +231,8 @@ def evaluate(train: list[CalibrationView], validation: list[CalibrationView],
              X: np.ndarray, T_base_target: np.ndarray, K: np.ndarray,
              dist: np.ndarray, *, refined: bool, method: str = "TSAI",
              method_ranking: list | None = None, intrinsics_check: dict | None = None,
-             cross_val_rms_px: float | None = None) -> CalibrationReport:
+             cross_val_rms_px: float | None = None,
+             rejected_views: list | None = None) -> CalibrationReport:
     report = CalibrationReport(
         refined=refined,
         method=method,
@@ -240,6 +245,7 @@ def evaluate(train: list[CalibrationView], validation: list[CalibrationView],
         method_ranking=method_ranking,
         intrinsics_check=intrinsics_check,
         cross_val_rms_px=cross_val_rms_px,
+        rejected_views=list(rejected_views or []),
     )
     report.diagnosis = diagnose(report)
     return report
