@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically auto-pull the robodk monorepo (origin/main)
+
+[Timer]
+# First check shortly after boot, then every 2 minutes while up.
+OnBootSec=90s
+OnUnitActiveSec=2min
+# Catch up on missed ticks (Jetson powered off / link was down).
+Persistent=true
+
+[Install]
+WantedBy=timers.target

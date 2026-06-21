@@ -68,11 +68,19 @@ Two relevant directories in `~`:
 `color` (JPEG). Matches `receive_data()` in the macros.
 
 **Handshake** (optional, backward compatible): right after connecting a client may
-send one line — `MODE COLOR` (color-only, depth_len=0) or `MODE COLOR Q<n>`
-(color-only + JPEG quality `<n>`, clamped 10–100). No line / anything else ⇒ full
-depth+color at default quality, so existing depth clients are untouched. The live
-aiming preview sends `MODE COLOR Q60`; one-shot captures send `MODE COLOR` (default
-high quality, for crisp ChArUco corners).
+send one line — `MODE COLOR` (color-only, depth_len=0), `MODE COLOR Q<n>`
+(color-only + JPEG quality `<n>`, clamped 10–100), or `MODE COLOR H264 [B<kbps>]`
+(color-only **hardware-NVENC H.264 byte-stream**, bitrate `<kbps>`, default 4000).
+No line / anything else ⇒ full depth+color at default quality, so existing depth
+clients are untouched. The live aiming preview sends `MODE COLOR Q60` (or
+`MODE COLOR H264 B<kbps>` when `calibration.preview_codec = "h264"`); one-shot
+captures send `MODE COLOR` (default high quality, for crisp ChArUco corners).
+
+**H.264 wire format** differs from JPEG/full mode: there is **no per-frame header**
+— after the handshake the server relays a continuous Annex-B byte-stream straight
+from the encoder, and the client (`tasni/core/camera.py` `_H264Stream`, PyAV) finds
+the access-unit boundaries itself. Baseline profile (no B-frames) + inlined SPS/PPS
+keep latency low and let a client start decoding at the next IDR.
 
 ## Streaming performance — current state & what's next (2026-06-21)
 The streaming path was reviewed for latency/throughput. **Applied** (safe, wire-
@@ -96,14 +104,32 @@ not the stack:
   CPU JPEG + fast lossless depth. Not outdated.
 - The **dated** part is the transport: per-frame JPEG over a hand-rolled TCP framing.
 
-**The big unrealized win — the Nano's hardware video encoder (NVENC).** The Nano has a
-dedicated H.264/H.265 encoder that this server doesn't use. A GStreamer pipeline
-(`appsrc → nvvidconv → nvv4l2h264enc → RTP/UDP`, or RTSP) would cut preview bandwidth
-~10–20× and offload the CPU, giving true realtime even over Wi-Fi. **Caveat:** H.264 is
-lossy + inter-frame, which can soften ChArUco/ArUco corners — so use it for the *live
-aiming preview* only and keep the JPEG/lossless path for authoritative captures
-(hybrid). This is a dedicated effort (Jetson multimedia stack + a client decode path),
-not a drop-in, and must be validated on the device.
+**The Nano's hardware video encoder (NVENC) — implemented + tested end-to-end on the
+device (2026-06-21).** The Nano has a dedicated H.264/H.265 encoder; the server now
+uses it for the live preview. Measured over the real link: **first frame in ~0.4 s,
+then ~37 fps of 1280×720** (NVENC → H.264 over TCP → PyAV decode on the workstation)
+— vs the old depth path's ~0.5 fps. The NVENC GStreamer stack is present and works:
+`gst-launch-1.0` + `nvv4l2h264enc`/`nvv4l2h265enc`, `nvvidconv`, `nvjpegenc`, encoder
+node `/dev/nvhost-msenc`; the `fdsrc → rawvideoparse(bgr) → videoconvert → nvvidconv
+(NV12 NVMM) → nvv4l2h264enc → h264parse → fdsink` pipeline negotiates and emits
+Baseline-profile H.264.
+
+Design (transport = **H.264 over the existing TCP connection**, chosen over true RTSP
+because the browser never talks to the Jetson directly — frames go Jetson → Windows
+`tasni` client → browser — so RTSP's direct-player payoff doesn't apply, and reusing
+the port-1024 connection keeps the lease/handshake/timeout intact). The 3.10 server
+venv lacks GStreamer `gi` bindings (those are system-py3.6 only), so the server drives
+`gst-launch-1.0` as a **subprocess**: raw BGR frames in on stdin, NVENC H.264 out on
+stdout (`server/server_unicast_syncronous.py` `stream_h264`). The client decodes with
+**PyAV** (`tasni/core/camera.py` `_H264Stream`). H.264 is lossy + inter-frame (can
+soften ChArUco/ArUco corners) so it is the **live-preview path only** — one-shot
+captures always keep the JPEG/lossless path (hybrid).
+
+**Enable it:** `pip install av` on the workstation (`pip install -e .[h264]`), set
+`calibration.preview_codec = "h264"` (optional `preview_h264_bitrate_kbps`), then
+`python tools/jetson_deploy.py deploy` and run the live aiming preview. Default stays
+`"jpeg"` (no extra deps). **Validate on the device** — confirm preview latency/fps and
+that the aiming gate still detects the board reliably at the chosen bitrate.
 
 **Other levers, in priority order:**
 1. **Wire the link.** The flaky Wi-Fi (see below) caps everything; a wired/AP-mode
@@ -134,6 +160,28 @@ Unit file: `server/realsense-camera.service` (installed to
 `/etc/systemd/system/`). The Jetson tracks this repo's `main`; server code is in `server/`.
 The legacy `/etc/crontab` autostart (39 broken lines) has been removed
 (backup: `/etc/crontab.pre-cleanup.bak`).
+
+### Auto-pull — the Jetson follows `origin/main` on its own (2026-06-21)
+A **systemd timer** (`jetson-autopull.timer`, every ~2 min) keeps the Jetson's clone
+in lock-step with `origin/main`, so **push to `main` and the Jetson deploys itself** —
+no manual `deploy` needed. Each tick fetches and, if `main` moved, hard-resets the clone
+to it. Safety: it **defers the whole update if a client is connected on :1024** (never
+interrupts a live capture — code and running service can't drift), and it **only
+restarts `realsense-camera` when the pulled change touched `server/`** (an unrelated
+commit doesn't blip the camera). Any failure (flaky link) just retries next tick.
+
+```bash
+python tools/jetson_deploy.py setup-autopull   # install/refresh the timer (idempotent)
+python tools/jetson_deploy.py status           # shows the timer's next/last run too
+# on the Jetson:
+journalctl -u jetson-autopull -f               # watch it work
+```
+Puller script is installed to `/usr/local/bin/jetson-autopull.sh` (not run from the
+repo, so a broken pull can't disable the thing that would fix it); it runs as root for
+`systemctl` but does git as `jetson` (its GitHub credentials). Source of truth:
+`server/jetson-autopull.{sh,service,timer}`. Manual `deploy` still works for an
+immediate push-and-restart; the timer just makes it automatic. NOTE: it tracks
+**`main`** — work on a feature branch lands on the Jetson only once merged to `main`.
 
 ### Legacy manual start (fallback only — don't run alongside the service)
 The old desktop shortcuts still exist; both run the venv Python against a script in

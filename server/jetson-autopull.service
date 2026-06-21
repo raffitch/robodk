@@ -1,0 +1,13 @@
+[Unit]
+Description=Auto-pull robodk monorepo (origin/main) and restart camera on server changes
+Documentation=https://github.com/raffitch/robodk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Installed copy (independent of the repo, so a bad pull can't break the puller).
+ExecStart=/usr/local/bin/jetson-autopull.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jetson-autopull

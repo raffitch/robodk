@@ -144,7 +144,9 @@ class CalibrationModule(WorkflowModule):
             try:
                 services.live.start(analyze, fps=cc.preview_fps,
                                     timeout_s=cc.preview_timeout_s, color_only=True,
-                                    quality=cc.preview_jpeg_quality)
+                                    quality=cc.preview_jpeg_quality,
+                                    codec=cc.preview_codec,
+                                    bitrate=cc.preview_h264_bitrate_kbps)
             except CameraBusy as e:
                 raise HTTPException(409, str(e))
             return {"status": "started"}

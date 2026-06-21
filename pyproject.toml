@@ -18,6 +18,11 @@ dependencies = [
     "PyTurboJPEG",             # fast JPEG decode (optional; falls back to cv2)
 ]
 
+[project.optional-dependencies]
+# Hardware-NVENC H.264 live preview: decodes the Jetson's H.264 byte-stream.
+# Only needed when calibration.preview_codec = "h264" (default is "jpeg").
+h264 = ["av"]                  # PyAV (bundles ffmpeg) — `pip install av`
+
 [project.scripts]
 tasni = "tasni.__main__:main"
 

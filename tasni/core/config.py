@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # D435i color intrinsics per stream resolution, copied from the original
 # AutoCalibrate macro (factory values read off this specific camera).
@@ -164,6 +164,22 @@ class CalibrationConfig(_Model):
     # bytes over Wi-Fi = higher fps; aiming tolerates softness. One-shot captures
     # ignore this and use the server's default (high) quality for crisp corners.
     preview_jpeg_quality: int = 60
+    # Live-preview codec: "jpeg" (per-frame TurboJPEG, the default — no extra deps)
+    # or "h264" (the Nano's hardware NVENC encoder — ~10-20x less bandwidth and far
+    # lower CPU/latency, decoded client-side via PyAV). H.264 is lossy + inter-frame
+    # so it can soften ChArUco corners; it is the *preview* path only — one-shot
+    # captures always use the JPEG/lossless path regardless of this setting. Using
+    # "h264" requires PyAV on the workstation (`pip install av`) and a Jetson with
+    # the GStreamer NVENC stack (present on JetPack 4.6.x).
+    preview_codec: str = "jpeg"
+    preview_h264_bitrate_kbps: int = 4000   # NVENC target bitrate for the preview
+
+    @field_validator("preview_codec")
+    @classmethod
+    def _check_codec(cls, v: str) -> str:
+        if v not in ("jpeg", "h264"):
+            raise ValueError("preview_codec must be 'jpeg' or 'h264'")
+        return v
     # HUD X/Y/Z jog hints are in the camera optical frame (X right, Y down, Z
     # forward). Flip an axis here if the pendant's TOOL axis runs the other way.
     jog_invert_x: bool = False

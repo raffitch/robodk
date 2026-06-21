@@ -59,12 +59,17 @@ repo, and known operational issues are in **[docs/jetson-scanner.md](docs/jetson
 The Jetson server code is vendored here in **[server/](server/)** (was a separate repo).
 It runs as a systemd service `realsense-camera` (auto-start on boot). Manage from here:
 ```
-python tools/jetson_deploy.py status     # active? listening on 1024? logs
-python tools/jetson_deploy.py deploy      # push, then this: git pull on Jetson + restart
-python tools/jetson_deploy.py bootstrap   # (re)install the service (idempotent)
+python tools/jetson_deploy.py status        # active? listening on 1024? auto-pull timer? logs
+python tools/jetson_deploy.py deploy         # manual: git pull on Jetson + restart now
+python tools/jetson_deploy.py setup-autopull # install the auto-pull timer (idempotent)
+python tools/jetson_deploy.py bootstrap      # (re)install service + auto-pull (idempotent)
 ```
-The Jetson clones THIS repo to `~/robodk` and tracks `main`. So: **one repo** — push here,
-then `deploy`. See [docs/jetson-scanner.md](docs/jetson-scanner.md).
+The Jetson clones THIS repo to `~/robodk` and tracks `main`. So: **one repo** — and it
+**auto-pulls `origin/main` every ~2 min** (systemd timer), restarting the camera only
+when `server/` changed and no client is mid-capture. So normally: **just push to `main`**
+and the Jetson deploys itself; `deploy` is only for an immediate push-and-restart. A
+feature branch reaches the Jetson only once merged to `main`. See
+[docs/jetson-scanner.md](docs/jetson-scanner.md).
 
 ## North star (the actual goal)
 Build **ONE external control-panel app** (Python, drives RoboDK over its API) with a clean

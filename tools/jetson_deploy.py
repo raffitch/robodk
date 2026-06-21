@@ -6,10 +6,11 @@ Reads creds from ../secrets/jetson.env (git-ignored). Uses the installed SSH key
 back to password. sudo uses JETSON_SUDO_PASSWORD.
 
 Commands:
-    python tools/jetson_deploy.py bootstrap   # one-time: clone repo, install+enable service, retire dead cron
-    python tools/jetson_deploy.py deploy      # git pull on Jetson + restart service
-    python tools/jetson_deploy.py status      # service + port + recent logs
-    python tools/jetson_deploy.py logs        # tail journal
+    python tools/jetson_deploy.py bootstrap     # one-time: clone repo, install+enable service, auto-pull, retire dead cron
+    python tools/jetson_deploy.py deploy        # git pull on Jetson + restart service
+    python tools/jetson_deploy.py setup-autopull # install/refresh the auto-pull timer (Jetson follows origin/main)
+    python tools/jetson_deploy.py status        # service + auto-pull timer + port + recent logs
+    python tools/jetson_deploy.py logs          # tail journal
     python tools/jetson_deploy.py start|stop|restart
 """
 import os
@@ -26,12 +27,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SECRETS = os.path.join(HERE, "..", "secrets", "jetson.env")
 KEY = os.path.expanduser("~/.ssh/jetson_robodk")
 UNIT_LOCAL = os.path.join(HERE, "..", "server", "realsense-camera.service")
+AUTOPULL_SH_LOCAL = os.path.join(HERE, "..", "server", "jetson-autopull.sh")
+AUTOPULL_SVC_LOCAL = os.path.join(HERE, "..", "server", "jetson-autopull.service")
+AUTOPULL_TIMER_LOCAL = os.path.join(HERE, "..", "server", "jetson-autopull.timer")
 
 REPO_URL = "https://github.com/raffitch/robodk.git"
 REPO_DIR = "/home/jetson/robodk"
 VENV_PY = "/home/jetson/EtherSenseServer/ethenv/bin/python"
 SERVER = "/home/jetson/robodk/server/server_unicast_syncronous.py"
 UNIT_NAME = "realsense-camera"
+AUTOPULL_NAME = "jetson-autopull"
+AUTOPULL_BIN = "/usr/local/bin/jetson-autopull.sh"
 
 
 def load_env(path):
@@ -191,7 +197,10 @@ def bootstrap(j):
     # also check user crontab for completeness
     j.sudo("crontab -l 2>/dev/null | sed -i '/EtherSense/d' - 2>/dev/null; true", quiet=True)
 
-    print("\nBOOTSTRAP COMPLETE. The camera server is now a systemd service (auto-start on boot).")
+    setup_autopull(j)
+
+    print("\nBOOTSTRAP COMPLETE. The camera server is a systemd service (auto-start on "
+          "boot) and the Jetson now auto-pulls origin/main every ~2 min.")
 
 
 def _test_run_server(j):
@@ -207,6 +216,34 @@ def _test_run_server(j):
     print(">> test-run OK: bound port 1024")
 
 
+def setup_autopull(j):
+    """Install/refresh the auto-pull timer so the Jetson follows origin/main on its
+    own: every couple of minutes it fetches, and if main moved it hard-resets to it
+    (restarting the camera only when server/ changed and no client is mid-capture).
+
+    The puller script is installed to /usr/local/bin (not run from the repo) so that
+    even a broken pull can't disable the mechanism that would fix it. Idempotent —
+    safe to re-run to push an updated script/units."""
+    step("Install the auto-pull timer (Jetson follows origin/main automatically)")
+    # CRLF guard: this repo lives on Windows; a \r in the shebang line breaks exec.
+    j.put(os.path.abspath(AUTOPULL_SH_LOCAL), "/tmp/jetson-autopull.sh")
+    j.put(os.path.abspath(AUTOPULL_SVC_LOCAL), f"/tmp/{AUTOPULL_NAME}.service")
+    j.put(os.path.abspath(AUTOPULL_TIMER_LOCAL), f"/tmp/{AUTOPULL_NAME}.timer")
+    j.sudo(
+        "sed -i 's/\\r$//' /tmp/jetson-autopull.sh "
+        f"&& install -m 755 -o root -g root /tmp/jetson-autopull.sh {AUTOPULL_BIN} "
+        f"&& install -m 644 -o root -g root /tmp/{AUTOPULL_NAME}.service "
+        f"/etc/systemd/system/{AUTOPULL_NAME}.service "
+        f"&& install -m 644 -o root -g root /tmp/{AUTOPULL_NAME}.timer "
+        f"/etc/systemd/system/{AUTOPULL_NAME}.timer",
+        check=True, quiet=True)
+    j.sudo("systemctl daemon-reload", check=True)
+    j.sudo(f"systemctl enable --now {AUTOPULL_NAME}.timer", check=True)
+    print("auto-pull timer installed and enabled.")
+    j.run(f"systemctl is-active {AUTOPULL_NAME}.timer; "
+          f"systemctl list-timers {AUTOPULL_NAME}.timer --no-pager 2>/dev/null | head -3")
+
+
 def deploy(j):
     step("Pulling latest on the Jetson and restarting the service")
     j.run(f"cd {REPO_DIR} && git fetch --quiet origin && git checkout main && git pull origin main", check=True)
@@ -219,6 +256,9 @@ def deploy(j):
 def status(j):
     j.run(f"systemctl is-active {UNIT_NAME} 2>/dev/null; systemctl is-enabled {UNIT_NAME} 2>/dev/null")
     j.run("ss -tln | grep ':1024' && echo LISTENING || echo 'NOT listening on 1024'")
+    print("--- auto-pull timer ---")
+    j.run(f"systemctl is-active {AUTOPULL_NAME}.timer 2>/dev/null; "
+          f"systemctl list-timers {AUTOPULL_NAME}.timer --no-pager 2>/dev/null | head -3")
     print("--- recent logs ---")
     j.sudo(f"journalctl -u {UNIT_NAME} -n 15 --no-pager")
 
@@ -232,6 +272,8 @@ def main():
             bootstrap(j)
         elif cmd == "deploy":
             deploy(j)
+        elif cmd in ("setup-autopull", "autopull"):
+            setup_autopull(j)
         elif cmd == "status":
             status(j)
         elif cmd == "logs":

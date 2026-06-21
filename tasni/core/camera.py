@@ -112,18 +112,27 @@ class CameraClient:
         return Frame(color=color, depth=depth, timestamp=timestamp)
 
     @staticmethod
-    def _request_color_only(sock: socket.socket, quality: int | None = None) -> None:
-        """Send the color-only handshake (``MODE COLOR``), optionally asking the
-        server to encode at a lower JPEG ``quality`` (``MODE COLOR Q<n>``) — fewer
-        bytes over Wi-Fi, used by the live preview where a little softness is fine.
+    def _request_color_only(sock: socket.socket, quality: int | None = None,
+                            codec: str = "jpeg", bitrate: int | None = None) -> None:
+        """Send the color-only handshake (``MODE COLOR``).
+
+        For the default JPEG codec, ``quality`` optionally asks the server to encode
+        smaller (``MODE COLOR Q<n>``) — fewer bytes over Wi-Fi, used by the live
+        preview where a little softness is fine. For ``codec="h264"`` it instead
+        requests the hardware-NVENC H.264 byte-stream (``MODE COLOR H264 [B<kbps>]``),
+        which cuts preview bandwidth ~10-20x; ``bitrate`` (kbps) tunes the encoder.
         Full clients send nothing — the server defaults to the full depth+color
         stream — so this is the only explicit request needed and existing depth
         clients are untouched. A server that predates the handshake falls back to
-        full frames, which the decoder still handles, so sending this is always
-        safe (an old server ignores the trailing Q token too)."""
-        msg = b"MODE COLOR" + (f" Q{int(quality)}".encode() if quality else b"") + b"\n"
+        full frames, which the JPEG decoder still handles, so sending this is always
+        safe (an old server ignores the trailing tokens too)."""
+        msg = b"MODE COLOR"
+        if codec == "h264":
+            msg += b" H264" + (f" B{int(bitrate)}".encode() if bitrate else b"")
+        elif quality:
+            msg += f" Q{int(quality)}".encode()
         try:
-            sock.sendall(msg)
+            sock.sendall(msg + b"\n")
         except OSError:
             pass
 
@@ -159,7 +168,8 @@ class CameraClient:
 
     @contextmanager
     def stream(self, *, timeout: float | None = None, color_only: bool = False,
-               quality: int | None = None):
+               quality: int | None = None, codec: str = "jpeg",
+               bitrate: int | None = None):
         """Hold one connection open and read frames back-to-back.
 
         The Jetson server streams continuously over a single connection, so for
@@ -167,10 +177,13 @@ class CameraClient:
         dominant cost over the cell's Wi-Fi). ``color_only`` further asks the
         server to drop the depth payload (the bulk of the bytes), and ``quality``
         asks it to encode the JPEG smaller — together that is what makes the preview
-        realtime. Yields an object with ``read(with_depth=False) -> Frame``.
-        Unicast: stop any other camera user first (the platform stops the live
-        preview before one-shot grabs)."""
+        realtime. ``codec="h264"`` instead pulls the Nano's hardware-NVENC H.264
+        stream (color-only, decoded here via PyAV; ``bitrate`` in kbps) for an even
+        lighter, lower-latency preview. Yields an object with
+        ``read(with_depth=False) -> Frame``. Unicast: stop any other camera user
+        first (the platform stops the live preview before one-shot grabs)."""
         cfg = self.config
+        h264 = codec == "h264"
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(cfg.timeout_s if timeout is None else timeout)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -183,10 +196,10 @@ class CameraClient:
         except OSError as e:
             s.close()
             raise CameraError(f"camera socket error: {e}") from e
-        if color_only:
-            self._request_color_only(s, quality)
+        if color_only or h264:                       # h264 is inherently color-only
+            self._request_color_only(s, quality, codec=codec, bitrate=bitrate)
         try:
-            yield _CameraStream(self, s)
+            yield _H264Stream(s) if h264 else _CameraStream(self, s)
         finally:
             try:
                 s.shutdown(socket.SHUT_RDWR)
@@ -221,3 +234,68 @@ class _CameraStream:
         color = self._client._decode_color(color_raw)
         depth = self._client._decode_depth(depth_raw) if with_depth else None
         return Frame(color=color, depth=depth, timestamp=ts)
+
+
+class _H264Stream:
+    """A held-open connection to the server's hardware-NVENC H.264 byte-stream.
+
+    Unlike :class:`_CameraStream` there is no per-frame framing: the server relays a
+    continuous Annex-B byte-stream, so we feed raw socket bytes to a PyAV decoder and
+    pull decoded frames out. PyAV's parser finds the access-unit boundaries, buffers
+    partial NAL units, and emits frames as they complete. H.264 here is color-only
+    (the preview/aiming path); depth is never available, so ``read`` returns
+    ``Frame.depth = None``. PyAV is an optional dependency — if it is missing we raise
+    a clear :class:`CameraError` pointing at the JPEG fallback (``preview_codec``)."""
+
+    def __init__(self, sock: socket.socket):
+        try:
+            import av  # noqa: F401  (optional dependency)
+        except Exception as e:  # noqa: BLE001
+            raise CameraError(
+                "H.264 preview needs PyAV — `pip install av`, or set "
+                "calibration.preview_codec='jpeg' to use the JPEG path") from e
+        self._av = av
+        self._sock = sock
+        self._codec = av.codec.CodecContext.create("h264", "r")
+        self._pending: list = []   # decoded frames not yet returned to the caller
+
+    def _recv(self) -> bytes:
+        try:
+            data = self._sock.recv(65536)
+        except socket.timeout as e:
+            raise CameraError("camera timeout (h264 stream)") from e
+        except OSError as e:
+            raise CameraError(f"camera socket error: {e}") from e
+        if not data:
+            raise CameraError("connection closed by camera server")
+        return data
+
+    def _feed(self, data: bytes) -> None:
+        # parse() chunks the byte-stream into packets; decode() yields 0+ frames.
+        # Transient errors before the first IDR (or on a dropped packet) are
+        # expected — swallow them and keep reading rather than killing the preview.
+        try:
+            for packet in self._codec.parse(data):
+                self._pending.extend(self._codec.decode(packet))
+        except self._av.error.AVError:
+            pass
+
+    def read(self, *, with_depth: bool = False, drain: bool = False) -> Frame:
+        """Return the next decoded frame. With ``drain=True``, consume every byte
+        already available on the socket and return only the newest decoded frame —
+        keeping the live preview at the live edge (mirrors
+        :meth:`_CameraStream.read`)."""
+        while not self._pending:
+            self._feed(self._recv())
+        if drain:
+            while True:
+                ready, _, _ = select.select([self._sock], [], [], 0)
+                if not ready:
+                    break
+                self._feed(self._recv())
+            frame = self._pending[-1]
+            self._pending.clear()
+        else:
+            frame = self._pending.pop(0)
+        color = frame.to_ndarray(format="bgr24")
+        return Frame(color=color, depth=None, timestamp=0.0)

@@ -1,0 +1,6 @@
+# Files that run on the Jetson (Linux) must keep LF line endings even though this
+# repo is edited on Windows — a CRLF in a shell shebang or a systemd unit breaks
+# execution. Force LF on checkout regardless of anyone's core.autocrlf.
+*.sh            text eol=lf
+*.service       text eol=lf
+*.timer         text eol=lf
