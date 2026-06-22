@@ -28,6 +28,8 @@ interface Report {
   board_consistency_mm: { rms: number; max: number };
   motion_diversity?: { axis_spread: number; min_pair_deg: number; max_pair_deg: number; well_conditioned: boolean; note?: string };
   intrinsics_check?: { warn: boolean; note: string } | null;
+  intrinsics_auto?: { rms_px: number; n_views: number; coverage_pct: number;
+                      fix_k3: boolean; source: string } | null;
   cross_val_rms_px?: number | null;
   rejected_views?: string[];
   diagnosis?: { verdict: "pass" | "borderline" | "fail"; headline: string; causes: string[] };
@@ -41,13 +43,14 @@ interface RunResult {
   n_skipped?: string[];
   can_apply: boolean;
 }
-interface TourPose { name: string; reachable: boolean; collision: boolean | null; ok: boolean; error?: string | null; }
+interface TourPose { name: string; reachable: boolean; collision: boolean | null; ok: boolean; error?: string | null; transit?: boolean | null; }
 interface TourResult {
   kind: "sim_tour";
   total: number;
   passed: number;
   unreachable: number;
   collisions: number;
+  transit_collisions?: number;
   collisions_checked: boolean;
   returned_to_start: boolean;
   all_ok: boolean;
@@ -82,6 +85,13 @@ export default function Calibration() {
   const { mark: markFrame, reset: resetStream, stat: streamStat } = useStreamStats();
   const [targets, setTargets] = useState<number | null>(null);   // null = none created
   const [generating, setGenerating] = useState(false);
+  // Collision-map status at the current pose (no robot motion). available:false
+  // means RoboDK has no effective collision map, so Create targets can't filter
+  // colliding poses. guarded_tools lists the flange tools now force-checked
+  // against the arm (RoboDK omits those pairs by default). null = not checked yet.
+  const [collision, setCollision] = useState<
+    { available: boolean; count: number | null; guarded_tools?: string[]; guarded_pairs?: number } | null>(null);
+  const [collisionBusy, setCollisionBusy] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   // Phase 2 — safety & operator trust.
@@ -128,6 +138,18 @@ export default function Calibration() {
     } catch { /* RoboDK not ready — leave targets unknown */ }
   }, []);
 
+  // Ask RoboDK whether it's actually evaluating collisions (current pose, no
+  // motion). Safe to call any time a connection is expected.
+  const checkCollision = useCallback(async () => {
+    setCollisionBusy(true);
+    try {
+      const r = await api.get<{ available: boolean; count: number | null;
+        guarded_tools?: string[]; guarded_pairs?: number }>("/collision/status");
+      setCollision(r);
+    } catch { setCollision(null); }
+    finally { setCollisionBusy(false); }
+  }, []);
+
   useEffect(() => { loadConfig(); refreshJob(); }, [loadConfig, refreshJob]);
 
   // Stop the live gate if we leave the page (frees the unicast camera).
@@ -142,6 +164,9 @@ export default function Calibration() {
         setConn("ready");
         setConnInfo(`Ready — robot and the '${r.tool}' camera tool are present.`);
         refreshTargets(); refreshJob();   // pick up targets / solved run already in the cell
+        // NB: collision status is checked lazily (Recheck button / after generate),
+        // NOT here — probing collisions on the 117 MB station right after connect is
+        // heavy and was making the connection itself slow.
       } else {
         setConn("error");
         setConnInfo("Station opened but missing: " + r.missing.join(", ")
@@ -209,12 +234,38 @@ export default function Calibration() {
   const generateTargets = async () => {
     setGenerating(true); setRunError(null);
     try {
-      const r = await api.post<{ created: number; look_distance_mm: number }>("/poses/generate");
+      const r = await api.post<{ created: number; look_distance_mm: number;
+        collisions_checked?: boolean; candidates_collided?: number;
+        collision_filter_enabled?: boolean;
+        camera_tool_offset_mm?: number; targets_cartesian?: number;
+        collision_guard?: { tools: string[]; pairs_enabled: number } | null }>("/poses/generate");
       setTargets(r.created);
       setTour(null);    // a fresh target set invalidates any prior dry-run verdict
       setLive(false);   // generate stops the live gate server-side
+      checkCollision(); // re-probe the chip (generation disables checking again afterwards)
+      const dropped = r.collisions_checked
+        ? (r.candidates_collided
+            ? ` (${r.candidates_collided} colliding pose${r.candidates_collided === 1 ? "" : "s"} filtered out)`
+            : "")
+        : r.collision_filter_enabled === false
+          ? " (collision filter disabled in config)"
+          : " (collisions NOT checked — no collision map in RoboDK)";
+      const guard = r.collision_guard && r.collision_guard.pairs_enabled
+        ? ` Guarded ${r.collision_guard.tools.join(", ") || "mounted tools"} against the arm.`
+        : "";
+      // Camera TCP offset: targets are joint-locked to the camera (active TCP), so
+      // selecting one drives the camera — not the flange — to the viewpoint. If this
+      // is near 0 the Realsense tool has no real mount (calibration not applied), and
+      // the flange would visit the viewpoint instead — re-apply a calibration first.
+      const off = r.camera_tool_offset_mm;
+      const offNote = off != null
+        ? ` Camera TCP ${Math.round(off)} mm off the flange${off < 15 ? " — ⚠ looks like NO offset; re-apply a calibration so targets drive the camera, not the flange" : ""}.`
+        : "";
+      const cart = r.targets_cartesian
+        ? ` ⚠ ${r.targets_cartesian} target(s) couldn't be joint-locked (no IK branch) — those follow the GUI's active tool.`
+        : "";
       addLog(`created ${r.created} targets (working distance ~${Math.round(r.look_distance_mm)} mm)`
-        + " — inspect them in RoboDK, then Run calibration.");
+        + dropped + guard + offNote + cart + " — inspect them in RoboDK, then Run calibration.");
     } catch (e: any) {
       addLog("create targets: " + e.message, true);
       setRunError("Create targets: " + e.message);
@@ -365,6 +416,28 @@ export default function Calibration() {
           );
         })()}
 
+        {/* Collision-map readiness: Create targets can only filter colliding poses
+            (the spindle hitting the arm) when RoboDK is evaluating a collision map. */}
+        <div className={"collision-chip " + (collision == null ? "unknown"
+            : collision.available ? "ok" : "bad")}>
+          {collision == null ? (
+            <span>Collision check: <b>unknown</b> — connect, or recheck.</span>
+          ) : collision.available ? (
+            <span>✓ Collision checking <b>active</b> — colliding poses are filtered when you Create targets.
+              {collision.guarded_tools && collision.guarded_tools.length
+                ? ` Guarding ${collision.guarded_tools.join(", ")} against the arm.`
+                : ""}
+              {collision.count ? ` (current pose: ${collision.count} colliding pair${collision.count === 1 ? "" : "s"})` : ""}</span>
+          ) : (
+            <span>⚠ <b>No collision map detected</b> — Create targets cannot filter colliding poses.
+              Set it up in RoboDK (<b>Tools → Collision Map</b>), enable the spindle↔arm pairs, and save the station.</span>
+          )}
+          <button className="secondary" onClick={checkCollision}
+                  disabled={collisionBusy || !ready} style={{ marginLeft: "auto" }}>
+            {collisionBusy ? "Checking…" : "Recheck"}
+          </button>
+        </div>
+
         <div className="btn-row">
           {!live
             ? <button onClick={startLive} disabled={running}>Start camera</button>
@@ -485,8 +558,9 @@ export default function Calibration() {
           <div className={"tour-result " + (tour.all_ok ? "ok" : "bad")}>
             <div className="tour-head">
               {tour.all_ok ? "✓ Dry run passed" : "⚠ Dry run found issues"} —
-              {" "}{tour.passed}/{tour.total} poses reachable{tour.collisions_checked
-                ? `, ${tour.collisions} collision${tour.collisions === 1 ? "" : "s"}`
+              {" "}{tour.passed}/{tour.total} poses OK{tour.collisions_checked
+                ? `, ${tour.collisions} resting collision${tour.collisions === 1 ? "" : "s"}`
+                  + (tour.transit_collisions ? `, ${tour.transit_collisions} transit collision${tour.transit_collisions === 1 ? "" : "s"}` : "")
                 : " (collisions not checked on this build)"},
               {" "}return-to-start {tour.returned_to_start ? "ok" : "FAILED"}.
             </div>
@@ -494,7 +568,7 @@ export default function Calibration() {
               <div className="tour-bad">
                 Problem poses:{" "}
                 {tour.poses.filter((p) => !p.ok)
-                  .map((p) => `${p.name} (${!p.reachable ? "unreachable" : "collision"})`)
+                  .map((p) => `${p.name} (${!p.reachable ? "unreachable" : p.transit ? "transit collision" : "collision"})`)
                   .join(", ")}
               </div>
             )}
@@ -604,6 +678,11 @@ function Metrics({ result }: { result: RunResult }) {
     rows.push(["Motion diversity",
       `axis-spread ${r.motion_diversity.axis_spread.toFixed(2)} · rot ${Math.round(r.motion_diversity.min_pair_deg)}–${Math.round(r.motion_diversity.max_pair_deg)}°`,
       r.motion_diversity.well_conditioned ? "good" : "warn"]);
+  if (r.intrinsics_auto)
+    rows.push(["Intrinsics (auto-calibrated)",
+      `${r.intrinsics_auto.n_views} views · fit RMS ${r.intrinsics_auto.rms_px.toFixed(3)} px · `
+      + `coverage ${Math.round(r.intrinsics_auto.coverage_pct * 100)}%`,
+      r.intrinsics_auto.coverage_pct >= 0.6 ? "good" : "warn"]);
   if (r.intrinsics_check)
     rows.push(["Intrinsics check", r.intrinsics_check.note,
       r.intrinsics_check.warn ? "warn" : "good"]);

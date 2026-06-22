@@ -11,7 +11,8 @@ from pydantic import BaseModel
 from ..base import ServiceContainer, WorkflowModule
 from .service import (
     CalibrationJob, CalibrationParams, SimTourJob, TARGET_PREFIX,
-    apply_calibration, gate_thresholds, generate_calibration_targets)
+    apply_calibration, apply_intrinsics, dry_tour_required, gate_thresholds,
+    generate_calibration_targets)
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
@@ -33,6 +34,12 @@ class ApplyBody(BaseModel):
     run_id: str | None = None
 
 
+class IntrSolveBody(BaseModel):
+    # Fix k3 (the high-order radial term) to 0 by default — the D4xx RGB lens is
+    # low-distortion and a free k3 overfits a limited image region.
+    fix_k3: bool = True
+
+
 class CalibrationModule(WorkflowModule):
     id = "calibration"
     title = "Calibration"
@@ -43,6 +50,9 @@ class CalibrationModule(WorkflowModule):
     def __init__(self, services: ServiceContainer):
         super().__init__(services)
         self._active_job: CalibrationJob | None = None
+        # Dedicated RGB intrinsic-calibration session (camera-only; accumulates
+        # auto-captured ChArUco views across the frame). Lazily created on first use.
+        self._intr = None
 
     # -- REST ---------------------------------------------------------------
     def router(self) -> "APIRouter":
@@ -81,25 +91,68 @@ class CalibrationModule(WorkflowModule):
             except Exception as e:
                 raise HTTPException(503, f"RoboDK unavailable: {e}")
 
+        @router.get("/collision/status")
+        def collision_status() -> dict:
+            """Confirm RoboDK is actually evaluating collisions at the current pose
+            (no robot motion). ``available: false`` means no collision map is set up,
+            so target generation can't filter colliding poses. Also force-enables and
+            reports the mounted-tool↔arm pairs (``guarded_tools``) RoboDK omits by
+            default — the spindle/camera hitting the arm — so the chip reflects what
+            Create targets will actually filter."""
+            cc = services.config.calibration
+            try:
+                return services.rdk.collision_status(
+                    ensure_pairs=cc.collision_self_pairs,
+                    skip_trailing=cc.collision_skip_wrist_links)
+            except Exception as e:
+                raise HTTPException(503, f"RoboDK unavailable: {e}")
+
         @router.post("/connect")
         def connect() -> dict:
             """Open the cell's station (loads Tasni.rdk if RoboDK came up empty)
-            and verify it's set up for RealSense calibration. First load of the
-            ~117 MB station is slow."""
+            and report ready only once the robot is actually detected.
+
+            The first load of the ~117 MB station is slow, so this POLLS for the
+            robot to appear (up to ``robodk.connect_timeout_s``) instead of judging
+            the connection on a single slow query — the single-query approach is why
+            the first click used to report a problem while a second click (by then
+            the station is loaded) worked. On a transient socket error mid-load the
+            session is reset so the next poll re-attaches cleanly."""
+            import time
+
             c = services.config.robodk
-            try:
-                robot_ok = services.rdk.robot().Valid()
-                tool_ok = services.rdk.item_exists(c.camera_tool)
-                ready = robot_ok and tool_ok
-                missing = [n for n, ok in (
-                    (c.robot_name, robot_ok), (f"tool {c.camera_tool!r}", tool_ok))
-                    if not ok]
-                return {"connected": True, "ready": ready,
-                        "robot": c.robot_name, "robot_valid": robot_ok,
-                        "tool": c.camera_tool, "tool_present": tool_ok,
-                        "missing": missing}
-            except Exception as e:
-                raise HTTPException(503, f"RoboDK unavailable: {e}")
+            deadline = time.monotonic() + float(c.connect_timeout_s)
+            last_err: Exception | None = None
+            while True:
+                try:
+                    robot_ok = services.rdk.robot().Valid()
+                    if robot_ok:
+                        tool_ok = services.rdk.item_exists(c.camera_tool)
+                        missing = [n for n, ok in (
+                            (c.robot_name, robot_ok),
+                            (f"tool {c.camera_tool!r}", tool_ok)) if not ok]
+                        return {"connected": True, "ready": robot_ok and tool_ok,
+                                "robot": c.robot_name, "robot_valid": robot_ok,
+                                "tool": c.camera_tool, "tool_present": tool_ok,
+                                "missing": missing}
+                    last_err = None        # connected; the robot just isn't loaded yet
+                except Exception as e:     # socket/timeout while RoboDK is busy loading
+                    last_err = e
+                    try:
+                        services.rdk.session.reset()   # re-attach on the next poll
+                    except Exception:
+                        pass
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(1.0)
+            if last_err is not None:
+                raise HTTPException(503,
+                    f"RoboDK didn't become ready within {float(c.connect_timeout_s):.0f}s — "
+                    f"it may still be loading the station. Give it a moment and click "
+                    f"Connect again. ({last_err})")
+            return {"connected": True, "ready": False, "robot": c.robot_name,
+                    "robot_valid": False, "tool": c.camera_tool,
+                    "tool_present": False, "missing": [c.robot_name]}
 
         @router.post("/live/start")
         def live_start() -> dict:
@@ -215,6 +268,10 @@ class CalibrationModule(WorkflowModule):
             if len(services.rdk.list_targets(TARGET_PREFIX)) == 0:
                 raise HTTPException(400, "no calibration targets — aim the camera "
                                     "until the gate is green and Create targets first")
+            if dry_tour_required(services):
+                raise HTTPException(409, "the camera tool was recreated from a past "
+                                    "calibration — run the dry tour (Simulate) and let "
+                                    "it pass before the real run")
             services.live.stop()    # release the camera for the capture grabs
             params = CalibrationParams(holdout_count=body.holdout_count, refine=body.refine)
             self._active_job = CalibrationJob(services, params)
@@ -266,5 +323,106 @@ class CalibrationModule(WorkflowModule):
                 "result": services.jobs.result,
                 "error": services.jobs.error,
             }
+
+        # -- RGB intrinsic calibration (camera-only; no robot motion) -------
+        def _intr_session():
+            from .intrinsics_calib import IntrinsicCalibSession
+            if self._intr is None:
+                self._intr = IntrinsicCalibSession(services.config.camera.size)
+            return self._intr
+
+        @router.get("/intrinsics/status")
+        def intr_status() -> dict:
+            return _intr_session().status()
+
+        @router.post("/intrinsics/live/start")
+        def intr_live_start() -> dict:
+            """Start the intrinsic-capture preview: auto-capture diverse ChArUco views
+            as the operator waves the board across the frame. Camera-only; runs on the
+            shared live preview in JPEG (NOT h264, so corners stay crisp)."""
+            if services.jobs.running:
+                raise HTTPException(409, "a calibration run is in progress")
+
+            import cv2
+
+            from ...core.camera_lease import CameraBusy
+            from .charuco import CharucoTarget
+            from .intrinsics_calib import draw_overlay
+            c = services.config
+            session = _intr_session()
+            board = CharucoTarget(c.board)
+            PREVIEW_W = 960
+            enc = [cv2.IMWRITE_JPEG_QUALITY, 80]
+
+            def analyze(frame):
+                found = board.detect_points(frame.color, min_corners=1)
+                if found is None:
+                    st = session.offer_none()
+                    img = draw_overlay(frame.color, None, None, st)
+                else:
+                    corners, ids, obj = found
+                    st = session.offer(corners, ids, obj)
+                    img = draw_overlay(frame.color, corners, ids, st)
+                h, w = img.shape[:2]
+                if w > PREVIEW_W:
+                    img = cv2.resize(img, (PREVIEW_W, int(h * PREVIEW_W / w)),
+                                     interpolation=cv2.INTER_AREA)
+                ok, jpeg = cv2.imencode(".jpg", img, enc)
+                return (jpeg.tobytes() if ok else b""), st
+
+            services.live.stop()    # switch the shared preview out of any aiming stream
+            try:
+                services.live.start(analyze, fps=c.calibration.preview_fps,
+                                    timeout_s=c.calibration.preview_timeout_s,
+                                    color_only=True, codec="jpeg")
+            except CameraBusy as e:
+                raise HTTPException(409, str(e))
+            return {"status": "started", **session.status()}
+
+        @router.post("/intrinsics/live/stop")
+        def intr_live_stop() -> dict:
+            services.live.stop()
+            return {"status": "stopped"}
+
+        @router.post("/intrinsics/reset")
+        def intr_reset() -> dict:
+            session = _intr_session()
+            session.reset()
+            return session.status()
+
+        @router.post("/intrinsics/solve")
+        def intr_solve(body: IntrSolveBody) -> dict:
+            """Solve K + distortion from the captured views (cv2.calibrateCamera) and
+            save a report. Stops the capture preview first (frees the camera)."""
+            import json
+            import time
+
+            from ...core.logging import new_run_dir
+            if self._intr is None or self._intr.count < 1:
+                raise HTTPException(400, "no captured views — start intrinsic capture "
+                                    "and move the board around the frame first")
+            services.live.stop()
+            try:
+                report = self._intr.solve(services.config.camera.K, fix_k3=body.fix_k3)
+            except RuntimeError as e:
+                raise HTTPException(400, str(e))
+            except Exception as e:
+                raise HTTPException(400, f"intrinsic solve failed: {e}")
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            run_dir = new_run_dir("calibration", f"intrinsics-{stamp}")
+            (run_dir / "report.json").write_text(json.dumps(report, indent=2),
+                                                 encoding="utf-8")
+            return {**report, "run_dir": str(run_dir)}
+
+        @router.post("/intrinsics/apply")
+        def intr_apply() -> dict:
+            """Write the solved K + distortion into the camera config (live + persisted
+            to tasni.config.json) — takes effect immediately, no restart needed."""
+            if self._intr is None or self._intr.last_report is None:
+                raise HTTPException(400, "no solved intrinsics to apply — solve first")
+            try:
+                return apply_intrinsics(services, self._intr.last_report)
+            except Exception as e:
+                raise HTTPException(400, f"failed to apply intrinsics: {e}")
 
         return router

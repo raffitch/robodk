@@ -221,6 +221,16 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .tour-head { font-weight: 600; }
 .tour-bad { margin-top: 4px; color: var(--warn); font-family: var(--mono); font-size: 12px; }
 
+/* collision-map readiness chip (gates the Create-targets collision filter) */
+.collision-chip { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px;
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;
+  font-size: 13px; line-height: 1.45; }
+.collision-chip > span { flex: 1; }
+.collision-chip.ok { border-left: 3px solid var(--ok); background: rgba(63,185,80,.07); }
+.collision-chip.bad { border-left: 3px solid var(--warn); background: rgba(210,153,34,.07); }
+.collision-chip.unknown { border-left: 3px solid var(--border); color: var(--muted); }
+.collision-chip button { white-space: nowrap; }
+
 /* live per-pose board-lock thumbnails during a run */
 .thumb-strip { display: flex; gap: 6px; overflow-x: auto; padding: 8px 0 2px; }
 .thumb-strip img { height: 64px; border-radius: 5px; border: 1px solid var(--border); flex: 0 0 auto; }

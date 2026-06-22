@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from .geometry import invert_T
 from .session import RdkSession
 
 
@@ -34,6 +35,13 @@ class RdkIO:
     def __init__(self, session: RdkSession):
         self.session = session
         self._frame = None        # active reference frame item (set by use_tool_and_frame)
+        # Mounting pose (flange->tool, 4x4) of the tool last activated. We pass this
+        # EXPLICITLY to SolveIK/SolveFK rather than trusting the robot's "active tool"
+        # state — in an attach session setPoseTool doesn't reliably make a tool the
+        # active TCP, so Pose()/SolveIK would silently fall back to the FLANGE and the
+        # generated targets would be flange poses (the camera offset dropped). With
+        # this every IK/pose query is anchored to the real camera TCP.
+        self._tool_pose: np.ndarray | None = None
 
     @property
     def rdk(self):
@@ -66,7 +74,8 @@ class RdkIO:
                 if frame.Valid() and frame.Type() == robolink.ITEM_TYPE_FRAME:
                     robot.setPoseFrame(frame)
                     self._frame = frame
-        return pose_to_T(tool.PoseTool())
+        self._tool_pose = pose_to_T(tool.PoseTool())
+        return self._tool_pose
 
     def use_camera_tool(self, tool_name: str) -> np.ndarray:
         """Activate ``tool_name`` and adopt the robot's base reference frame.
@@ -88,12 +97,32 @@ class RdkIO:
             self._frame = base
         else:
             self._frame = None      # AddTarget(None) / Pose() then use the base frame
-        return pose_to_T(tool.PoseTool())
+        self._tool_pose = pose_to_T(tool.PoseTool())
+        return self._tool_pose
 
     # -- poses --------------------------------------------------------------
     def tcp_pose_T(self) -> np.ndarray:
         """Current TCP pose in the active reference frame (numpy 4x4)."""
         return pose_to_T(self.robot().Pose())
+
+    def flange_pose_T(self) -> np.ndarray:
+        """Current **flange** pose in the active reference frame, derived from the
+        active TCP and its tool offset — so it is the flange regardless of which tool
+        (camera, flange, spindle) RoboDK currently has active. ``Pose() @
+        inv(PoseTool())`` = (base->TCP) @ (TCP->flange) = base->flange."""
+        robot = self.robot()
+        return pose_to_T(robot.Pose()) @ invert_T(pose_to_T(robot.PoseTool()))
+
+    def camera_pose_T(self) -> np.ndarray:
+        """Current **camera** (Realsense TCP) pose in the active frame, computed
+        explicitly as ``flange @ camera_mount`` from the last-activated tool's
+        mounting offset (:attr:`_tool_pose`). This is the camera's pose even when the
+        active TCP is the flange — the whole point: the generated targets orbit (and
+        IK is solved for) the camera, never the flange. Falls back to the raw active
+        TCP if no camera tool has been activated yet."""
+        if self._tool_pose is None:
+            return self.tcp_pose_T()
+        return self.flange_pose_T() @ self._tool_pose
 
     def current_joints(self):
         """Current joint vector (RoboDK ``Mat``) — snapshot for a safe return."""
@@ -106,10 +135,30 @@ class RdkIO:
     def move_j_pose(self, T: np.ndarray) -> None:
         self.robot().MoveJ(T_to_pose(T))
 
+    def _solve_ik(self, T: np.ndarray, seed=None):
+        """Raw ``SolveIK`` for a pose, with the camera tool passed **explicitly**.
+
+        ``T`` is the pose of the camera (the last-activated tool's TCP) in the active
+        reference frame; passing the tool mount (``_tool_pose``) as SolveIK's ``tool``
+        argument makes the result place the CAMERA — not the flange — at ``T``,
+        independent of whatever tool RoboDK thinks is active. ``seed`` (joints_approx)
+        pins a deterministic IK branch. May raise; callers wrap as needed."""
+        robot = self.robot()
+        pose = T_to_pose(T)
+        tool = T_to_pose(self._tool_pose) if self._tool_pose is not None else None
+        if seed is not None and tool is not None:
+            return robot.SolveIK(pose, seed, tool)
+        if seed is not None:
+            return robot.SolveIK(pose, seed)
+        if tool is not None:
+            return robot.SolveIK(pose, None, tool)
+        return robot.SolveIK(pose)
+
     def is_reachable(self, T: np.ndarray) -> bool:
-        """True if the robot has an IK solution for this TCP pose (active tool/frame)."""
+        """True if the robot has an IK solution placing the **camera** at this pose
+        (camera tool passed explicitly — not the flange)."""
         try:
-            sol = self.robot().SolveIK(T_to_pose(T))
+            sol = self._solve_ik(T)
         except Exception:
             return False
         try:
@@ -117,12 +166,51 @@ class RdkIO:
         except Exception:
             return np.asarray(sol).size >= 6
 
+    def solve_joints_for_pose(self, T: np.ndarray, seed=None):
+        """A clean joint vector (RoboDK ``Mat``) that places the **camera** (the
+        Realsense tool's TCP) at pose ``T``, or ``None`` if no IK solution exists.
+
+        Used to lock a generated calibration target to a joint configuration so it
+        reproduces the camera at the viewpoint when the target is selected/visited —
+        the IK is solved with the camera tool passed explicitly (see :meth:`_solve_ik`),
+        so the joints drive the camera, NOT the flange, to ``T``. A bare cartesian
+        target instead stores only a TCP pose, which RoboDK drives the currently
+        active tool to — the "flange visits the TCP" the operator sees.
+
+        Anchors to ``seed`` (the gate/seed joints) for a deterministic IK branch.
+        If the seeded solve finds no branch near the seed (a wrist-flipped cone-edge
+        pose that nonetheless has *some* solution), it retries seedless from the seed
+        config so a pose that is reachable at all still yields a config to lock.
+        Never raises."""
+        robot = self.robot()
+        try:
+            if seed is not None:
+                sol = self._ik_to_joints(self._solve_ik(T, seed), seed)
+                if sol is not None:
+                    return sol
+                try:
+                    robot.setJoints(seed)   # deterministic 'nearest' for the retry
+                except Exception:
+                    pass
+            return self._ik_to_joints(self._solve_ik(T), seed)
+        except Exception:
+            return None
+
     # -- temporary targets (auto pose generation) ---------------------------
-    def add_target(self, name: str, T: np.ndarray):
-        """Create a cartesian target at pose ``T`` in the active frame; return it."""
+    def add_target(self, name: str, T: np.ndarray, joints=None):
+        """Create a target at pose ``T`` in the active frame; return it.
+
+        If ``joints`` (an opaque RoboDK joint vector from :meth:`screen_collisions`)
+        is given, the target is stored as a **joint target** locked to that exact
+        configuration — so the pose that was collision-checked is the one actually
+        visited. Without it, a cartesian target is created and RoboDK may reach it in
+        a different (possibly colliding) IK branch."""
         frame = getattr(self, "_frame", None)
         target = self.rdk.AddTarget(name, frame, self.robot())
         target.setPose(T_to_pose(T))
+        if joints is not None:
+            target.setAsJointTarget()
+            target.setJoints(joints)
         return target
 
     def delete_items(self, names: list[str]) -> None:
@@ -163,6 +251,281 @@ class RdkIO:
         except Exception:
             return False
 
+    def robot_dof(self) -> int:
+        """Number of robot axes (joint vector length). Falls back to 6 — the
+        cell's KUKA — if the live count can't be read. NB: count the joint values
+        (``Joints().list()``); ``Mat.Rows()`` returns the row *lists*, not a count."""
+        try:
+            n = int(np.asarray(self.robot().Joints().list(), dtype=float).size)
+            return n if n > 0 else 6
+        except Exception:
+            return 6
+
+    def mounted_tool_items(self) -> list:
+        """Every body that rides on the robot flange: all TOOL items in the station
+        (the camera, the spindle, …) plus any OBJECT anywhere under the robot.
+
+        Discovery uses ``ItemList(ITEM_TYPE_TOOL)`` rather than only ``robot.Childs()``
+        so a tool is found *regardless of how it is parented* — a spindle that wasn't
+        a direct child of the robot is exactly why its arm-collision pairs never got
+        enabled and the spindle-into-A4 pose still got created. It then recursively
+        walks the robot's descendants to also catch a spindle modelled as an OBJECT
+        (attached to a tool or deeper in the subtree). Deduped by name; never raises.
+        (Single-robot cell, so every tool rides this arm.)"""
+        import robolink
+
+        robot = self.robot()
+        found: list = []
+        seen: set = set()
+
+        def add(it) -> None:
+            try:
+                key = it.Name()
+            except Exception:
+                key = id(it)
+            if key not in seen:
+                seen.add(key)
+                found.append(it)
+
+        # 1) every tool in the station — robust to parentage.
+        try:
+            for it in self.rdk.ItemList(robolink.ITEM_TYPE_TOOL):
+                add(it)
+        except Exception:
+            pass
+
+        # 2) objects anywhere in the robot's subtree (depth-limited guard).
+        def walk(item, depth: int = 0) -> None:
+            if depth > 6:
+                return
+            try:
+                kids = item.Childs()
+            except Exception:
+                return
+            for k in kids:
+                try:
+                    t = k.Type()
+                except Exception:
+                    continue
+                if t == robolink.ITEM_TYPE_OBJECT:
+                    add(k)
+                if t in (robolink.ITEM_TYPE_OBJECT, robolink.ITEM_TYPE_TOOL):
+                    walk(k, depth + 1)
+
+        walk(robot)
+        return found
+
+    def ensure_mounted_tool_collision_pairs(self, skip_trailing: int = 2) -> dict:
+        """Force-enable collision checking between every flange-mounted body
+        (tools + their objects) and the robot's arm links.
+
+        Why this is needed: RoboDK's default collision map EXCLUDES a tool from
+        colliding with its own robot (the tool is the robot's child), so a spindle
+        swinging into link 4 reports zero collisions and the pose sails through the
+        generation filter / dry tour. Re-enabling those pairs is what lets
+        :meth:`screen_collisions` and the dry tour actually catch a tool-vs-arm
+        self-collision.
+
+        Robot link ids: 0 = base, 1..dof = the moving links (``dof`` = the flange
+        the tools bolt to). We enable the tool against links ``0..dof-skip_trailing``
+        and skip the trailing ``skip_trailing`` links (the wrist + mounting flange
+        the tool naturally sits against) so it isn't reported forever-colliding
+        with its own mount. Idempotent, best-effort (modifies the live collision
+        map only — never saved to the .rdk), and never raises. Returns a summary
+        ``{"tools", "links", "pairs_enabled", "pairs_failed", "dof"}`` for the
+        UI/log."""
+        import robolink
+
+        robot = self.robot()
+        dof = self.robot_dof()
+        last_link = max(0, dof - max(0, int(skip_trailing)))
+        link_ids = list(range(0, last_link + 1))
+        tools = self.mounted_tool_items()
+        enabled = failed = 0
+        names: list[str] = []
+        for it in tools:
+            ok_any = False
+            for lid in link_ids:
+                try:
+                    r = self.rdk.setCollisionActivePair(
+                        robolink.COLLISION_ON, it, robot, 0, lid)
+                    if int(r) == 1:
+                        enabled += 1
+                        ok_any = True
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+            if ok_any:
+                try:
+                    names.append(it.Name())
+                except Exception:
+                    pass
+        return {"tools": names, "links": link_ids, "pairs_enabled": enabled,
+                "pairs_failed": failed, "dof": dof}
+
+    # Joint step (deg) MoveJ_Test interpolates at while checking the approach — fine
+    # enough to catch a thin self-collision, coarse enough to stay quick on the big
+    # station. The destination config is always checked regardless of this.
+    COLLISION_STEP_DEG = 8.0
+
+    @staticmethod
+    def _ik_to_joints(ik, seed_joints):
+        """A clean joint vector (RoboDK ``Mat``) from a ``SolveIK`` result, or ``None``
+        if it isn't a real solution.
+
+        ``SolveIK`` returns an N-element ``Mat`` when reachable (N = DOF, occasionally
+        +2 trailing config values) and a 1-element ``Mat([0])`` when not. We validate
+        on the element COUNT — ``Mat.Cols()/Rows()`` return the row/column *lists*, not
+        integer counts, so a ``Cols()==1`` style test is always False — and trim to the
+        seed's DOF so the stored config and the ``MoveJ_Test`` start/end vectors are the
+        same length."""
+        import robodk.robomath as robomath
+
+        try:
+            vals = [float(v) for v in np.asarray(ik.list(), dtype=float).ravel()]
+        except Exception:
+            try:
+                vals = [float(v) for v in np.asarray(ik, dtype=float).ravel()]
+            except Exception:
+                return None
+        if len(vals) < 6:
+            return None
+        dof = None
+        if seed_joints is not None:
+            try:
+                dof = int(np.asarray(seed_joints.list(), dtype=float).size)
+            except Exception:
+                dof = None
+        if dof and 0 < dof <= len(vals):
+            vals = vals[:dof]
+        return robomath.Mat(vals)
+
+    def screen_collisions(self, poses: list[np.ndarray], *,
+                          guard_skip: int | None = None
+                          ) -> tuple[list[bool], bool, list]:
+        """Test each TCP pose for collisions **in simulation** and record the exact
+        joint configuration used.
+
+        Returns ``(mask, checked, joints)``:
+
+        * ``mask[i]``   True if pose ``i`` is collision-free, or its collision state
+          couldn't be judged (unjudgeable poses are kept — this is a filter, the dry
+          tour is the authoritative gate).
+        * ``checked``   True iff collision checking was active for the sweep (False ⇒
+          the build won't enable it ⇒ nothing dropped).
+        * ``joints[i]`` the IK joint vector for pose ``i`` (opaque RoboDK ``Mat``), or
+          ``None`` if no solution. Pass it to :meth:`add_target` so the *tested*
+          configuration is the one stored — otherwise a cartesian target can be
+          reached in a different IK branch that collides.
+
+        ``guard_skip`` (when not None) force-enables the mounted-tool↔arm collision
+        pairs **after** turning collision checking on — see the comment below; this is
+        what actually catches the spindle↔arm self-collision and MUST happen here, not
+        before, because ``setCollisionActive(ON)`` rebuilds the default map.
+
+        Uses ``MoveJ_Test`` (interpolates the move and returns the number of colliding
+        object pairs) from the robot's current ``seed`` joints to each candidate — so
+        it catches the robot self-colliding with its own tooling (e.g. the spindle
+        hitting link 4 in a wrist-flipped config). A resting-config ``Collisions()``
+        backstop re-checks the endpoint in case the coarse joint step stepped over a
+        thin contact. The spindle and every other flange body participate as long as
+        their pair is enabled in the station's collision map.
+
+        Safety: forces SIMULATE, restores the seed joints and prior run mode, and
+        **disables collision checking again afterwards** (leaving it on makes every
+        later RoboDK call recompute collisions on the 117 MB station — the cause of
+        slow/timing-out reconnects). Never raises."""
+        robot = self.robot()
+        try:
+            seed_joints = robot.Joints()
+        except Exception:
+            seed_joints = None
+        prior_mode = self.current_run_mode()
+        self.rdk.setRunMode(self.RUNMODE_SIMULATE)
+        on = self.set_collision_checking(True)
+        # Enable the mounted-tool<->arm collision pairs AFTER checking is on:
+        # setCollisionActive(ON) rebuilds the collision map from RoboDK's defaults,
+        # which EXCLUDE a tool from colliding with its own robot — so any pair enabled
+        # while checking was off (e.g. by a caller before this) is wiped, and the
+        # spindle<->A4 self-collision goes unseen (the target-12 collider that kept
+        # slipping through). Re-applying here — the same order the dry tour uses —
+        # keeps them active for the MoveJ_Test sweep below.
+        if on and guard_skip is not None:
+            self.ensure_mounted_tool_collision_pairs(guard_skip)
+        mask: list[bool] = []
+        joints: list = []
+        try:
+            for T in poses:
+                sol = None
+                collides: bool | None = None
+                try:
+                    # Anchor every solve to the seed config so the chosen IK branch
+                    # is deterministic: without joints_approx, SolveIK returns the
+                    # branch nearest the robot's CURRENT sim position, which drifts
+                    # because MoveJ_Test below leaves the robot at each candidate.
+                    # _solve_ik passes the camera tool EXPLICITLY, so the joints place
+                    # the camera (not the flange) at T — the config we lock + collision
+                    # check is the one the camera actually reaches the viewpoint in.
+                    ik = self._solve_ik(T, seed_joints)
+                    # SolveIK returns the joints as a Mat: reachable -> an N-element
+                    # vector (N = DOF, sometimes +2 config values); unreachable -> a
+                    # 1-element Mat([0]). CRITICAL: Mat.Cols()/Rows() return the row/
+                    # column LISTS, not counts, so the old `ik.Cols()==1 and
+                    # ik.Rows()>=6` was ALWAYS False — MoveJ_Test never ran and every
+                    # pose survived as an un-collision-checked cartesian target (the
+                    # spindle-into-A4 that slipped through). Discriminate on element
+                    # count instead.
+                    sol = self._ik_to_joints(ik, seed_joints)
+                    if sol is not None and on:
+                        j1 = seed_joints if seed_joints is not None else sol
+                        ncol = robot.MoveJ_Test(j1, sol, self.COLLISION_STEP_DEG)
+                        collides = int(ncol) > 0
+                        if not collides:
+                            # MoveJ_Test leaves the robot AT sol when the path is
+                            # clear, so re-check the resting config directly — a
+                            # coarse joint step can step over a thin endpoint contact.
+                            rest = self.collisions()
+                            collides = bool(rest)
+                except Exception:
+                    sol, collides = sol, None
+                joints.append(sol)
+                mask.append(True if collides is None else not collides)
+        finally:
+            if seed_joints is not None:
+                try:
+                    robot.setJoints(seed_joints)
+                except Exception:
+                    pass
+            self.set_run_mode_raw(prior_mode)
+            self.set_collision_checking(False)   # don't leave the station heavy
+        return mask, on, joints
+
+    def collision_status(self, *, ensure_pairs: bool = False,
+                         skip_trailing: int = 2) -> dict:
+        """Best-effort snapshot of RoboDK collision checking at the **current** pose
+        — no motion. Briefly enables checking to force a recompute, reads the count,
+        then **disables it again** (so it doesn't slow every later call). Returns
+        ``{"available": bool, "count": int | None}``; ``available`` False means this
+        build/station can't evaluate collisions, so the generation filter drops
+        nothing.
+
+        When ``ensure_pairs`` is set, also force-enables the mounted-tool↔arm
+        collision pairs first (see :meth:`ensure_mounted_tool_collision_pairs`) and
+        adds ``guarded_tools`` / ``guarded_pairs`` so the UI chip can confirm the
+        spindle/camera are actually being checked against the arm — RoboDK omits
+        those pairs by default."""
+        on = self.set_collision_checking(True)
+        guard = (self.ensure_mounted_tool_collision_pairs(skip_trailing)
+                 if on and ensure_pairs else None)
+        n = self.collisions() if on else None
+        self.set_collision_checking(False)
+        out = {"available": n is not None, "count": n}
+        if guard is not None:
+            out["guarded_tools"] = guard["tools"]
+            out["guarded_pairs"] = guard["pairs_enabled"]
+        return out
+
     def collisions(self) -> int | None:
         """Number of colliding object pairs in the current (simulated) state, or
         ``None`` if this build/station can't check collisions. Best-effort; never
@@ -193,6 +556,38 @@ class RdkIO:
         target = self.rdk.Item(name, robolink.ITEM_TYPE_TARGET)
         self.robot().MoveJ(target)
 
+    def target_joints(self, name: str):
+        """The joint vector stored on a target (RoboDK ``Mat``), or ``None`` if it
+        isn't a joint target / can't be read. Used to sweep the *exact* config the
+        real run will visit when collision-checking the path between targets."""
+        import robolink
+
+        try:
+            t = self.rdk.Item(name, robolink.ITEM_TYPE_TARGET)
+            if not t.Valid():
+                return None
+            j = t.Joints()
+            # Count the values (Mat.Cols()/Rows() return lists, not counts — the
+            # gotcha that silently broke the collision sweep).
+            if int(np.asarray(j.list(), dtype=float).size) >= 6:
+                return j
+        except Exception:
+            pass
+        return None
+
+    def move_j_test(self, j1, j2, step_deg: float | None = None):
+        """Collision-swept feasibility of the interpolated joint move ``j1 -> j2``.
+        Returns the number of colliding object pairs along the path (0 = clear), or
+        ``None`` if the inputs are bad / the build can't evaluate it. Requires global
+        collision checking to be ON to actually report collisions."""
+        if j1 is None or j2 is None:
+            return None
+        step = self.COLLISION_STEP_DEG if step_deg is None else step_deg
+        try:
+            return int(self.robot().MoveJ_Test(j1, j2, step))
+        except Exception:
+            return None
+
     def list_tools(self) -> list[str]:
         import robolink
 
@@ -210,3 +605,10 @@ class RdkIO:
 
         tool = self.rdk.Item(tool_name, robolink.ITEM_TYPE_TOOL)
         return pose_to_T(tool.PoseTool())
+
+    def create_tool(self, tool_name: str, T: np.ndarray):
+        """Add a tool named ``tool_name`` on the robot flange at mounting pose ``T``
+        (flange->tool, numpy 4x4). Used to self-heal a deleted camera tool from a
+        known-good offset so the *camera* — not the flange — is what the generated
+        targets drive. Returns the new tool item."""
+        return self.robot().AddTool(T_to_pose(T), tool_name)

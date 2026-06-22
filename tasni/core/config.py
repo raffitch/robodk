@@ -113,6 +113,19 @@ class RoboDKConfig(_Model):
     # "simulate" keeps the robot in RoboDK only; "run_robot" drives the real arm.
     # Calibration only makes sense on the real arm (the camera rides on it).
     run_mode: str = "run_robot"
+    # robolink's default socket timeout is only 10 s — too short for the first
+    # access to the 117 MB station (RoboDK is busy loading / recomputing, so the
+    # bare existence queries don't return in time and the FIRST Connect "fails"
+    # while a second click — by now the station is loaded — succeeds instantly).
+    # Give the connection a generous timeout so the first load completes in one
+    # click. Applied right after the socket opens, before any heavy query.
+    connect_timeout_s: float = 120.0
+    # A station saved with collision checking ON makes RoboDK recompute the whole
+    # collision map on EVERY API call against the 117 MB cell — the chronic
+    # slowness behind the timing-out first connect. Turn checking OFF right after
+    # the station is loaded (the collision MAP / pair config is preserved; the app
+    # re-enables checking only transiently for the pose filter + the dry tour).
+    disable_collisions_on_connect: bool = True
 
 
 class CalibrationConfig(_Model):
@@ -140,6 +153,17 @@ class CalibrationConfig(_Model):
     # corners and WARN if they diverge from the configured camera matrix. Never
     # feeds the solve (review-then-apply); set False to skip the extra solve.
     verify_intrinsics: bool = True
+
+    # Auto intrinsic calibration: on a hand-eye run, if the cell has no calibrated
+    # intrinsics yet (no "intrinsics applied" marker — still on factory K / zero
+    # distortion), derive K + distortion from the SAME captured board views, apply
+    # them, and recompute each view's board pose with the better model before the
+    # hand-eye solve. Runs once (the marker gates it) and needs no separate step or
+    # motion. The board stays centred in hand-eye poses, so edge coverage is limited
+    # (k3 is fixed); the dedicated full-frame "Camera intrinsics" capture is still
+    # the most accurate path and supersedes this when run.
+    auto_intrinsics: bool = True
+    intrinsics_fix_k3: bool = True      # fix the overfit-prone high-order radial term
 
     # Robust outlier rejection: after the initial solve, drop training views whose
     # per-view reprojection RMS is an outlier (a mis-detected board / bad pose drags
@@ -199,6 +223,28 @@ class CalibrationConfig(_Model):
     roll_max_deg: float = 75.0          # roll spread about the optical axis
     distance_jitter: float = 0.12       # +/- fraction of working distance
     look_distance_mm: float = 500.0     # fallback if the seed board distance unknown
+    # Drop generated poses where the robot (incl. mounted tooling like a spindle)
+    # collides, checked in RoboDK SIMULATE before any target is written — so a pose
+    # that would drive the spindle into the arm never becomes a TasniCalib_* target.
+    # Needs the station's collision map set up; degrades to "not checked" (drops
+    # nothing) where the build/station can't evaluate collisions. The dry tour
+    # remains the final pre-run gate.
+    collision_filter: bool = True
+    # RoboDK's default collision map EXCLUDES a tool from colliding with its own
+    # robot (the tool is the robot's child), so a flange-mounted spindle swinging
+    # into a forearm link is never flagged — and the pose survives collision_filter
+    # even though it self-collides. When True, target creation + the dry tour
+    # force-enable collision pairs between EVERY body mounted on the flange (the
+    # camera, the spindle, any other tool/object) and the robot's arm links, so
+    # those tool-vs-arm self-collisions are actually caught. Modifies the live
+    # collision map only (it is not written back to the .rdk).
+    collision_self_pairs: bool = True
+    # Trailing robot links — the wrist + the mounting flange the tools naturally
+    # sit against — skipped when enabling tool<->arm pairs, so a tool isn't forever
+    # "colliding" with the flange it is bolted to. 2 skips A5+A6 on a 6-axis arm,
+    # leaving A1..A4 checked (A4 is the link tools were observed to hit). Raise it
+    # if a bulky tool false-triggers against the wrist.
+    collision_skip_wrist_links: int = 2
 
 
 class WebConfig(_Model):

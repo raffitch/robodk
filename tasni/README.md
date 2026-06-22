@@ -34,7 +34,10 @@ robot while a **live aiming HUD** shows the board's distance + angle; when the
 **DETECT · DISTANCE · ANGLE** lamps lock green, **Create targets** generates ~15
 reachable poses around the robot's *current* pose (left as `TasniCalib_*` to inspect
 in RoboDK), then **Run** drives the robot through them and solves. The Jetson camera
-server must be up on TCP 1024.
+server must be up on TCP 1024. **Camera intrinsics are handled under the hood**: the
+first Run auto-calibrates K + lens distortion from the same captured views and applies
+them (the D435i ships its RGB stream with zero distortion), so there's no separate
+intrinsics step.
 
 ## Architecture
 

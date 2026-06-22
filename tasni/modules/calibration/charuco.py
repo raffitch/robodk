@@ -71,6 +71,18 @@ class CharucoTarget:
                              obj_points=self._all_obj[ids.flatten()],
                              rvec=rvec, tvec=tvec)
 
+    def detect_points(self, image: np.ndarray, *, min_corners: int = 6
+                      ) -> "tuple[np.ndarray, np.ndarray, np.ndarray] | None":
+        """Detect ChArUco corners and their board-frame coords, with **no** pose
+        estimation (so it needs no K/dist). Returns ``(corners (N,1,2), ids (N,1),
+        obj_points (N,3))`` or ``None``. Used by intrinsic calibration, which solves
+        K/distortion from the raw 2D-3D correspondences."""
+        found = self._detect_corners(image, min_corners=min_corners)
+        if found is None:
+            return None
+        corners, ids = found
+        return corners, ids, self._all_obj[ids.flatten()]
+
     def detect(self, image: np.ndarray, K: np.ndarray, dist: np.ndarray,
                *, min_corners: int = 6) -> ViewDetection | None:
         """Detect the board in ``image`` and estimate its pose in the camera.

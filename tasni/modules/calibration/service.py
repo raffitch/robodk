@@ -30,7 +30,6 @@ import numpy as np
 from ...core import runs
 from ...core.aiming import GateThresholds, evaluate_gate
 from ...core.events import JobEvent
-from ...core.geometry import invert_T
 from ...core.jobrunner import JobContext
 from ...core.logging import get_logger, new_run_dir
 from ...core.rdk_io import RdkIO
@@ -57,6 +56,79 @@ def _camera_hold(services, owner: str):
     no-op when the container has no lease (older fakes in tests)."""
     lease = getattr(services, "camera_lease", None)
     return lease.hold(owner) if lease is not None else nullcontext()
+
+
+def dry_tour_required(services) -> bool:
+    """True while a recreated camera tool still needs a passing dry tour before the
+    real run is allowed (see :func:`ensure_camera_tool`)."""
+    return bool(getattr(services, "calib_dry_tour_required", False))
+
+
+def _set_dry_tour_required(services, value: bool) -> None:
+    setattr(services, "calib_dry_tour_required", value)
+
+
+def _last_good_camera_pose(services):
+    """``(X_cam2gripper, run_id)`` from the currently-applied calibration on disk,
+    or ``None`` if nothing has been applied yet. This is the *real* mounting offset
+    of the camera tool — the only safe pose to recreate a deleted tool at."""
+    active = runs.read_active("calibration")
+    if not active:
+        return None
+    run_id = active.get("run_id")
+    if not run_id:
+        return None
+    try:
+        report = runs.load_report("calibration", run_id)
+        X = np.asarray(report["X_cam2gripper"], dtype=float)
+    except (runs.RunNotFound, KeyError, ValueError, TypeError):
+        return None
+    if X.shape != (4, 4) or not np.all(np.isfinite(X)):
+        return None
+    return X, run_id
+
+
+def ensure_camera_tool(services, *, log=None) -> dict:
+    """Make sure the camera tool exists; self-heal a deleted-and-saved tool from
+    the last applied calibration.
+
+    Why not just recreate it at identity: the generated ``TasniCalib_*`` targets are
+    *camera* (TCP) poses, and the robot drives the active TCP to them. A tool with an
+    identity mount would put the **flange** where the camera should go — a whole
+    camera-stick-out shift in arm configuration, i.e. a collision risk. So we only
+    recreate it at the *real* offset recovered from the last calibration; with no
+    calibration history there is no safe offset to invent, so we refuse and ask the
+    operator to re-add the camera (with its 3D model).
+
+    Returns ``{"present": True, "restored": run_id|None}``. Raises ``RuntimeError``
+    only when the tool is missing AND unrecoverable.
+    """
+    rdk: RdkIO = services.rdk
+    tool_name = services.config.robodk.camera_tool
+    if rdk.item_exists(tool_name):
+        return {"present": True, "restored": None}
+
+    recovered = _last_good_camera_pose(services)
+    if recovered is None:
+        raise RuntimeError(
+            f"tool {tool_name!r} not found and no prior calibration to restore its "
+            f"mounting offset from — re-add the RealSense camera (its 3D model + a "
+            f"tool named {tool_name!r}) on the flange in RoboDK. Auto-recreating it "
+            f"at a guessed offset is unsafe: the robot would drive the flange, not "
+            f"the camera, to each target and could collide.")
+    X, run_id = recovered
+    rdk.create_tool(tool_name, X)
+    # Latch the dry-tour gate: the run refuses until a dry tour passes (the
+    # recreated tool has no 3D model, so collisions are unchecked — verify motion
+    # in simulation before driving the real arm).
+    _set_dry_tour_required(services, True)
+    msg = (f"{tool_name!r} tool was missing — recreated it from the last applied "
+           f"calibration ({run_id}). VERIFY its position in RoboDK and run the dry "
+           f"tour before moving the real robot. Note: the recreated tool has no 3D "
+           f"model, so the collision check cannot see the camera body.")
+    if log:
+        log(msg)
+    return {"present": True, "restored": run_id}
 
 
 def gate_thresholds(ccfg) -> GateThresholds:
@@ -88,16 +160,28 @@ def generate_calibration_targets(services) -> dict:
     tool_name = cfg.robodk.camera_tool
     K, dist = cfg.camera.K, cfg.camera.dist
 
-    if not rdk.item_exists(tool_name):
-        raise RuntimeError(
-            f"tool {tool_name!r} not found — mount the RealSense camera "
-            f"(3D model + a tool named {tool_name!r}) on the flange in RoboDK")
+    ensure_camera_tool(
+        services,
+        log=lambda m: services.bus.publish(JobEvent("log", {"message": m})))
 
     # Free the camera (unicast) so our authoritative grab gets the frame.
     if services.live.running:
         services.live.stop()
 
     tool_pose = rdk.use_camera_tool(tool_name)
+    # The seed + all generated poses are CAMERA (active-TCP) poses. If the Realsense
+    # tool has no real mounting offset (PoseTool ≈ identity), its TCP sits AT the
+    # flange, so the orbit centres on the flange axis, not where the camera looks —
+    # which looks and behaves like "targets for the flange, not the camera". Warn so
+    # the operator sets the approximate camera mount (calibration then refines it).
+    tool_offset_mm = float(np.linalg.norm(np.asarray(tool_pose)[:3, 3]))
+    if tool_offset_mm < 15.0:
+        services.bus.publish(JobEvent("log", {"message":
+            f"WARNING: the {tool_name!r} tool is only ~{tool_offset_mm:.0f} mm from the "
+            f"flange (≈ no offset) — poses will be generated for the FLANGE, not the "
+            f"camera. Set the camera's approximate mounting pose on the {tool_name!r} "
+            f"tool in RoboDK (calibration refines it), or apply a prior calibration "
+            f"first, then re-create targets."}))
     board = CharucoTarget(cfg.board)
     with _camera_hold(services, "target-creation"):
         frame = cam.grab(color_only=True)
@@ -122,7 +206,16 @@ def generate_calibration_targets(services) -> dict:
             + f"tilt {reading.tilt_deg and round(reading.tilt_deg, 1)}°). "
             + "Jog the robot until all HUD lamps are green, then create targets.")
 
-    seed_T = rdk.tcp_pose_T()
+    # The seed is the CAMERA pose (computed explicitly from the flange + the Realsense
+    # tool offset), not whatever the active TCP happens to be — so the generated poses
+    # orbit the camera's view, and the IK that locks each target drives the camera to
+    # it. tcp_pose_T()/Pose() would silently be the flange if the tool isn't active.
+    seed_T = rdk.camera_pose_T()
+    try:
+        # The gate/seed config — anchors the IK branch when locking targets to joints.
+        seed_joints = rdk.current_joints()
+    except Exception:
+        seed_joints = None
     look = float(reading.distance_mm)
 
     prior = rdk.list_targets(TARGET_PREFIX)
@@ -144,26 +237,112 @@ def generate_calibration_targets(services) -> dict:
             f">= {MIN_TRAIN_VIEWS}) — jog to a more open part of the workspace "
             f"(still framing the board) and retry")
 
+    # Drop poses where the robot collides with its mounted tooling (e.g. a spindle)
+    # or the cell — evaluated in SIMULATE before any target is written, so a
+    # would-collide pose never becomes a TasniCalib_* target. The sweep also returns
+    # the exact joint configuration it checked: we store those as JOINT targets so
+    # the pose that was collision-checked is the one actually visited (a cartesian
+    # target can otherwise be reached in a different, colliding IK branch — the
+    # cause of a "filtered but still colliding" target). Degrades to a no-op where
+    # the station has no collision map (col_checked False -> nothing dropped).
+    #
+    # First close RoboDK's default blind spot: it excludes a tool from colliding
+    # with its own robot, so a flange-mounted spindle/camera hitting an arm link
+    # is never reported. This call discovers the flange bodies and reports them; the
+    # pairs are (re)enabled INSIDE screen_collisions (via guard_skip) *after* it turns
+    # checking on, because setCollisionActive(ON) rebuilds the default map and would
+    # wipe pairs enabled here — the reason the spindle-into-A4 target-12 slipped through.
+    guard = None
+    guard_skip = None
+    if ccfg.collision_filter and ccfg.collision_self_pairs:
+        guard_skip = ccfg.collision_skip_wrist_links
+        guard = rdk.ensure_mounted_tool_collision_pairs(ccfg.collision_skip_wrist_links)
+        n_pairs = (guard or {}).get("pairs_enabled", 0)
+        if n_pairs:
+            services.bus.publish(JobEvent("log", {"message":
+                f"collision guard: enabled {n_pairs} tool↔arm pair(s) for "
+                f"{', '.join(guard['tools']) or 'mounted tools'} vs links "
+                f"{guard['links']} (RoboDK omits these by default)"}))
+        else:
+            services.bus.publish(JobEvent("log", {"message":
+                "WARNING: collision guard enabled 0 tool↔arm pairs — no flange "
+                "tool/object was found, so a spindle-vs-arm collision can't be "
+                "filtered. Confirm the camera/spindle are mounted on the robot in "
+                "RoboDK."}))
+
+    n_collide = 0
+    col_checked = False
+    reach_joints: list = [None] * n_reach
+    if ccfg.collision_filter:
+        mask, col_checked, jts = rdk.screen_collisions([T for _, T in reachable],
+                                                       guard_skip=guard_skip)
+        kept = [k for k in range(n_reach) if mask[k]]
+        if col_checked:
+            n_collide = n_reach - len(kept)
+        reachable = [reachable[k] for k in kept]
+        reach_joints = [jts[k] for k in kept]       # locked configs (may be None)
+        services.bus.publish(JobEvent("log", {"message":
+            f"collision screen: checking {'ACTIVE' if col_checked else 'unavailable'}; "
+            f"swept {n_reach} reachable pose(s), {n_collide} collided and were dropped"}))
+        if col_checked and len(reachable) < MIN_TRAIN_VIEWS:
+            raise RuntimeError(
+                f"only {len(reachable)} collision-free poses around this view "
+                f"({n_collide} of {n_reach} reachable poses would collide — "
+                f"likely the mounted tooling/spindle hitting the arm). Jog to a "
+                f"more open part of the workspace (still framing the board), or "
+                f"remove the tooling, and retry.")
+
+    n_usable = len(reachable)
     reach_T = [T for _, T in reachable]
-    sel = select_diverse(reach_T, min(ccfg.pose_count, n_reach),
+    sel = select_diverse(reach_T, min(ccfg.pose_count, n_usable),
                          seed_fwd=seed_T[:3, 2])
-    chosen = [reachable[k] for k in sel]            # index-sorted -> spiral naming
+    chosen = [(reachable[k][0], reachable[k][1], reach_joints[k])
+              for k in sel]                         # index-sorted -> spiral naming
+
+    # Lock every target to a joint configuration solved with the *camera* tool
+    # active, so selecting/visiting it reproduces the camera (TCP) at the viewpoint
+    # regardless of which tool the RoboDK GUI has active. A bare cartesian target
+    # stores only a TCP pose, which RoboDK drives the *currently active* tool to —
+    # with the flange selected that puts the FLANGE where the camera should be (the
+    # "flange visits the TCP" the operator reported). screen_collisions already
+    # locks the collision-checked config; here we back-fill any pose it left
+    # unlocked (collision filter off, or no IK branch near the seed).
+    n_backfilled = 0
+    locked: list = []
+    for _, T, joints in chosen:
+        if joints is None:
+            joints = rdk.solve_joints_for_pose(T, seed_joints)
+            if joints is not None:
+                n_backfilled += 1
+        locked.append((T, joints))
+    n_cartesian = sum(1 for _, j in locked if j is None)
+
     created: list[str] = []
-    for _, T in chosen:
+    for T, joints in locked:
         name = f"{TARGET_PREFIX}{len(created) + 1:02d}"
-        rdk.add_target(name, T)
+        rdk.add_target(name, T, joints=joints)
         created.append(name)
+    services.bus.publish(JobEvent("log", {"message":
+        f"targets stored as JOINT targets locked to the camera TCP "
+        f"(tool offset {tool_offset_mm:.0f} mm off the flange): "
+        f"{len(created) - n_cartesian}/{len(created)} locked"
+        + (f", {n_backfilled} back-filled by IK" if n_backfilled else "")
+        + (f"; WARNING {n_cartesian} left cartesian (no IK branch) — those will "
+           f"follow whatever tool is active in the GUI" if n_cartesian else "")}))
 
     # Effective cone: how much of the configured cone the kept poses actually span.
     # At an edge-of-workspace seed the wide (diversity-rich) poses are unreachable,
     # so this can be far narrower than cone_half_angle_deg — warn BEFORE capture
     # rather than discovering it from motion_diversity after a full run.
-    _, eff_max, eff_mean = viewing_angle_span([T for _, T in chosen], seed_T[:3, 2])
+    _, eff_max, eff_mean = viewing_angle_span([T for _, T, _ in chosen], seed_T[:3, 2])
+    collide_note = (f"; {n_collide} dropped for collision" if col_checked and n_collide
+                    else ("; collision-checked" if col_checked
+                          else "; collisions NOT checked (no station collision map)"))
     services.bus.publish(JobEvent("log",
         {"message": f"created {len(created)} calibration targets "
                     f"(working distance ~{look:.0f} mm; {n_reach}/{len(candidates)} "
-                    f"candidates reachable; effective cone ~{eff_max:.0f}° of "
-                    f"{ccfg.cone_half_angle_deg:.0f}°) — inspect them in RoboDK"}))
+                    f"candidates reachable{collide_note}; effective cone ~{eff_max:.0f}° "
+                    f"of {ccfg.cone_half_angle_deg:.0f}°) — inspect them in RoboDK"}))
     if eff_max < 0.5 * ccfg.cone_half_angle_deg:
         services.bus.publish(JobEvent("log",
             {"message": f"WARNING: reachable poses span only ~{eff_max:.0f}° "
@@ -180,7 +359,13 @@ def generate_calibration_targets(services) -> dict:
     return {"created": len(created), "targets": created,
             "look_distance_mm": look, "gate": reading.to_dict(),
             "candidates_reachable": n_reach, "candidates_total": len(candidates),
-            "effective_cone_deg": round(eff_max, 1)}
+            "collisions_checked": col_checked, "candidates_collided": n_collide,
+            "collision_filter_enabled": ccfg.collision_filter,
+            "effective_cone_deg": round(eff_max, 1),
+            "camera_tool_offset_mm": round(tool_offset_mm, 1),
+            "targets_joint_locked": len(created) - n_cartesian,
+            "targets_cartesian": n_cartesian,
+            "collision_guard": guard}
 
 
 def _split_views(views: list, holdout: int, strategy: str, seed: int):
@@ -255,18 +440,61 @@ def apply_calibration(services, *, job: "CalibrationJob | None" = None,
             "source": source, "active": payload}
 
 
+def intrinsics_present(services) -> bool:
+    """True once calibrated (non-factory) intrinsics have been applied — a marker
+    :func:`apply_intrinsics` writes. Absent ⇒ the cell is still on the factory K /
+    zero distortion, so the auto path should calibrate them on the next run."""
+    return runs.read_active("intrinsics") is not None
+
+
+def apply_intrinsics(services, report: dict, *, source: str = "manual") -> dict:
+    """Write a solved camera matrix + lens distortion into the camera config.
+
+    Mutates the **live** config (so the very next grab / hand-eye solve uses the new
+    intrinsics with no restart) AND persists to ``tasni.config.json`` (so it
+    survives one). Only the *active* resolution's K is replaced — the other
+    resolutions are preserved — while ``dist_coeffs`` is resolution-independent
+    (OpenCV distortion operates in normalised coords) so it applies to all. Records
+    an ``intrinsics`` active-marker (so :func:`intrinsics_present` is True and the
+    auto path won't redo it); ``source`` is "manual" (dedicated capture) or "auto"
+    (derived from a hand-eye run's views).
+    """
+    from ...core.config import save_overrides
+
+    cam = services.config.camera
+    res = cam.resolution
+    K = np.asarray(report["K"], dtype=float)
+    dist = [float(x) for x in report["dist"]]
+    full = {r: (K.tolist() if r == res else [row[:] for row in rows])
+            for r, rows in cam.intrinsics.items()}
+    full[res] = K.tolist()                 # in case the active res wasn't in the map
+    cam.intrinsics = full                   # validate_assignment re-checks the shape
+    cam.dist_coeffs = dist
+    save_overrides({"camera": {"intrinsics": full, "dist_coeffs": dist}})
+    runs.write_active("intrinsics", {
+        "module": "intrinsics", "source": source, "resolution": res,
+        "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "rms_px": report.get("rms_px"), "n_views": report.get("n_views"),
+        "coverage_pct": report.get("coverage_pct"), "fix_k3": report.get("fix_k3"),
+    })
+    return {"status": "applied", "resolution": res, "K": K.tolist(), "dist": dist,
+            "source": source}
+
+
 @dataclass
 class TourPoseResult:
     """One pose's verdict on the simulated dry tour."""
     name: str
     reachable: bool
-    collision: bool | None        # None = collisions not checked on this build
+    collision: bool | None        # resting-pose collision (None = not checked)
     ok: bool
     error: str | None = None
+    transit: bool | None = None   # collision while SWEEPING into this pose (None = not checked)
 
     def to_dict(self) -> dict:
         return {"name": self.name, "reachable": self.reachable,
-                "collision": self.collision, "ok": self.ok, "error": self.error}
+                "collision": self.collision, "ok": self.ok, "error": self.error,
+                "transit": self.transit}
 
 
 class SimTourJob:
@@ -288,10 +516,7 @@ class SimTourJob:
     def __call__(self, ctx: JobContext) -> dict:
         rdk: RdkIO = self.services.rdk
 
-        if not rdk.item_exists(self.tool_name):
-            raise RuntimeError(
-                f"tool {self.tool_name!r} not found — mount the RealSense camera "
-                f"(3D model + a tool named {self.tool_name!r}) on the flange in RoboDK")
+        ensure_camera_tool(self.services, log=ctx.log)
 
         targets = rdk.list_targets(TARGET_PREFIX)
         if not targets:
@@ -304,6 +529,15 @@ class SimTourJob:
         ctx.log(f"dry run (SIMULATE) — visiting {len(targets)} targets, no hardware motion")
         rdk.use_camera_tool(self.tool_name)
         collisions_on = rdk.set_collision_checking(True)
+        # Same blind spot as Create targets: RoboDK won't check a tool against its
+        # own robot, so enable the mounted-tool↔arm pairs before the tour or the
+        # spindle-into-A4 case stays invisible here too.
+        if collisions_on and self.services.config.calibration.collision_self_pairs:
+            guard = rdk.ensure_mounted_tool_collision_pairs(
+                self.services.config.calibration.collision_skip_wrist_links)
+            if guard and guard.get("pairs_enabled"):
+                ctx.log(f"collision guard: {guard['pairs_enabled']} tool↔arm pair(s) "
+                        f"enabled ({', '.join(guard['tools']) or 'mounted tools'})")
         try:
             start_joints = rdk.current_joints()
         except Exception:
@@ -311,14 +545,25 @@ class SimTourJob:
 
         results: list[TourPoseResult] = []
         total = len(targets)
+        # The real run drives start -> t1 -> t2 -> ... -> tN -> start. Resting-pose
+        # checks alone miss a tool that sweeps THROUGH an arm link mid-move yet
+        # clears both endpoints, so sweep each segment (the config we came from to
+        # the next target's config) with MoveJ_Test, the same swept API the pose
+        # filter uses. prev_joints starts at the seed/start config.
+        prev_joints = start_joints
         try:
             for i, name in enumerate(targets):
                 ctx.check_cancel()
                 ctx.progress(i + 1, total, f"checking {name}")
                 reachable = rdk.is_reachable(rdk.target_pose_T(name))
                 collision: bool | None = None
+                transit: bool | None = None
                 err: str | None = None
                 if reachable:
+                    dest = rdk.target_joints(name)
+                    if collisions_on and prev_joints is not None and dest is not None:
+                        ncol = rdk.move_j_test(prev_joints, dest)
+                        transit = None if ncol is None else bool(ncol)
                     try:
                         rdk.move_j(name)
                     except Exception as e:   # noqa: BLE001 - a sim move failure is a fail, not a crash
@@ -326,14 +571,28 @@ class SimTourJob:
                     if reachable and collisions_on:
                         n_col = rdk.collisions()
                         collision = None if n_col is None else bool(n_col)
-                ok = reachable and not bool(collision)
-                results.append(TourPoseResult(name, reachable, collision, ok, err))
-                flag = "OK" if ok else ("UNREACHABLE" if not reachable else "COLLISION")
+                    if reachable:
+                        try:
+                            prev_joints = rdk.current_joints()
+                        except Exception:
+                            prev_joints = dest if dest is not None else prev_joints
+                ok = reachable and not bool(collision) and not bool(transit)
+                results.append(TourPoseResult(name, reachable, collision, ok, err,
+                                              transit=transit))
+                flag = ("OK" if ok else "UNREACHABLE" if not reachable
+                        else "TRANSIT-COLLISION" if transit else "COLLISION")
                 ctx.log(f"{name}: {flag}")
 
-            # Return-to-start (the guarantee the real run makes; verify it here too).
+            # Return-to-start (the guarantee the real run makes; verify it here too) —
+            # and sweep the path back, since that move runs on the real arm as well.
             returned = False
+            return_path_ok = True
             if start_joints is not None:
+                if collisions_on and prev_joints is not None:
+                    ncol = rdk.move_j_test(prev_joints, start_joints)
+                    if ncol:
+                        return_path_ok = False
+                        ctx.log(f"return-to-start path COLLIDES ({ncol} pair(s))")
                 try:
                     rdk.move_j_joints(start_joints)
                     returned = True
@@ -343,9 +602,17 @@ class SimTourJob:
             n_pass = sum(1 for r in results if r.ok)
             n_unreachable = sum(1 for r in results if not r.reachable)
             n_collision = sum(1 for r in results if r.collision)
-            all_ok = n_pass == total and returned
-            ctx.log(f"dry run complete: {n_pass}/{total} poses OK; "
-                    f"return-to-start {'ok' if returned else 'FAILED'}"
+            n_transit = sum(1 for r in results if r.transit)
+            all_ok = n_pass == total and returned and return_path_ok
+            # A clean dry tour clears the restored-tool safety latch, re-enabling the
+            # real run (only meaningful when a recreated tool armed it).
+            if all_ok and dry_tour_required(self.services):
+                _set_dry_tour_required(self.services, False)
+                ctx.log("restored-tool safety latch cleared (dry tour passed) — "
+                        "the real run is enabled again")
+            ctx.log(f"dry run complete: {n_pass}/{total} poses OK"
+                    + (f"; {n_transit} transit collision(s)" if n_transit else "")
+                    + f"; return-to-start {'ok' if returned and return_path_ok else 'FAILED'}"
                     + ("" if collisions_on else "; collisions not checked on this build"))
             return {
                 "kind": "sim_tour",
@@ -353,8 +620,9 @@ class SimTourJob:
                 "passed": n_pass,
                 "unreachable": n_unreachable,
                 "collisions": n_collision,
+                "transit_collisions": n_transit,
                 "collisions_checked": collisions_on,
-                "returned_to_start": returned,
+                "returned_to_start": returned and return_path_ok,
                 "all_ok": all_ok,
                 "poses": [r.to_dict() for r in results],
             }
@@ -405,10 +673,13 @@ class CalibrationJob:
         K, dist = cfg.camera.K, cfg.camera.dist
         board = CharucoTarget(cfg.board)
 
-        if not rdk.item_exists(self.tool_name):
+        ensure_camera_tool(self.services, log=ctx.log)
+        if dry_tour_required(self.services):
             raise RuntimeError(
-                f"tool {self.tool_name!r} not found — mount the RealSense camera "
-                f"(3D model + a tool named {self.tool_name!r}) on the flange in RoboDK")
+                "the camera tool was recreated from a past calibration and has not "
+                "passed a dry tour since — run the dry tour (Simulate) and let it "
+                "pass before moving the real robot, so a wrong tool position can't "
+                "drive the arm into a collision.")
 
         targets = rdk.list_targets(TARGET_PREFIX)
         holdout = (self.params.holdout_count if self.params.holdout_count is not None
@@ -448,6 +719,43 @@ class CalibrationJob:
                 raise RuntimeError(
                     f"only {len(views)} usable views; need >= {MIN_TRAIN_VIEWS} "
                     f"training poses. Skipped (no board): {skipped}")
+
+            # Auto intrinsic calibration (once, under the hood): if the cell has no
+            # calibrated intrinsics yet, derive K + distortion from THESE captured
+            # board views — no separate step, no extra motion — apply them, then
+            # recompute each view's board pose with the better model so the hand-eye
+            # solve below uses it. Gated on the marker (so it runs only when missing).
+            # Degrades to a no-op (keeps the configured intrinsics) on any failure.
+            report_intrinsics_auto = None
+            if ccfg.auto_intrinsics and not intrinsics_present(self.services):
+                try:
+                    from .intrinsics_calib import solve_intrinsics
+                    obj_l = [v.obj_points.astype(np.float32) for v in views]
+                    img_l = [v.corners.reshape(-1, 1, 2).astype(np.float32) for v in views]
+                    intr = solve_intrinsics(obj_l, img_l, cfg.camera.size, K,
+                                            fix_k3=ccfg.intrinsics_fix_k3)
+                    apply_intrinsics(self.services, intr, source="auto")
+                    K, dist = cfg.camera.K, cfg.camera.dist     # reload the applied model
+                    for v in views:                              # re-pose with new K/dist
+                        ok, rvec, tvec = cv2.solvePnP(
+                            v.obj_points.astype(np.float64),
+                            v.corners.reshape(-1, 1, 2).astype(np.float64), K, dist)
+                        if ok:
+                            v.R_target2cam = cv2.Rodrigues(rvec)[0]
+                            v.t_target2cam = tvec.reshape(3)
+                    cov = int(round(intr["coverage_pct"] * 100))
+                    ctx.log(f"auto intrinsics (none on file): calibrated K+distortion from "
+                            f"{intr['n_views']} captured views — fit RMS {intr['rms_px']:.3f} px, "
+                            f"coverage {cov}% (k3 {'fixed' if intr['fix_k3'] else 'free'}); applied")
+                    if intr["coverage_pct"] < 0.6:
+                        ctx.log("NOTE: the board stays centred in hand-eye poses, so intrinsic "
+                                "edge coverage is thin — for best distortion accuracy run the "
+                                "dedicated Camera intrinsics capture (Step 0) and re-run.")
+                    report_intrinsics_auto = {**intr, "source": "auto"}
+                except Exception as e:   # noqa: BLE001 - the optional step must never abort a run
+                    ctx.log(f"auto intrinsics skipped ({type(e).__name__}: {e}); "
+                            f"continuing with the configured intrinsics")
+
             # Scale the holdout down so the training set never drops below
             # MIN_TRAIN_VIEWS — a thin capture (poses lost to reachability /
             # detection) should spend its views on the solve, not validation.
@@ -502,10 +810,18 @@ class CalibrationJob:
                               rejected_views=rejected)
             self.solved_X = X
 
+            report_dict = report.to_dict()
+            if report_intrinsics_auto is not None:
+                report_dict["intrinsics_auto"] = report_intrinsics_auto
             summary = report.summary()
             for line in summary.splitlines():
                 ctx.log(line)
-            (run_dir / "report.json").write_text(json.dumps(report.to_dict(), indent=2),
+            if report_intrinsics_auto is not None:                # already logged above
+                summary += (
+                    f"\nintrinsics: auto-calibrated from {report_intrinsics_auto['n_views']} "
+                    f"views (fit RMS {report_intrinsics_auto['rms_px']:.3f} px, coverage "
+                    f"{int(report_intrinsics_auto['coverage_pct'] * 100)}%); applied")
+            (run_dir / "report.json").write_text(json.dumps(report_dict, indent=2),
                                                  encoding="utf-8")
             (run_dir / "summary.txt").write_text(summary, encoding="utf-8")
             # A tiny sidecar so apply-by-run-id (after a server restart, when the
@@ -517,10 +833,10 @@ class CalibrationJob:
                  "refined": do_refine}, indent=2), encoding="utf-8")
 
             self.result = CalibrationResult(
-                report=report.to_dict(), summary=summary, run_dir=str(run_dir),
+                report=report_dict, summary=summary, run_dir=str(run_dir),
                 tool_name=self.tool_name, n_captured=len(views), n_skipped=skipped)
             return {
-                "summary": summary, "report": report.to_dict(), "run_dir": str(run_dir),
+                "summary": summary, "report": report_dict, "run_dir": str(run_dir),
                 "tool_name": self.tool_name, "n_captured": len(views),
                 "n_skipped": skipped, "can_apply": True,
             }
@@ -573,7 +889,11 @@ class CalibrationJob:
             rep = images[len(images) // 2]                 # a representative frame
             self._emit_frame(ctx, board.annotate(rep, det, K, dist, name),
                              run_dir / f"{name}.jpg")
-            flange = rdk.tcp_pose_T() @ invert_T(tool_pose)   # true flange in frame
+            # The flange (gripper2base) the hand-eye solve needs, derived from the
+            # active TCP and its offset — robust to which tool is active (vs the old
+            # tcp_pose_T() @ inv(tool_pose), which was the FLANGE only if the camera
+            # tool happened to be the active TCP).
+            flange = rdk.flange_pose_T()
             views.append(CalibrationView(name, flange, det.R_target2cam,
                                          det.t_target2cam, det.corners, det.obj_points))
             n_frames = len(images)
