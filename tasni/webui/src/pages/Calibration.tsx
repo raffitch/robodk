@@ -217,17 +217,29 @@ export default function Calibration() {
     });
   }, [subscribe]);
 
+  const beginLive = async (clearGate: boolean) => {
+    resetStream();
+    if (clearGate) setGate(null);
+    await api.post("/live/start");
+    setLive(true);
+  };
+
   const startLive = async () => {
     try {
-      resetStream();
-      await api.post("/live/start");
-      setLive(true);
+      setFrame(null);
+      await beginLive(true);
       addLog("live aiming gate started — jog the robot until all lamps are green.");
-    } catch (e: any) { addLog("live: " + e.message, true); }
+    } catch (e: any) {
+      setLive(false);
+      resetStream();
+      addLog("live: " + e.message, true);
+    }
   };
   const stopLive = async () => {
     try { await api.post("/live/stop"); } catch { /* ignore */ }
     setLive(false);
+    setGate(null);
+    setFrame(null);
     resetStream();
   };
 
@@ -237,13 +249,16 @@ export default function Calibration() {
       const r = await api.post<{ created: number; look_distance_mm: number;
         collisions_checked?: boolean; candidates_collided?: number;
         collision_filter_enabled?: boolean;
+        collision_filter_bypassed?: boolean;
         camera_tool_offset_mm?: number; targets_cartesian?: number;
         collision_guard?: { tools: string[]; pairs_enabled: number } | null }>("/poses/generate");
       setTargets(r.created);
       setTour(null);    // a fresh target set invalidates any prior dry-run verdict
       setLive(false);   // generate stops the live gate server-side
       checkCollision(); // re-probe the chip (generation disables checking again afterwards)
-      const dropped = r.collisions_checked
+      const dropped = r.collision_filter_bypassed
+        ? ` (RoboDK reported ${r.candidates_collided ?? 0} colliding pose${(r.candidates_collided ?? 0) === 1 ? "" : "s"}; filter bypassed for calibration)`
+        : r.collisions_checked
         ? (r.candidates_collided
             ? ` (${r.candidates_collided} colliding pose${r.candidates_collided === 1 ? "" : "s"} filtered out)`
             : "")
@@ -266,9 +281,11 @@ export default function Calibration() {
         : "";
       addLog(`created ${r.created} targets (working distance ~${Math.round(r.look_distance_mm)} mm)`
         + dropped + guard + offNote + cart + " — inspect them in RoboDK, then Run calibration.");
+      beginLive(false).catch(() => setLive(false));
     } catch (e: any) {
       addLog("create targets: " + e.message, true);
       setRunError("Create targets: " + e.message);
+      beginLive(false).catch(() => setLive(false));
     }
     finally { setGenerating(false); }
   };
@@ -374,7 +391,7 @@ export default function Calibration() {
         <div className="aim-wrap">
           {frame ? <img className="preview" src={frame} alt="camera" />
                  : <div className="preview" />}
-          {live && <AimHud gate={gate} />}
+          {live && <AimHud gate={gate} mode="calibration" />}
           {live && <StreamStats stat={streamStat} />}
           {!live && <div className="aim-off">camera off — press “Start camera”</div>}
         </div>

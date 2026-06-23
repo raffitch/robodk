@@ -230,6 +230,12 @@ class CalibrationConfig(_Model):
     # nothing) where the build/station can't evaluate collisions. The dry tour
     # remains the final pre-run gate.
     collision_filter: bool = True
+    # Keep calibration moving when a station collision map is noisy/stale (a common
+    # case when the current seed already reports self-contact). The filter still
+    # drops clearly colliding poses when enough remain; if too few remain, target
+    # creation falls back to reachable poses and logs a warning. Set True for a
+    # hard safety gate that refuses generation instead.
+    collision_filter_hard_fail: bool = False
     # RoboDK's default collision map EXCLUDES a tool from colliding with its own
     # robot (the tool is the robot's child), so a flange-mounted spindle swinging
     # into a forearm link is never flagged — and the pose survives collision_filter

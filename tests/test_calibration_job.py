@@ -292,6 +292,7 @@ def test_generate_refuses_when_tooling_collides():
     """If too few collision-free poses survive, generation refuses with a
     tooling/spindle-collision message rather than creating unsafe targets."""
     services, rdk, _X, _state = _build_fakes()
+    services.config.calibration.collision_filter_hard_fail = True
 
     def mask(poses, *, guard_skip=None):   # only 2 free -> below MIN_TRAIN_VIEWS
         m = [False] * len(poses)
@@ -310,6 +311,25 @@ def test_generate_refuses_when_tooling_collides():
     print("[collision refusal]", msg.splitlines()[0])
 
 
+def test_generate_bypasses_noisy_collision_map_by_default():
+    """Calibration keeps target creation usable when RoboDK reports every
+    otherwise-reachable candidate as colliding; the collision report is surfaced
+    but the generated targets fall back to reachable poses."""
+    services, rdk, _X, _state = _build_fakes()
+
+    def mask(poses, *, guard_skip=None):
+        return [False] * len(poses), True, [None] * len(poses)
+    rdk.screen_collisions = mask
+
+    gen = service_mod.generate_calibration_targets(services)
+    assert gen["collision_filter_bypassed"] is True
+    assert gen["candidates_collided"] == gen["candidates_reachable"]
+    assert gen["created"] == 15
+    assert len(rdk.list_targets("TasniCalib_")) == 15
+    print("[collision bypass] created", gen["created"],
+          "after", gen["candidates_collided"], "reported collisions")
+
+
 if __name__ == "__main__":
     test_generate_then_run_recovers_truth()
     test_auto_intrinsics_runs_when_missing_and_skips_when_present()
@@ -319,4 +339,5 @@ if __name__ == "__main__":
     test_generate_reports_collision_guard()
     test_generate_skips_guard_when_disabled()
     test_generate_refuses_when_tooling_collides()
+    test_generate_bypasses_noisy_collision_map_by_default()
     print("\nGate-gated calibration job tests passed.")

@@ -231,6 +231,7 @@ def generate_calibration_targets(services) -> dict:
     # conditioning; see select_diverse / the workspace-edge finding in robot_probe).
     reachable = [(i, T) for i, T in enumerate(candidates) if rdk.is_reachable(T)]
     n_reach = len(reachable)
+    reachable_before_collision = list(reachable)
     if n_reach < MIN_TRAIN_VIEWS:
         raise RuntimeError(
             f"only {n_reach} reachable poses around this view (need "
@@ -272,6 +273,7 @@ def generate_calibration_targets(services) -> dict:
 
     n_collide = 0
     col_checked = False
+    collision_filter_bypassed = False
     reach_joints: list = [None] * n_reach
     if ccfg.collision_filter:
         mask, col_checked, jts = rdk.screen_collisions([T for _, T in reachable],
@@ -285,12 +287,22 @@ def generate_calibration_targets(services) -> dict:
             f"collision screen: checking {'ACTIVE' if col_checked else 'unavailable'}; "
             f"swept {n_reach} reachable pose(s), {n_collide} collided and were dropped"}))
         if col_checked and len(reachable) < MIN_TRAIN_VIEWS:
-            raise RuntimeError(
-                f"only {len(reachable)} collision-free poses around this view "
-                f"({n_collide} of {n_reach} reachable poses would collide — "
-                f"likely the mounted tooling/spindle hitting the arm). Jog to a "
-                f"more open part of the workspace (still framing the board), or "
-                f"remove the tooling, and retry.")
+            if ccfg.collision_filter_hard_fail:
+                raise RuntimeError(
+                    f"only {len(reachable)} collision-free poses around this view "
+                    f"({n_collide} of {n_reach} reachable poses would collide — "
+                    f"likely the mounted tooling/spindle hitting the arm). Jog to a "
+                    f"more open part of the workspace (still framing the board), or "
+                    f"remove the tooling, and retry.")
+            collision_filter_bypassed = True
+            reachable = reachable_before_collision
+            reach_joints = [None] * len(reachable)
+            services.bus.publish(JobEvent("log", {"message":
+                "WARNING: RoboDK reported too many calibration candidate poses as "
+                "colliding, so target creation is continuing with reachable poses "
+                "only. Inspect the targets in RoboDK and run the dry tour before "
+                "moving the real robot; set calibration.collision_filter_hard_fail "
+                "to true for strict refusal."}))
 
     n_usable = len(reachable)
     reach_T = [T for _, T in reachable]
@@ -335,9 +347,11 @@ def generate_calibration_targets(services) -> dict:
     # so this can be far narrower than cone_half_angle_deg — warn BEFORE capture
     # rather than discovering it from motion_diversity after a full run.
     _, eff_max, eff_mean = viewing_angle_span([T for _, T, _ in chosen], seed_T[:3, 2])
-    collide_note = (f"; {n_collide} dropped for collision" if col_checked and n_collide
-                    else ("; collision-checked" if col_checked
-                          else "; collisions NOT checked (no station collision map)"))
+    collide_note = (f"; collision filter bypassed after {n_collide} reported collision(s)"
+                    if collision_filter_bypassed else
+                    (f"; {n_collide} dropped for collision" if col_checked and n_collide
+                     else ("; collision-checked" if col_checked
+                           else "; collisions NOT checked (no station collision map)")))
     services.bus.publish(JobEvent("log",
         {"message": f"created {len(created)} calibration targets "
                     f"(working distance ~{look:.0f} mm; {n_reach}/{len(candidates)} "
@@ -361,6 +375,7 @@ def generate_calibration_targets(services) -> dict:
             "candidates_reachable": n_reach, "candidates_total": len(candidates),
             "collisions_checked": col_checked, "candidates_collided": n_collide,
             "collision_filter_enabled": ccfg.collision_filter,
+            "collision_filter_bypassed": collision_filter_bypassed,
             "effective_cone_deg": round(eff_max, 1),
             "camera_tool_offset_mm": round(tool_offset_mm, 1),
             "targets_joint_locked": len(created) - n_cartesian,

@@ -13,7 +13,7 @@ export interface GateReading {
   distance_mm?: number | null;
   tilt_deg?: number | null;
   offset?: [number, number] | null;
-  gates?: { detected: boolean; distance: boolean; angle: boolean };
+  gates?: { detected: boolean; distance: boolean; angle: boolean; framed?: boolean };
   ok: boolean;
   ideal_distance_mm?: number;
   distance_tol_mm?: number;
@@ -26,6 +26,12 @@ export interface GateReading {
   tilt_c_deg?: number | null;
   live?: boolean;
   error?: string;
+  // Survey fields (full-frame surface measurement — scan module only)
+  fully_framed?: boolean | null;
+  outline_uv?: Array<[number, number]> | null;   // 4 projected corners, normalized 0-1
+  grid_uv?: Array<[[number, number], [number, number]]> | null;  // metric grid segments
+  grid_spacing_mm?: number | null;
+  extent_mm?: [number, number] | null;           // (longer, shorter) surface size mm
 }
 
 const W = 1280, H = 720, CX = W / 2, CY = H / 2;
@@ -35,7 +41,7 @@ const MONO = "ui-monospace, Consolas, monospace";
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const r = (n: number) => Math.round(n);
 
-function Hud({ gate }: { gate: GateReading | null }) {
+function Hud({ gate, mode = "scan" }: { gate: GateReading | null; mode?: "calibration" | "scan" }) {
   const detected = !!gate?.detected;
   const locked = !!gate?.ok;
   const main = locked ? OK : detected ? WARN : BAD;
@@ -66,6 +72,24 @@ function Hud({ gate }: { gate: GateReading | null }) {
         <circle cx={CX} cy={CY} r={7} fill={detected ? main : "none"} />
       </g>
 
+      {/* survey surface overlay (outline + metric grid) — behind all other HUD elements */}
+      {mode === "scan" && gate?.outline_uv && gate.outline_uv.length >= 3 && (() => {
+        const pts = gate.outline_uv!.map(([u, v]) =>
+          `${(u * W).toFixed(1)},${(v * H).toFixed(1)}`).join(" ");
+        const col = gate.fully_framed == null ? DIM
+          : gate.fully_framed ? OK : WARN;
+        return (
+          <>
+            <polygon points={pts} fill="none" stroke={col} strokeWidth={2.5}
+                     strokeDasharray="10 6" opacity={0.75} />
+            {gate.grid_uv && gate.grid_uv.map(([[u1, v1], [u2, v2]], i) => (
+              <line key={i} x1={u1 * W} y1={v1 * H} x2={u2 * W} y2={v2 * H}
+                    stroke={col} strokeWidth={1} opacity={0.35} />
+            ))}
+          </>
+        );
+      })()}
+
       {/* fly-to vector + board lock bracket */}
       {detected && (
         <>
@@ -94,6 +118,15 @@ function Hud({ gate }: { gate: GateReading | null }) {
           {(gate.tilt_b_deg != null || gate.tilt_c_deg != null) && (
             <TiltFix b={gate.tilt_b_deg ?? 0} c={gate.tilt_c_deg ?? 0}
                      ok={!!gate.gates?.angle} />
+          )}
+          {/* Surface framing readout (survey mode only — scan module). */}
+          {mode === "scan" && gate.fully_framed != null && (
+            <Readout y={440} label="FRAMED"
+              value={gate.extent_mm
+                ? `${r(gate.extent_mm[0])}×${r(gate.extent_mm[1])}`
+                : gate.fully_framed ? "FULL" : "OVER"}
+              unit={gate.extent_mm ? "mm" : ""}
+              ok={!!gate.gates?.framed} />
           )}
         </>
       )}
@@ -205,7 +238,10 @@ function JogBar({ move, ctol, dtol }:
 }
 
 // -- error boundary: never let a bad frame blank the page; self-heal next frame.
-export default class AimHud extends Component<{ gate: GateReading | null }, { err: boolean }> {
+export default class AimHud extends Component<
+  { gate: GateReading | null; mode?: "calibration" | "scan" },
+  { err: boolean }
+> {
   state = { err: false };
   static getDerivedStateFromError() { return { err: true }; }
   componentDidUpdate(prev: { gate: GateReading | null }) {
@@ -213,6 +249,6 @@ export default class AimHud extends Component<{ gate: GateReading | null }, { er
   }
   render(): ReactNode {
     if (this.state.err) return null;
-    return <Hud gate={this.props.gate} />;
+    return <Hud gate={this.props.gate} mode={this.props.mode} />;
   }
 }
