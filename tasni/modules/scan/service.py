@@ -28,6 +28,7 @@ import cv2
 import numpy as np
 
 from ...core import runs
+from ...core.camera import CameraError
 from ...core.events import JobEvent
 from ...core.jobrunner import JobContext
 from ...core.logging import get_logger, new_run_dir
@@ -379,6 +380,18 @@ class ScanCaptureJob:
                     pass
 
     def _capture(self, ctx, rdk, cam, targets, scfg):
+        """Visit each target and gather a depth+color view per pose. Burst mode (if
+        enabled and the server supports it) buffers frames on the Jetson and pulls
+        them in one transfer at the end; otherwise grab per pose. Falls back to the
+        per-pose path if the burst handshake is rejected (a pre-burst server)."""
+        if scfg.burst_capture:
+            try:
+                return self._capture_burst(ctx, rdk, cam, targets, scfg)
+            except CameraError as e:
+                ctx.log(f"burst capture unavailable ({e}); using per-pose grab")
+        return self._capture_per_pose(ctx, rdk, cam, targets, scfg)
+
+    def _capture_per_pose(self, ctx, rdk, cam, targets, scfg):
         views: list[ScanView] = []
         skipped: list[str] = []
         total = len(targets)
@@ -398,6 +411,57 @@ class ScanCaptureJob:
             if ok:
                 ctx.frame(jpeg.tobytes())
             ctx.log(f"{name}: captured ({np.count_nonzero(frame.depth)} depth px)")
+        return views, skipped
+
+    def _capture_burst(self, ctx, rdk, cam, targets, scfg):
+        """Fast tour: at each pose the Jetson buffers the depth+color frame (a quick
+        round-trip returning a thumbnail), then all frames are pulled in ONE burst and
+        the Jetson buffer is dropped. The per-pose camera pose is still recorded as
+        each view's extrinsic, so the fused result is identical to the per-pose path —
+        only the network cost moves out of the robot loop.
+
+        Alignment: the server buffers one frame per CAP that returns a thumbnail (a
+        ``None`` thumbnail means it skipped that pose — no valid frame / buffer full),
+        so ``fetch_all`` returns exactly the buffered ones, in order. We therefore pair
+        the returned frames against only the poses whose CAP buffered a frame — never
+        by raw target index, which would misalign every view after a skip."""
+        skipped: list[str] = []
+        captured: list = []          # (name, pose) for each CAP that buffered a frame
+        total = len(targets)
+        with cam.burst(timeout=scfg.grab_timeout_s) as bs:
+            for i, name in enumerate(targets):
+                ctx.check_cancel()
+                ctx.progress(i + 1, total, f"capturing {name}")
+                rdk.move_j(name)
+                time.sleep(scfg.settle_s)
+                thumb = bs.capture()                   # Jetson grabs + buffers the frame
+                if thumb is None:                      # server skipped -> not in fetch_all
+                    ctx.log(f"{name}: no frame buffered — skipped")
+                    skipped.append(name)
+                    continue
+                try:
+                    pose = rdk.camera_pose_T()         # uses the STORED tool offset
+                except Exception:
+                    pose = None
+                captured.append((name, pose))
+                ctx.frame(thumb)                       # live per-pose thumbnail strip
+                ctx.log(f"{name}: captured (buffered on Jetson)")
+            ctx.progress(total, total, "downloading buffered frames…")
+            ctx.log("transferring all buffered frames from the Jetson in one burst…")
+            frames = bs.fetch_all()
+            bs.clear()                                 # delete the buffer on the Jetson
+
+        if len(frames) != len(captured):
+            ctx.log(f"WARNING: Jetson returned {len(frames)} frame(s) but {len(captured)} "
+                    f"were buffered — pairing the overlap (some views may be dropped)")
+        views: list[ScanView] = []
+        for (name, pose), fr in zip(captured, frames):
+            if fr is None or fr.depth is None or pose is None:
+                ctx.log(f"{name}: no depth/pose — skipped")
+                skipped.append(name)
+                continue
+            views.append(ScanView(color=fr.color, depth=fr.depth, pose_T=pose))
+        ctx.log(f"burst transfer complete: {len(frames)} frame(s), {len(views)} usable")
         return views, skipped
 
 

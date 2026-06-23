@@ -210,6 +210,83 @@ class CameraClient:
     def grab_color(self, *, with_depth: bool = False) -> np.ndarray:
         return self.grab(with_depth=with_depth).color
 
+    @contextmanager
+    def burst(self, *, timeout: float | None = None):
+        """Open a burst-capture session (see :class:`_BurstSession`).
+
+        At each pose the client tells the server to buffer one depth+color frame in
+        RAM (a fast, near-thumbnail round-trip); after the tour all frames are pulled
+        in ONE transfer and the server buffer is dropped. This keeps the robot tour
+        from stalling on a per-pose depth transfer over Wi-Fi while preserving the
+        exact same per-frame data the per-pose path uses (so fusion is identical).
+
+        Negotiates support first: sends ``MODE BURST`` and expects ``BURST READY``.
+        A server that predates burst would instead start a full stream, so the ack
+        check fails and we raise :class:`CameraError` — letting the caller fall back
+        to per-pose :meth:`grab`. Unicast: stop any other camera user first."""
+        cfg = self.config
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(cfg.timeout_s if timeout is None else timeout)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        _set_nodelay(s)
+        try:
+            s.connect((cfg.ip, cfg.port))
+        except (socket.timeout, OSError) as e:
+            s.close()
+            raise CameraError(f"camera socket error: {e}") from e
+        ready = b""
+        try:
+            s.sendall(b"MODE BURST\n")
+            ready = self._recv_exact(s, len(b"BURST READY\n"))
+        except (CameraError, OSError) as e:
+            s.close()
+            raise CameraError(f"burst handshake failed (old server?): {e}") from e
+        if not ready.startswith(b"BURST READY"):
+            s.close()
+            raise CameraError("camera server does not support burst capture")
+        try:
+            yield _BurstSession(self, s)
+        finally:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            s.close()
+
+
+class _BurstSession:
+    """An open burst connection. The server buffers frames in RAM and ships them on
+    :meth:`fetch_all`; :meth:`clear` drops that buffer (so nothing is left on the
+    Jetson). Commands are newline-terminated; replies are length-prefixed."""
+
+    def __init__(self, client: "CameraClient", sock: socket.socket):
+        self._client = client
+        self._sock = sock
+
+    def capture(self) -> bytes | None:
+        """Tell the server to grab + buffer one depth+color frame. Returns a small
+        color thumbnail (JPEG bytes) for the live per-pose strip, or ``None`` if the
+        server skipped it (no valid frame, or the buffer is full)."""
+        self._sock.sendall(b"CAP\n")
+        _idx = struct.unpack("<I", self._client._recv_exact(self._sock, 4))[0]
+        thumb_len = struct.unpack("<I", self._client._recv_exact(self._sock, 4))[0]
+        if thumb_len == 0:
+            return None
+        return self._client._recv_exact(self._sock, thumb_len)
+
+    def fetch_all(self) -> "list[Frame]":
+        """Pull every buffered frame in one burst, in capture order (the per-frame
+        framing is identical to the normal stream, so decode is shared)."""
+        self._sock.sendall(b"GET\n")
+        count = struct.unpack("<I", self._client._recv_exact(self._sock, 4))[0]
+        return [self._client._read_frame(self._sock, with_depth=True)
+                for _ in range(count)]
+
+    def clear(self) -> None:
+        """Drop the server's RAM buffer — delete the captured data on the Jetson."""
+        self._sock.sendall(b"CLEAR\n")
+        self._client._recv_exact(self._sock, 4)        # ack
+
 
 class _CameraStream:
     """A held-open camera connection; ``read()`` returns the next frame."""

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -107,9 +108,25 @@ def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
             self.inserted["mesh"] = path
             return SimpleNamespace(Valid=lambda: True)
 
+    class FakeBurst:
+        """Mimics _BurstSession: CAP renders+buffers the frame at the current pose,
+        GET returns them all in order, CLEAR records that the Jetson buffer dropped."""
+        def __init__(self): self._buf = []; self.cleared = False
+        def capture(self):
+            self._buf.append(_render(state["cam"]))
+            return b"thumb"                       # non-empty -> shows in the strip
+        def fetch_all(self): return list(self._buf)
+        def clear(self): self.cleared = True
+
     class FakeCamera:
+        def __init__(self): self.last_burst = None
         def grab(self, with_depth=False, timeout=None, color_only=False):
             return _render(state["cam"])
+        @contextmanager
+        def burst(self, timeout=None):
+            b = FakeBurst()
+            self.last_burst = b
+            yield b
 
     cfg = AppConfig()
     cfg.camera.intrinsics = {"320x240": K.tolist()}
@@ -186,6 +203,44 @@ def test_generate_run_insert():
           tuple(round(s) for s in res["plane"]["size_mm"]), "mm; inserted")
 
 
+def test_burst_capture_path():
+    """With scan.burst_capture on, the job captures via the burst session, fuses the
+    same table, and CLEARs the Jetson buffer (no data left on the device)."""
+    try:
+        import open3d  # noqa: F401
+    except Exception:
+        print("[skip] open3d not installed — `pip install -e .[scan]`")
+        return
+    services, state = _build_fakes()
+    services.config.scan.burst_capture = True
+
+    gen = scan_service.generate_scan_targets(services)
+    assert gen["created"] == 8, gen
+
+    with tempfile.TemporaryDirectory() as t:
+        runs.REPO_ROOT = Path(t)
+
+        def fake_new_run_dir(mid, stamp):
+            d = Path(t) / "runs" / mid / stamp
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        orig = scan_service.new_run_dir
+        scan_service.new_run_dir = fake_new_run_dir
+        try:
+            job = scan_service.ScanCaptureJob(services, scan_service.ScanParams())
+            res = job(_Ctx())
+            assert res["kind"] == "scan" and res["n_views"] == 8, res
+            sz = res["plane"]["size_mm"]
+            assert 240 < sz[0] < 360 and 240 < sz[1] < 360, sz   # ~300 x 300 mm table
+            assert res["plane"]["inlier_frac"] > 0.8
+            assert services.camera.last_burst is not None
+            assert services.camera.last_burst.cleared, "burst buffer must be cleared on the Jetson"
+        finally:
+            scan_service.new_run_dir = orig
+            runs.REPO_ROOT = _ORIG_ROOT
+    print("[scan burst] gen 8 ->", res["n_views"], "views fused via burst; buffer cleared")
+
+
 def test_generate_refuses_when_too_far():
     services, state = _build_fakes()
     state["cam"] = _look_at((0, 0, 900), (0, 0, 0))      # 900 mm > 500 +/- 150
@@ -220,6 +275,7 @@ def test_run_without_targets_errors():
 
 if __name__ == "__main__":
     test_generate_run_insert()
+    test_burst_capture_path()
     test_generate_refuses_when_too_far()
     test_warns_but_proceeds_without_calibration()
     test_run_without_targets_errors()

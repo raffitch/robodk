@@ -85,13 +85,19 @@ def handle_client(conn, addr):
     # bandwidth ~10-20x and offloads the CPU. It is lossy + inter-frame (can soften
     # ChArUco corners) so it's the live-preview path only; one-shot captures keep
     # the JPEG/lossless path (the client never requests H264 for those).
+    #     "MODE BURST"        -> burst capture: buffer aligned depth+color frames in
+    #                            RAM and ship them all in one transfer at the end (see
+    #                            stream_burst). Keeps the robot tour from stalling on a
+    #                            per-pose depth transfer over Wi-Fi.
     color_only = False
     quality = None
     codec = 'jpeg'
+    burst = False
     h264_bitrate = 4000  # kbps; overridden by a "B<kbps>" handshake token
     try:
         conn.settimeout(0.5)
         req = conn.recv(64).strip().upper()
+        burst = req.startswith(b'MODE BURST')
         color_only = req.startswith(b'MODE COLOR') or req == b'C'
         for tok in req.split():
             if tok == b'H264':
@@ -111,7 +117,14 @@ def handle_client(conn, addr):
         # depth+color frame over slow Wi-Fi can take a few seconds) is not killed.
         conn.settimeout(10.0)
     print(f"Connection from {addr} (color_only={color_only}, codec={codec}, "
-          f"quality={quality}, bitrate={h264_bitrate})")
+          f"quality={quality}, bitrate={h264_bitrate}, burst={burst})")
+
+    if burst:
+        # Burst capture: interactive CAP/GET/CLEAR loop on this connection; returns
+        # to accept() when the client disconnects (or the buffer is done).
+        stream_burst(conn, addr)
+        conn.close()
+        return
 
     if codec == 'h264':
         # Hardware H.264 path: relay the NVENC byte-stream over this connection and
@@ -256,6 +269,106 @@ def stream_h264(conn, addr, width, height, bitrate_kbps):
             except OSError:
                 pass
         feeder_thread.join(timeout=2)
+
+
+def _recv_line(conn, maxlen=64):
+    """Read one newline-terminated command line from ``conn`` (CAP/GET/CLEAR).
+
+    Commands are tiny and the client sends one at a time (it waits for each reply
+    before sending the next), so a byte-at-a-time read can't over-read into the next
+    command or into frame data. Returns b'' if the peer closed."""
+    buf = bytearray()
+    while len(buf) < maxlen:
+        ch = conn.recv(1)
+        if not ch:
+            break                 # peer closed
+        if ch == b'\n':
+            break
+        buf.extend(ch)
+    return bytes(buf)
+
+
+def stream_burst(conn, addr, max_frames=64):
+    """Burst capture: buffer aligned depth+color frames on the Jetson, then transfer
+    them all in one burst — so the robot tour isn't stalled by a per-pose depth
+    transfer over the cell's Wi-Fi (a full depth+color frame can take 6-11 s).
+
+    Protocol on this connection (newline-terminated commands; length-prefixed replies):
+
+        (server first sends ``BURST READY\\n`` so the client can confirm support)
+        CAP    -> grab + align + filter + compress ONE frame into a RAM buffer; reply
+                  ``<I idx><I thumb_len><thumb JPEG>`` (a small color thumbnail for the
+                  client's live per-pose strip). thumb_len=0 signals a skip.
+        GET    -> reply ``<I count>`` then each buffered frame as
+                  ``<I depth_len><I color_len><d ts> + depth(lz4 .npy) + color(JPEG)``
+                  (identical per-frame framing to the normal stream, so the client
+                  reuses its decoder).
+        CLEAR  -> drop the buffer; reply ``<I 0>``.
+
+    The buffer is RAM-only and is ALSO dropped when the connection ends (finally), so
+    an abandoned/dropped burst leaves NO data on the Jetson — no disk garbage. Between
+    CAP commands the robot is moving, so the command read uses a generous timeout."""
+    jpeg = turbojpeg.TurboJPEG('/usr/lib/aarch64-linux-gnu/libturbojpeg.so.0')
+    buffer = []   # list of (depth_compressed: bytes, color_jpeg: bytes, ts: float)
+    try:
+        conn.sendall(b'BURST READY\n')
+    except OSError:
+        return
+    print(f"Burst session opened with {addr}")
+    try:
+        while True:
+            # The next command may be many seconds away (the robot is moving between
+            # poses); wait generously rather than dropping the connection.
+            conn.settimeout(180.0)
+            cmd = _recv_line(conn).strip().upper()
+            if not cmd:
+                break                      # peer closed
+
+            if cmd == b'CAP':
+                depth = color = None
+                tries = 0
+                while (depth is None or color is None) and tries < 10:
+                    depth, color, _ts = getFrames(pipeline, align, depth_filters)
+                    tries += 1
+                if depth is None or color is None or len(buffer) >= max_frames:
+                    # signal a skip (no frame / buffer full) — index still advances
+                    conn.sendall(struct.pack('<I', len(buffer)) + struct.pack('<I', 0))
+                    continue
+                depth_buffer = io.BytesIO()
+                np.save(depth_buffer, depth)
+                depth_buffer.seek(0)
+                depth_compressed = lz4f.compress(depth_buffer.read())
+                color_jpeg = jpeg.encode(color)
+                idx = len(buffer)
+                buffer.append((depth_compressed, color_jpeg, _ts))
+                # Small thumbnail (~4x downscale) for the live per-pose strip.
+                thumb_src = np.ascontiguousarray(color[::4, ::4])
+                thumb = jpeg.encode(thumb_src, quality=60)
+                conn.sendall(struct.pack('<I', idx) + struct.pack('<I', len(thumb)) + thumb)
+
+            elif cmd == b'GET':
+                # One bulk transfer of all buffered frames. Send frame-by-frame (each
+                # bounded like the normal path) under a generous timeout.
+                conn.settimeout(120.0)
+                conn.sendall(struct.pack('<I', len(buffer)))
+                for depth_compressed, color_jpeg, ts in buffer:
+                    frame_data = (struct.pack('<I', len(depth_compressed))
+                                  + struct.pack('<I', len(color_jpeg))
+                                  + struct.pack('<d', ts)
+                                  + depth_compressed + color_jpeg)
+                    conn.sendall(frame_data)
+
+            elif cmd == b'CLEAR':
+                buffer = []
+                conn.sendall(struct.pack('<I', 0))
+
+            # unknown commands are ignored (keeps the protocol forgiving)
+    except (ConnectionResetError, BrokenPipeError, socket.timeout, OSError) as e:
+        print(f"Burst connection to {addr} ended: {e}")
+    finally:
+        n = len(buffer)
+        buffer = []                        # RAM buffer dropped — nothing left on the Jetson
+        print(f"Burst session with {addr} closed; cleared {n} buffered frame(s)")
 
 
 def setup_depth_filters():

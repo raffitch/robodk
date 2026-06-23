@@ -26,7 +26,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tasni.core.camera import CameraClient, _HEADER  # noqa: E402
+from tasni.core.camera import CameraClient, CameraError, _HEADER  # noqa: E402
 from tasni.core.config import CameraConfig  # noqa: E402
 
 
@@ -250,6 +250,135 @@ def test_decode_color_cv2_fallback_matches_turbojpeg_path():
     print("[decode] turbojpeg and cv2-fallback decode agree")
 
 
+# -- burst capture ----------------------------------------------------------
+def _thumb_jpeg(color: np.ndarray) -> bytes:
+    """A small color thumbnail, the server's way (~4x downscale -> JPEG)."""
+    import cv2
+
+    ok, jpeg = cv2.imencode(".jpg", np.ascontiguousarray(color[::4, ::4]),
+                            [cv2.IMWRITE_JPEG_QUALITY, 60])
+    assert ok
+    return jpeg.tobytes()
+
+
+class FakeBurstSocket:
+    """In-memory burst *server*: interprets MODE BURST / CAP / GET / CLEAR and queues
+    exactly the bytes the real ``stream_burst`` would send, so the client's
+    ``_BurstSession`` exercises the real framing with no OS sockets. Kept in lockstep
+    with server_unicast_syncronous.py:stream_burst the same way ``_server_encode``
+    mirrors the per-frame framing."""
+
+    def __init__(self, frames: "list[tuple[np.ndarray, np.ndarray, float]]"):
+        self._frames = frames            # (color, depth, ts) to serve, in CAP order
+        self._buffer: list[bytes] = []   # full per-frame bytes captured so far
+        self._out = bytearray()          # bytes queued for the client to recv
+        self._pos = 0
+        self.cleared = False
+
+    def sendall(self, data: bytes) -> None:
+        for line in bytes(data).split(b"\n"):
+            cmd = line.strip().upper()
+            if not cmd:
+                continue
+            if cmd.startswith(b"MODE BURST"):
+                self._out.extend(b"BURST READY\n")
+            elif cmd == b"CAP":
+                color, depth, ts = self._frames[len(self._buffer)]
+                frame, _ = _server_encode(color, depth, ts)
+                idx = len(self._buffer)
+                self._buffer.append(frame)
+                thumb = _thumb_jpeg(color)
+                self._out += struct.pack("<I", idx) + struct.pack("<I", len(thumb)) + thumb
+            elif cmd == b"GET":
+                self._out += struct.pack("<I", len(self._buffer))
+                for frame in self._buffer:
+                    self._out += frame
+            elif cmd == b"CLEAR":
+                self._buffer = []
+                self.cleared = True
+                self._out += struct.pack("<I", 0)
+
+    def recv(self, n: int) -> bytes:
+        if self._pos >= len(self._out):
+            return b""
+        end = min(self._pos + min(n, 7), len(self._out))   # 7-byte chunks
+        out = bytes(self._out[self._pos:end])
+        self._pos = end
+        return out
+
+    def settimeout(self, *_a): pass
+    def setsockopt(self, *_a): pass
+    def connect(self, *_a): pass
+    def shutdown(self, *_a): pass
+    def close(self): pass
+
+
+def test_burst_session_roundtrip():
+    """CAP buffers a frame + returns a thumbnail; GET bursts every frame back in
+    order (depth+color+ts lossless); CLEAR drops the Jetson buffer."""
+    import tasni.core.camera as camera_mod
+
+    client = CameraClient(CameraConfig())
+    colors = [_make_color() for _ in range(3)]
+    depths = [np.arange(64 * 48, dtype=np.uint16).reshape(48, 64) * (k + 1) for k in range(3)]
+    frames_in = list(zip(colors, depths, [1.0, 2.0, 3.0]))
+    sock = FakeBurstSocket(frames_in)
+
+    orig = camera_mod.socket.socket
+    camera_mod.socket.socket = lambda *a, **k: sock
+    try:
+        with client.burst() as bs:
+            thumbs = [bs.capture() for _ in range(3)]
+            frames = bs.fetch_all()
+            bs.clear()
+    finally:
+        camera_mod.socket.socket = orig
+
+    assert all(t for t in thumbs), "each CAP should return a thumbnail"
+    assert len(frames) == 3
+    for fr, (color, depth, ts) in zip(frames, frames_in):
+        _assert_color_roundtrip(fr.color, color)
+        np.testing.assert_array_equal(fr.depth, depth)     # lz4+npy is lossless
+        assert abs(fr.timestamp - ts) < 1e-6
+    assert sock.cleared, "CLEAR must drop the server buffer (no Jetson garbage)"
+    print("[burst] CAP buffers+thumb, GET bursts all frames in order, CLEAR drops buffer")
+
+
+def test_burst_handshake_rejected_on_old_server():
+    """A pre-burst server doesn't answer with BURST READY (it would start a full
+    stream), so the client must raise CameraError — the caller falls back to grab()."""
+    import tasni.core.camera as camera_mod
+
+    client = CameraClient(CameraConfig())
+    frame_bytes, _ = _server_encode(_make_color(), None, 1.0)   # old server just streams
+    sock = FakeSocket(frame_bytes)
+
+    orig = camera_mod.socket.socket
+    camera_mod.socket.socket = lambda *a, **k: sock
+    raised = False
+    try:
+        with client.burst():
+            pass
+    except CameraError:
+        raised = True
+    finally:
+        camera_mod.socket.socket = orig
+    assert raised, "burst() must reject a server that doesn't advertise BURST READY"
+    print("[burst] old server (no BURST READY) -> CameraError; client falls back")
+
+
+def test_server_burst_handshake_detection():
+    """Mirror the server's routing: a `MODE BURST` line selects burst mode (and is
+    distinct from MODE COLOR / FULL)."""
+    def detects_burst(req: bytes) -> bool:
+        return req.strip().upper().startswith(b"MODE BURST")
+    assert detects_burst(b"MODE BURST\n")
+    assert not detects_burst(b"MODE COLOR\n")
+    assert not detects_burst(b"")
+    assert not detects_burst(b"garbage")
+    print("[handshake] MODE BURST routes to burst mode")
+
+
 if __name__ == "__main__":
     test_full_frame_roundtrip()
     test_color_only_means_depth_len_zero()
@@ -258,4 +387,7 @@ if __name__ == "__main__":
     test_server_parses_quality_handshake()
     test_recv_exact_reassembles_across_chunks()
     test_decode_color_cv2_fallback_matches_turbojpeg_path()
+    test_burst_session_roundtrip()
+    test_burst_handshake_rejected_on_old_server()
+    test_server_burst_handshake_detection()
     print("\nCamera wire-format round-trip tests passed.")

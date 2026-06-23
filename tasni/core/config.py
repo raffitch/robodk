@@ -306,6 +306,17 @@ class ScanConfig(_Model):
     # -- capture ------------------------------------------------------------
     settle_s: float = 0.4               # pause after MoveJ before grabbing
     frames_per_pose: int = 1            # depth frames per pose (1 = single grab)
+    # Burst capture (opt-in; needs the burst-capable Jetson server). Default
+    # per-pose capture grabs depth+color over Wi-Fi at EACH pose (~6-11 s each),
+    # stalling the robot between poses. Burst mode instead has the Jetson buffer
+    # each pose's frame in RAM and transfer them all in ONE burst after the tour —
+    # the robot tour isn't blocked on transfer and the (same total) bytes move in a
+    # single efficient stream. The Jetson buffer is RAM-only and is dropped after a
+    # successful transfer AND on disconnect, so no data is left on the device.
+    # OFF until the burst-capable server is deployed: a pre-burst server would
+    # mishandle the handshake, so the client probes for support and FALLS BACK to
+    # per-pose grab if the server doesn't advertise it.
+    burst_capture: bool = False
 
     # -- TSDF fusion (Open3D ScalableTSDFVolume) ----------------------------
     # Per-view RGBD is integrated with the camera pose as extrinsic; the volume is
