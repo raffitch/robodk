@@ -612,3 +612,87 @@ class RdkIO:
         known-good offset so the *camera* — not the flange — is what the generated
         targets drive. Returns the new tool item."""
         return self.robot().AddTool(T_to_pose(T), tool_name)
+
+    # -- scene geometry creation (scan module: frame / rectangle / mesh) ----
+    def robot_base_frame(self):
+        """The reference frame the robot is attached to (its parent), or ``None``.
+        Scan results are computed in this frame — each view's camera pose comes from
+        :meth:`camera_pose_T` in the active (base) frame — so new items default to it."""
+        import robolink
+
+        base = self.robot().Parent()
+        if base.Valid() and base.Type() == robolink.ITEM_TYPE_FRAME:
+            return base
+        return None
+
+    def add_frame(self, name: str, T: np.ndarray, parent=None):
+        """Create a reference FRAME named ``name`` at pose ``T`` (numpy 4x4) relative
+        to ``parent`` (default: the robot base frame). This is the *working frame* the
+        scan derives from the table plane — the user then programs/jogs in it. Replaces
+        any existing same-named frame so re-inserting a scan is idempotent. Returns the
+        frame item."""
+        import robolink
+
+        parent = parent if parent is not None else self.robot_base_frame()
+        existing = self.rdk.Item(name, robolink.ITEM_TYPE_FRAME)
+        if existing.Valid():
+            existing.Delete()
+        frame = self.rdk.AddFrame(name, parent if parent is not None else 0)
+        frame.setPose(T_to_pose(T))
+        return frame
+
+    def add_rectangle(self, name: str, corners_xyz: np.ndarray, parent=None,
+                      color: list | None = None):
+        """Create a flat quadrilateral OBJECT from 4 ``corners_xyz`` (4x3, ordered
+        around the rectangle) as a visual work-surface reference. The corner
+        coordinates are in ``parent`` (default: robot base frame), the frame the scan
+        computes them in. Replaces any existing same-named object. Returns the object.
+
+        Implemented as a tiny 2-triangle OBJ imported via ``AddFile`` rather than
+        ``AddShape``: RoboDK's ``AddShape`` rejects a shape when an attach *parent* is
+        given ("Invalid shape … 3xN") and returns an invalid item, whereas a parented
+        ``AddFile`` is reliable (the same path the fused mesh uses)."""
+        import os
+        from tempfile import TemporaryDirectory
+
+        import robolink
+
+        c = np.asarray(corners_xyz, dtype=float).reshape(4, 3)
+        existing = self.rdk.Item(name, robolink.ITEM_TYPE_OBJECT)
+        if existing.Valid():
+            existing.Delete()
+        # 4 vertices, 2 triangles — both windings so the quad is visible from either
+        # side (no back-face culling surprises).
+        lines = ["# Tasni work-surface rectangle"]
+        lines += [f"v {p[0]:.6f} {p[1]:.6f} {p[2]:.6f}" for p in c]
+        lines += ["f 1 2 3", "f 1 3 4", "f 1 3 2", "f 1 4 3"]
+        add_to = parent if parent is not None else self.robot_base_frame()
+        with TemporaryDirectory(prefix="tasni_rect_") as td:
+            path = os.path.join(td, "rect.obj")
+            with open(path, "w", encoding="ascii") as fh:
+                fh.write("\n".join(lines) + "\n")
+            obj = self.rdk.AddFile(path, add_to if add_to is not None else 0)
+        if obj.Valid():
+            obj.setName(name)
+            obj.setColor(color if color is not None else [0.0, 0.6, 1.0, 0.5])
+        return obj
+
+    def add_mesh_file(self, name: str, path: str, parent=None,
+                      color: list | None = None):
+        """Import a mesh file (``.obj``/``.ply``/...) as an OBJECT named ``name`` under
+        ``parent`` (default: robot base frame) — the fused scan surface. Mirrors
+        ``macros/3DScan.py:save_point_cloud`` (``AddFile`` + name + color). Replaces any
+        existing same-named object. Returns the object item (invalid item if the import
+        failed)."""
+        import robolink
+
+        existing = self.rdk.Item(name, robolink.ITEM_TYPE_OBJECT)
+        if existing.Valid():
+            existing.Delete()
+        add_to = parent if parent is not None else self.robot_base_frame()
+        item = self.rdk.AddFile(path, add_to if add_to is not None else 0)
+        if item.Valid():
+            item.setName(name)
+            if color is not None:
+                item.setColor(color)
+        return item

@@ -20,6 +20,10 @@ export interface GateReading {
   max_tilt_deg?: number;
   move_cam?: [number, number, number] | null;  // camera-frame mm to reach ideal
   center_tol_mm?: number;
+  // Scan standoff gate only: how to correct a surface tilt, as TOOL-frame rotations
+  // (KUKA A/B/C: A=about Z, B=about Y, C=about X). Absent for the calibration board gate.
+  tilt_b_deg?: number | null;
+  tilt_c_deg?: number | null;
   live?: boolean;
   error?: string;
 }
@@ -86,6 +90,11 @@ function Hud({ gate }: { gate: GateReading | null }) {
           <Readout y={200} label="TILT" value={`${(gate.tilt_deg ?? 0).toFixed(1)}`}
             unit={`deg  max ${r(gate.max_tilt_deg ?? 25)}`}
             ok={!!gate.gates?.angle} />
+          {/* Tilt-correction reference (scan only): which TOOL rotation levels it. */}
+          {(gate.tilt_b_deg != null || gate.tilt_c_deg != null) && (
+            <TiltFix b={gate.tilt_b_deg ?? 0} c={gate.tilt_c_deg ?? 0}
+                     ok={!!gate.gates?.angle} />
+          )}
         </>
       )}
 
@@ -125,6 +134,35 @@ function Readout({ y, label, value, unit, ok }:
       </text>
       <text x={44} y={y + 73} fontSize={48} fontWeight={800} fill={color}>
         {value}<tspan fontSize={25} fontWeight={500} fill={DIM} dx="12">{unit}</tspan>
+      </text>
+    </g>
+  );
+}
+
+function TiltFix({ b, c, ok }: { b: number; c: number; ok: boolean }) {
+  // Tells the operator which TOOL rotation makes the surface fronto-parallel, in
+  // KUKA A/B/C terms. B = rotate about Y (left/right), C = rotate about X (fwd/back);
+  // A = rotate about Z and does NOT change tilt. Signed degrees; small = leave it.
+  const color = ok ? OK : WARN;
+  const dir = (v: number, neg: string, pos: string) =>
+    Math.abs(v) < 1 ? "·" : v > 0 ? pos : neg;
+  return (
+    <g>
+      <rect x={26} y={296} width={384} height={132} rx={10} fill={INK} />
+      <text x={44} y={326} fontSize={23} fill={DIM}>
+        LEVEL — ROTATE TOOL
+        <tspan dx="10" fill={color} fontWeight={800}>{ok ? "✓ LEVEL" : "✗ TILTED"}</tspan>
+      </text>
+      <text x={44} y={366} fontSize={34} fontWeight={800} fill={color}>
+        B {dir(b, "◀", "▶")} {r(Math.abs(b))}°
+        <tspan fontSize={20} fontWeight={500} fill={DIM} dx="10">about Y · left/right</tspan>
+      </text>
+      <text x={44} y={402} fontSize={34} fontWeight={800} fill={color}>
+        C {dir(c, "▼", "▲")} {r(Math.abs(c))}°
+        <tspan fontSize={20} fontWeight={500} fill={DIM} dx="10">about X · fwd/back</tspan>
+      </text>
+      <text x={44} y={422} fontSize={17} fill={DIM}>
+        KUKA: A=rot Z (no tilt effect) · B=rot Y · C=rot X
       </text>
     </g>
   );

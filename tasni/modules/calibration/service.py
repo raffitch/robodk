@@ -509,20 +509,32 @@ class SimTourJob:
     so a dry tour can't leave the station silently in RUN_ROBOT.
     """
 
-    def __init__(self, services):
+    def __init__(self, services, *, target_prefix: str = TARGET_PREFIX,
+                 collision_self_pairs: bool | None = None,
+                 collision_skip_wrist_links: int | None = None):
         self.services = services
         self.tool_name: str = services.config.robodk.camera_tool
+        # Parameterised so the scan module reuses this exact dry tour for its own
+        # TasniScan_* targets + collision knobs; default to calibration's values so
+        # the calibration call sites are unchanged.
+        cc = services.config.calibration
+        self.target_prefix = target_prefix
+        self.collision_self_pairs = (cc.collision_self_pairs
+                                     if collision_self_pairs is None else collision_self_pairs)
+        self.collision_skip_wrist_links = (cc.collision_skip_wrist_links
+                                           if collision_skip_wrist_links is None
+                                           else collision_skip_wrist_links)
 
     def __call__(self, ctx: JobContext) -> dict:
         rdk: RdkIO = self.services.rdk
 
         ensure_camera_tool(self.services, log=ctx.log)
 
-        targets = rdk.list_targets(TARGET_PREFIX)
+        targets = rdk.list_targets(self.target_prefix)
         if not targets:
             raise RuntimeError(
-                "no TasniCalib_* targets to simulate — aim the camera until the "
-                "gate is green and click Create targets first")
+                f"no {self.target_prefix}* targets to simulate — aim the camera until "
+                f"the gate is green and click Create targets first")
 
         prior_mode = rdk.current_run_mode()
         rdk.apply_run_mode("simulate")
@@ -532,9 +544,9 @@ class SimTourJob:
         # Same blind spot as Create targets: RoboDK won't check a tool against its
         # own robot, so enable the mounted-tool↔arm pairs before the tour or the
         # spindle-into-A4 case stays invisible here too.
-        if collisions_on and self.services.config.calibration.collision_self_pairs:
+        if collisions_on and self.collision_self_pairs:
             guard = rdk.ensure_mounted_tool_collision_pairs(
-                self.services.config.calibration.collision_skip_wrist_links)
+                self.collision_skip_wrist_links)
             if guard and guard.get("pairs_enabled"):
                 ctx.log(f"collision guard: {guard['pairs_enabled']} tool↔arm pair(s) "
                         f"enabled ({', '.join(guard['tools']) or 'mounted tools'})")

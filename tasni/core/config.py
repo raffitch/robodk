@@ -247,6 +247,102 @@ class CalibrationConfig(_Model):
     collision_skip_wrist_links: int = 2
 
 
+class ScanConfig(_Model):
+    """Scan-module knobs (module #2): standoff gate + pose generation + capture +
+    TSDF fusion + plane/rectangle/frame extraction.
+
+    The scan reuses the *stored* hand-eye result (the camera tool offset +
+    intrinsics) to register each view — it never runs calibration. Defaults target
+    a small table at ~0.5 m standoff with a D435i.
+    """
+
+    target_prefix: str = "TasniScan_"   # generated scan poses (never reuse calib targets)
+
+    # -- standoff gate (depth-based; a table has no ChArUco board) ----------
+    # The operator jogs the camera to look down at the surface from a neutral
+    # standoff; these bands decide when the HUD lamps go green (all green ->
+    # Create targets). Distance is the median depth of a central image patch.
+    ideal_distance_mm: float = 500.0    # target camera<->surface standoff
+    distance_tol_mm: float = 150.0      # +/- band around ideal_distance_mm
+    max_tilt_deg: float = 35.0          # surface normal may be this far off the optical axis
+    center_patch_frac: float = 0.25     # central image fraction sampled for depth/normal
+    min_valid_depth_frac: float = 0.5   # >= this fraction of the patch must have valid depth
+
+    # -- live preview while aiming ------------------------------------------
+    # The video streams COLOR-ONLY (fast, like calibration); the depth gate
+    # (distance + tilt) is refreshed on an interleave every ``gate_period_s`` (the
+    # unicast camera can't stream fast color AND depth at once). So the preview
+    # stays smooth while the standoff/tilt readout updates ~once a second.
+    preview_fps: float = 6.0
+    preview_timeout_s: float = 4.0
+    preview_jpeg_quality: int = 60      # color-only preview JPEG quality (Wi-Fi)
+    # The preview is a smooth COLOR-ONLY stream (same as calibration); the standoff +
+    # tilt panels (RANGE · TILT · LEVEL) are shown after the depth check on Create
+    # targets (it refuses + shows the tilt-fix if out of band, so you adjust and retry).
+    # live_depth_gate=True would sample depth *live* during the preview for continuous
+    # panels — but a depth frame here takes ~8 s over the cell's Wi-Fi, which freezes
+    # the video and tanks the framerate, so it is OFF by default and only sensible on a
+    # WIRED link. Wiring the Jetson (Ethernet) is the single biggest win — see docs.
+    live_depth_gate: bool = False
+    gate_period_s: float = 1.2          # (live_depth_gate only) depth-grab interval
+    # Depth grabs are slow + variable over Wi-Fi (measured ~6-11 s), so the socket
+    # timeout for a depth-bearing grab must be generous or poses fail/skip. Color-only
+    # grabs/streaming keep the shorter ``camera.timeout_s``.
+    grab_timeout_s: float = 25.0
+    # HUD jog hints are in the camera optical frame (X right, Y down, Z forward).
+    jog_invert_x: bool = False
+    jog_invert_y: bool = False
+    jog_invert_z: bool = False
+
+    # -- pose generation (reuses the calibration cone+roll generator) -------
+    # Orbit the gated standoff seed in a cone so the surface stays in view, with
+    # roll + distance variation for viewing-angle diversity (better fusion).
+    pose_count: int = 12                # reachable poses to capture
+    cone_half_angle_deg: float = 40.0   # max view-angle change from the seed (down) view
+    roll_max_deg: float = 30.0          # roll spread about the optical axis
+    distance_jitter: float = 0.15       # +/- fraction of standoff
+    look_distance_mm: float = 500.0     # fallback standoff if the gate distance is unknown
+
+    # -- capture ------------------------------------------------------------
+    settle_s: float = 0.4               # pause after MoveJ before grabbing
+    frames_per_pose: int = 1            # depth frames per pose (1 = single grab)
+
+    # -- TSDF fusion (Open3D ScalableTSDFVolume) ----------------------------
+    # Per-view RGBD is integrated with the camera pose as extrinsic; the volume is
+    # a 3D weighted average -> denoised mesh. voxel_size drives resolution/cost.
+    voxel_size_m: float = 0.004         # 4 mm TSDF voxel
+    sdf_trunc_m: float = 0.02           # truncation distance (~5 voxels)
+    depth_scale: float = 1000.0         # RealSense depth units -> metres (uint16 mm)
+    depth_min_m: float = 0.2            # ignore depth nearer than this
+    depth_max_m: float = 1.5            # ignore depth farther than this (table standoff)
+    preview_max_points: int = 60000     # decimate the cloud before streaming to the viewer
+
+    # -- region of interest: isolate the work surface (the "top layer") ----
+    # Without this, fusing every view captures the whole room and RANSAC locks
+    # onto the FLOOR (the biggest plane), not the table. We crop the fused cloud to
+    # a box around where the camera was aimed (the look-point = each view's optical
+    # axis at its central depth, averaged) BEFORE fitting: a Z band a little below
+    # the surface to well above it drops the floor/ceiling, and the XY radius drops
+    # far walls/clutter. Generous XY by default so a normal table isn't clipped;
+    # raise it for a bigger surface, or disable to fuse everything.
+    roi_enabled: bool = True
+    roi_radius_m: float = 1.0           # XY half-extent around the aim (2 m box)
+    roi_below_m: float = 0.10           # keep this far below the surface (floor dropped)
+    roi_above_m: float = 0.40           # keep this far above (objects on the surface)
+
+    # -- plane + rectangle extraction (RANSAC on the fused cloud) -----------
+    ransac_distance_m: float = 0.006    # plane inlier band
+    ransac_n: int = 3
+    ransac_iterations: int = 1000
+    plane_downsample_m: float = 0.005   # voxel-downsample before RANSAC (speed/robustness)
+    min_inlier_frac: float = 0.25       # plane must claim >= this fraction of points to trust
+
+    # -- collision guard + dry tour (same semantics as calibration) --------
+    collision_filter: bool = True
+    collision_self_pairs: bool = True
+    collision_skip_wrist_links: int = 2
+
+
 class WebConfig(_Model):
     host: str = "127.0.0.1"
     port: int = 8000
@@ -257,6 +353,7 @@ class AppConfig(_Model):
     board: BoardConfig = Field(default_factory=BoardConfig)
     robodk: RoboDKConfig = Field(default_factory=RoboDKConfig)
     calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
+    scan: ScanConfig = Field(default_factory=ScanConfig)
     web: WebConfig = Field(default_factory=WebConfig)
 
 

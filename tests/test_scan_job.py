@@ -1,0 +1,226 @@
+"""Job-level scan test with fake core services — no RoboDK, real Open3D fusion.
+
+Drives the real path:
+  generate_scan_targets (depth gate -> seed=current pose -> reachable TasniScan_*)
+  -> ScanCaptureJob (visit, grab synthetic depth, TSDF fuse, fit work plane)
+  -> insert_scan (create frame + rectangle + mesh)
+
+The fake camera renders depth of a flat 300x300 mm "table" at base z=0 from the
+robot's current pose, so the fused surface + work frame are checked end to end.
+
+    py -3.10 tests/test_scan_job.py
+"""
+from __future__ import annotations
+
+import sys
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tasni.core import runs  # noqa: E402
+from tasni.core.camera_lease import CameraLease  # noqa: E402
+from tasni.core.config import AppConfig  # noqa: E402
+from tasni.core.geometry import Rt_to_T  # noqa: E402
+from tasni.core.jobrunner import JobContext  # noqa: E402
+from tasni.modules.scan import service as scan_service  # noqa: E402
+
+W, H = 320, 240
+K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
+TABLE_HALF_MM = 150.0
+_ORIG_ROOT = runs.REPO_ROOT
+
+
+class _Ctx(JobContext):
+    def __init__(self): self.frames = 0
+    def progress(self, *a, **k): pass
+    def log(self, *a, **k): pass
+    def frame(self, *a, **k): self.frames += 1
+    def check_cancel(self): pass
+
+
+def _look_at(cam_pos, target):
+    cam_pos = np.asarray(cam_pos, float)
+    z = np.asarray(target, float) - cam_pos
+    z /= np.linalg.norm(z)
+    a = np.array([1.0, 0, 0]) if abs(z[2]) > 0.9 else np.array([0, 0, 1.0])
+    x = np.cross(a, z); x /= np.linalg.norm(x)
+    y = np.cross(z, x)
+    return Rt_to_T(np.column_stack([x, y, z]), cam_pos)
+
+
+def _render(T_base_cam):
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    us, vs = np.meshgrid(np.arange(W), np.arange(H))
+    dirs_cam = np.stack([(us - cx) / fx, (vs - cy) / fy, np.ones_like(us, float)], -1)
+    R, t = T_base_cam[:3, :3], T_base_cam[:3, 3]
+    dirs_base = dirs_cam @ R.T
+    dz = dirs_base[..., 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        s = (0.0 - t[2]) / dz
+    P = t + s[..., None] * dirs_base
+    valid = ((np.abs(P[..., 0]) <= TABLE_HALF_MM) & (np.abs(P[..., 1]) <= TABLE_HALF_MM)
+             & (s > 0) & np.isfinite(s))
+    depth = np.where(valid, s, 0).astype(np.uint16)
+    color = np.full((H, W, 3), 128, np.uint8)
+    return SimpleNamespace(color=color, depth=depth, timestamp=0.0)
+
+
+def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
+    seed_T = _look_at((0, 0, 500), (0, 0, 0))           # straight down, 500 mm
+    state = {"cam": seed_T, "targets": {}, "joints": {}}
+    mount = Rt_to_T(np.eye(3), np.asarray(mount_mm, float))
+
+    class FakeRdk:
+        def __init__(self): self.inserted = {}
+        def item_exists(self, name): return True
+        def apply_run_mode(self, mode=None): return "run_robot"
+        def use_camera_tool(self, tool): return mount
+        def camera_pose_T(self): return state["cam"]
+        def current_joints(self): return "HOME"
+        def move_j_joints(self, j): state["cam"] = seed_T
+        def is_reachable(self, T): return True
+        def screen_collisions(self, poses, *, guard_skip=None):
+            return [True] * len(poses), False, [None] * len(poses)
+        def solve_joints_for_pose(self, T, seed=None):
+            return ("joints", float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
+        def ensure_mounted_tool_collision_pairs(self, skip_trailing=2):
+            return {"tools": ["Realsense"], "links": [0, 1, 2, 3, 4],
+                    "pairs_enabled": 10, "pairs_failed": 0, "dof": 6}
+        def list_targets(self, prefix=""):
+            return sorted(n for n in state["targets"] if n.startswith(prefix))
+        def add_target(self, name, T, joints=None):
+            state["targets"][name] = T; state["joints"][name] = joints
+        def delete_items(self, names):
+            for n in list(names): state["targets"].pop(n, None)
+        def move_j(self, name): state["cam"] = state["targets"][name]
+        def add_frame(self, name, T, parent=None):
+            self.inserted["frame"] = np.asarray(T, float)
+            return SimpleNamespace(Valid=lambda: True)
+        def add_rectangle(self, name, corners, parent=None, color=None):
+            self.inserted["rect"] = np.asarray(corners, float)
+            return SimpleNamespace(Valid=lambda: True)
+        def add_mesh_file(self, name, path, parent=None, color=None):
+            self.inserted["mesh"] = path
+            return SimpleNamespace(Valid=lambda: True)
+
+    class FakeCamera:
+        def grab(self, with_depth=False, timeout=None, color_only=False):
+            return _render(state["cam"])
+
+    cfg = AppConfig()
+    cfg.camera.intrinsics = {"320x240": K.tolist()}
+    cfg.camera.resolution = "320x240"
+    cfg.scan.pose_count = 8
+    cfg.scan.cone_half_angle_deg = 30.0
+    cfg.scan.voxel_size_m = 0.005
+    services = SimpleNamespace(config=cfg, rdk=FakeRdk(), camera=FakeCamera(),
+                               camera_lease=CameraLease(),
+                               bus=SimpleNamespace(publish=lambda *a, **k: None),
+                               live=SimpleNamespace(running=False, stop=lambda: None),
+                               calib_dry_tour_required=False)
+    return services, state
+
+
+def test_generate_run_insert():
+    try:
+        import open3d  # noqa: F401
+    except Exception:
+        print("[skip] open3d not installed — `pip install -e .[scan]`")
+        return
+    services, state = _build_fakes()
+    rdk = services.rdk
+
+    gen = scan_service.generate_scan_targets(services)
+    assert gen["created"] == 8, gen
+    assert all(n.startswith("TasniScan_") for n in gen["targets"])
+    assert gen["gate"]["ok"] is True
+    assert gen["calibration_on_file"] is True
+    assert abs(gen["look_distance_mm"] - 500) < 10
+
+    with tempfile.TemporaryDirectory() as t:
+        runs.REPO_ROOT = Path(t)
+
+        def fake_new_run_dir(mid, stamp):
+            d = Path(t) / "runs" / mid / stamp
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        orig = scan_service.new_run_dir
+        scan_service.new_run_dir = fake_new_run_dir
+        try:
+            job = scan_service.ScanCaptureJob(services, scan_service.ScanParams())
+            res = job(_Ctx())
+            assert res["kind"] == "scan" and res["can_insert"] is True
+            assert res["n_views"] == 8
+            assert res["mesh_vertices"] > 0
+            sz = res["plane"]["size_mm"]
+            assert 240 < sz[0] < 360 and 240 < sz[1] < 360, sz   # ~300 x 300 mm table
+            assert res["plane"]["inlier_frac"] > 0.8
+            # frame Z (col 2) points up out of the table
+            fT = np.asarray(res["plane"]["frame_T_mm"], float)
+            assert float(fT[:3, 2] @ [0, 0, 1]) > 0.99, fT[:3, 2]
+            # targets persist (user-created)
+            assert len(rdk.list_targets("TasniScan_")) == 8
+
+            # Insert from the in-memory result -> frame + rectangle + mesh created.
+            out = scan_service.insert_scan(services, job=job)
+            assert out["status"] == "inserted"
+            assert "frame" in rdk.inserted and "rect" in rdk.inserted and "mesh" in rdk.inserted
+            assert rdk.inserted["rect"].shape == (4, 3)
+            active = runs.read_active("scan")
+            assert active["frame"] == scan_service.FRAME_NAME
+
+            # Insert by run_id (from disk) also works.
+            rdk.inserted.clear()
+            stamp = res["stamp"]
+            out2 = scan_service.insert_scan(services, run_id=stamp)
+            assert out2["source"] == "run_id" and "frame" in rdk.inserted
+        finally:
+            scan_service.new_run_dir = orig
+            runs.REPO_ROOT = _ORIG_ROOT
+    print("[scan] gen 8 ->", res["n_views"], "views fused;",
+          res["mesh_vertices"], "verts; surface",
+          tuple(round(s) for s in res["plane"]["size_mm"]), "mm; inserted")
+
+
+def test_generate_refuses_when_too_far():
+    services, state = _build_fakes()
+    state["cam"] = _look_at((0, 0, 900), (0, 0, 0))      # 900 mm > 500 +/- 150
+    try:
+        scan_service.generate_scan_targets(services)
+        raise AssertionError("expected refusal — surface out of the standoff band")
+    except RuntimeError as e:
+        assert "distance" in str(e)
+    assert services.rdk.list_targets("TasniScan_") == []
+    print("[gate refusal] too-far standoff refused, nothing created")
+
+
+def test_warns_but_proceeds_without_calibration():
+    """Decoupling: a near-identity tool offset (no calibration) must NOT block —
+    it warns and still creates targets (calibration_on_file=False)."""
+    services, state = _build_fakes(mount_mm=(0.0, 0.0, 2.0))   # ~no offset
+    gen = scan_service.generate_scan_targets(services)
+    assert gen["created"] == 8
+    assert gen["calibration_on_file"] is False
+    print("[decoupled] no calibration on file -> warned, still created", gen["created"])
+
+
+def test_run_without_targets_errors():
+    services, _state = _build_fakes()
+    try:
+        scan_service.ScanCaptureJob(services, scan_service.ScanParams())(_Ctx())
+        raise AssertionError("expected run to require targets")
+    except RuntimeError as e:
+        assert "targets" in str(e)
+    print("[run needs targets] refused")
+
+
+if __name__ == "__main__":
+    test_generate_run_insert()
+    test_generate_refuses_when_too_far()
+    test_warns_but_proceeds_without_calibration()
+    test_run_without_targets_errors()
+    print("\nScan job (gate -> generate -> run -> insert) tests passed.")

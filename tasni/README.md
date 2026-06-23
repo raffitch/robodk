@@ -117,3 +117,33 @@ method, the solver now runs **all five and keeps the lowest-reprojection winner*
 singular-mount check (`tests/test_calibration_synthetic.py`) TSAI returns ~627 px
 while PARK wins at ~0 px. The reprojection metric still makes any bad solve
 **visible**; refinement sharpens the chosen winner.
+
+## Scan module (#2)
+
+3D-scan a work surface → a **fused mesh** + a **working frame + rectangle**, built on
+the same core + module pattern as calibration (`tasni/modules/scan/`). Replaces the
+old `macros/3DScan.py` (OpenCV/Open3D popups, concatenation-not-fusion, WSL/NKSR).
+
+- **Same flow, depth gate:** Connect → Start camera → a **depth standoff HUD**
+  (`scan/depth_gate.py`, pure numpy — no ChArUco board: it reads the central patch's
+  median depth + surface tilt) → **Create targets** (gate-gated; reachable cone poses
+  around the standoff seed, IK-filtered + collision-screened, left as `TasniScan_*`) →
+  **Dry run** (reuses calibration's `SimTourJob`) → **Run** → review → **Insert**.
+- **TSDF fusion** (`scan/reconstruct.py`, Open3D `ScalableTSDFVolume`): each posed
+  RGBD view is integrated with the camera pose as extrinsic → a denoised
+  marching-cubes mesh. "The biggest scan-quality win" from the best-practices review.
+- **Plane → frame + rectangle** (`scan/plane.py`, pure numpy): RANSAC the dominant
+  plane (normal = Z) + a minimum-area oriented rectangle, with a fixed **convention**
+  (origin = corner nearest the robot base, X = long edge) so the geometry-only frame is
+  repeatable without a marker.
+- **In-browser 3D review** (`webui/src/pages/ScanViewer.tsx`, Three.js): the fused
+  cloud + proposed frame/rectangle render in the page; nothing touches RoboDK until
+  **Insert** creates the frame + rectangle (+ mesh) via new `RdkIO.add_frame /
+  add_rectangle / add_mesh_file`.
+- **Decoupled from calibration:** uses the *stored* `Realsense` tool offset +
+  intrinsics; never runs calibration, only **warns** if none is on file.
+- **Dependency:** Open3D, imported lazily — `pip install -e .[scan]`. Artifacts
+  (mesh.obj/.ply, report.json, preview.npz) land in `runs/scan/<stamp>/`.
+- **Tests** (no hardware): `tests/test_scan_{config,plane,reconstruct,depth_gate,job}.py`.
+- Later modes of this module: object scan (same engine), a camera-feedback loop (the
+  live depth gate is the seam), and optional marker-anchored framing.
