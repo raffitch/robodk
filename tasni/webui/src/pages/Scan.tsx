@@ -62,6 +62,7 @@ export default function Scan() {
   const { mark: markFrame, reset: resetStream, stat: streamStat } = useStreamStats();
   const [targets, setTargets] = useState<number | null>(null);
   const [generating, setGenerating] = useState(false);
+  const [thumbs, setThumbs] = useState<string[]>([]);   // per-pose captures during a run
 
   const [result, setResult] = useState<ScanResult | null>(null);
   const [viewerNonce, setViewerNonce] = useState(0);
@@ -128,10 +129,17 @@ export default function Scan() {
       } else if (ev.type === "log") {
         addLog(ev.payload.message);
       } else if (ev.type === "frame") {
-        setFrame("data:image/jpeg;base64," + ev.payload.jpeg_b64);
-        markFrame();          // clock the stream rate/jitter (shown by StreamStats)
+        const src = "data:image/jpeg;base64," + ev.payload.jpeg_b64;
+        setFrame(src);
+        // During a real run each frame is one pose's capture — keep the strip.
+        // Otherwise it's the live aiming stream, so clock its rate/jitter.
+        if (runKindRef.current === "run") setThumbs((t) => [...t, src]);
+        else markFrame();
       } else if (ev.type === "gate") {
-        setGate(ev.payload as GateReading);
+        // Only real readings carry `gates`/`error`; ignore the color-only preview's
+        // empty liveness pings so the HUD never shows a misleading SEARCHING.
+        const p = ev.payload as GateReading;
+        if (p && (p.gates || p.error)) setGate(p);
       } else if (ev.type === "result") {
         if (ev.payload.name === "sim_tour") {
           setTour(ev.payload.result as TourResult);
@@ -150,12 +158,21 @@ export default function Scan() {
     });
   }, [subscribe]);
 
+  // Start (or resume) the smooth color preview. clearGate=true drops stale HUD
+  // panels (a fresh "Start camera"); clearGate=false keeps the last depth reading
+  // visible (resuming after a Create-targets check, so the operator keeps live
+  // video + fps alongside the standoff/tilt guidance).
+  const beginLive = async (clearGate: boolean) => {
+    resetStream();
+    if (clearGate) setGate(null);
+    await api.post("/live/start");
+    setLive(true);
+  };
   const startLive = async () => {
     try {
-      resetStream(); setGate(null);   // drop any stale panels from a prior check
-      await api.post("/live/start"); setLive(true);
+      await beginLive(true);
       addLog("camera started — jog it to look down at the table, then Create targets.");
-    } catch (e: any) { addLog("live: " + e.message, true); }
+    } catch (e: any) { setLive(false); addLog("live: " + e.message, true); }
   };
   const stopLive = async () => {
     try { await api.post("/live/stop"); } catch { /* ignore */ }
@@ -167,21 +184,24 @@ export default function Scan() {
       const r = await api.post<{ created: number; look_distance_mm: number;
         calibration_on_file: boolean; candidates_collided?: number;
         collisions_checked?: boolean }>("/poses/generate");
-      setTargets(r.created); setTour(null); setLive(false); resetStream();
+      setTargets(r.created); setTour(null);
       const cal = r.calibration_on_file ? "" :
         " ⚠ no calibration on file — the mesh/frame may be off; run Calibration once for accuracy.";
       addLog(`created ${r.created} scan targets (standoff ~${Math.round(r.look_distance_mm)} mm)`
         + (r.collisions_checked && r.candidates_collided
             ? ` (${r.candidates_collided} colliding filtered)` : "")
         + cal + " — inspect them in RoboDK, then Run.");
+      // The depth check stopped the server-side preview; resume it so the operator
+      // keeps live video + fps, with the green gate panels still shown as confirmation.
+      beginLive(false).catch(() => setLive(false));
     } catch (e: any) {
       // The authoritative grab stops the server-side preview and publishes the gate
-      // reading (distance/tilt + tilt-fix), so drop to not-live and let the HUD show
-      // that reading over the judged frame — the operator reads how to fix it, then
-      // Start camera again to re-aim.
-      setLive(false); resetStream();
+      // reading (distance/tilt + tilt-fix). Resume the live video so the operator can
+      // re-aim, keeping the HUD panels (the last reading) as guidance — then Create
+      // targets again to re-check.
       addLog("create targets: " + e.message, true);
       setRunError("Create targets: " + e.message);
+      beginLive(false).catch(() => setLive(false));
     } finally { setGenerating(false); }
   };
   const dryRun = async () => {
@@ -196,7 +216,7 @@ export default function Scan() {
   const openRunConfirm = () => { setCellClear(false); setShowConfirm(true); };
   const doRun = async () => {
     setShowConfirm(false);
-    setResult(null); setInserted(false); setPct(0); setRunError(null);
+    setResult(null); setInserted(false); setPct(0); setRunError(null); setThumbs([]);
     setStatus("starting…"); setRunning(true); setRunKind("run"); setLive(false);
     try { await api.post("/run"); }
     catch (e: any) {
@@ -367,6 +387,14 @@ export default function Scan() {
         )}
         <div className="progress"><div style={{ width: `${pct}%` }} /></div>
         <div className="status-line">{status}</div>
+
+        {thumbs.length > 0 && (
+          <div className="thumb-strip">
+            {thumbs.map((src, i) => (
+              <img key={i} src={src} alt={`pose ${i + 1}`} title={`pose ${i + 1}`} />
+            ))}
+          </div>
+        )}
       </div>
 
       {/* ---- Review + insert ------------------------------------------- */}

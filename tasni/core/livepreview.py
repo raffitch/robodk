@@ -133,7 +133,11 @@ class LivePreview:
                         frame = stream.read(drain=True, with_depth=vid_with_depth)
                         jpeg, metrics = analyze(frame)
                         _publish_frame(jpeg)
-                        if not interleave:
+                        if not interleave and metrics:
+                            # Scan's color-only preview yields no gate metrics ({});
+                            # publishing an empty gate would render the HUD as a
+                            # misleading SEARCHING. Calibration always yields a
+                            # populated reading, so it is unaffected.
                             _publish_gate(metrics)
                         elif time.monotonic() - last_depth >= depth_period_s:
                             break    # leave the color stream to refresh the depth gate
