@@ -4,6 +4,7 @@ import { useEvents, type JobEvent } from "../api/events";
 import AimHud, { type GateReading } from "./AimHud";
 import CalibrationGuide from "./CalibrationGuide";
 import ConeDiagram from "./ConeDiagram";
+import IntrinsicsPanel from "./IntrinsicsPanel";
 import StreamStats, { useStreamStats } from "./StreamStats";
 
 const api = moduleApi("calibration");
@@ -106,6 +107,9 @@ export default function Calibration() {
     { available: boolean; count: number | null; guarded_tools?: string[]; guarded_pairs?: number } | null>(null);
   const [collisionBusy, setCollisionBusy] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
+  // True while Step-0 intrinsic capture owns the shared camera stream — the main
+  // aiming subscription then ignores frames/gate so the two never cross-feed.
+  const intrinsicsLiveRef = useRef(false);
 
   // Phase 2 — safety & operator trust.
   const [tour, setTour] = useState<TourResult | null>(null);     // last dry-run verdict
@@ -207,6 +211,9 @@ export default function Calibration() {
       } else if (ev.type === "log") {
         addLog(ev.payload.message);
       } else if (ev.type === "frame") {
+        // Suppress only the IDLE aiming stream while Step-0 capture owns the camera;
+        // a real run's frames (board-lock thumbnails) must still come through.
+        if (intrinsicsLiveRef.current && runKindRef.current === null) return;
         const src = "data:image/jpeg;base64," + ev.payload.jpeg_b64;
         setFrame(src);
         // During a real run each frame is one pose's board lock — keep the strip.
@@ -214,6 +221,7 @@ export default function Calibration() {
         if (runKindRef.current === "run") setThumbs((t) => [...t, src]);
         else markFrame();
       } else if (ev.type === "gate") {
+        if ((ev.payload as any)?.mode === "intrinsics") return;   // not an aiming gate
         setGate(ev.payload as GateReading);
       } else if (ev.type === "result") {
         if (ev.payload.name === "sim_tour") {
@@ -234,6 +242,7 @@ export default function Calibration() {
   }, [subscribe]);
 
   const beginLive = async (clearGate: boolean) => {
+    intrinsicsLiveRef.current = false;   // aiming reclaims the shared camera stream
     resetStream();
     if (clearGate) setGate(null);
     await api.post("/live/start");
@@ -403,6 +412,19 @@ export default function Calibration() {
           <div className="hint">Connecting opens RoboDK (if needed) and checks the robot + camera tool.
             You jog the robot yourself; creating targets stays locked until the gate is green.</div>}
       </div>
+
+      {/* ---- Step 0: camera intrinsics (optional, camera-only) ---------- */}
+      <IntrinsicsPanel
+        disabled={running}
+        onLiveChange={(v) => {
+          intrinsicsLiveRef.current = v;
+          // Stop the aiming gate so the two camera streams don't fight; clear its
+          // stale frame/gate so the aiming HUD doesn't show the last intrinsics view.
+          if (v && live) stopLive();
+          if (v) { setFrame(null); setGate(null); }
+        }}
+        onApplied={loadConfig}
+      />
 
       {/* ---- Aiming gate ------------------------------------------------- */}
       <div className="card">
