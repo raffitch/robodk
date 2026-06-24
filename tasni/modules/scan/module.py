@@ -13,8 +13,10 @@ from pydantic import BaseModel
 
 from ..base import ServiceContainer, WorkflowModule
 from ..calibration.service import SimTourJob
-from .service import (ScanCaptureJob, ScanParams, generate_scan_targets,
-                      insert_scan, scan_gate_thresholds)
+from .service import (ScanCaptureJob, ScanParams, ScanResult, generate_scan_targets,
+                      insert_scan, scan_gate_thresholds, scan_gate_payload)
+from .depth_gate import evaluate_depth_gate
+from .survey import SurveyThresholds, survey_surface
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
@@ -36,6 +38,8 @@ class ScanModule(WorkflowModule):
     def __init__(self, services: ServiceContainer):
         super().__init__(services)
         self._active_job: ScanCaptureJob | None = None
+        self._reference_result: ScanResult | None = None  # set by reference-mode locate
+        self._planned_voxel_m: float | None = None         # set by /poses/generate for /run
 
     def router(self) -> "APIRouter":
         from fastapi import APIRouter, HTTPException, Response
@@ -127,11 +131,13 @@ class ScanModule(WorkflowModule):
             import cv2
 
             from ...core.camera_lease import CameraBusy
-            from .depth_gate import evaluate_depth_gate
             c = services.config
             sc = c.scan
             K = c.camera.K
             th = scan_gate_thresholds(sc)
+            survey_th = SurveyThresholds(
+                accurate_min_mm=sc.accurate_min_mm, accurate_max_mm=sc.accurate_max_mm,
+                survey_max_tilt_deg=sc.survey_max_tilt_deg, grid_target_px=sc.grid_target_px)
             PREVIEW_W = 960
             enc = [cv2.IMWRITE_JPEG_QUALITY, sc.preview_jpeg_quality]
 
@@ -157,8 +163,9 @@ class ScanModule(WorkflowModule):
             kwargs = dict(fps=sc.preview_fps, timeout_s=sc.preview_timeout_s,
                           color_only=True, quality=sc.preview_jpeg_quality)
             if sc.live_depth_gate:
-                kwargs["depth_probe"] = (lambda frame: evaluate_depth_gate(
-                    frame.depth, K, th, depth_scale=sc.depth_scale).to_dict())
+                kwargs["depth_probe"] = (lambda frame: scan_gate_payload(
+                    evaluate_depth_gate(frame.depth, K, th, depth_scale=sc.depth_scale),
+                    survey_surface(frame.depth, K, survey_th, depth_scale=sc.depth_scale)))
                 kwargs["depth_period_s"] = sc.gate_period_s
             try:
                 services.live.start(analyze, **kwargs)
@@ -176,7 +183,16 @@ class ScanModule(WorkflowModule):
             if services.jobs.running:
                 raise HTTPException(409, "a job is already running")
             try:
-                return generate_scan_targets(services)
+                result_dict = generate_scan_targets(services)
+                # Reference mode returns a ready ScanResult with no targets.
+                if result_dict.get("mode") == "reference" and "_scan_result" in result_dict:
+                    self._reference_result = result_dict.pop("_scan_result")
+                    self._active_job = None
+                    self._planned_voxel_m = None
+                else:
+                    self._reference_result = None
+                    self._planned_voxel_m = result_dict.get("voxel_size_m")
+                return result_dict
             except RuntimeError as e:
                 raise HTTPException(400, str(e))
             except Exception as e:
@@ -217,7 +233,8 @@ class ScanModule(WorkflowModule):
                 raise HTTPException(400, "no scan targets — aim the camera until the "
                                     "gate is green and Create targets first")
             services.live.stop()
-            self._active_job = ScanCaptureJob(services, ScanParams())
+            self._active_job = ScanCaptureJob(services, ScanParams(
+                voxel_size_m=self._planned_voxel_m))
             services.jobs.start(self._active_job, name="scan")
             return {"status": "started"}
 
@@ -235,9 +252,11 @@ class ScanModule(WorkflowModule):
         def result() -> dict:
             """Metadata of the last scan (plane frame/rectangle in mm + mesh stats) for
             the review UI. The point cloud itself comes from /preview.bin."""
-            if self._active_job is None or self._active_job.result is None:
-                raise HTTPException(404, "no scan result yet — run a scan first")
-            return self._active_job.result.report
+            if self._active_job is not None and self._active_job.result is not None:
+                return self._active_job.result.report
+            if self._reference_result is not None:
+                return self._reference_result.report
+            raise HTTPException(404, "no scan result yet — run a scan first")
 
         @router.get("/preview.bin")
         def preview_bin(run_id: str | None = None):
@@ -270,10 +289,13 @@ class ScanModule(WorkflowModule):
             """Create the work frame + rectangle (+ fused mesh) in the station."""
             from ...core.runs import RunNotFound
 
-            if body.run_id is None and (
-                    self._active_job is None or self._active_job.result is None):
+            has_job_result = (self._active_job is not None
+                              and self._active_job.result is not None)
+            if body.run_id is None and not has_job_result and self._reference_result is None:
                 raise HTTPException(400, "no scan to insert — run a scan first, or pass a run_id")
             try:
+                if body.run_id is None and not has_job_result and self._reference_result is not None:
+                    return insert_scan(services, result=self._reference_result)
                 return insert_scan(services, job=self._active_job, run_id=body.run_id)
             except RunNotFound as e:
                 raise HTTPException(404, str(e))

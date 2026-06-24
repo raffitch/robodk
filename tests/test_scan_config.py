@@ -32,6 +32,7 @@ def test_defaults_present_and_sane():
     for k in ("pose_count", "cone_half_angle_deg", "roll_max_deg",
               "distance_jitter", "look_distance_mm"):
         assert hasattr(s, k)
+    assert s.collision_filter_hard_fail is False
     print("[defaults] scan present; prefix", s.target_prefix,
           "voxel", s.voxel_size_m, "ideal", s.ideal_distance_mm)
 

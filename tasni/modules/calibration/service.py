@@ -545,11 +545,12 @@ class TourPoseResult:
     ok: bool
     error: str | None = None
     transit: bool | None = None   # collision while SWEEPING into this pose (None = not checked)
+    collision_pairs: list[str] | None = None
 
     def to_dict(self) -> dict:
         return {"name": self.name, "reachable": self.reachable,
                 "collision": self.collision, "ok": self.ok, "error": self.error,
-                "transit": self.transit}
+                "transit": self.transit, "collision_pairs": self.collision_pairs}
 
 
 class SimTourJob:
@@ -626,11 +627,14 @@ class SimTourJob:
                 collision: bool | None = None
                 transit: bool | None = None
                 err: str | None = None
+                pairs: list[str] | None = None
                 if reachable:
                     dest = rdk.target_joints(name)
                     if collisions_on and prev_joints is not None and dest is not None:
                         ncol = rdk.move_j_test(prev_joints, dest)
                         transit = None if ncol is None else bool(ncol)
+                        if transit:
+                            pairs = getattr(rdk, "collision_pairs", lambda: [])()
                     try:
                         rdk.move_j(name)
                     except Exception as e:   # noqa: BLE001 - a sim move failure is a fail, not a crash
@@ -638,6 +642,8 @@ class SimTourJob:
                     if reachable and collisions_on:
                         n_col = rdk.collisions()
                         collision = None if n_col is None else bool(n_col)
+                        if collision:
+                            pairs = getattr(rdk, "collision_pairs", lambda: [])() or pairs
                     if reachable:
                         try:
                             prev_joints = rdk.current_joints()
@@ -645,10 +651,11 @@ class SimTourJob:
                             prev_joints = dest if dest is not None else prev_joints
                 ok = reachable and not bool(collision) and not bool(transit)
                 results.append(TourPoseResult(name, reachable, collision, ok, err,
-                                              transit=transit))
+                                              transit=transit, collision_pairs=pairs))
                 flag = ("OK" if ok else "UNREACHABLE" if not reachable
                         else "TRANSIT-COLLISION" if transit else "COLLISION")
-                ctx.log(f"{name}: {flag}")
+                pair_txt = f" ({'; '.join(pairs[:3])})" if pairs else ""
+                ctx.log(f"{name}: {flag}{pair_txt}")
 
             # Return-to-start (the guarantee the real run makes; verify it here too) —
             # and sweep the path back, since that move runs on the real arm as well.

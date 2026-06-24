@@ -43,7 +43,7 @@ interface RunResult {
   n_skipped?: string[];
   can_apply: boolean;
 }
-interface TourPose { name: string; reachable: boolean; collision: boolean | null; ok: boolean; error?: string | null; transit?: boolean | null; }
+interface TourPose { name: string; reachable: boolean; collision: boolean | null; ok: boolean; error?: string | null; transit?: boolean | null; collision_pairs?: string[] | null; }
 interface TourResult {
   kind: "sim_tour";
   total: number;
@@ -595,7 +595,11 @@ export default function Calibration() {
               <div className="tour-bad">
                 Problem poses:{" "}
                 {tour.poses.filter((p) => !p.ok)
-                  .map((p) => `${p.name} (${!p.reachable ? "unreachable" : p.transit ? "transit collision" : "collision"})`)
+                  .map((p) => {
+                    const kind = !p.reachable ? "unreachable" : p.transit ? "transit collision" : "collision";
+                    const pairs = p.collision_pairs?.length ? `: ${p.collision_pairs.slice(0, 2).join("; ")}` : "";
+                    return `${p.name} (${kind}${pairs})`;
+                  })
                   .join(", ")}
               </div>
             )}

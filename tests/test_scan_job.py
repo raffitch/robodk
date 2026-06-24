@@ -241,6 +241,65 @@ def test_burst_capture_path():
     print("[scan burst] gen 8 ->", res["n_views"], "views fused via burst; buffer cleared")
 
 
+def test_generate_targets_when_survey_touches_border():
+    """A full-frame survey can mark FRAMED red while the old centre gate is valid.
+
+    Target creation should still use the current-pose cone, not fail just because the
+    measured surface reaches the image border.
+    """
+    global TABLE_HALF_MM
+    saved = TABLE_HALF_MM
+    TABLE_HALF_MM = 1000.0
+    try:
+        services, _state = _build_fakes()
+        gen = scan_service.generate_scan_targets(services)
+        assert gen["created"] == 8, gen
+        assert gen["gate"]["ok"] is True, gen["gate"]
+        assert gen["gate"]["gates"].get("framed") is False, gen["gate"]
+        assert abs(gen["look_distance_mm"] - 500) < 10, gen["look_distance_mm"]
+    finally:
+        TABLE_HALF_MM = saved
+    print("[survey border] framed red but centre gate OK -> created", gen["created"])
+
+
+def test_scan_collision_filter_bypasses_noisy_wall_map_by_default():
+    """Scan should match calibration's soft default for noisy collision maps.
+
+    If RoboDK reports every reachable candidate as colliding (for example an oversized
+    wall collision mesh), target creation still leaves reachable targets for operator
+    inspection unless scan.collision_filter_hard_fail is enabled.
+    """
+    services, _state = _build_fakes()
+
+    def all_collide(poses, *, guard_skip=None):
+        return [False] * len(poses), True, [None] * len(poses)
+
+    services.rdk.screen_collisions = all_collide
+    gen = scan_service.generate_scan_targets(services)
+    assert gen["created"] == 8, gen
+    assert gen["collision_filter_bypassed"] is True, gen
+    assert gen["candidates_collided"] == gen["candidates_reachable"], gen
+    assert len(services.rdk.list_targets("TasniScan_")) == 8
+    print("[scan collision bypass] wall/noisy map reported all colliding -> created", gen["created"])
+
+
+def test_scan_collision_filter_hard_fail_can_still_refuse():
+    services, _state = _build_fakes()
+    services.config.scan.collision_filter_hard_fail = True
+
+    def all_collide(poses, *, guard_skip=None):
+        return [False] * len(poses), True, [None] * len(poses)
+
+    services.rdk.screen_collisions = all_collide
+    try:
+        scan_service.generate_scan_targets(services)
+        raise AssertionError("expected hard-fail scan collision filter to refuse")
+    except RuntimeError as e:
+        assert "collision-free poses" in str(e), e
+    assert services.rdk.list_targets("TasniScan_") == []
+    print("[scan collision hard fail] strict mode refused noisy collision map")
+
+
 def test_generate_refuses_when_too_far():
     services, state = _build_fakes()
     state["cam"] = _look_at((0, 0, 900), (0, 0, 0))      # 900 mm > 500 +/- 150
@@ -276,6 +335,9 @@ def test_run_without_targets_errors():
 if __name__ == "__main__":
     test_generate_run_insert()
     test_burst_capture_path()
+    test_generate_targets_when_survey_touches_border()
+    test_scan_collision_filter_bypasses_noisy_wall_map_by_default()
+    test_scan_collision_filter_hard_fail_can_still_refuse()
     test_generate_refuses_when_too_far()
     test_warns_but_proceeds_without_calibration()
     test_run_without_targets_errors()

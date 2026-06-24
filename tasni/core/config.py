@@ -312,7 +312,7 @@ class ScanConfig(_Model):
     # panels — but a depth frame here takes ~8 s over the cell's Wi-Fi, which freezes
     # the video and tanks the framerate, so it is OFF by default and only sensible on a
     # WIRED link. Wiring the Jetson (Ethernet) is the single biggest win — see docs.
-    live_depth_gate: bool = False
+    live_depth_gate: bool = True
     gate_period_s: float = 1.2          # (live_depth_gate only) depth-grab interval
     # Depth grabs are slow + variable over Wi-Fi (measured ~6-11 s), so the socket
     # timeout for a depth-bearing grab must be generous or poses fail/skip. Color-only
@@ -331,6 +331,23 @@ class ScanConfig(_Model):
     roll_max_deg: float = 30.0          # roll spread about the optical axis
     distance_jitter: float = 0.15       # +/- fraction of standoff
     look_distance_mm: float = 500.0     # fallback standoff if the gate distance is unknown
+
+    # -- surface-aware scan planning (survey → planner → execute) -----------
+    # Replaces fixed standoff/cone/count with values derived from the measured surface.
+    # Old knobs (cone_half_angle_deg, pose_count, voxel_size_m) remain as fallbacks.
+    accurate_min_mm: float = 300.0       # near edge of D435i accurate depth band
+    accurate_max_mm: float = 800.0       # far edge; beyond -> reference mode (no tour/mesh)
+    frame_margin: float = 1.3            # surface must fit FOV with this margin
+    survey_max_tilt_deg: float = 6.0     # survey squareness gate (tighter than max_tilt_deg)
+    voxel_k: float = 0.008               # voxel_size_m = standoff_mm * voxel_k, clamped
+    voxel_min_m: float = 0.002           # finest voxel (small / close surfaces)
+    voxel_max_m: float = 0.006           # coarsest voxel
+    surface_type: str = "flat"           # "flat" | "raised" → cone/count preset
+    flat_cone_deg: float = 18.0          # cone half-angle for flat surfaces
+    flat_views: int = 8                  # view count for flat surfaces
+    raised_cone_deg: float = 38.0        # cone half-angle for raised objects
+    raised_views: int = 13               # view count for raised objects
+    grid_target_px: int = 64             # desired on-screen grid cell (px) for live overlay
 
     # -- capture ------------------------------------------------------------
     settle_s: float = 0.4               # pause after MoveJ before grabbing
@@ -379,6 +396,11 @@ class ScanConfig(_Model):
 
     # -- collision guard + dry tour (same semantics as calibration) --------
     collision_filter: bool = True
+    # Same soft default as calibration: if RoboDK's collision map reports so many
+    # collisions that target creation would fail (common with stale/oversized wall
+    # or fixture geometry), keep the reachable targets and make the operator inspect
+    # them / dry-run before moving the real robot. Set True for strict refusal.
+    collision_filter_hard_fail: bool = False
     collision_self_pairs: bool = True
     collision_skip_wrist_links: int = 2
 

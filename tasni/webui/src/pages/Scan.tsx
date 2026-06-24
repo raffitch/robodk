@@ -26,9 +26,10 @@ interface Plane {
   inlier_count: number;
 }
 interface ScanResult {
-  kind: "scan";
+  kind?: "scan";
   run_dir: string;
   can_insert: boolean;
+  mode?: string;           // "quality" | "reference"
   n_views: number;
   n_points: number;
   mesh_vertices: number;
@@ -36,7 +37,7 @@ interface ScanResult {
   stamp?: string;
   plane: Plane;
 }
-interface TourPose { name: string; reachable: boolean; collision: boolean | null; ok: boolean; transit?: boolean | null; }
+interface TourPose { name: string; reachable: boolean; collision: boolean | null; ok: boolean; transit?: boolean | null; collision_pairs?: string[] | null; }
 interface TourResult {
   kind: "sim_tour"; total: number; passed: number; unreachable: number;
   collisions: number; transit_collisions?: number; collisions_checked: boolean;
@@ -61,6 +62,7 @@ export default function Scan() {
   const [gate, setGate] = useState<GateReading | null>(null);
   const { mark: markFrame, reset: resetStream, stat: streamStat } = useStreamStats();
   const [targets, setTargets] = useState<number | null>(null);
+  const [scanMode, setScanMode] = useState<"quality" | "reference" | null>(null);
   const [generating, setGenerating] = useState(false);
   const [thumbs, setThumbs] = useState<string[]>([]);   // per-pose captures during a run
 
@@ -171,7 +173,7 @@ export default function Scan() {
   const startLive = async () => {
     try {
       await beginLive(true);
-      addLog("camera started — jog it to look down at the table, then Create targets.");
+      addLog("camera started — aim it at the surface to be scanned, then Create targets.");
     } catch (e: any) { setLive(false); addLog("live: " + e.message, true); }
   };
   const stopLive = async () => {
@@ -181,24 +183,54 @@ export default function Scan() {
   const generateTargets = async () => {
     setGenerating(true); setRunError(null);
     try {
-      const r = await api.post<{ created: number; look_distance_mm: number;
-        calibration_on_file: boolean; candidates_collided?: number;
-        collisions_checked?: boolean }>("/poses/generate");
-      setTargets(r.created); setTour(null);
-      const cal = r.calibration_on_file ? "" :
-        " ⚠ no calibration on file — the mesh/frame may be off; run Calibration once for accuracy.";
-      addLog(`created ${r.created} scan targets (standoff ~${Math.round(r.look_distance_mm)} mm)`
-        + (r.collisions_checked && r.candidates_collided
-            ? ` (${r.candidates_collided} colliding filtered)` : "")
-        + cal + " — inspect them in RoboDK, then Run.");
-      // The depth check stopped the server-side preview; resume it so the operator
-      // keeps live video + fps, with the green gate panels still shown as confirmation.
+      const r = await api.post<{
+        created: number;
+        mode?: string;
+        look_distance_mm?: number;
+        extent_mm?: [number, number];
+        voxel_size_m?: number;
+        calibration_on_file: boolean;
+        candidates_collided?: number;
+        collisions_checked?: boolean;
+        collision_filter_bypassed?: boolean;
+        can_insert?: boolean;
+      }>("/poses/generate");
+      const mode = (r.mode ?? "quality") as "quality" | "reference";
+      setScanMode(mode);
+      setTargets(r.created > 0 ? r.created : null);
+      setTour(null);
+
+      if (mode === "reference") {
+        const extTxt = r.extent_mm
+          ? `${Math.round(r.extent_mm[0])} × ${Math.round(r.extent_mm[1])} mm`
+          : "unknown size";
+        addLog(
+          `reference surface: ${extTxt} — too large / far for a quality scan tour. ` +
+          "A reference rectangle was placed directly. Review below, then Insert."
+        );
+        // Fetch the ready reference result and show it in the Review section.
+        try {
+          const res = await api.get<ScanResult>("/result");
+          setResult({ ...res, can_insert: true } as ScanResult);
+          setViewerNonce((n) => n + 1); setInserted(false);
+        } catch { /* not critical — user can re-check */ }
+      } else {
+        const cal = r.calibration_on_file ? "" :
+          " ⚠ no calibration on file — the mesh/frame may be off; run Calibration once for accuracy.";
+        addLog(
+          `created ${r.created} scan targets` +
+          (r.look_distance_mm != null ? ` (standoff ~${Math.round(r.look_distance_mm)} mm)` : "") +
+          (r.extent_mm ? ` — surface ${Math.round(r.extent_mm[0])} × ${Math.round(r.extent_mm[1])} mm` : "") +
+          (r.collision_filter_bypassed
+            ? ` ⚠ collision filter bypassed after ${r.candidates_collided ?? 0} reported collisions; inspect/dry-run`
+            : r.collisions_checked && r.candidates_collided
+              ? ` (${r.candidates_collided} colliding filtered)` : "")
+          + cal + " — inspect in RoboDK, then Run."
+        );
+      }
+      // Resume smooth preview so the operator keeps live video + fps alongside the HUD.
       beginLive(false).catch(() => setLive(false));
     } catch (e: any) {
-      // The authoritative grab stops the server-side preview and publishes the gate
-      // reading (distance/tilt + tilt-fix). Resume the live video so the operator can
-      // re-aim, keeping the HUD panels (the last reading) as guidance — then Create
-      // targets again to re-check.
       addLog("create targets: " + e.message, true);
       setRunError("Create targets: " + e.message);
       beginLive(false).catch(() => setLive(false));
@@ -253,6 +285,7 @@ export default function Scan() {
     ["DETECT", gate?.gates?.detected],
     ["DISTANCE", gate?.gates?.distance],
     ["ANGLE", gate?.gates?.angle],
+    ["FRAMED", gate?.gates?.framed],
   ];
   const pl = result?.plane;
 
@@ -279,16 +312,15 @@ export default function Scan() {
           If none is on file it warns and proceeds (the mesh/frame may be less accurate).</div>
       </div>
 
-      {/* ---- Standoff gate ---------------------------------------------- */}
+      {/* ---- Survey gate ------------------------------------------------ */}
       <div className="card">
-        <h2>Aim at the table</h2>
+        <h2>Survey the surface</h2>
         <div className="hint" style={{ marginTop: 0, marginBottom: 10 }}>
-          Start the camera (smooth color preview, same as calibration) and jog it to look
-          down at the surface — ideal standoff
-          <b> {g ? g.ideal_distance_mm : 500} ± {g ? g.distance_tol_mm : 150} mm</b>, tilt
-          <b> ≤ {g ? g.max_tilt_deg : 35}°</b>. Standoff + tilt are checked when you
-          <b> Create targets</b>: it refuses and shows how to fix the tilt (KUKA B/C) if
-          you're out of band.
+          Start the camera and aim it at the work surface. <b>Create targets</b> checks the
+          centre standoff and tilt, then generates calibration-style cone targets from the
+          robot's current pose. The full-frame survey outline and FRAMED lamp are guidance
+          for coverage; they do not block target creation when the centre gate is valid.
+          Tilt correction is shown as KUKA B/C.
         </div>
         <div className="aim-wrap">
           {frame ? <img className="preview" src={frame} alt="camera" />
@@ -296,7 +328,7 @@ export default function Scan() {
           {/* The HUD panels need depth (slow on Wi-Fi), so they appear from the
               Create-targets check, not live. During smooth aiming we show just the
               video + fps; no misleading "SEARCHING". */}
-          {gate && <AimHud gate={gate} />}
+          {gate && <AimHud gate={gate} mode="scan" />}
           {live && <StreamStats stat={streamStat} />}
           {!live && !gate && <div className="aim-off">camera off — press “Start camera”</div>}
         </div>
@@ -332,9 +364,14 @@ export default function Scan() {
           ? <div className="ok-text" style={{ marginTop: 8, fontSize: 13 }}>
               ✓ {targets} scan targets created (TasniScan_*). Inspect in RoboDK, then Run below.
             </div>
-          : <div className="hint">Aim the camera at the table (live video), then Create targets — it
-              checks standoff + tilt (refusing with a fix if out of band) and seeds pose generation
-              from the robot's current pose.</div>}
+          : scanMode === "reference"
+          ? <div className="ok-text" style={{ marginTop: 8, fontSize: 13 }}>
+              ✓ Reference surface detected — rectangle placed directly. Review &amp; Insert below.
+              Re-aim closer (300–800 mm) for a quality mesh tour.
+            </div>
+          : <div className="hint">Start the camera, aim it at the surface to be scanned, and
+              Create targets — the centre gate measures standoff/tilt and seeds the same cone
+              pose generator used by calibration.</div>}
       </div>
 
       {/* ---- Run -------------------------------------------------------- */}
@@ -379,7 +416,11 @@ export default function Scan() {
               <div className="tour-bad">
                 Problem poses:{" "}
                 {tour.poses.filter((p) => !p.ok)
-                  .map((p) => `${p.name} (${!p.reachable ? "unreachable" : p.transit ? "transit collision" : "collision"})`)
+                  .map((p) => {
+                    const kind = !p.reachable ? "unreachable" : p.transit ? "transit collision" : "collision";
+                    const pairs = p.collision_pairs?.length ? `: ${p.collision_pairs.slice(0, 2).join("; ")}` : "";
+                    return `${p.name} (${kind}${pairs})`;
+                  })
                   .join(", ")}
               </div>
             )}
@@ -402,19 +443,32 @@ export default function Scan() {
         <h2>Review &amp; insert</h2>
         {result ? (
           <>
-            <ScanViewer nonce={viewerNonce} src={PREVIEW_URL}
-                        frameT={pl?.frame_T_mm} corners={pl?.corners_mm} />
+            {result.mode !== "reference" && (
+              <ScanViewer nonce={viewerNonce} src={PREVIEW_URL}
+                          frameT={pl?.frame_T_mm} corners={pl?.corners_mm} />
+            )}
             <div className="kv" style={{ marginTop: 12 }}>
               <div className="k">Work surface</div>
               <div className="v">{Math.round(pl!.size_mm[0])} × {Math.round(pl!.size_mm[1])} mm
                 <span className="hint"> (plane inliers {Math.round(pl!.inlier_frac * 100)}%)</span></div>
-              <div className="k">Fused</div>
-              <div className="v">{result.n_views} views · {result.n_points.toLocaleString()} points ·
-                {result.mesh_vertices.toLocaleString()} mesh verts</div>
+              {result.mode === "reference" ? (
+                <>
+                  <div className="k">Mode</div>
+                  <div className="v">Reference — single-frame rectangle
+                    <span className="hint"> (surface too large / far for a quality tour)</span></div>
+                </>
+              ) : (
+                <>
+                  <div className="k">Fused</div>
+                  <div className="v">{result.n_views} views · {result.n_points.toLocaleString()} points ·
+                    {result.mesh_vertices.toLocaleString()} mesh verts</div>
+                </>
+              )}
             </div>
             <div className="hint" style={{ marginTop: 6 }}>
-              Orbit/zoom the cloud above. The blue rectangle + axes are the proposed work surface and
-              frame. Insert creates them (and the mesh) in RoboDK — nothing is added until you do.
+              {result.mode === "reference"
+                ? "The work rectangle + frame were placed from a single frame. Insert adds them to RoboDK."
+                : "Orbit/zoom the cloud above. The blue rectangle + axes are the proposed work surface and frame. Insert creates them (and the mesh) in RoboDK — nothing is added until you do."}
             </div>
             <div className="btn-row">
               <button onClick={insert} disabled={!result.can_insert || inserted}>
@@ -424,7 +478,8 @@ export default function Scan() {
             <div className="hint">Artifacts: <code>{result.run_dir}</code></div>
           </>
         ) : (
-          <div className="hint">Run a scan to fuse the surface and preview the proposed frame + rectangle here.</div>
+          <div className="hint">Run a scan to fuse the surface and preview the proposed frame + rectangle here.
+            For a reference surface (too large for a tour), the rectangle appears here after Create targets.</div>
         )}
       </div>
 

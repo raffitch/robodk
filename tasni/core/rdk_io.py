@@ -519,8 +519,11 @@ class RdkIO:
         guard = (self.ensure_mounted_tool_collision_pairs(skip_trailing)
                  if on and ensure_pairs else None)
         n = self.collisions() if on else None
+        pairs = self.collision_pairs() if n else []
         self.set_collision_checking(False)
         out = {"available": n is not None, "count": n}
+        if pairs:
+            out["pairs"] = pairs
         if guard is not None:
             out["guarded_tools"] = guard["tools"]
             out["guarded_pairs"] = guard["pairs_enabled"]
@@ -534,6 +537,30 @@ class RdkIO:
             return int(self.rdk.Collisions())
         except Exception:
             return None
+
+    def collision_pairs(self, limit: int = 8) -> list[str]:
+        """Best-effort names of currently colliding item pairs.
+
+        RoboDK exposes pair details separately from the collision count. Returning
+        names here gives the UI/logs enough signal to spot false positives such as
+        an oversized "Wall" object colliding with a robot link.
+        """
+        try:
+            pairs = self.rdk.CollisionPairs()
+        except Exception:
+            return []
+        out: list[str] = []
+        for p in pairs[:max(0, int(limit))]:
+            try:
+                item1, item2, id1, id2 = p
+                n1 = item1.Name() if item1.Valid() else "<invalid>"
+                n2 = item2.Name() if item2.Valid() else "<invalid>"
+                l1 = f":L{id1}" if int(id1) else ""
+                l2 = f":L{id2}" if int(id2) else ""
+                out.append(f"{n1}{l1} ↔ {n2}{l2}")
+            except Exception:
+                continue
+        return out
 
     def list_targets(self, prefix: str | None = None) -> list[str]:
         """Sorted names of TARGET items, filtered by ``prefix``."""

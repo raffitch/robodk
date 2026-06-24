@@ -40,6 +40,8 @@ from ..calibration.service import (_camera_hold, dry_tour_required,
                                     ensure_camera_tool)
 from .depth_gate import ScanGateThresholds, evaluate_depth_gate
 from .plane import work_plane_from_points
+from .planner import ScanPlan, plan_scan
+from .survey import SurveyThresholds, survey_surface
 from .reconstruct import (ScanView, cloud_points_m, crop_box, decimate_for_preview,
                           fuse_views, look_point_from_views, save_mesh)
 
@@ -66,8 +68,117 @@ def scan_gate_thresholds(scfg) -> ScanGateThresholds:
         min_valid_depth_frac=scfg.min_valid_depth_frac)
 
 
+def _survey_thresholds(scfg) -> SurveyThresholds:
+    return SurveyThresholds(
+        accurate_min_mm=scfg.accurate_min_mm,
+        accurate_max_mm=scfg.accurate_max_mm,
+        survey_max_tilt_deg=scfg.survey_max_tilt_deg,
+        grid_target_px=scfg.grid_target_px,
+    )
+
+
+def _backproject_depth(depth: np.ndarray, K: np.ndarray, *,
+                       depth_scale: float = 1000.0) -> np.ndarray:
+    """Back-project a raw uint16 depth image to camera-frame 3D points (mm)."""
+    d = np.asarray(depth, float)
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    ys, xs = np.nonzero(d > 0)
+    if len(ys) == 0:
+        return np.zeros((0, 3), float)
+    z_mm = d[ys, xs] / float(depth_scale) * 1000.0
+    return np.column_stack([(xs - cx) / fx * z_mm, (ys - cy) / fy * z_mm, z_mm])
+
+
+def _reference_locate(services, frame, survey, seed_T: np.ndarray,
+                      plan: ScanPlan) -> "ScanResult":
+    """Reference mode: fit plane + rectangle from a single survey depth frame.
+
+    No robot tour, no TSDF fusion. Returns a ScanResult with mesh_obj_path=None.
+    The result is ready to insert (frame + rectangle) without a Run step.
+    """
+    cfg = services.config
+    scfg = cfg.scan
+    K = cfg.camera.K
+    pub = _log_pub(services)
+
+    pts_cam_mm = _backproject_depth(frame.depth, K, depth_scale=scfg.depth_scale)
+    if len(pts_cam_mm) == 0:
+        raise RuntimeError("reference locate: no valid depth pixels in the survey frame")
+
+    R = np.asarray(seed_T[:3, :3], float)
+    t = np.asarray(seed_T[:3, 3], float)
+    pts_base_m = ((R @ pts_cam_mm.T).T + t) / 1000.0   # mm → m
+
+    try:
+        wp = work_plane_from_points(
+            pts_base_m, distance=scfg.ransac_distance_m,
+            n_iterations=scfg.ransac_iterations, min_inlier_frac=scfg.min_inlier_frac)
+    except ValueError as e:
+        raise RuntimeError(f"reference locate: plane fit failed — {e}") from e
+
+    frame_T_mm = wp.frame_T.copy()
+    frame_T_mm[:3, 3] *= 1000.0
+    corners_mm = wp.corners * 1000.0
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    run_dir = new_run_dir("scan", stamp)
+    sz = [float(wp.size[0] * 1000.0), float(wp.size[1] * 1000.0)]
+
+    report = {
+        "module": "scan", "stamp": stamp, "run_dir": str(run_dir),
+        "mode": "reference",
+        "n_views": 1, "n_points": int(len(pts_base_m)),
+        "mesh_vertices": 0, "mesh_triangles": 0, "mesh_file": None,
+        "plane": {
+            "frame_T_mm": frame_T_mm.tolist(),
+            "corners_mm": corners_mm.tolist(),
+            "size_mm": sz,
+            "normal": wp.normal.tolist(),
+            "inlier_frac": float(wp.inlier_frac),
+            "inlier_count": int(wp.inlier_count),
+        },
+    }
+    try:
+        (run_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        runs.write_meta("scan", stamp, {"module": "scan", "stamp": stamp, "mode": "reference",
+                                        "tool_name": cfg.robodk.camera_tool})
+    except Exception:
+        pass
+
+    pub(f"reference surface: {sz[0]:.0f}×{sz[1]:.0f} mm from single frame "
+        f"(standoff ~{survey.standoff_mm and round(survey.standoff_mm)} mm, "
+        f"inliers {wp.inlier_frac:.0%}). Review, then Insert.")
+
+    return ScanResult(report=report, run_dir=str(run_dir),
+                      frame_T_mm=frame_T_mm, corners_mm=corners_mm, mesh_obj_path=None)
+
+
 def _log_pub(services):
     return lambda m: services.bus.publish(JobEvent("log", {"message": m}))
+
+
+def scan_gate_payload(reading, survey) -> dict:
+    """Publish the centre-patch gate plus full-frame survey overlays.
+
+    The centre patch stays authoritative for target creation because it preserves
+    the calibration-style workflow: use the current reachable camera pose as the
+    cone seed, then orbit the measured standoff. The full-frame survey remains
+    useful for the HUD and for voxel planning when its extent is trustworthy.
+    """
+    payload = reading.to_dict()
+    if survey is not None and survey.detected:
+        payload.update({
+            "fully_framed": survey.fully_framed,
+            "outline_uv": survey.outline_uv,
+            "grid_uv": survey.grid_uv,
+            "grid_spacing_mm": survey.grid_spacing_mm,
+            "extent_mm": list(survey.extent_mm) if survey.extent_mm is not None else None,
+            "fov_deg": list(survey.fov_deg),
+        })
+        payload["gates"] = {**payload.get("gates", {}),
+                            "framed": bool(survey.fully_framed)}
+    return payload
 
 
 def generate_scan_targets(services) -> dict:
@@ -85,6 +196,7 @@ def generate_scan_targets(services) -> dict:
     cam = services.camera
     tool_name = cfg.robodk.camera_tool
     K = cfg.camera.K
+    W, H = cfg.camera.size
     prefix = scfg.target_prefix
     pub = _log_pub(services)
 
@@ -105,16 +217,23 @@ def generate_scan_targets(services) -> dict:
             f"the FLANGE, so the fused mesh + work frame may be off. Run Calibration "
             f"once for an accurate scan; proceeding with the stored offset for now."}))
 
+    # Keep the centre-patch depth gate as the authority for target creation.
+    # The full-frame survey is advisory/planning metadata; it must not move the
+    # seed pose or block targets because its framing test is intentionally strict.
     th = scan_gate_thresholds(scfg)
+    survey_th = _survey_thresholds(scfg)
     with _camera_hold(services, "scan-target-creation"):
         frame = cam.grab(with_depth=True, timeout=scfg.grab_timeout_s)
-    reading = evaluate_depth_gate(frame.depth, K, th, depth_scale=scfg.depth_scale)
 
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:
         services.bus.publish(JobEvent("frame",
             {"jpeg_b64": base64.b64encode(jpeg.tobytes()).decode("ascii")}))
-    services.bus.publish(JobEvent("gate", {**reading.to_dict(), "live": False}))
+
+    reading = evaluate_depth_gate(frame.depth, K, th, depth_scale=scfg.depth_scale)
+    survey = survey_surface(frame.depth, K, survey_th, depth_scale=scfg.depth_scale)
+    gate_payload = scan_gate_payload(reading, survey)
+    services.bus.publish(JobEvent("gate", {**gate_payload, "live": False}))
 
     if not reading.ok:
         bad = [name for name, good in reading.gates.items() if not good]
@@ -124,14 +243,35 @@ def generate_scan_targets(services) -> dict:
             "surface not in the ideal band — fix " + ", ".join(bad)
             + f" (distance {dist} mm, tilt {tilt}°, valid depth "
             + f"{round(reading.valid_frac * 100)}%). Jog the camera to look down at "
-            + "the table until all HUD lamps are green, then create targets.")
+            + "the surface until the HUD lamps are green, then create targets.")
 
     seed_T = rdk.camera_pose_T()
     try:
         seed_joints = rdk.current_joints()
     except Exception:
         seed_joints = None
-    look = float(reading.distance_mm)
+
+    look = float(reading.distance_mm or scfg.look_distance_mm)
+    plan = None
+    planned_voxel_m = scfg.voxel_size_m
+    extent_mm = (list(survey.extent_mm)
+                 if survey.detected and survey.extent_mm is not None else None)
+    if survey.detected and survey.extent_mm is not None:
+        if survey.fully_framed:
+            plan = plan_scan(survey, K, (W, H), scfg, cam_to_base_T=seed_T)
+            planned_voxel_m = plan.voxel_size_m
+            pub(f"survey: {survey.extent_mm[0]:.0f}×{survey.extent_mm[1]:.0f} mm surface "
+                f"at {survey.standoff_mm:.0f} mm; using calibration-style cone targets "
+                f"(standoff {look:.0f} mm, cone {scfg.cone_half_angle_deg:.0f}°), "
+                f"voxel={planned_voxel_m*1000:.1f} mm")
+            for w in plan.warnings:
+                pub(f"WARNING (survey): {w}")
+        else:
+            pub("survey: surface outline touches the image border; using the stable "
+                "centre-patch standoff gate and default cone/voxel settings for targets")
+    else:
+        pub("survey: no trustworthy full-frame extent; using the stable centre-patch "
+            "standoff gate and default cone/voxel settings for targets")
 
     prior = rdk.list_targets(prefix)
     if prior:
@@ -143,6 +283,7 @@ def generate_scan_targets(services) -> dict:
         roll_max_deg=scfg.roll_max_deg, distance_jitter=scfg.distance_jitter)
     reachable = [(i, T) for i, T in enumerate(candidates) if rdk.is_reachable(T)]
     n_reach = len(reachable)
+    reachable_before_collision = list(reachable)
     if n_reach < SCAN_MIN_VIEWS:
         raise RuntimeError(
             f"only {n_reach} reachable poses around this view (need >= {SCAN_MIN_VIEWS}) "
@@ -162,6 +303,7 @@ def generate_scan_targets(services) -> dict:
 
     n_collide = 0
     col_checked = False
+    collision_filter_bypassed = False
     reach_joints: list = [None] * n_reach
     if scfg.collision_filter:
         mask, col_checked, jts = rdk.screen_collisions([T for _, T in reachable],
@@ -175,9 +317,20 @@ def generate_scan_targets(services) -> dict:
             f"collision screen: {'ACTIVE' if col_checked else 'unavailable'}; swept "
             f"{n_reach} reachable pose(s), {n_collide} collided and were dropped"}))
         if col_checked and len(reachable) < SCAN_MIN_VIEWS:
-            raise RuntimeError(
-                f"only {len(reachable)} collision-free poses ({n_collide} of {n_reach} "
-                f"would collide) — jog to a more open part of the workspace and retry")
+            if scfg.collision_filter_hard_fail:
+                raise RuntimeError(
+                    f"only {len(reachable)} collision-free poses ({n_collide} of {n_reach} "
+                    f"would collide) — jog to a more open part of the workspace and retry")
+            collision_filter_bypassed = True
+            reachable = reachable_before_collision
+            reach_joints = [None] * len(reachable)
+            services.bus.publish(JobEvent("log", {"message":
+                "WARNING: RoboDK reported too many scan candidate poses as colliding, "
+                "so target creation is continuing with reachable poses only. This is "
+                "often a noisy/stale collision map or oversized wall/fixture collision "
+                "geometry. Inspect the targets in RoboDK and run the dry tour before "
+                "moving the real robot; set scan.collision_filter_hard_fail to true "
+                "for strict refusal."}))
 
     n_usable = len(reachable)
     reach_T = [T for _, T in reachable]
@@ -196,23 +349,38 @@ def generate_scan_targets(services) -> dict:
         created.append(name)
 
     _, eff_max, eff_mean = viewing_angle_span([T for _, T, _ in chosen], seed_T[:3, 2])
+    extent_txt = (f"; extent {round(extent_mm[0])}×{round(extent_mm[1])} mm"
+                  if extent_mm else "")
+    collide_note = (f"; collision filter bypassed after {n_collide} reported collision(s)"
+                    if collision_filter_bypassed else
+                    (f"; {n_collide} dropped for collision" if col_checked and n_collide
+                     else ("; collision-checked" if col_checked
+                           else "; collisions NOT checked")))
     services.bus.publish(JobEvent("log", {"message":
-        f"created {len(created)} scan targets (standoff ~{look:.0f} mm; "
+        f"created {len(created)} scan targets (standoff ~{look:.0f} mm{extent_txt}; "
         f"{n_reach}/{len(candidates)} candidates reachable; effective cone "
-        f"~{eff_max:.0f}° of {scfg.cone_half_angle_deg:.0f}°) — inspect them in RoboDK"}))
+        f"~{eff_max:.0f}° of {scfg.cone_half_angle_deg:.0f}°{collide_note}) — "
+        f"inspect them in RoboDK"}))
 
-    return {"created": len(created), "targets": created, "look_distance_mm": look,
-            "gate": reading.to_dict(), "candidates_reachable": n_reach,
+    return {"mode": "quality", "created": len(created), "targets": created,
+            "look_distance_mm": look,
+            "gate": gate_payload, "candidates_reachable": n_reach,
             "candidates_total": len(candidates), "collisions_checked": col_checked,
             "candidates_collided": n_collide, "effective_cone_deg": round(eff_max, 1),
             "camera_tool_offset_mm": round(tool_offset_mm, 1),
-            "calibration_on_file": tool_offset_mm >= 15.0}
+            "calibration_on_file": tool_offset_mm >= 15.0,
+            "collision_filter_enabled": scfg.collision_filter,
+            "collision_filter_bypassed": collision_filter_bypassed,
+            "extent_mm": extent_mm,
+            "voxel_size_m": planned_voxel_m,
+            "plan": plan.to_dict() if plan is not None else None}
 
 
 # -- capture + reconstruct job ----------------------------------------------
 @dataclass
 class ScanParams:
     save_artifacts: bool = True
+    voxel_size_m: float | None = None   # None → use ScanConfig default
 
 
 @dataclass
@@ -299,8 +467,10 @@ class ScanCaptureJob:
                     f"Skipped (no depth): {skipped}")
 
             ctx.progress(len(targets), len(targets), "fusing")
-            ctx.log(f"fusing {len(views)} views (TSDF voxel {scfg.voxel_size_m * 1000:.0f} mm)…")
-            res = fuse_views(views, K, width, height, voxel_size_m=scfg.voxel_size_m,
+            voxel_m = (self.params.voxel_size_m
+                       if self.params.voxel_size_m is not None else scfg.voxel_size_m)
+            ctx.log(f"fusing {len(views)} views (TSDF voxel {voxel_m * 1000:.0f} mm)…")
+            res = fuse_views(views, K, width, height, voxel_size_m=voxel_m,
                              sdf_trunc_m=scfg.sdf_trunc_m, depth_scale=scfg.depth_scale,
                              depth_min_m=scfg.depth_min_m, depth_max_m=scfg.depth_max_m)
 
@@ -467,15 +637,22 @@ class ScanCaptureJob:
 
 # -- insert (the explicit "apply") ------------------------------------------
 def insert_scan(services, *, job: "ScanCaptureJob | None" = None,
-                run_id: str | None = None) -> dict:
+                run_id: str | None = None,
+                result: "ScanResult | None" = None) -> dict:
     """Create the work frame + rectangle (+ fused mesh) in the open station.
 
-    Two sources (mirrors ``apply_calibration``): an explicit ``run_id`` loads the
-    plane + mesh from disk (survives a restart), else the in-memory last job. Records
-    ``runs/scan/active.json``. Raises ``RuntimeError`` if there is nothing to insert.
+    Three sources: a direct ``result`` (reference-mode single-frame locate), an
+    explicit ``run_id`` loaded from disk (survives restart), or the in-memory last
+    job. Records ``runs/scan/active.json``. Raises ``RuntimeError`` if nothing to insert.
     """
     rdk: RdkIO = services.rdk
-    if run_id is not None:
+    if result is not None:
+        r = result
+        frame_T_mm, corners_mm = r.frame_T_mm, r.corners_mm
+        mesh_path = r.mesh_obj_path
+        report = r.report
+        stamp_id, source = report.get("stamp"), "reference"
+    elif run_id is not None:
         report = runs.load_report("scan", run_id)
         plane = report["plane"]
         frame_T_mm = np.asarray(plane["frame_T_mm"], float)
