@@ -250,6 +250,7 @@ export default function Calibration() {
         collisions_checked?: boolean; candidates_collided?: number;
         collision_filter_enabled?: boolean;
         collision_filter_bypassed?: boolean;
+        visibility_checked?: boolean; poses_offframe_dropped?: number;
         camera_tool_offset_mm?: number; targets_cartesian?: number;
         collision_guard?: { tools: string[]; pairs_enabled: number } | null }>("/poses/generate");
       setTargets(r.created);
@@ -279,8 +280,15 @@ export default function Calibration() {
       const cart = r.targets_cartesian
         ? ` ⚠ ${r.targets_cartesian} target(s) couldn't be joint-locked (no IK branch) — those follow the GUI's active tool.`
         : "";
+      // Visibility filter: poses where the board would clip the frame are dropped
+      // before any motion, so the run never wastes a tour on a pose that sees nothing.
+      const vis = r.visibility_checked
+        ? (r.poses_offframe_dropped
+            ? ` ${r.poses_offframe_dropped} pose(s) that would clip the board off-frame were dropped.`
+            : " All targets keep the board in frame.")
+        : "";
       addLog(`created ${r.created} targets (working distance ~${Math.round(r.look_distance_mm)} mm)`
-        + dropped + guard + offNote + cart + " — inspect them in RoboDK, then Run calibration.");
+        + dropped + guard + vis + offNote + cart + " — inspect them in RoboDK, then Run calibration.");
       beginLive(false).catch(() => setLive(false));
     } catch (e: any) {
       addLog("create targets: " + e.message, true);
@@ -479,9 +487,11 @@ export default function Calibration() {
         <div className="card">
           <h2>Target spread</h2>
           <div className="hint" style={{ marginTop: 0, marginBottom: 6 }}>
-            Create targets orbits your aimed view in a cone (so the board stays in frame),
-            with roll and distance variation — the rotational diversity the hand-eye solve
-            needs. A wider cone gives a better-conditioned solve.
+            Create targets orbits your aimed view in a cone, with roll and distance
+            variation — the rotational diversity the hand-eye solve needs (the kept set
+            is spread across both tilt and roll, not just viewing direction). Only poses
+            that are reachable, collision-free <i>and</i> keep the board in frame become
+            targets. A wider cone gives a better-conditioned solve.
           </div>
           <ConeDiagram coneDeg={config.calibration.cone_half_angle_deg}
                        count={config.calibration.pose_count}

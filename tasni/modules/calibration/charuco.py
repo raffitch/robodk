@@ -41,6 +41,13 @@ class CharucoTarget:
         # of all corners is robust to the origin convention.
         self.board_center = self._all_obj.mean(axis=0).astype(np.float64)
 
+    @property
+    def all_obj_points(self) -> np.ndarray:
+        """All inner ChArUco corners in the board frame (mm) — the detectable
+        feature cloud. Used by the visibility pre-filter (project these into a
+        candidate camera to predict whether the board stays in frame)."""
+        return self._all_obj
+
     def _detect_corners(self, image: np.ndarray, *, min_corners: int = 1):
         """Detect markers + interpolate ChArUco corners (no pose estimation).
 

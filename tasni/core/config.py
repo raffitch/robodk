@@ -134,7 +134,17 @@ class CalibrationConfig(_Model):
     settle_s: float = 0.4               # pause after MoveJ before grabbing a frame
     holdout_count: int = 3              # poses held out of the solve for validation
     refine: bool = True                 # post-solve reprojection-minimizing refinement
-    min_charuco_corners: int = 6        # reject a view with fewer detected corners
+    # Two corner floors, deliberately decoupled. ``min_charuco_corners`` is the
+    # DETECTION floor — used by the live aiming gate's DETECT lamp and the
+    # authoritative generate-grab: "can we see the board well enough to aim". Keep
+    # it low so aiming isn't punishing. ``min_charuco_corners_solve`` is the higher
+    # SOLVE-ACCEPTANCE floor — a captured pose only contributes to the hand-eye solve
+    # if it has at least this many corners, so each per-view PnP board pose (the B in
+    # AX=XB) is well-constrained. A weak 6-corner view detects fine for aiming but
+    # gives a noisy pose that drags the linear solve; requiring more for the solve
+    # raises input quality without making the operator aim harder.
+    min_charuco_corners: int = 6        # detection floor (aiming gate + generate grab)
+    min_charuco_corners_solve: int = 12  # solve-acceptance floor (a pose must beat this to be used)
 
     # Capture: median several frames per pose (per-corner pixel median) to beat
     # per-frame blur/glare/sensor noise. 1 = single grab (the old behaviour).
@@ -214,15 +224,28 @@ class CalibrationConfig(_Model):
     # so the board stays visible, with roll + distance variation for hand-eye
     # conditioning. The TasniCalib_* targets are left in the station to inspect.
     pose_count: int = 15                # reachable poses to capture
-    # A wider cone => more diverse rotation axes => a better-conditioned hand-eye
-    # solve (measured on the generator: 32deg -> axis-spread 0.10, 45deg -> 0.17).
-    # 45deg keeps the board within reliable ChArUco detection. NOTE: roll does not
-    # help axis spread (it piles rotation onto the optical axis), so tune diversity
-    # via the cone, not the roll. The motion_diversity metric reports the result.
+    # A wider cone => more diverse view-direction (tilt) axes => a better-conditioned
+    # hand-eye solve (measured on the generator: 32deg -> axis-spread 0.10, 45deg ->
+    # 0.17). 45deg keeps the board within reliable ChArUco detection. The cone tilts
+    # supply rotation axes in the camera X-Y plane; roll about the optical axis
+    # supplies the third (Z) axis. select_diverse() picks the kept set by full-
+    # rotation farthest-point sampling, so BOTH the tilt and the roll spread are
+    # maximized (not just the view direction). The motion_diversity metric reports it.
     cone_half_angle_deg: float = 45.0   # max view-angle change from the seed view
-    roll_max_deg: float = 75.0          # roll spread about the optical axis
+    roll_max_deg: float = 75.0          # roll spread about the optical axis (the 3rd rot axis)
     distance_jitter: float = 0.12       # +/- fraction of working distance
     look_distance_mm: float = 500.0     # fallback if the seed board distance unknown
+    # Visibility pre-filter: a pose can be reachable AND collision-free yet aim so
+    # the board clips the frame edge (or leaves view), which only shows up as a
+    # skipped capture after the robot has already driven there. Before writing
+    # targets we project the board (corners derived from the seed detection) into
+    # each candidate's image and drop poses where too little of the board lands
+    # inside the frame. Pure pinhole (no distortion — adequate for a margin gate on
+    # the low-distortion D4xx lens). So the pre-run guarantee becomes reachable +
+    # collision-free + board-in-frame, not just the first two.
+    visibility_filter: bool = True
+    min_board_visible_frac: float = 0.85   # >= this fraction of board corners must land in-frame
+    board_visible_margin_frac: float = 0.04  # inset the frame by this fraction (keep off the edge)
     # Drop generated poses where the robot (incl. mounted tooling like a spindle)
     # collides, checked in RoboDK SIMULATE before any target is written — so a pose
     # that would drive the spindle into the arm never becomes a TasniCalib_* target.

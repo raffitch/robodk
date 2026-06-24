@@ -30,6 +30,7 @@ import numpy as np
 from ...core import runs
 from ...core.aiming import GateThresholds, evaluate_gate
 from ...core.events import JobEvent
+from ...core.geometry import Rt_to_T, transform_points
 from ...core.jobrunner import JobContext
 from ...core.logging import get_logger, new_run_dir
 from ...core.rdk_io import RdkIO
@@ -37,7 +38,8 @@ from .charuco import CharucoTarget
 from .handeye import (CalibrationView, cross_validate, estimate_board_in_base,
                       refine, reject_outliers, solve_best, solve_handeye)
 from .intrinsics import verify_intrinsics
-from .poses import generate_calibration_poses, select_diverse, viewing_angle_span
+from .poses import (board_visible_fraction, generate_calibration_poses,
+                    select_diverse, viewing_angle_span)
 from .quality import evaluate
 
 log = get_logger("tasni.calibration")
@@ -304,6 +306,39 @@ def generate_calibration_targets(services) -> dict:
                 "moving the real robot; set calibration.collision_filter_hard_fail "
                 "to true for strict refusal."}))
 
+    # Visibility pre-filter: a pose can be reachable AND collision-free yet aim so
+    # the board clips the frame edge (or leaves view), which today only surfaces as
+    # a skipped capture *after* the robot has driven there. Project the board (its
+    # corners placed in the base frame from the seed detection) into each surviving
+    # candidate's image and drop poses that don't keep enough of the board in frame —
+    # so the pre-run guarantee becomes reachable + collision-free + board-in-frame.
+    # Cheap pure-numpy pinhole; degrades to a no-op if it would starve the solve.
+    n_offframe = 0
+    vis_checked = False
+    if ccfg.visibility_filter and det is not None and reachable:
+        T_base_board = seed_T @ Rt_to_T(det.R_target2cam, det.t_target2cam)
+        board_pts_base = transform_points(T_base_board, board.all_obj_points)
+        img_size = cfg.camera.size
+        vis = [board_visible_fraction(T, board_pts_base, K, img_size,
+                                      margin_frac=ccfg.board_visible_margin_frac)
+               for _, T in reachable]
+        keep = [k for k, f in enumerate(vis) if f >= ccfg.min_board_visible_frac]
+        vis_checked = True
+        if len(keep) >= MIN_TRAIN_VIEWS:
+            n_offframe = len(reachable) - len(keep)
+            reachable = [reachable[k] for k in keep]
+            reach_joints = [reach_joints[k] for k in keep]
+            services.bus.publish(JobEvent("log", {"message":
+                f"visibility screen: {n_offframe} pose(s) would clip the board out of "
+                f"frame and were dropped; {len(reachable)} keep the board in view"}))
+        else:
+            # A framing gate must never starve the solve: keep all reachable poses
+            # and warn — the capture step still skips any that truly clip.
+            services.bus.publish(JobEvent("log", {"message":
+                f"WARNING: only {len(keep)} reachable pose(s) keep the board fully in "
+                f"frame (need >= {MIN_TRAIN_VIEWS}) — visibility filter not applied. "
+                f"Inspect the targets; some may clip the board and be skipped at capture."}))
+
     n_usable = len(reachable)
     reach_T = [T for _, T in reachable]
     sel = select_diverse(reach_T, min(ccfg.pose_count, n_usable),
@@ -352,11 +387,14 @@ def generate_calibration_targets(services) -> dict:
                     (f"; {n_collide} dropped for collision" if col_checked and n_collide
                      else ("; collision-checked" if col_checked
                            else "; collisions NOT checked (no station collision map)")))
+    vis_note = (f"; {n_offframe} dropped off-frame" if vis_checked and n_offframe
+                else ("; board-in-frame checked" if vis_checked else ""))
     services.bus.publish(JobEvent("log",
         {"message": f"created {len(created)} calibration targets "
                     f"(working distance ~{look:.0f} mm; {n_reach}/{len(candidates)} "
-                    f"candidates reachable{collide_note}; effective cone ~{eff_max:.0f}° "
-                    f"of {ccfg.cone_half_angle_deg:.0f}°) — inspect them in RoboDK"}))
+                    f"candidates reachable{collide_note}{vis_note}; effective cone "
+                    f"~{eff_max:.0f}° of {ccfg.cone_half_angle_deg:.0f}°) — inspect "
+                    f"them in RoboDK"}))
     if eff_max < 0.5 * ccfg.cone_half_angle_deg:
         services.bus.publish(JobEvent("log",
             {"message": f"WARNING: reachable poses span only ~{eff_max:.0f}° "
@@ -376,6 +414,8 @@ def generate_calibration_targets(services) -> dict:
             "collisions_checked": col_checked, "candidates_collided": n_collide,
             "collision_filter_enabled": ccfg.collision_filter,
             "collision_filter_bypassed": collision_filter_bypassed,
+            "visibility_checked": vis_checked,
+            "poses_offframe_dropped": n_offframe,
             "effective_cone_deg": round(eff_max, 1),
             "camera_tool_offset_mm": round(tool_offset_mm, 1),
             "targets_joint_locked": len(created) - n_cartesian,
@@ -907,10 +947,14 @@ class CalibrationJob:
             rdk.move_j(name)
             time.sleep(ccfg.settle_s)
             images = [f.color for f in self._grab_frames(cam, ccfg.frames_per_pose)]
+            # Accept a pose into the solve only with the higher SOLVE corner floor
+            # (not the low aiming-detection floor): a weak few-corner view gives a
+            # noisy per-view board pose that drags the linear hand-eye solve.
             det = board.detect_median(images, K, dist,
-                                      min_corners=ccfg.min_charuco_corners)
+                                      min_corners=ccfg.min_charuco_corners_solve)
             if det is None:
-                ctx.log(f"{name}: no board / too few corners — skipped")
+                ctx.log(f"{name}: board not seen with >= "
+                        f"{ccfg.min_charuco_corners_solve} corners — skipped")
                 skipped.append(name)
                 continue
             rep = images[len(images) // 2]                 # a representative frame

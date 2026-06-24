@@ -113,6 +113,41 @@ def test_select_diverse_beats_first_n():
     assert min(viewing_angle_span(diverse, seed_fwd)[:1]) < 15.0
 
 
+def test_select_diverse_spreads_orientation_not_just_view():
+    """Roll-aware (full-rotation) FPS must avoid keeping two near-identical
+    ORIENTATIONS — a +Z-only pick can keep two poses that differ only in roll
+    (≈0° apart on the viewing axis, yet distinct rotations the solve wants). So the
+    closest pair of selected poses stays well separated in rotation space."""
+    from tasni.modules.calibration.poses import _rotation_geodesic
+    cc, seed_T, cands = _seed_and_candidates()
+    sel = select_diverse(cands, cc.pose_count, seed_fwd=seed_T[:3, 2])
+    Rsel = [np.asarray(cands[i], float)[:3, :3] for i in sel]
+    mind = min(np.degrees(_rotation_geodesic(Rsel[a], Rsel[b]))
+               for a in range(len(Rsel)) for b in range(a + 1, len(Rsel)))
+    assert mind > 10.0, f"selected orientations too close: min pair {mind:.1f}°"
+
+
+def test_board_visible_fraction_flags_off_aim():
+    """The visibility predictor: ~1.0 when the camera frames the board, low when it
+    aims off it, and 0.0 when the board sits behind the camera."""
+    from tasni.core.geometry import transform_points
+    from tasni.modules.calibration.poses import board_visible_fraction
+
+    board_center = np.array([800.0, 0.0, 200.0])
+    seed_pos = np.array([300.0, 0.0, 560.0])
+    T_base_target = syn._look_at(board_center, seed_pos, 0.0)
+    board_pts = transform_points(T_base_target, syn._make_board_points())
+    size = (1920, 1080)                                   # matches syn.K (1080p)
+
+    on_aim = syn._look_at(seed_pos, board_center, 0.0)
+    off_aim = syn._look_at(seed_pos, board_center + np.array([0.0, 0.0, 800.0]), 0.0)
+    looking_away = syn._look_at(seed_pos, 2 * seed_pos - board_center, 0.0)
+
+    assert board_visible_fraction(on_aim, board_pts, syn.K, size) > 0.99
+    assert board_visible_fraction(off_aim, board_pts, syn.K, size) < 0.5
+    assert board_visible_fraction(looking_away, board_pts, syn.K, size) == 0.0
+
+
 def test_select_diverse_respects_count_and_membership():
     cc, seed_T, cands = _seed_and_candidates()
     # Fewer reachable than requested -> keep all, no duplication.
@@ -129,5 +164,7 @@ def test_select_diverse_respects_count_and_membership():
 if __name__ == "__main__":
     test_generated_poses_solve_well()
     test_select_diverse_beats_first_n()
+    test_select_diverse_spreads_orientation_not_just_view()
+    test_board_visible_fraction_flags_off_aim()
     test_select_diverse_respects_count_and_membership()
     print("\nPose-generation conditioning check passed.")
