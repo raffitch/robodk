@@ -16,7 +16,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tasni.core.aiming import (  # noqa: E402
-    GateThresholds, board_tilt_deg, evaluate_gate)
+    GateThresholds, board_tilt_bc_deg, board_tilt_deg, evaluate_gate)
 from tasni.modules.calibration.charuco import ViewDetection  # noqa: E402
 
 W, H = 1920, 1080
@@ -25,10 +25,12 @@ TH = GateThresholds(min_corners=6, ideal_distance_mm=450.0,
                     distance_tol_mm=80.0, max_tilt_deg=25.0)
 
 
-def _det(*, n=20, distance=450.0, tilt_deg=0.0, tx=0.0, ty=0.0) -> ViewDetection:
+def _det(*, n=20, distance=450.0, tilt_deg=0.0, tilt_axis="x", tx=0.0, ty=0.0) -> ViewDetection:
     """A detection whose board sits at ``distance`` mm, tilted ``tilt_deg`` about
-    the camera X axis, centred unless tx/ty given (mm in the camera frame)."""
-    rvec = np.array([np.deg2rad(tilt_deg), 0.0, 0.0]).reshape(3, 1)
+    the camera ``tilt_axis`` ("x" or "y"), centred unless tx/ty given (mm in the
+    camera frame)."""
+    axis = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0)}[tilt_axis]
+    rvec = (np.array(axis) * np.deg2rad(tilt_deg)).reshape(3, 1)
     tz = float(np.sqrt(max(distance**2 - tx**2 - ty**2, 0.0)))
     tvec = np.array([tx, ty, tz]).reshape(3, 1)
     ids = np.arange(n).reshape(-1, 1).astype(np.int32)
@@ -67,6 +69,27 @@ def test_angle_gate():
     assert not g.gates["angle"] and not g.ok and g.tilt_deg > 39
 
 
+def test_tilt_direction_bc():
+    # A pure tilt about camera X is corrected by C alone (no B); a pure tilt about
+    # camera Y by B alone (no C) — same B/C decomposition the scan gate uses, so the
+    # HUD's ROTATE-TOOL arrows read identically for board aim and surface aim.
+    gx = evaluate_gate(_det(tilt_deg=20, tilt_axis="x"), K, (H, W), TH)
+    assert abs(gx.tilt_c_deg - 20) < 1e-3, gx.tilt_c_deg     # +20 about X -> C +20
+    assert abs(gx.tilt_b_deg) < 1e-3, gx.tilt_b_deg
+    gy = evaluate_gate(_det(tilt_deg=20, tilt_axis="y"), K, (H, W), TH)
+    assert abs(gy.tilt_b_deg + 20) < 1e-3, gy.tilt_b_deg     # +20 about Y -> B -20
+    assert abs(gy.tilt_c_deg) < 1e-3, gy.tilt_c_deg
+    # the standalone helper agrees with the gate, and fronto-parallel -> ~0 / 0
+    R = cv2.Rodrigues(np.array([np.deg2rad(20), 0, 0]))[0]
+    b, c = board_tilt_bc_deg(R)
+    assert abs(b) < 1e-3 and abs(c - 20) < 1e-3
+    g0 = evaluate_gate(_det(tilt_deg=0), K, (H, W), TH)
+    assert abs(g0.tilt_b_deg) < 1e-6 and abs(g0.tilt_c_deg) < 1e-6
+    # fields ride into to_dict (detected) and stay None when no board
+    assert g0.to_dict()["tilt_c_deg"] is not None
+    assert evaluate_gate(None, K, (H, W), TH).to_dict()["tilt_b_deg"] is None
+
+
 def test_corner_and_none_gates():
     assert not evaluate_gate(_det(n=4), K, (H, W), TH).gates["detected"]
     none = evaluate_gate(None, K, (H, W), TH)
@@ -98,6 +121,7 @@ if __name__ == "__main__":
     test_all_green_when_ideal()
     test_distance_gate()
     test_angle_gate()
+    test_tilt_direction_bc()
     test_corner_and_none_gates()
     test_offset_sign()
     test_board_center_reference()

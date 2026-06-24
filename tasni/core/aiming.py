@@ -58,6 +58,14 @@ class GateReading:
     # jog hints. None if no board.
     move_cam: tuple[float, float, float] | None = None
     center_tol_mm: float = 40.0
+    # How to correct the tilt, as TOOL-frame rotations (KUKA A/B/C convention:
+    # A = rotate about Z, B = about Y, C = about X). A board tilt is fixed by B + C
+    # (a rotation about Z / A doesn't change tilt). Signed degrees the operator
+    # should rotate the TOOL to make the board fronto-parallel; None if no board.
+    # Same decomposition as the scan gate (modules/scan/depth_gate.py) so the HUD's
+    # ROTATE-TOOL panel reads identically for board aim and surface aim.
+    tilt_b_deg: float | None = None      # rotate about camera/TOOL Y (KUKA B): left/right
+    tilt_c_deg: float | None = None      # rotate about camera/TOOL X (KUKA C): fwd/back
 
     def to_dict(self) -> dict:
         return {
@@ -73,6 +81,8 @@ class GateReading:
             "max_tilt_deg": self.max_tilt_deg,
             "move_cam": list(self.move_cam) if self.move_cam is not None else None,
             "center_tol_mm": self.center_tol_mm,
+            "tilt_b_deg": self.tilt_b_deg,
+            "tilt_c_deg": self.tilt_c_deg,
         }
 
 
@@ -90,6 +100,30 @@ def board_tilt_deg(R_target2cam: np.ndarray) -> float:
         return 0.0
     align = abs(float(n[2]) / norm)               # |n · [0,0,1]|
     return float(np.degrees(np.arccos(np.clip(align, 0.0, 1.0))))
+
+
+def board_tilt_bc_deg(R_target2cam: np.ndarray) -> tuple[float, float]:
+    """Signed TOOL rotations (KUKA B about Y, C about X) that bring the board
+    fronto-parallel — i.e. which way to rotate the tool to level the board.
+
+    The board normal is its +Z axis in the camera frame (column 2 of
+    ``R_target2cam``). We orient it to face the camera (negative optical Z, like the
+    scan gate) then decompose into a rotation about the camera/TOOL Y axis (KUKA B,
+    left/right) and X axis (KUKA C, fwd/back). A rotation about Z (KUKA A) doesn't
+    change tilt, so only B and C are returned. Signs match the scan gate's so the
+    HUD's ◀▶ / ▲▼ arrows mean the same thing for both."""
+    n = np.asarray(R_target2cam, dtype=float)[:, 2]
+    norm = float(np.linalg.norm(n))
+    if norm < 1e-9:
+        return (0.0, 0.0)
+    n = n / norm
+    if n[2] > 0:                     # face the camera (toward -Z optical axis)
+        n = -n
+    nx, ny, nz = float(n[0]), float(n[1]), float(n[2])
+    denom = max(-nz, 1e-9)
+    tilt_b_deg = float(np.degrees(np.arctan2(nx, denom)))   # about Y -> KUKA B
+    tilt_c_deg = float(np.degrees(np.arctan2(ny, denom)))   # about X -> KUKA C
+    return (tilt_b_deg, tilt_c_deg)
 
 
 def board_offset(t_target2cam: np.ndarray, K: np.ndarray,
@@ -127,6 +161,7 @@ def evaluate_gate(det: ViewDetection | None, K: np.ndarray, image_shape: tuple,
               if board_center_mm is not None else t)
     distance = float(np.linalg.norm(center))
     tilt = board_tilt_deg(R)
+    tilt_b, tilt_c = board_tilt_bc_deg(R)
     offset = board_offset(center, K, image_shape)
 
     # Translation to bring the board centre to (0, 0, ideal) in the camera frame,
@@ -142,4 +177,5 @@ def evaluate_gate(det: ViewDetection | None, K: np.ndarray, image_shape: tuple,
     }
     return GateReading(True, det.n_corners, distance, tilt, offset, gates,
                        all(gates.values()), th.ideal_distance_mm,
-                       th.distance_tol_mm, th.max_tilt_deg, move_cam, th.center_tol_mm)
+                       th.distance_tol_mm, th.max_tilt_deg, move_cam, th.center_tol_mm,
+                       tilt_b_deg=tilt_b, tilt_c_deg=tilt_c)

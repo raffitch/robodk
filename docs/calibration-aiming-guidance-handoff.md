@@ -1,6 +1,15 @@
 # Handoff — calibration aiming guidance (Part 2: board tilt-direction guidance)
 
-**Status:** design locked, NOT started. Implement next session.
+**Status:** ✅ §1–4 DONE (2026-06-24). The calibration gate now emits
+`tilt_b_deg`/`tilt_c_deg` and the HUD's ROTATE-TOOL panel shows board-level
+direction. `board_tilt_bc_deg()` in `core/aiming.py` reuses the scan gate's
+normal→B/C decomposition (signs consistent by construction); `evaluate_gate`
+carries the two fields and `to_dict()` emits them (both live-preview and
+authoritative-grab paths ride along, no other change). Frontend copy tweak (§3b)
+skipped — `TiltFix` has no "surface" wording, reads fine for the board. Test
+`test_tilt_direction_bc` added; 125 pytest green + `vite build` green.
+**Remaining:** real-board sign verification (§3b note / §7 last bullet — needs the
+cell), and the secondary ideas in §5 and the collision follow-ups in §6.
 **Branch:** `calibration-improvements` (HEAD `725e9dd` as of 2026-06-24).
 **Context:** follow-up to the calibration collision-safety work (commit `725e9dd`).
 The user asked to improve "how we position the robot, what info we display, and how
