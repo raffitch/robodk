@@ -246,6 +246,23 @@ class CalibrationConfig(_Model):
     visibility_filter: bool = True
     min_board_visible_frac: float = 0.85   # >= this fraction of board corners must land in-frame
     board_visible_margin_frac: float = 0.04  # inset the frame by this fraction (keep off the edge)
+    # Derived board keep-out: the physical platform the board sits on is often bigger
+    # than (or absent from) the station's CAD, so a pose that grazes it isn't caught
+    # by the modelled collision objects. From the seed board detection we add a box
+    # spanning the board footprint + a lateral margin, from just above the board down
+    # toward the floor — a conservative stand-in for the platform — as a collision
+    # object (``TasniBoardKeepout``). The baseline-relative screen then drops any pose
+    # whose tool/arm enters it (the seed view sits well clear, so it's not in the
+    # baseline). Tune the margin to cover your real platform.
+    board_keepout: bool = True
+    # Lateral margin beyond the board footprint — set it to how far your physical
+    # platform extends past the board. ~300 mm was needed to catch the observed 8->9
+    # transit dip in the test cell (the long turret tools swing ~300 mm out from the
+    # board); reduce for a small pedestal. Generous is safe: only a tool/arm that
+    # actually dips below the box top within this footprint trips it.
+    board_keepout_margin_mm: float = 300.0
+    board_keepout_above_mm: float = 10.0    # box top this far above the board surface
+    board_keepout_depth_mm: float = 600.0   # how far down toward the floor the box extends
     # Drop generated poses where the robot (incl. mounted tooling like a spindle)
     # collides, checked in RoboDK SIMULATE before any target is written — so a pose
     # that would drive the spindle into the arm never becomes a TasniCalib_* target.
@@ -253,11 +270,32 @@ class CalibrationConfig(_Model):
     # nothing) where the build/station can't evaluate collisions. The dry tour
     # remains the final pre-run gate.
     collision_filter: bool = True
-    # Keep calibration moving when a station collision map is noisy/stale (a common
-    # case when the current seed already reports self-contact). The filter still
-    # drops clearly colliding poses when enough remain; if too few remain, target
-    # creation falls back to reachable poses and logs a warning. Set True for a
-    # hard safety gate that refuses generation instead.
+    # Baseline-relative screening: a real cell reports many CONSTANT collisions even
+    # at the safe pose the operator aimed from — the robot base overlapping a
+    # pedestal, each flange tool touching the wrist it is bolted to, a parked
+    # external axis clipping a wall. Counting *total* collisions then marks every
+    # pose as "colliding", which used to trip the fallback below and ship the whole
+    # set (the bug behind a spindle-into-arm target). Instead we record the colliding
+    # PAIR-SET at the safe seed and reject a pose/transit only if it introduces a
+    # pair NOT in that baseline — so constant artifacts are ignored and only genuine
+    # new contact (a tool entering the pedestal, the spindle swinging into a link) is
+    # dropped. Leave on; off restores the old total-count behaviour.
+    collision_baseline_relative: bool = True
+    # Joint-path samples per move when screening the SWEPT approach (start->pose and,
+    # in the dry tour, pose->pose): a pose can rest clear yet bump an obstacle mid-
+    # move (the 8->9 transit the operator reported). Endpoints + interior points are
+    # each pair-checked against the baseline. More = finer (slower on the big station).
+    collision_path_samples: int = 6
+    # Also force-enable collision pairs between every flange-mounted body and every
+    # static OBJECT in the station (the board pedestal, walls, cabinet, floor).
+    # RoboDK omits tool<->object pairs by default the same way it omits tool<->own-
+    # robot, so a tool dipping into the board's pedestal goes unseen. Safe with
+    # baseline-relative on (constant overlaps are subtracted out).
+    collision_obstacle_pairs: bool = True
+    # With baseline-relative screening, genuinely-colliding poses are always dropped
+    # and never shipped. This flag now only governs the case where collisions cannot
+    # be evaluated at all (no station collision map): False = proceed with the
+    # reachable poses and warn (inspect + dry-run first); True = refuse instead.
     collision_filter_hard_fail: bool = False
     # RoboDK's default collision map EXCLUDES a tool from colliding with its own
     # robot (the tool is the robot's child), so a flange-mounted spindle swinging

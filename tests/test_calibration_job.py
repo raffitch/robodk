@@ -65,10 +65,11 @@ def _build_fakes():
         def current_joints(self): return "HOME"
         def move_j_joints(self, j): state["cam"] = seed_T    # return-to-start
         def is_reachable(self, T): return True
-        def screen_collisions(self, poses, *, guard_skip=None):
+        def screen_collisions(self, poses, *, guard_skip=None, **kw):
             # No station collision map in the fake -> "not checked", drop nothing,
             # no locked joints from the sweep -> generation must back-fill joints
             # via solve_joints_for_pose so every target is still joint-locked.
+            # **kw absorbs obstacle_pairs/baseline_relative/path_samples.
             return [True] * len(poses), False, [None] * len(poses)
         def solve_joints_for_pose(self, T, seed=None):
             return ("joints", float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
@@ -87,6 +88,10 @@ def _build_fakes():
                 state["targets"].pop(n, None)
         def move_j(self, name): state["cam"] = state["targets"][name]
         def set_tool_pose(self, tool, T): FakeRdk.applied = (tool, T)
+        def add_keepout_box(self, name, board_pts_base, *, margin_mm, above_mm,
+                            depth_mm, parent=None, color=None):
+            FakeRdk.keepout = (name, np.asarray(board_pts_base).shape)
+            return SimpleNamespace(Valid=lambda: True)
     rdk = FakeRdk()
 
     class FakeCamera:
@@ -246,7 +251,7 @@ def test_generate_drops_colliding_poses():
     collides (checked=True), and reports how many were dropped."""
     services, rdk, _X, _state = _build_fakes()
 
-    def mask(poses, *, guard_skip=None):   # mark ~1/4 of candidates as colliding
+    def mask(poses, *, guard_skip=None, **kw):   # mark ~1/4 of candidates as colliding
         m = [True] * len(poses)
         for i in range(0, len(poses), 4):
             m[i] = False
@@ -290,12 +295,12 @@ def test_generate_skips_guard_when_disabled():
 
 
 def test_generate_refuses_when_tooling_collides():
-    """If too few collision-free poses survive, generation refuses with a
-    tooling/spindle-collision message rather than creating unsafe targets."""
+    """If too few collision-free poses survive the (baseline-relative) screen,
+    generation refuses with guidance rather than creating unsafe targets — it never
+    ships a pose that introduces a new collision."""
     services, rdk, _X, _state = _build_fakes()
-    services.config.calibration.collision_filter_hard_fail = True
 
-    def mask(poses, *, guard_skip=None):   # only 2 free -> below MIN_TRAIN_VIEWS
+    def mask(poses, *, guard_skip=None, **kw):   # only 2 free -> below MIN_TRAIN_VIEWS
         m = [False] * len(poses)
         m[0] = m[1] = True
         return m, True, [None] * len(poses)
@@ -307,28 +312,30 @@ def test_generate_refuses_when_tooling_collides():
         raise AssertionError("expected refusal due to tooling collisions")
     except RuntimeError as e:
         msg = str(e)
-        assert "collide" in msg
+        assert "collision-free" in msg and "Re-seed" in msg
     assert rdk.list_targets("TasniCalib_") == []   # nothing created
     print("[collision refusal]", msg.splitlines()[0])
 
 
-def test_generate_bypasses_noisy_collision_map_by_default():
-    """Calibration keeps target creation usable when RoboDK reports every
-    otherwise-reachable candidate as colliding; the collision report is surfaced
-    but the generated targets fall back to reachable poses."""
+def test_generate_refuses_when_all_poses_collide():
+    """When every reachable candidate introduces a new collision, generation REFUSES
+    (the silent ship-everything bypass is gone) — a colliding target is never created.
+    Replaces the old 'bypass keeps it usable' behaviour."""
     services, rdk, _X, _state = _build_fakes()
 
-    def mask(poses, *, guard_skip=None):
+    def mask(poses, *, guard_skip=None, **kw):
         return [False] * len(poses), True, [None] * len(poses)
     rdk.screen_collisions = mask
 
-    gen = service_mod.generate_calibration_targets(services)
-    assert gen["collision_filter_bypassed"] is True
-    assert gen["candidates_collided"] == gen["candidates_reachable"]
-    assert gen["created"] == 15
-    assert len(rdk.list_targets("TasniCalib_")) == 15
-    print("[collision bypass] created", gen["created"],
-          "after", gen["candidates_collided"], "reported collisions")
+    msg = ""
+    try:
+        service_mod.generate_calibration_targets(services)
+        raise AssertionError("expected refusal when all candidates collide")
+    except RuntimeError as e:
+        msg = str(e)
+        assert "collision-free" in msg
+    assert rdk.list_targets("TasniCalib_") == []   # nothing shipped
+    print("[all collide -> refuse]", msg.splitlines()[0])
 
 
 if __name__ == "__main__":
@@ -340,5 +347,5 @@ if __name__ == "__main__":
     test_generate_reports_collision_guard()
     test_generate_skips_guard_when_disabled()
     test_generate_refuses_when_tooling_collides()
-    test_generate_bypasses_noisy_collision_map_by_default()
+    test_generate_refuses_when_all_poses_collide()
     print("\nGate-gated calibration job tests passed.")

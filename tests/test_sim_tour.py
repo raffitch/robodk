@@ -86,6 +86,30 @@ class FakeRdk:
     def move_j_test(self, j1, j2, step_deg=None):
         return self._transit.get(j2, 0)        # j2 is the destination joint vector
 
+    # -- baseline-relative collision API (the fake has no constant artifacts, so its
+    #    baseline is empty and "new collisions" == the modelled resting/transit ones).
+    @staticmethod
+    def _keys(count):
+        return set(frozenset({(f"obj{i}", 0), ("KUKA", i + 1)}) for i in range(int(count)))
+    def ensure_obstacle_collision_pairs(self):
+        return {"objects": ["Pedestal", "wallall"], "pairs_enabled": 4, "pairs_failed": 0}
+    def collision_pair_keys(self):
+        if not self._collisions_on:
+            return None
+        cnt = 0 if self._collisions is None else self._collisions.get(self._current, 0)
+        return self._keys(cnt)
+    def new_collisions_here(self, baseline):
+        keys = self.collision_pair_keys()
+        if keys is None:
+            return None, []
+        new = keys - (baseline or set())
+        return bool(new), sorted(str(sorted(k)) for k in new)
+    def path_new_collisions(self, j1, j2, baseline, samples=6):
+        if not self._collisions_on:
+            return None
+        self._current = j2                     # the sweep leaves the robot at the dest
+        return self._transit.get(j2, 0) > 0
+
 
 def _run(rdk) -> dict:
     services = SimpleNamespace(config=AppConfig(), rdk=rdk)

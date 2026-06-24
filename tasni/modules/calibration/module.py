@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from ..base import ServiceContainer, WorkflowModule
 from .service import (
-    CalibrationJob, CalibrationParams, SimTourJob, TARGET_PREFIX,
+    BOARD_KEEPOUT_NAME, CalibrationJob, CalibrationParams, SimTourJob, TARGET_PREFIX,
     apply_calibration, apply_intrinsics, dry_tour_required, gate_thresholds,
     generate_calibration_targets)
 
@@ -280,11 +280,18 @@ class CalibrationModule(WorkflowModule):
 
         @router.post("/poses/clear")
         def poses_clear() -> dict:
-            """Delete the generated TasniCalib_* targets from the station."""
+            """Delete the generated TasniCalib_* targets and the board keep-out box
+            from the station."""
             try:
                 existing = services.rdk.list_targets(TARGET_PREFIX)
                 services.rdk.delete_items(existing)
-                return {"cleared": len(existing)}
+                # Remove the platform stand-in too, so it doesn't linger as a stale
+                # obstacle for the next aim (it's re-derived on the next Create targets).
+                removed_keepout = False
+                if services.rdk.item_exists(BOARD_KEEPOUT_NAME):
+                    services.rdk.delete_items([BOARD_KEEPOUT_NAME])
+                    removed_keepout = True
+                return {"cleared": len(existing), "keepout_removed": removed_keepout}
             except Exception as e:
                 raise HTTPException(503, f"RoboDK unavailable: {e}")
 

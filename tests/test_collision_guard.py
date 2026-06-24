@@ -183,19 +183,79 @@ class FakeRdkIK:
     def Collisions(self): return 0          # resting-config backstop -> clear
 
 
-def test_screen_collisions_runs_movej_test_and_drops_colliders():
+def test_screen_collisions_movej_count_when_not_baseline_relative():
+    """Legacy total-count path (baseline_relative=False): MoveJ_Test runs per pose
+    and any colliding candidate is dropped."""
     robot = FakeRobotIK(ncols=[0, 3, 0])   # candidate 1 collides (3 pairs)
     rdk = FakeRdkIK(robot)
     io = RdkIO(SimpleNamespace(rdk=rdk, config=RoboDKConfig()))
     poses = [np.eye(4) for _ in range(3)]
 
-    mask, checked, joints = io.screen_collisions(poses)
+    mask, checked, joints = io.screen_collisions(poses, baseline_relative=False)
 
-    assert robot.movej_tests == 3          # MoveJ_Test ACTUALLY RAN per pose (the fix)
+    assert robot.movej_tests == 3          # MoveJ_Test ACTUALLY RAN per pose
     assert checked is True
     assert mask == [True, False, True]     # the colliding candidate is dropped
     assert all(j is not None for j in joints)   # joint configs recorded -> JOINT targets
-    print("[screen] MoveJ_Test ran", robot.movej_tests, "times, mask", mask)
+    print("[screen legacy] MoveJ_Test ran", robot.movej_tests, "times, mask", mask)
+
+
+# --- baseline-relative screening (the default) ---------------------------------
+# A real cell reports CONSTANT collisions even at the safe seed (robot base on a
+# pedestal, a tool against its wrist). screen_collisions records that baseline pair-
+# set and drops a pose only if it adds a pair NOT in the baseline — so a candidate
+# whose swept path stays at the baseline is kept, and one that introduces a new
+# pair (a tool entering the pedestal / the spindle into a link) is dropped.
+class _Obj:
+    def __init__(self, name): self._n = name
+    def Name(self): return self._n
+    def Valid(self): return True
+
+
+class FakeRobotBR:
+    """SolveIK tags each candidate with a marker in joint 0 (1, 2, 3, …); setJoints
+    records the current marker so the fake map can vary by config."""
+    def __init__(self): self._ik = 0; self.cfg = 0.0
+    def Joints(self): return robomath.Mat([0.0] * 6)          # seed: marker 0
+    def setJoints(self, j):
+        try: self.cfg = float(np.asarray(j.list(), float).ravel()[0])
+        except Exception: self.cfg = 0.0
+    def SolveIK(self, pose, joints_approx=None, tool=None, reference=None):
+        self._ik += 1
+        return robomath.Mat([float(self._ik), 0.2, 0.3, 0.4, 0.5, 0.6])
+
+
+class FakeRdkBR(FakeRdkIK):
+    """One CONSTANT baseline pair always; a candidate whose endpoint marker is in
+    ``colliding`` adds one extra (new) pair."""
+    def __init__(self, robot, colliding):
+        super().__init__(robot); self._colliding = set(colliding)
+    def setCollisionActivePair(self, *a, **k): return 1
+    def ItemList(self, filter=None, list_names=False): return []
+    def _pairs(self):
+        m = self._robot.cfg
+        base = [(_Obj("robot"), _Obj("Pedestal"), 0, 0)]      # constant artifact
+        if abs(m - round(m)) < 1e-6 and int(round(m)) in self._colliding:
+            return base + [(_Obj("spindle"), _Obj("KUKA"), 0, 4)]   # NEW contact
+        return base
+    def Collisions(self): return len(self._pairs())
+    def CollisionPairs(self): return self._pairs()
+
+
+def test_screen_collisions_drops_baseline_relative_new_collisions():
+    robot = FakeRobotBR()
+    rdk = FakeRdkBR(robot, colliding={2})   # candidate #2 introduces a NEW pair
+    io = RdkIO(SimpleNamespace(rdk=rdk, config=RoboDKConfig()))
+    poses = [np.eye(4) for _ in range(3)]
+
+    mask, checked, joints = io.screen_collisions(poses, path_samples=3)
+
+    assert checked is True
+    # The constant robot↔Pedestal pair is in the baseline and ignored; only #2,
+    # which adds spindle↔KUKA, is dropped.
+    assert mask == [True, False, True]
+    assert all(j is not None for j in joints)
+    print("[screen baseline-relative] mask", mask)
 
 
 def test_screen_collisions_unreachable_solution_is_none():
@@ -258,6 +318,40 @@ def test_screen_collisions_enables_guard_pairs_after_checking_on():
     print("[guard order] COLLISION_ON then", len(pair_links), "Spindle pairs")
 
 
+def test_add_keepout_box_spans_footprint_and_depth():
+    """The platform stand-in spans the board footprint + lateral margin, with its top
+    just above the board and extending ``depth`` down toward the floor."""
+    class _ExistingNone:
+        def Valid(self): return False        # no prior box -> no delete
+    class _NewObj:
+        def Valid(self): return True
+        def setName(self, n): pass
+        def setColor(self, c): pass
+    captured = {}
+    class _RdkKO:
+        def Item(self, name, itemtype=0): return _ExistingNone()
+        def AddFile(self, path, parent=0):
+            verts = []
+            with open(path) as fh:
+                for line in fh:
+                    if line.startswith("v "):
+                        verts.append([float(x) for x in line.split()[1:4]])
+            captured["v"] = np.array(verts)
+            return _NewObj()
+    io = RdkIO(SimpleNamespace(rdk=_RdkKO(), config=RoboDKConfig()))
+    board = np.array([[100, 50, 200], [-100, 50, 200],
+                      [100, -50, 210], [-100, -50, 205]], float)
+    io.add_keepout_box("KO", board, margin_mm=80, above_mm=10, depth_mm=600, parent=0)
+    v = captured["v"]
+    assert v.shape == (8, 3)
+    # footprint x[-100,100]±80 -> [-180,180]; y[-50,50]±80 -> [-130,130]
+    assert abs(v[:, 0].min() + 180) < 1e-6 and abs(v[:, 0].max() - 180) < 1e-6
+    assert abs(v[:, 1].min() + 130) < 1e-6 and abs(v[:, 1].max() - 130) < 1e-6
+    # top = max board z (210) + 10 = 220; bottom = 220 - 600 = -380
+    assert abs(v[:, 2].max() - 220) < 1e-6 and abs(v[:, 2].min() + 380) < 1e-6
+    print("[keepout box]", v.min(axis=0).tolist(), "->", v.max(axis=0).tolist())
+
+
 def test_screen_collisions_no_guard_when_skip_none():
     """Without guard_skip, screen_collisions touches no collision pairs (back-compat
     — the dry tour / other callers that manage their own pairs are unaffected)."""
@@ -279,7 +373,9 @@ if __name__ == "__main__":
     test_skip_one_keeps_the_wrist_link_guarded()
     test_robot_dof_reads_joint_count()
     test_dof_falls_back_when_unreadable()
-    test_screen_collisions_runs_movej_test_and_drops_colliders()
+    test_screen_collisions_movej_count_when_not_baseline_relative()
+    test_screen_collisions_drops_baseline_relative_new_collisions()
+    test_add_keepout_box_spans_footprint_and_depth()
     test_screen_collisions_unreachable_solution_is_none()
     test_screen_collisions_enables_guard_pairs_after_checking_on()
     test_screen_collisions_no_guard_when_skip_none()

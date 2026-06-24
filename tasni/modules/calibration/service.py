@@ -45,6 +45,11 @@ from .quality import evaluate
 log = get_logger("tasni.calibration")
 
 TARGET_PREFIX = "TasniCalib_"
+# A collision OBJECT spanning the board footprint + margin, down toward the floor —
+# a conservative stand-in for the physical platform the board sits on (which is often
+# bigger than, or absent from, the station CAD). Created at generation, left in the
+# station to inspect, removed by Clear targets.
+BOARD_KEEPOUT_NAME = "TasniBoardKeepout"
 
 # Hand-eye needs a minimum well-conditioned training set; below this the linear
 # solve is under-constrained regardless of how good each view's reprojection is.
@@ -224,6 +229,35 @@ def generate_calibration_targets(services) -> dict:
     if prior:
         rdk.delete_items(prior)
 
+    # The board's pose in the base frame, from the seed detection — used for the
+    # visibility filter (below) and the keep-out box. seed_T is the camera pose in
+    # base; det.* is the board in the camera; so seed_T @ T_cam_board = T_base_board.
+    T_base_board = seed_T @ Rt_to_T(det.R_target2cam, det.t_target2cam)
+    board_pts_base = transform_points(T_base_board, board.all_obj_points)
+
+    # Add a conservative platform stand-in (board footprint + margin, down toward the
+    # floor) as a collision object, so a pose that grazes the real platform — bigger
+    # than the station CAD — is caught by the baseline-relative screen below. Left in
+    # the station to inspect; Clear targets removes it. Best-effort.
+    keepout_added = False
+    if ccfg.board_keepout:
+        try:
+            box = rdk.add_keepout_box(
+                BOARD_KEEPOUT_NAME, board_pts_base,
+                margin_mm=ccfg.board_keepout_margin_mm,
+                above_mm=ccfg.board_keepout_above_mm,
+                depth_mm=ccfg.board_keepout_depth_mm)
+            keepout_added = bool(box is not None and getattr(box, "Valid", lambda: True)())
+            if keepout_added:
+                services.bus.publish(JobEvent("log", {"message":
+                    f"board keep-out: added {BOARD_KEEPOUT_NAME!r} (board footprint + "
+                    f"{ccfg.board_keepout_margin_mm:.0f} mm, {ccfg.board_keepout_depth_mm:.0f} mm "
+                    f"deep) as a platform stand-in — poses grazing the platform are dropped"}))
+        except Exception as e:   # noqa: BLE001 - the keep-out is a bonus, never abort
+            services.bus.publish(JobEvent("log", {"message":
+                f"board keep-out: could not add the platform stand-in "
+                f"({type(e).__name__}: {e}); continuing without it"}))
+
     candidates = generate_calibration_poses(
         seed_T, count=ccfg.pose_count, look_distance_mm=look,
         cone_half_angle_deg=ccfg.cone_half_angle_deg,
@@ -233,7 +267,6 @@ def generate_calibration_targets(services) -> dict:
     # conditioning; see select_diverse / the workspace-edge finding in robot_probe).
     reachable = [(i, T) for i, T in enumerate(candidates) if rdk.is_reachable(T)]
     n_reach = len(reachable)
-    reachable_before_collision = list(reachable)
     if n_reach < MIN_TRAIN_VIEWS:
         raise RuntimeError(
             f"only {n_reach} reachable poses around this view (need "
@@ -275,11 +308,19 @@ def generate_calibration_targets(services) -> dict:
 
     n_collide = 0
     col_checked = False
-    collision_filter_bypassed = False
+    collision_filter_bypassed = False   # retained for the API/UI shape; never set now
     reach_joints: list = [None] * n_reach
     if ccfg.collision_filter:
-        mask, col_checked, jts = rdk.screen_collisions([T for _, T in reachable],
-                                                       guard_skip=guard_skip)
+        # Baseline-relative screen: drops only poses that introduce a NEW collision
+        # beyond the constant ones present at the safe seed (robot-base↔pedestal, each
+        # tool↔its wrist, a parked axis↔wall). Obstacle pairs enabled so a tool
+        # entering the board pedestal is seen; the path is swept so a mid-move bump is
+        # too. A genuinely-colliding pose is ALWAYS dropped — never shipped.
+        mask, col_checked, jts = rdk.screen_collisions(
+            [T for _, T in reachable], guard_skip=guard_skip,
+            obstacle_pairs=ccfg.collision_obstacle_pairs,
+            baseline_relative=ccfg.collision_baseline_relative,
+            path_samples=ccfg.collision_path_samples)
         kept = [k for k in range(n_reach) if mask[k]]
         if col_checked:
             n_collide = n_reach - len(kept)
@@ -287,24 +328,30 @@ def generate_calibration_targets(services) -> dict:
         reach_joints = [jts[k] for k in kept]       # locked configs (may be None)
         services.bus.publish(JobEvent("log", {"message":
             f"collision screen: checking {'ACTIVE' if col_checked else 'unavailable'}; "
-            f"swept {n_reach} reachable pose(s), {n_collide} collided and were dropped"}))
-        if col_checked and len(reachable) < MIN_TRAIN_VIEWS:
+            f"swept {n_reach} reachable pose(s), {n_collide} introduced a new "
+            f"collision and were dropped"}))
+        if not col_checked:
+            # The station/build can't evaluate collisions (no collision map). Nothing
+            # was dropped — proceed with reachable poses (inspect + dry-run), unless a
+            # hard gate is configured.
             if ccfg.collision_filter_hard_fail:
                 raise RuntimeError(
-                    f"only {len(reachable)} collision-free poses around this view "
-                    f"({n_collide} of {n_reach} reachable poses would collide — "
-                    f"likely the mounted tooling/spindle hitting the arm). Jog to a "
-                    f"more open part of the workspace (still framing the board), or "
-                    f"remove the tooling, and retry.")
-            collision_filter_bypassed = True
-            reachable = reachable_before_collision
-            reach_joints = [None] * len(reachable)
+                    "collision checking is unavailable on this station (no collision "
+                    "map) and collision_filter_hard_fail is set — set up Tools → "
+                    "Collision Map in RoboDK and save, or clear the hard-fail flag.")
             services.bus.publish(JobEvent("log", {"message":
-                "WARNING: RoboDK reported too many calibration candidate poses as "
-                "colliding, so target creation is continuing with reachable poses "
-                "only. Inspect the targets in RoboDK and run the dry tour before "
-                "moving the real robot; set calibration.collision_filter_hard_fail "
-                "to true for strict refusal."}))
+                "WARNING: collisions could NOT be checked (no station collision map) — "
+                "creating reachable poses only. Inspect them in RoboDK and run the dry "
+                "tour before moving the real robot."}))
+        elif len(reachable) < MIN_TRAIN_VIEWS:
+            # Enough poses genuinely collide that too few clean ones remain. Refuse —
+            # never ship a colliding target (the operator chose refuse-with-guidance).
+            raise RuntimeError(
+                f"only {len(reachable)} collision-free pose(s) around this view — "
+                f"{n_collide} of {n_reach} reachable poses introduce a NEW collision "
+                f"(the mounted tooling swinging into the arm, or a tool entering the "
+                f"board pedestal). Re-seed at a more open part of the workspace (still "
+                f"framing the board), or clear the obstruction, and Create targets again.")
 
     # Visibility pre-filter: a pose can be reachable AND collision-free yet aim so
     # the board clips the frame edge (or leaves view), which today only surfaces as
@@ -315,10 +362,8 @@ def generate_calibration_targets(services) -> dict:
     # Cheap pure-numpy pinhole; degrades to a no-op if it would starve the solve.
     n_offframe = 0
     vis_checked = False
-    if ccfg.visibility_filter and det is not None and reachable:
-        T_base_board = seed_T @ Rt_to_T(det.R_target2cam, det.t_target2cam)
-        board_pts_base = transform_points(T_base_board, board.all_obj_points)
-        img_size = cfg.camera.size
+    if ccfg.visibility_filter and reachable:
+        img_size = cfg.camera.size      # board_pts_base computed above (from the seed)
         vis = [board_visible_fraction(T, board_pts_base, K, img_size,
                                       margin_frac=ccfg.board_visible_margin_frac)
                for _, T in reachable]
@@ -416,6 +461,7 @@ def generate_calibration_targets(services) -> dict:
             "collision_filter_bypassed": collision_filter_bypassed,
             "visibility_checked": vis_checked,
             "poses_offframe_dropped": n_offframe,
+            "board_keepout_added": keepout_added,
             "effective_cone_deg": round(eff_max, 1),
             "camera_tool_offset_mm": round(tool_offset_mm, 1),
             "targets_joint_locked": len(created) - n_cartesian,
@@ -600,16 +646,33 @@ class SimTourJob:
         # Same blind spot as Create targets: RoboDK won't check a tool against its
         # own robot, so enable the mounted-tool↔arm pairs before the tour or the
         # spindle-into-A4 case stays invisible here too.
+        ccfg = self.services.config.calibration
         if collisions_on and self.collision_self_pairs:
             guard = rdk.ensure_mounted_tool_collision_pairs(
                 self.collision_skip_wrist_links)
             if guard and guard.get("pairs_enabled"):
                 ctx.log(f"collision guard: {guard['pairs_enabled']} tool↔arm pair(s) "
                         f"enabled ({', '.join(guard['tools']) or 'mounted tools'})")
+            # Also check the mounted tools against the static obstacles (board
+            # pedestal, walls, …) — RoboDK omits tool↔object pairs by default, the
+            # reason a tool dipping into the pedestal mid-tour went unseen.
+            if ccfg.collision_obstacle_pairs:
+                obs = rdk.ensure_obstacle_collision_pairs()
+                if obs and obs.get("pairs_enabled"):
+                    ctx.log(f"collision guard: {obs['pairs_enabled']} tool↔object "
+                            f"pair(s) enabled ({', '.join(obs['objects']) or 'objects'})")
         try:
             start_joints = rdk.current_joints()
         except Exception:
             start_joints = None
+        # Baseline collision pair-set at the safe start config: the constant cell
+        # artifacts (robot base↔pedestal, tool↔its wrist, parked axis↔wall) to
+        # subtract so the tour reports only NEW collisions — a genuine bump.
+        baseline = set()
+        if collisions_on and ccfg.collision_baseline_relative:
+            bk = rdk.collision_pair_keys()
+            baseline = bk if bk is not None else set()
+        samples = ccfg.collision_path_samples
 
         results: list[TourPoseResult] = []
         total = len(targets)
@@ -631,19 +694,30 @@ class SimTourJob:
                 if reachable:
                     dest = rdk.target_joints(name)
                     if collisions_on and prev_joints is not None and dest is not None:
-                        ncol = rdk.move_j_test(prev_joints, dest)
-                        transit = None if ncol is None else bool(ncol)
-                        if transit:
-                            pairs = getattr(rdk, "collision_pairs", lambda: [])()
+                        if ccfg.collision_baseline_relative:
+                            transit = rdk.path_new_collisions(prev_joints, dest,
+                                                              baseline, samples)
+                            if transit:
+                                _, pairs = rdk.new_collisions_here(baseline)
+                        else:
+                            ncol = rdk.move_j_test(prev_joints, dest)
+                            transit = None if ncol is None else bool(ncol)
+                            if transit:
+                                pairs = getattr(rdk, "collision_pairs", lambda: [])()
                     try:
                         rdk.move_j(name)
                     except Exception as e:   # noqa: BLE001 - a sim move failure is a fail, not a crash
                         reachable, err = False, str(e)
                     if reachable and collisions_on:
-                        n_col = rdk.collisions()
-                        collision = None if n_col is None else bool(n_col)
-                        if collision:
-                            pairs = getattr(rdk, "collision_pairs", lambda: [])() or pairs
+                        if ccfg.collision_baseline_relative:
+                            collision, newp = rdk.new_collisions_here(baseline)
+                            if collision:
+                                pairs = newp or pairs
+                        else:
+                            n_col = rdk.collisions()
+                            collision = None if n_col is None else bool(n_col)
+                            if collision:
+                                pairs = getattr(rdk, "collision_pairs", lambda: [])() or pairs
                     if reachable:
                         try:
                             prev_joints = rdk.current_joints()
@@ -663,10 +737,16 @@ class SimTourJob:
             return_path_ok = True
             if start_joints is not None:
                 if collisions_on and prev_joints is not None:
-                    ncol = rdk.move_j_test(prev_joints, start_joints)
-                    if ncol:
-                        return_path_ok = False
-                        ctx.log(f"return-to-start path COLLIDES ({ncol} pair(s))")
+                    if ccfg.collision_baseline_relative:
+                        if rdk.path_new_collisions(prev_joints, start_joints,
+                                                   baseline, samples):
+                            return_path_ok = False
+                            ctx.log("return-to-start path introduces a NEW collision")
+                    else:
+                        ncol = rdk.move_j_test(prev_joints, start_joints)
+                        if ncol:
+                            return_path_ok = False
+                            ctx.log(f"return-to-start path COLLIDES ({ncol} pair(s))")
                 try:
                     rdk.move_j_joints(start_joints)
                     returned = True

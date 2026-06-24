@@ -364,6 +364,46 @@ class RdkIO:
         return {"tools": names, "links": link_ids, "pairs_enabled": enabled,
                 "pairs_failed": failed, "dof": dof}
 
+    def ensure_obstacle_collision_pairs(self) -> dict:
+        """Force-enable collision pairs between every flange-mounted body (tools +
+        their objects) and every static OBJECT in the station (the board pedestal,
+        walls, cabinet, floor, …).
+
+        Why: RoboDK's default map omits a tool↔object pair the same way it omits a
+        tool↔own-robot pair, so a tool dipping into the board's pedestal reports zero
+        collisions and the pose sails through. Re-enabling these lets
+        :meth:`screen_collisions` and the dry tour see tool-vs-obstacle contact.
+        Enabling *all* tool↔object pairs is safe under baseline-relative screening:
+        a pair that's already in contact at the safe seed (e.g. the robot base
+        overlapping the pedestal) is recorded in the baseline and subtracted out, so
+        only NEW contact is ever acted on. Idempotent, best-effort, never raises.
+        Returns ``{"objects", "pairs_enabled", "pairs_failed"}``."""
+        import robolink
+
+        tools = self.mounted_tool_items()
+        objects = self.rdk.ItemList(robolink.ITEM_TYPE_OBJECT)
+        enabled = failed = 0
+        names: list[str] = []
+        for ob in objects:
+            ok_any = False
+            for it in tools:
+                try:
+                    r = self.rdk.setCollisionActivePair(
+                        robolink.COLLISION_ON, it, ob, 0, 0)
+                    if int(r) == 1:
+                        enabled += 1
+                        ok_any = True
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+            if ok_any:
+                try:
+                    names.append(ob.Name())
+                except Exception:
+                    pass
+        return {"objects": names, "pairs_enabled": enabled, "pairs_failed": failed}
+
     # Joint step (deg) MoveJ_Test interpolates at while checking the approach — fine
     # enough to catch a thin self-collision, coarse enough to stay quick on the big
     # station. The destination config is always checked regardless of this.
@@ -401,8 +441,72 @@ class RdkIO:
             vals = vals[:dof]
         return robomath.Mat(vals)
 
+    @staticmethod
+    def _format_pair_keys(keys) -> list[str]:
+        """Readable ``A:Ln ↔ B`` strings for a set of canonical pair keys."""
+        out = []
+        for k in keys or ():
+            parts = [f"{name}:L{lid}" if lid else name
+                     for (name, lid) in sorted(k, key=lambda x: (x[0], x[1]))]
+            out.append(" ↔ ".join(parts))
+        return sorted(out)
+
+    def new_collisions_here(self, baseline):
+        """At the current (already-positioned) sim config, return
+        ``(has_new, readable_new_pairs)`` — collisions beyond ``baseline``. ``has_new``
+        is ``None`` if collisions can't be evaluated. The resting-config companion to
+        :meth:`path_new_collisions`."""
+        keys = self.collision_pair_keys()
+        if keys is None:
+            return None, []
+        new = keys - (baseline or set())
+        return bool(new), self._format_pair_keys(new)
+
+    def path_new_collisions(self, j1, j2, baseline, samples: int = 6):
+        """Does interpolating the joint move ``j1 -> j2`` introduce a colliding pair
+        not present in ``baseline``? Samples the path (endpoints + interior points),
+        reading the canonical pair-set at each. Returns ``True`` (a new collision
+        appears), ``False`` (none beyond the baseline), or ``None`` (couldn't judge).
+
+        ``j1`` may be ``None`` (then only the destination ``j2`` is checked). This is
+        the swept, baseline-relative check both target generation (seed -> pose) and
+        the dry tour (pose -> pose) use, so a pose that rests clear yet bumps an
+        obstacle mid-move (the 8->9 transit) is caught."""
+        import robodk.robomath as robomath
+
+        robot = self.robot()
+        try:
+            b = np.asarray(j2.list(), dtype=float).ravel()
+        except Exception:
+            return None
+        a = None
+        if j1 is not None:
+            try:
+                aa = np.asarray(j1.list(), dtype=float).ravel()
+                if aa.shape == b.shape:
+                    a = aa
+            except Exception:
+                a = None
+        samples = max(1, int(samples))
+        fracs = ([1.0] if a is None or samples == 1
+                 else [k / (samples - 1) for k in range(samples)])
+        base = baseline or set()
+        for f in fracs:
+            cfg = b if a is None else a + (b - a) * f
+            try:
+                robot.setJoints(robomath.Mat([float(x) for x in cfg]))
+            except Exception:
+                return None
+            keys = self.collision_pair_keys()
+            if keys is None:
+                return None
+            if keys - base:
+                return True
+        return False
+
     def screen_collisions(self, poses: list[np.ndarray], *,
-                          guard_skip: int | None = None
+                          guard_skip: int | None = None, obstacle_pairs: bool = False,
+                          baseline_relative: bool = True, path_samples: int = 6
                           ) -> tuple[list[bool], bool, list]:
         """Test each TCP pose for collisions **in simulation** and record the exact
         joint configuration used.
@@ -420,17 +524,19 @@ class RdkIO:
           reached in a different IK branch that collides.
 
         ``guard_skip`` (when not None) force-enables the mounted-tool↔arm collision
-        pairs **after** turning collision checking on — see the comment below; this is
-        what actually catches the spindle↔arm self-collision and MUST happen here, not
-        before, because ``setCollisionActive(ON)`` rebuilds the default map.
+        pairs, and ``obstacle_pairs`` the tool↔static-object pairs — both **after**
+        turning collision checking on, because ``setCollisionActive(ON)`` rebuilds the
+        default map (which excludes a tool↔own-robot and tool↔object), wiping any pair
+        enabled earlier.
 
-        Uses ``MoveJ_Test`` (interpolates the move and returns the number of colliding
-        object pairs) from the robot's current ``seed`` joints to each candidate — so
-        it catches the robot self-colliding with its own tooling (e.g. the spindle
-        hitting link 4 in a wrist-flipped config). A resting-config ``Collisions()``
-        backstop re-checks the endpoint in case the coarse joint step stepped over a
-        thin contact. The spindle and every other flange body participate as long as
-        their pair is enabled in the station's collision map.
+        Screening is **baseline-relative** (``baseline_relative``): a real cell reports
+        constant collisions even at the safe seed pose (robot base on a pedestal, each
+        tool against its mounting wrist, a parked axis clipping a wall). We record the
+        colliding pair-set at the seed and reject a pose only if its swept path
+        introduces a pair NOT in that baseline — so those artifacts are ignored and
+        only genuine new contact drops the pose. ``path_samples`` interior+endpoint
+        configs are checked along ``seed -> pose`` so a mid-move bump is caught too.
+        (``baseline_relative=False`` restores the old total-count ``MoveJ_Test``.)
 
         Safety: forces SIMULATE, restores the seed joints and prior run mode, and
         **disables collision checking again afterwards** (leaving it on makes every
@@ -444,15 +550,20 @@ class RdkIO:
         prior_mode = self.current_run_mode()
         self.rdk.setRunMode(self.RUNMODE_SIMULATE)
         on = self.set_collision_checking(True)
-        # Enable the mounted-tool<->arm collision pairs AFTER checking is on:
-        # setCollisionActive(ON) rebuilds the collision map from RoboDK's defaults,
-        # which EXCLUDE a tool from colliding with its own robot — so any pair enabled
-        # while checking was off (e.g. by a caller before this) is wiped, and the
-        # spindle<->A4 self-collision goes unseen (the target-12 collider that kept
-        # slipping through). Re-applying here — the same order the dry tour uses —
-        # keeps them active for the MoveJ_Test sweep below.
         if on and guard_skip is not None:
             self.ensure_mounted_tool_collision_pairs(guard_skip)
+        if on and obstacle_pairs:
+            self.ensure_obstacle_collision_pairs()
+        # Record the baseline collision pair-set at the SAFE seed config (the pose the
+        # operator aimed from), so the constant modelling artifacts are subtracted out.
+        baseline = set()
+        if on and baseline_relative and seed_joints is not None:
+            try:
+                robot.setJoints(seed_joints)
+            except Exception:
+                pass
+            bk = self.collision_pair_keys()
+            baseline = bk if bk is not None else set()
         mask: list[bool] = []
         joints: list = []
         try:
@@ -460,33 +571,22 @@ class RdkIO:
                 sol = None
                 collides: bool | None = None
                 try:
-                    # Anchor every solve to the seed config so the chosen IK branch
-                    # is deterministic: without joints_approx, SolveIK returns the
-                    # branch nearest the robot's CURRENT sim position, which drifts
-                    # because MoveJ_Test below leaves the robot at each candidate.
-                    # _solve_ik passes the camera tool EXPLICITLY, so the joints place
-                    # the camera (not the flange) at T — the config we lock + collision
-                    # check is the one the camera actually reaches the viewpoint in.
+                    # Anchor every solve to the seed config so the chosen IK branch is
+                    # deterministic, and pass the camera tool EXPLICITLY so the joints
+                    # place the camera (not the flange) at T — the config we lock +
+                    # collision-check is the one the camera reaches the viewpoint in.
                     ik = self._solve_ik(T, seed_joints)
-                    # SolveIK returns the joints as a Mat: reachable -> an N-element
-                    # vector (N = DOF, sometimes +2 config values); unreachable -> a
-                    # 1-element Mat([0]). CRITICAL: Mat.Cols()/Rows() return the row/
-                    # column LISTS, not counts, so the old `ik.Cols()==1 and
-                    # ik.Rows()>=6` was ALWAYS False — MoveJ_Test never ran and every
-                    # pose survived as an un-collision-checked cartesian target (the
-                    # spindle-into-A4 that slipped through). Discriminate on element
-                    # count instead.
                     sol = self._ik_to_joints(ik, seed_joints)
                     if sol is not None and on:
-                        j1 = seed_joints if seed_joints is not None else sol
-                        ncol = robot.MoveJ_Test(j1, sol, self.COLLISION_STEP_DEG)
-                        collides = int(ncol) > 0
-                        if not collides:
-                            # MoveJ_Test leaves the robot AT sol when the path is
-                            # clear, so re-check the resting config directly — a
-                            # coarse joint step can step over a thin endpoint contact.
-                            rest = self.collisions()
-                            collides = bool(rest)
+                        if baseline_relative:
+                            collides = self.path_new_collisions(
+                                seed_joints, sol, baseline, path_samples)
+                        else:
+                            j1 = seed_joints if seed_joints is not None else sol
+                            ncol = robot.MoveJ_Test(j1, sol, self.COLLISION_STEP_DEG)
+                            collides = int(ncol) > 0
+                            if not collides:
+                                collides = bool(self.collisions())
                 except Exception:
                     sol, collides = sol, None
                 joints.append(sol)
@@ -561,6 +661,36 @@ class RdkIO:
             except Exception:
                 continue
         return out
+
+    def collision_pair_keys(self):
+        """Canonical, order-independent set of the currently-colliding pairs (sim
+        state), or ``None`` if collisions can't be evaluated on this build/station.
+
+        Each key is a ``frozenset`` of ``(item_name, link_id)`` endpoints, so the
+        same physical pair hashes identically no matter which order RoboDK reports it
+        in. This is the unit of *baseline-relative* screening: a pose is unsafe only
+        if its set contains a pair the safe seed's set does not (see
+        :meth:`screen_collisions`). Best-effort; never raises."""
+        try:
+            n = int(self.rdk.Collisions())          # force a recompute of the map
+        except Exception:
+            return None
+        if n <= 0:
+            return set()
+        try:
+            pairs = self.rdk.CollisionPairs()
+        except Exception:
+            return set()
+        keys = set()
+        for p in pairs:
+            try:
+                it1, it2, id1, id2 = p
+                n1 = it1.Name() if it1.Valid() else "<invalid>"
+                n2 = it2.Name() if it2.Valid() else "<invalid>"
+                keys.add(frozenset({(n1, int(id1)), (n2, int(id2))}))
+            except Exception:
+                continue
+        return keys
 
     def list_targets(self, prefix: str | None = None) -> list[str]:
         """Sorted names of TARGET items, filtered by ``prefix``."""
@@ -723,3 +853,46 @@ class RdkIO:
             if color is not None:
                 item.setColor(color)
         return item
+
+    def add_keepout_box(self, name: str, board_pts_base: np.ndarray, *,
+                        margin_mm: float, above_mm: float, depth_mm: float,
+                        parent=None, color: list | None = None):
+        """Create an axis-aligned box OBJECT spanning the board footprint + a lateral
+        ``margin_mm``, from ``above_mm`` above the board's top down by ``depth_mm``
+        toward the floor — a conservative stand-in for the physical platform the board
+        rests on, so the collision screen can drop a pose that would graze it.
+
+        ``board_pts_base`` is an ``(N, 3)`` array of board points in the base frame
+        (the frame the box is parented to). Replaces any existing same-named object so
+        re-creating it each generation is idempotent. Built as a 12-triangle OBJ via
+        ``AddFile`` (the reliable parented-import path :meth:`add_rectangle` uses)."""
+        import os
+        from tempfile import TemporaryDirectory
+
+        import robolink
+
+        pts = np.asarray(board_pts_base, dtype=float).reshape(-1, 3)
+        xlo, xhi = float(pts[:, 0].min()) - margin_mm, float(pts[:, 0].max()) + margin_mm
+        ylo, yhi = float(pts[:, 1].min()) - margin_mm, float(pts[:, 1].max()) + margin_mm
+        ztop = float(pts[:, 2].max()) + above_mm
+        zbot = ztop - depth_mm
+        verts = [(xlo, ylo, zbot), (xhi, ylo, zbot), (xhi, yhi, zbot), (xlo, yhi, zbot),
+                 (xlo, ylo, ztop), (xhi, ylo, ztop), (xhi, yhi, ztop), (xlo, yhi, ztop)]
+        faces = [(1, 2, 3), (1, 3, 4), (5, 8, 7), (5, 7, 6), (1, 5, 6), (1, 6, 2),
+                 (2, 6, 7), (2, 7, 3), (3, 7, 8), (3, 8, 4), (4, 8, 5), (4, 5, 1)]
+        existing = self.rdk.Item(name, robolink.ITEM_TYPE_OBJECT)
+        if existing.Valid():
+            existing.Delete()
+        lines = ["# Tasni board keep-out (platform stand-in)"]
+        lines += [f"v {x:.4f} {y:.4f} {z:.4f}" for (x, y, z) in verts]
+        lines += [f"f {a} {b} {c}" for (a, b, c) in faces]
+        add_to = parent if parent is not None else self.robot_base_frame()
+        with TemporaryDirectory(prefix="tasni_keepout_") as td:
+            path = os.path.join(td, "keepout.obj")
+            with open(path, "w", encoding="ascii") as fh:
+                fh.write("\n".join(lines) + "\n")
+            obj = self.rdk.AddFile(path, add_to if add_to is not None else 0)
+        if obj.Valid():
+            obj.setName(name)
+            obj.setColor(color if color is not None else [1.0, 0.25, 0.25, 0.28])
+        return obj
