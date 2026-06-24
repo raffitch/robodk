@@ -126,6 +126,16 @@ class RoboDKConfig(_Model):
     # the station is loaded (the collision MAP / pair config is preserved; the app
     # re-enables checking only transiently for the pose filter + the dry tour).
     disable_collisions_on_connect: bool = True
+    # Real-robot driver link. In "run_robot" mode RoboDK must be connected to the
+    # physical KUKA controller or it reports the robot "offline" and refuses to
+    # move — previously the operator had to link it by hand in RoboDK's "Connect
+    # robot" panel before every run. With this on, /connect links the controller
+    # (best-effort; the controller may be off) so the simulated robot then tracks
+    # the real one and the seed pose Create-targets reads is the arm's ACTUAL pose;
+    # the real run re-ensures the link and fails clearly if it can't establish it.
+    connect_robot_on_connect: bool = True
+    robot_ip: str = ""                 # blank -> use the IP stored on the robot item
+    robot_connect_timeout_s: float = 10.0
 
 
 class CalibrationConfig(_Model):

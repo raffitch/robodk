@@ -9,6 +9,19 @@ import StreamStats, { useStreamStats } from "./StreamStats";
 const api = moduleApi("calibration");
 const TARGET_PREFIX = "TasniCalib_";   // must match service.py TARGET_PREFIX
 
+// One line about the real-robot driver link (the thing that used to read "robot
+// offline" until the operator connected it by hand). null => auto-connect is off.
+export function robotLinkNote(
+  link?: { connected: boolean; message: string; ip: string; configured: boolean } | null
+): string {
+  if (!link) return "";
+  if (link.connected) return ` Real robot ONLINE${link.ip ? ` (${link.ip})` : ""}.`;
+  if (!link.configured)
+    return " Real robot not linked — no controller IP set on the robot in RoboDK.";
+  return ` Real robot OFFLINE — ${link.message || "controller not reachable"}.`
+    + " Power the controller + driver to run on the real arm.";
+}
+
 interface CalibConfig {
   robot: string;
   camera_tool: string;
@@ -159,10 +172,13 @@ export default function Calibration() {
     setConn("connecting");
     setConnInfo("Opening the Tasni station… first load of the 117 MB station can take 1–2 min.");
     try {
-      const r = await api.post<{ ready: boolean; tool: string; missing: string[] }>("/connect");
+      const r = await api.post<{ ready: boolean; tool: string; missing: string[];
+        robot_link?: { connected: boolean; message: string; ip: string;
+                       configured: boolean } | null }>("/connect");
       if (r.ready) {
         setConn("ready");
-        setConnInfo(`Ready — robot and the '${r.tool}' camera tool are present.`);
+        setConnInfo(`Ready — robot and the '${r.tool}' camera tool are present.`
+          + robotLinkNote(r.robot_link));
         refreshTargets(); refreshJob();   // pick up targets / solved run already in the cell
         // NB: collision status is checked lazily (Recheck button / after generate),
         // NOT here — probing collisions on the 117 MB station right after connect is

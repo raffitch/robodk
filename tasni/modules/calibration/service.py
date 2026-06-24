@@ -138,6 +138,33 @@ def ensure_camera_tool(services, *, log=None) -> dict:
     return {"present": True, "restored": run_id}
 
 
+def ensure_real_robot_link(rdk: RdkIO, robodk_cfg, *, log=None) -> None:
+    """Make sure RoboDK is linked to the PHYSICAL robot controller before any real
+    motion. Connects (best-effort) if the link isn't already up, and raises a clear
+    ``RuntimeError`` if the controller can't be reached — so a ``run_robot`` run
+    fails with an actionable message instead of RoboDK silently reporting the robot
+    "offline" and refusing to move (the symptom that forced a manual connect).
+
+    Shared by the calibration and scan run jobs. No-op (returns) when
+    ``connect_robot_on_connect`` is off, so the operator can keep linking by hand."""
+    if not getattr(robodk_cfg, "connect_robot_on_connect", False):
+        return
+    ready, msg = rdk.connect_robot(robodk_cfg.robot_ip,
+                                   timeout_s=robodk_cfg.robot_connect_timeout_s)
+    if not ready:
+        params = rdk.robot_connection_params()
+        where = f" at {params['ip']}" if params.get("ip") else \
+            " (no controller IP set on the robot in RoboDK)"
+        raise RuntimeError(
+            f"real robot offline — RoboDK could not link to the KUKA "
+            f"controller{where}: {msg or 'not ready'}. Check the controller is on, "
+            f"the RoboDK robot driver is running, and the network, then run again. "
+            f"(Linking the controller is what moves the arm; opening RoboDK alone "
+            f"does not.)")
+    if log:
+        log(f"real robot linked{(' (' + msg + ')') if msg else ''}")
+
+
 def gate_thresholds(ccfg) -> GateThresholds:
     """Build the gate thresholds from a CalibrationConfig (one source of truth so
     the live preview and the authoritative generate-grab gate identically)."""
@@ -850,6 +877,8 @@ class CalibrationJob:
 
         applied_mode = rdk.apply_run_mode("run_robot")
         ctx.log(f"run mode: {applied_mode} (REAL ROBOT)")
+        if applied_mode == "run_robot":
+            ensure_real_robot_link(rdk, cfg.robodk, log=ctx.log)
         tool_pose = rdk.use_camera_tool(self.tool_name)
         ctx.log(f"tool: {self.tool_name}; {len(targets)} targets to visit")
 

@@ -25,12 +25,31 @@ def T_to_pose(T: np.ndarray):
     return robomath.Mat(np.asarray(T, dtype=float).tolist())
 
 
+def link_real_robot(rdk: "RdkIO", cfg) -> dict | None:
+    """Best-effort connect the physical robot per a ``RoboDKConfig`` and summarise
+    the link for the ``/connect`` response + UI. Returns ``None`` when
+    ``connect_robot_on_connect`` is off (so the response field is simply absent).
+
+    Shared by the calibration and scan connect endpoints so both link the
+    controller the same way. Never raises (``connect_robot`` is best-effort)."""
+    if not getattr(cfg, "connect_robot_on_connect", False):
+        return None
+    ready, msg = rdk.connect_robot(cfg.robot_ip, timeout_s=cfg.robot_connect_timeout_s)
+    params = rdk.robot_connection_params()
+    return {"connected": ready, "message": msg, "ip": params.get("ip", ""),
+            "configured": bool(params.get("ip"))}
+
+
 class RdkIO:
     """Cell operations on top of an :class:`RdkSession`."""
 
     # RoboDK RUNMODE constants (avoids importing robolink just for the enum).
     RUNMODE_SIMULATE = 1
     RUNMODE_RUN_ROBOT = 6
+    # RoboDK real-robot driver connection status (robolink ROBOTCOM_*). The link is
+    # "ready" (robot movable) only at ROBOTCOM_READY; negative values are
+    # not-connected/disconnected/problems, positive values are working/waiting.
+    ROBOTCOM_READY = 0
 
     def __init__(self, session: RdkSession):
         self.session = session
@@ -125,8 +144,62 @@ class RdkIO:
         return self.flange_pose_T() @ self._tool_pose
 
     def current_joints(self):
-        """Current joint vector (RoboDK ``Mat``) — snapshot for a safe return."""
+        """Current joint vector (RoboDK ``Mat``) — snapshot for a safe return.
+
+        Once :meth:`connect_robot` has linked the physical controller, RoboDK's
+        driver mirrors the real arm into the model, so this is the live robot
+        position (the seed Create-targets orbits, and the start the run returns to)."""
         return self.robot().Joints()
+
+    # -- real-robot driver link --------------------------------------------
+    def robot_connection_params(self) -> dict:
+        """The real-controller connection params stored on the robot item — the
+        IP/port RoboDK's "Connect robot" panel shows. ``{"ip": "", ...}`` when
+        none is configured. Never raises."""
+        try:
+            ip, port, *_ = self.robot().ConnectionParams()
+            return {"ip": str(ip or ""), "port": int(port)}
+        except Exception:
+            return {"ip": "", "port": 0}
+
+    def robot_connected(self) -> tuple[bool, str]:
+        """``(ready, message)`` for the link to the PHYSICAL robot controller.
+        ``ready`` is True only when RoboDK reports ``ROBOTCOM_READY`` (driver
+        linked, arm movable). Never raises — a build with no driver, or a transient
+        socket error, simply reads as not-ready."""
+        try:
+            status, msg = self.robot().ConnectedState()
+            return int(status) == self.ROBOTCOM_READY, str(msg or "")
+        except Exception as e:
+            return False, str(e)
+
+    def connect_robot(self, ip: str = "", *, timeout_s: float = 10.0,
+                      poll_s: float = 0.4) -> tuple[bool, str]:
+        """Link RoboDK to the PHYSICAL robot via its driver and poll until the
+        controller reports ready (or ``timeout_s`` elapses). ``ip`` blank uses the
+        IP stored on the robot item (RoboDK's connection panel).
+
+        Returns ``(ready, message)`` and **never raises** — the controller may be
+        off, so the caller decides whether that's fatal (a real run) or merely
+        informational (the connect status chip). Idempotent: if the link is already
+        ready it returns immediately. No motion — this only establishes the driver
+        link and starts position monitoring (which makes the model track the arm)."""
+        import time
+
+        robot = self.robot()
+        ready, msg = self.robot_connected()
+        if ready:
+            return True, msg
+        try:
+            robot.Connect(ip, blocking=False)   # initiate; we poll ConnectedState
+        except Exception as e:
+            return False, f"driver connect failed: {e}"
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            ready, msg = self.robot_connected()
+            if ready or time.monotonic() >= deadline:
+                return ready, msg
+            time.sleep(max(0.05, float(poll_s)))
 
     def move_j_joints(self, joints) -> None:
         """MoveJ to a joint vector (avoids IK/elbow ambiguity of a cartesian move)."""

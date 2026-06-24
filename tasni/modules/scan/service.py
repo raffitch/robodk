@@ -37,7 +37,7 @@ from ...core.rdk_io import RdkIO
 from ..calibration.poses import (generate_calibration_poses, select_diverse,
                                   viewing_angle_span)
 from ..calibration.service import (_camera_hold, dry_tour_required,
-                                    ensure_camera_tool)
+                                    ensure_camera_tool, ensure_real_robot_link)
 from .depth_gate import ScanGateThresholds, evaluate_depth_gate
 from .plane import work_plane_from_points
 from .planner import ScanPlan, plan_scan
@@ -449,6 +449,8 @@ class ScanCaptureJob:
 
         applied_mode = rdk.apply_run_mode("run_robot")
         ctx.log(f"run mode: {applied_mode} (REAL ROBOT); {len(targets)} targets to visit")
+        if applied_mode == "run_robot":
+            ensure_real_robot_link(rdk, self.services.config.robodk, log=ctx.log)
         rdk.use_camera_tool(self.tool_name)
         try:
             start_joints = rdk.current_joints()

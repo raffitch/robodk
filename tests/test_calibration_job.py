@@ -57,6 +57,9 @@ def _build_fakes():
         applied = None
         def item_exists(self, name): return True
         def apply_run_mode(self, mode=None): return "run_robot"
+        def connect_robot(self, ip="", *, timeout_s=10.0, poll_s=0.4):
+            return True, "ROBOTCOM_READY"        # real robot link is up in the fake
+        def robot_connection_params(self): return {"ip": "10.0.0.5", "port": 7000}
         def use_camera_tool(self, tool): return X_true       # tool mount = truth
         def tcp_pose_T(self): return state["cam"]
         def camera_pose_T(self): return state["cam"]         # camera (TCP) in base

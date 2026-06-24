@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
+from ...core.rdk_io import link_real_robot
 from ..base import ServiceContainer, WorkflowModule
 from ..calibration.service import SimTourJob
 from .service import (ScanCaptureJob, ScanParams, ScanResult, generate_scan_targets,
@@ -79,10 +80,12 @@ class ScanModule(WorkflowModule):
                         missing = [n for n, ok in ((c.robot_name, robot_ok),
                                                    (f"tool {c.camera_tool!r}", tool_ok))
                                    if not ok]
+                        # Best-effort link the physical robot (same as calibration).
+                        robot_link = link_real_robot(services.rdk, c)
                         return {"connected": True, "ready": robot_ok and tool_ok,
                                 "robot": c.robot_name, "robot_valid": robot_ok,
                                 "tool": c.camera_tool, "tool_present": tool_ok,
-                                "missing": missing}
+                                "missing": missing, "robot_link": robot_link}
                     last_err = None
                 except Exception as e:
                     last_err = e

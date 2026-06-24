@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
+from ...core.rdk_io import link_real_robot
 from ..base import ServiceContainer, WorkflowModule
 from .service import (
     BOARD_KEEPOUT_NAME, CalibrationJob, CalibrationParams, SimTourJob, TARGET_PREFIX,
@@ -131,10 +132,15 @@ class CalibrationModule(WorkflowModule):
                         missing = [n for n, ok in (
                             (c.robot_name, robot_ok),
                             (f"tool {c.camera_tool!r}", tool_ok)) if not ok]
+                        # Best-effort link the PHYSICAL robot so the operator no
+                        # longer has to connect it by hand before a run (and so the
+                        # model tracks the real arm). Never blocks readiness on it —
+                        # the controller may be off; the real run re-ensures it.
+                        robot_link = link_real_robot(services.rdk, c)
                         return {"connected": True, "ready": robot_ok and tool_ok,
                                 "robot": c.robot_name, "robot_valid": robot_ok,
                                 "tool": c.camera_tool, "tool_present": tool_ok,
-                                "missing": missing}
+                                "missing": missing, "robot_link": robot_link}
                     last_err = None        # connected; the robot just isn't loaded yet
                 except Exception as e:     # socket/timeout while RoboDK is busy loading
                     last_err = e

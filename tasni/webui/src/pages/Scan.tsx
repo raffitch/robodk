@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { moduleApi } from "../api/client";
 import { useEvents, type JobEvent } from "../api/events";
 import AimHud, { type GateReading } from "./AimHud";
+import { robotLinkNote } from "./Calibration";
 import ScanViewer from "./ScanViewer";
 import StreamStats, { useStreamStats } from "./StreamStats";
 
@@ -109,10 +110,13 @@ export default function Scan() {
     setConn("connecting");
     setConnInfo("Opening the Tasni station… first load of the 117 MB station can take 1–2 min.");
     try {
-      const r = await api.post<{ ready: boolean; tool: string; missing: string[] }>("/connect");
+      const r = await api.post<{ ready: boolean; tool: string; missing: string[];
+        robot_link?: { connected: boolean; message: string; ip: string;
+                       configured: boolean } | null }>("/connect");
       if (r.ready) {
         setConn("ready");
-        setConnInfo(`Ready — robot and the '${r.tool}' camera tool are present.`);
+        setConnInfo(`Ready — robot and the '${r.tool}' camera tool are present.`
+          + robotLinkNote(r.robot_link));
         refreshTargets(); refreshJob();
       } else {
         setConn("error");

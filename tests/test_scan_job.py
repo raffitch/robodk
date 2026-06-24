@@ -79,6 +79,9 @@ def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
         def __init__(self): self.inserted = {}
         def item_exists(self, name): return True
         def apply_run_mode(self, mode=None): return "run_robot"
+        def connect_robot(self, ip="", *, timeout_s=10.0, poll_s=0.4):
+            return True, "ROBOTCOM_READY"
+        def robot_connection_params(self): return {"ip": "10.0.0.5", "port": 7000}
         def use_camera_tool(self, tool): return mount
         def camera_pose_T(self): return state["cam"]
         def current_joints(self): return "HOME"
