@@ -14,6 +14,8 @@ from __future__ import annotations
 import select
 import socket
 import struct
+import json
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -38,6 +40,7 @@ class Frame:
     color: np.ndarray              # HxWx3 BGR
     depth: np.ndarray | None       # HxW depth (uint16/float) or None if not decoded
     timestamp: float
+    telemetry: dict | None = None
 
 
 class CameraError(RuntimeError):
@@ -113,7 +116,8 @@ class CameraClient:
 
     @staticmethod
     def _request_color_only(sock: socket.socket, quality: int | None = None,
-                            codec: str = "jpeg", bitrate: int | None = None) -> None:
+                            codec: str = "jpeg", bitrate: int | None = None,
+                            scan_telemetry: bool = False) -> None:
         """Send the color-only handshake (``MODE COLOR``).
 
         For the default JPEG codec, ``quality`` optionally asks the server to encode
@@ -131,6 +135,8 @@ class CameraClient:
             msg += b" H264" + (f" B{int(bitrate)}".encode() if bitrate else b"")
         elif quality:
             msg += f" Q{int(quality)}".encode()
+        if scan_telemetry:
+            msg += b" SCAN"
         try:
             sock.sendall(msg + b"\n")
         except OSError:
@@ -169,7 +175,7 @@ class CameraClient:
     @contextmanager
     def stream(self, *, timeout: float | None = None, color_only: bool = False,
                quality: int | None = None, codec: str = "jpeg",
-               bitrate: int | None = None):
+               bitrate: int | None = None, scan_telemetry: bool = False):
         """Hold one connection open and read frames back-to-back.
 
         The Jetson server streams continuously over a single connection, so for
@@ -184,6 +190,9 @@ class CameraClient:
         first (the platform stops the live preview before one-shot grabs)."""
         cfg = self.config
         h264 = codec == "h264"
+        telemetry_reader = None
+        if scan_telemetry:
+            telemetry_reader = _TelemetryReader(cfg.ip, cfg.port, timeout_s=timeout)
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(cfg.timeout_s if timeout is None else timeout)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -197,10 +206,15 @@ class CameraClient:
             s.close()
             raise CameraError(f"camera socket error: {e}") from e
         if color_only or h264:                       # h264 is inherently color-only
-            self._request_color_only(s, quality, codec=codec, bitrate=bitrate)
+            self._request_color_only(
+                s, quality, codec=codec, bitrate=bitrate,
+                scan_telemetry=scan_telemetry)
         try:
-            yield _H264Stream(s) if h264 else _CameraStream(self, s)
+            yield (_H264Stream(s, telemetry_reader=telemetry_reader) if h264
+                   else _CameraStream(self, s, telemetry_reader=telemetry_reader))
         finally:
+            if telemetry_reader is not None:
+                telemetry_reader.close()
             try:
                 s.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -210,13 +224,139 @@ class CameraClient:
     def grab_color(self, *, with_depth: bool = False) -> np.ndarray:
         return self.grab(with_depth=with_depth).color
 
+    @contextmanager
+    def burst(self, *, timeout: float | None = None):
+        """Open a burst-capture session (see :class:`_BurstSession`).
 
-class _CameraStream:
-    """A held-open camera connection; ``read()`` returns the next frame."""
+        At each pose the client tells the server to buffer one depth+color frame in
+        RAM (a fast, near-thumbnail round-trip); after the tour all frames are pulled
+        in ONE transfer and the server buffer is dropped. This keeps the robot tour
+        from stalling on a per-pose depth transfer over Wi-Fi while preserving the
+        exact same per-frame data the per-pose path uses (so fusion is identical).
+
+        Negotiates support first: sends ``MODE BURST`` and expects ``BURST READY``.
+        A server that predates burst would instead start a full stream, so the ack
+        check fails and we raise :class:`CameraError` — letting the caller fall back
+        to per-pose :meth:`grab`. Unicast: stop any other camera user first."""
+        cfg = self.config
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(cfg.timeout_s if timeout is None else timeout)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        _set_nodelay(s)
+        try:
+            s.connect((cfg.ip, cfg.port))
+        except (socket.timeout, OSError) as e:
+            s.close()
+            raise CameraError(f"camera socket error: {e}") from e
+        ready = b""
+        try:
+            s.sendall(b"MODE BURST\n")
+            ready = self._recv_exact(s, len(b"BURST READY\n"))
+        except (CameraError, OSError) as e:
+            s.close()
+            raise CameraError(f"burst handshake failed (old server?): {e}") from e
+        if not ready.startswith(b"BURST READY"):
+            s.close()
+            raise CameraError("camera server does not support burst capture")
+        try:
+            yield _BurstSession(self, s)
+        finally:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            s.close()
+
+
+class _BurstSession:
+    """An open burst connection. The server buffers frames in RAM and ships them on
+    :meth:`fetch_all`; :meth:`clear` drops that buffer (so nothing is left on the
+    Jetson). Commands are newline-terminated; replies are length-prefixed."""
 
     def __init__(self, client: "CameraClient", sock: socket.socket):
         self._client = client
         self._sock = sock
+
+    def capture(self) -> bytes | None:
+        """Tell the server to grab + buffer one depth+color frame. Returns a small
+        color thumbnail (JPEG bytes) for the live per-pose strip, or ``None`` if the
+        server skipped it (no valid frame, or the buffer is full)."""
+        self._sock.sendall(b"CAP\n")
+        _idx = struct.unpack("<I", self._client._recv_exact(self._sock, 4))[0]
+        thumb_len = struct.unpack("<I", self._client._recv_exact(self._sock, 4))[0]
+        if thumb_len == 0:
+            return None
+        return self._client._recv_exact(self._sock, thumb_len)
+
+    def fetch_all(self) -> "list[Frame]":
+        """Pull every buffered frame in one burst, in capture order (the per-frame
+        framing is identical to the normal stream, so decode is shared)."""
+        self._sock.sendall(b"GET\n")
+        count = struct.unpack("<I", self._client._recv_exact(self._sock, 4))[0]
+        return [self._client._read_frame(self._sock, with_depth=True)
+                for _ in range(count)]
+
+    def clear(self) -> None:
+        """Drop the server's RAM buffer — delete the captured data on the Jetson."""
+        self._sock.sendall(b"CLEAR\n")
+        self._client._recv_exact(self._sock, 4)        # ack
+
+
+class _TelemetryReader:
+    """Background reader for compact depth-plane JSON on a second TCP channel."""
+
+    def __init__(self, host: str, port: int, timeout_s: float | None = None):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.settimeout(10.0 if timeout_s is None else timeout_s)
+        try:
+            self._sock.connect((host, port))
+            self._sock.sendall(b"MODE TELEMETRY\n")
+        except (socket.timeout, OSError) as e:
+            self._sock.close()
+            raise CameraError(f"scan telemetry connection failed: {e}") from e
+        self._latest = None
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="scan-telemetry",
+                                        daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        try:
+            while not self._stop.is_set():
+                raw_len = CameraClient._recv_exact(self._sock, 4)
+                n = struct.unpack("<I", raw_len)[0]
+                if n <= 0 or n > 65536:
+                    raise CameraError(f"invalid telemetry length {n}")
+                payload = json.loads(
+                    CameraClient._recv_exact(self._sock, n).decode("utf-8"))
+                with self._lock:
+                    self._latest = payload
+        except (CameraError, OSError, socket.timeout, ValueError, json.JSONDecodeError):
+            pass
+
+    def latest(self):
+        with self._lock:
+            return dict(self._latest) if self._latest is not None else None
+
+    def close(self):
+        self._stop.set()
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self._sock.close()
+        self._thread.join(timeout=1.0)
+
+
+class _CameraStream:
+    """A held-open camera connection; ``read()`` returns the next frame."""
+
+    def __init__(self, client: "CameraClient", sock: socket.socket,
+                 telemetry_reader: _TelemetryReader | None = None):
+        self._client = client
+        self._sock = sock
+        self._telemetry_reader = telemetry_reader
 
     def read(self, *, with_depth: bool = False, drain: bool = False) -> Frame:
         """Return the next frame. With ``drain=True``, first skip any frames
@@ -233,7 +373,9 @@ class _CameraStream:
         depth_raw, color_raw, ts = raw
         color = self._client._decode_color(color_raw)
         depth = self._client._decode_depth(depth_raw) if with_depth else None
-        return Frame(color=color, depth=depth, timestamp=ts)
+        telemetry = (self._telemetry_reader.latest()
+                     if self._telemetry_reader is not None else None)
+        return Frame(color=color, depth=depth, timestamp=ts, telemetry=telemetry)
 
 
 class _H264Stream:
@@ -247,7 +389,8 @@ class _H264Stream:
     ``Frame.depth = None``. PyAV is an optional dependency — if it is missing we raise
     a clear :class:`CameraError` pointing at the JPEG fallback (``preview_codec``)."""
 
-    def __init__(self, sock: socket.socket):
+    def __init__(self, sock: socket.socket,
+                 telemetry_reader: _TelemetryReader | None = None):
         try:
             import av  # noqa: F401  (optional dependency)
         except Exception as e:  # noqa: BLE001
@@ -256,6 +399,7 @@ class _H264Stream:
                 "calibration.preview_codec='jpeg' to use the JPEG path") from e
         self._av = av
         self._sock = sock
+        self._telemetry_reader = telemetry_reader
         self._codec = av.codec.CodecContext.create("h264", "r")
         self._pending: list = []   # decoded frames not yet returned to the caller
 
@@ -298,4 +442,6 @@ class _H264Stream:
         else:
             frame = self._pending.pop(0)
         color = frame.to_ndarray(format="bgr24")
-        return Frame(color=color, depth=None, timestamp=0.0)
+        telemetry = (self._telemetry_reader.latest()
+                     if self._telemetry_reader is not None else None)
+        return Frame(color=color, depth=None, timestamp=0.0, telemetry=telemetry)

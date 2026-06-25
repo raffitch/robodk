@@ -203,6 +203,14 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .lamp .lamp-state { margin-left: 6px; font-size: 10px; opacity: .85; letter-spacing: 1px; }
 .lamp.lock { margin-left: auto; font-size: 13px; }
 .lamp.lock.on { box-shadow: 0 0 12px rgba(63,185,80,.35) inset; }
+.scan-ready { display: flex; justify-content: space-between; gap: 14px; margin-top: 10px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+  color: var(--muted); background: var(--panel-2); font-size: 12px; }
+.scan-ready span:first-child { font-family: var(--mono); font-weight: 800; white-space: nowrap; }
+.scan-ready.holding { color: var(--warn); border-color: rgba(210,153,34,.45);
+  background: rgba(210,153,34,.08); }
+.scan-ready.ready { color: var(--ok); border-color: rgba(63,185,80,.5);
+  background: rgba(63,185,80,.10); }
 
 /* print-scale hard gate (Run card) + measure helper (guide) */
 .scale-gate { margin-top: 12px; background: rgba(210,153,34,.07); border: 1px solid var(--border);
@@ -220,6 +228,16 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .tour-result.bad { border-left: 3px solid var(--warn); background: rgba(210,153,34,.07); }
 .tour-head { font-weight: 600; }
 .tour-bad { margin-top: 4px; color: var(--warn); font-family: var(--mono); font-size: 12px; }
+
+/* collision-map readiness chip (gates the Create-targets collision filter) */
+.collision-chip { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px;
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;
+  font-size: 13px; line-height: 1.45; }
+.collision-chip > span { flex: 1; }
+.collision-chip.ok { border-left: 3px solid var(--ok); background: rgba(63,185,80,.07); }
+.collision-chip.bad { border-left: 3px solid var(--warn); background: rgba(210,153,34,.07); }
+.collision-chip.unknown { border-left: 3px solid var(--border); color: var(--muted); }
+.collision-chip button { white-space: nowrap; }
 
 /* live per-pose board-lock thumbnails during a run */
 .thumb-strip { display: flex; gap: 6px; overflow-x: auto; padding: 8px 0 2px; }

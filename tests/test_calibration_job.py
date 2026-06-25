@@ -50,27 +50,51 @@ def _build_fakes():
     T_base_target = syn._look_at(BOARD_CENTER, seed_pos, 0.0)   # board faces the camera
     X_true = Rt_to_T(syn._rot([0.3, 0.2, 1.0], 25), [40.0, -15.0, 55.0])  # cam2flange (= tool)
     obj = syn._make_board_points()
-    state = {"cam": seed_T, "targets": {}}
+    state = {"cam": seed_T, "targets": {}, "joints": {}}
 
     class FakeRdk:
         deleted: list = []
         applied = None
         def item_exists(self, name): return True
         def apply_run_mode(self, mode=None): return "run_robot"
+        def connect_robot(self, ip="", *, timeout_s=10.0, poll_s=0.4):
+            return True, "ROBOTCOM_READY"        # real robot link is up in the fake
+        def robot_connection_params(self): return {"ip": "10.0.0.5", "port": 7000}
         def use_camera_tool(self, tool): return X_true       # tool mount = truth
         def tcp_pose_T(self): return state["cam"]
+        def camera_pose_T(self): return state["cam"]         # camera (TCP) in base
+        def flange_pose_T(self):                             # base->flange = cam @ inv(mount)
+            return compose(state["cam"], invert_T(X_true))
         def current_joints(self): return "HOME"
         def move_j_joints(self, j): state["cam"] = seed_T    # return-to-start
         def is_reachable(self, T): return True
+        def screen_collisions(self, poses, *, guard_skip=None, **kw):
+            # No station collision map in the fake -> "not checked", drop nothing,
+            # no locked joints from the sweep -> generation must back-fill joints
+            # via solve_joints_for_pose so every target is still joint-locked.
+            # **kw absorbs obstacle_pairs/baseline_relative/path_samples.
+            return [True] * len(poses), False, [None] * len(poses)
+        def solve_joints_for_pose(self, T, seed=None):
+            return ("joints", float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
+        def ensure_mounted_tool_collision_pairs(self, skip_trailing=2):
+            self.guard_skip = skip_trailing          # record on the INSTANCE
+            return {"tools": ["Realsense", "Spindle"], "links": [0, 1, 2, 3, 4],
+                    "pairs_enabled": 10, "pairs_failed": 0, "dof": 6}
         def list_targets(self, prefix=""):
             return sorted(n for n in state["targets"] if n.startswith(prefix))
-        def add_target(self, name, T): state["targets"][name] = T
+        def add_target(self, name, T, joints=None):
+            state["targets"][name] = T
+            state["joints"][name] = joints
         def delete_items(self, names):
             FakeRdk.deleted = list(names)
             for n in list(names):
                 state["targets"].pop(n, None)
         def move_j(self, name): state["cam"] = state["targets"][name]
         def set_tool_pose(self, tool, T): FakeRdk.applied = (tool, T)
+        def add_keepout_box(self, name, board_pts_base, *, margin_mm, above_mm,
+                            depth_mm, parent=None, color=None):
+            FakeRdk.keepout = (name, np.asarray(board_pts_base).shape)
+            return SimpleNamespace(Valid=lambda: True)
     rdk = FakeRdk()
 
     class FakeCamera:
@@ -80,6 +104,7 @@ def _build_fakes():
 
     class FakeBoard:
         board_center = np.zeros(3)        # synthetic board points are centred at origin
+        all_obj_points = obj              # board-frame corner cloud (visibility filter)
         def __init__(self, cfg): pass
         def detect(self, image, K, dist, *, min_corners=6):
             from tasni.modules.calibration.handeye import reproject
@@ -98,6 +123,9 @@ def _build_fakes():
     cfg = AppConfig()
     cfg.calibration.pose_count = 15
     cfg.calibration.holdout_count = 3
+    # Isolate the hand-eye tests from the auto-intrinsics step (which writes config
+    # + a marker); test_auto_intrinsics_* covers that path explicitly.
+    cfg.calibration.auto_intrinsics = False
     services = SimpleNamespace(config=cfg, rdk=rdk, camera=FakeCamera(),
                                camera_lease=CameraLease(),
                                bus=SimpleNamespace(publish=lambda *a, **k: None),
@@ -106,13 +134,20 @@ def _build_fakes():
 
 
 def test_generate_then_run_recovers_truth():
-    services, rdk, X_true, _state = _build_fakes()
+    services, rdk, X_true, state = _build_fakes()
 
     gen = service_mod.generate_calibration_targets(services)
     assert gen["created"] == 15
     assert gen["gate"]["ok"] is True
     assert all(n.startswith("TasniCalib_") for n in gen["targets"])
     assert abs(gen["look_distance_mm"] - 450) < 5
+    assert gen["predicted_intrinsics_coverage_pct"] >= 0.9
+
+    # Every target is joint-locked to the camera TCP (back-filled here since the
+    # fake reports no collision-map joints) — so selecting one drives the CAMERA,
+    # not the flange, to the viewpoint regardless of the GUI's active tool.
+    assert gen["targets_joint_locked"] == 15 and gen["targets_cartesian"] == 0
+    assert all(state["joints"][n] is not None for n in gen["targets"])
 
     with tempfile.TemporaryDirectory() as tmp:
         service_mod.new_run_dir = lambda mid, stamp: Path(tmp)
@@ -125,6 +160,10 @@ def test_generate_then_run_recovers_truth():
         assert result["report"]["validation"]["n_views"] == 3
         assert result["report"]["train"]["rms_px"] < 1.0
         assert (Path(tmp) / "report.json").exists()
+        assert (Path(tmp) / "capture_geometry.json").exists()
+        geometry = result["report"]["capture_geometry"]
+        assert len(geometry["views"]) == 15
+        assert geometry["perpendicular_distance_mm"]["min"] > 0
 
         # Phase-1 report additions.
         rep = result["report"]
@@ -147,6 +186,58 @@ def test_generate_then_run_recovers_truth():
         tool = job.apply_to_tool()
         assert tool == "Realsense" and rdk.applied[0] == "Realsense"
         print("[gate->generate->run]\n" + result["summary"])
+
+
+def test_a3_generation_uses_longer_range_and_plane_clearance():
+    services, _rdk, _X, _state = _build_fakes()
+    services.config.board.paper_size = "A3"
+    services.config.board.square_size_mm = 40.0
+    services.config.board.marker_size_mm = 29.3
+
+    gen = service_mod.generate_calibration_targets(services)
+
+    assert gen["board_profile"] == "A3"
+    assert gen["look_distance_mm"] == 600.0
+    assert gen["min_perpendicular_mm"] == 425.0
+    assert gen["distance_jitter"] == 0.08
+
+
+def test_auto_intrinsics_refreshes_even_when_marker_present():
+    """Every well-covered run refreshes K + distortion. A stale marker from an
+    older centered data set must not suppress today's edge-covered fit."""
+    from tasni.core import config as cfgmod
+
+    services, rdk, _X, _state = _build_fakes()
+    services.config.calibration.auto_intrinsics = True
+
+    # Mock persistence so the test never touches the real config / runs tree.
+    marker: dict = {}
+    fake_runs = SimpleNamespace(
+        read_active=lambda m: marker.get(m),
+        write_active=lambda m, payload: marker.__setitem__(m, payload),
+        load_report=lambda *a, **k: (_ for _ in ()).throw(KeyError()))
+    orig_runs, orig_save = service_mod.runs, cfgmod.save_overrides
+    service_mod.runs = fake_runs
+    cfgmod.save_overrides = lambda updates: None
+    try:
+        service_mod.generate_calibration_targets(services)
+        with tempfile.TemporaryDirectory() as tmp:
+            service_mod.new_run_dir = lambda mid, stamp: Path(tmp)
+
+            res = service_mod.CalibrationJob(services, service_mod.CalibrationParams())(_Ctx())
+            ia = res["report"].get("intrinsics_auto")
+            assert ia is not None and ia["source"] == "auto" and ia["n_views"] >= 6
+            assert "intrinsics" in marker          # marker written -> now "present"
+            assert service_mod.intrinsics_present(services) is True
+
+            # Second run: marker is present, but the fit must run again.
+            res2 = service_mod.CalibrationJob(services, service_mod.CalibrationParams())(_Ctx())
+            ia2 = res2["report"].get("intrinsics_auto")
+            assert ia2 is not None and ia2["source"] == "auto"
+    finally:
+        service_mod.runs, cfgmod.save_overrides = orig_runs, orig_save
+    print(f"[auto intrinsics] refreshed from {ia['n_views']} views, "
+          f"fit RMS {ia['rms_px']:.3f}px; marker did not suppress second fit")
 
 
 def test_generate_refuses_when_not_aimed():
@@ -177,8 +268,126 @@ def test_run_without_targets_errors():
     print("[run needs targets]", msg.splitlines()[0])
 
 
+def test_generate_drops_colliding_poses():
+    """Collision-filtered generation excludes poses where the mounted tooling
+    collides (checked=True), and reports how many were dropped."""
+    services, rdk, _X, _state = _build_fakes()
+
+    def mask(poses, *, guard_skip=None, **kw):   # mark ~1/4 of candidates as colliding
+        m = [True] * len(poses)
+        for i in range(0, len(poses), 4):
+            m[i] = False
+        return m, True, [None] * len(poses)
+    rdk.screen_collisions = mask
+
+    gen = service_mod.generate_calibration_targets(services)
+    assert gen["collisions_checked"] is True
+    assert gen["candidates_collided"] > 0
+    assert gen["created"] == 15      # enough collision-free poses survive
+    print("[collision filter] dropped", gen["candidates_collided"],
+          "of", gen["candidates_reachable"], "reachable")
+
+
+def test_generate_reports_collision_guard():
+    """Generation force-enables the mounted-tool<->arm collision pairs RoboDK omits
+    by default, reports which tools were guarded, and forwards the CONFIGURED
+    wrist-skip (use a non-default value so a hardcoded/default can't pass)."""
+    services, rdk, _X, _state = _build_fakes()
+    services.config.calibration.collision_skip_wrist_links = 3   # non-default
+
+    gen = service_mod.generate_calibration_targets(services)
+    g = gen["collision_guard"]
+    assert g is not None and g["pairs_enabled"] == 10
+    assert "Spindle" in g["tools"]
+    assert rdk.guard_skip == 3          # the configured value reached the guard
+    print("[collision guard] guarded", g["tools"], "skip=", rdk.guard_skip)
+
+
+def test_generate_skips_guard_when_disabled():
+    """With collision_self_pairs off, generation does not touch the collision map
+    and reports no guard."""
+    services, rdk, _X, _state = _build_fakes()
+    services.config.calibration.collision_self_pairs = False
+    rdk.guard_skip = "NOT-CALLED"       # sentinel the guard would overwrite if run
+
+    gen = service_mod.generate_calibration_targets(services)
+    assert gen["collision_guard"] is None
+    assert rdk.guard_skip == "NOT-CALLED"   # guard genuinely not invoked
+    print("[collision guard off] no map changes")
+
+
+def test_generate_refuses_when_tooling_collides():
+    """If too few collision-free poses survive the (baseline-relative) screen,
+    generation refuses with guidance rather than creating unsafe targets — it never
+    ships a pose that introduces a new collision."""
+    services, rdk, _X, _state = _build_fakes()
+
+    def mask(poses, *, guard_skip=None, **kw):   # only 2 free -> below MIN_TRAIN_VIEWS
+        m = [False] * len(poses)
+        m[0] = m[1] = True
+        return m, True, [None] * len(poses)
+    rdk.screen_collisions = mask
+
+    msg = ""
+    try:
+        service_mod.generate_calibration_targets(services)
+        raise AssertionError("expected refusal due to tooling collisions")
+    except RuntimeError as e:
+        msg = str(e)
+        assert "collision-free" in msg and "Re-seed" in msg
+    assert rdk.list_targets("TasniCalib_") == []   # nothing created
+    print("[collision refusal]", msg.splitlines()[0])
+
+
+def test_generate_refuses_when_all_poses_collide():
+    """When every reachable candidate introduces a new collision, generation REFUSES
+    (the silent ship-everything bypass is gone) — a colliding target is never created.
+    Replaces the old 'bypass keeps it usable' behaviour."""
+    services, rdk, _X, _state = _build_fakes()
+
+    def mask(poses, *, guard_skip=None, **kw):
+        return [False] * len(poses), True, [None] * len(poses)
+    rdk.screen_collisions = mask
+
+    msg = ""
+    try:
+        service_mod.generate_calibration_targets(services)
+        raise AssertionError("expected refusal when all candidates collide")
+    except RuntimeError as e:
+        msg = str(e)
+        assert "collision-free" in msg
+    assert rdk.list_targets("TasniCalib_") == []   # nothing shipped
+    print("[all collide -> refuse]", msg.splitlines()[0])
+
+
+def test_generate_refuses_thin_intrinsic_coverage():
+    """A first-run target set must not silently permit an edge-starved intrinsic
+    fit; generation refuses before writing targets when predicted coverage is low."""
+    services, rdk, _X, _state = _build_fakes()
+    original = service_mod.projected_corner_coverage
+    service_mod.projected_corner_coverage = lambda *a, **k: (
+        0.5, [[0, 1, 1, 0], [0, 1, 1, 0], [0, 1, 1, 0]])
+    try:
+        try:
+            service_mod.generate_calibration_targets(services)
+            raise AssertionError("expected refusal for thin intrinsic coverage")
+        except RuntimeError as e:
+            assert "intrinsic image grid" in str(e) and "Re-seed" in str(e)
+    finally:
+        service_mod.projected_corner_coverage = original
+    assert rdk.list_targets("TasniCalib_") == []
+
+
 if __name__ == "__main__":
     test_generate_then_run_recovers_truth()
+    test_a3_generation_uses_longer_range_and_plane_clearance()
+    test_auto_intrinsics_refreshes_even_when_marker_present()
     test_generate_refuses_when_not_aimed()
     test_run_without_targets_errors()
+    test_generate_drops_colliding_poses()
+    test_generate_reports_collision_guard()
+    test_generate_skips_guard_when_disabled()
+    test_generate_refuses_when_tooling_collides()
+    test_generate_refuses_when_all_poses_collide()
+    test_generate_refuses_thin_intrinsic_coverage()
     print("\nGate-gated calibration job tests passed.")

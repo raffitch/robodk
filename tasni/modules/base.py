@@ -39,6 +39,13 @@ class ServiceContainer:
     jobs: JobRunner
     live: LivePreview
 
+    # Safety latch: set True when the calibration camera tool is recreated from a
+    # past calibration (its 3D model is gone, so the collision check is blind), and
+    # cleared only by a passing dry tour. The real run refuses while it is True so a
+    # wrong tool position can't drive the arm into a collision. See
+    # ``tasni.modules.calibration.service.ensure_camera_tool``.
+    calib_dry_tour_required: bool = False
+
     @classmethod
     def build(cls, config: AppConfig | None = None) -> "ServiceContainer":
         from ..core.config import load_config

@@ -103,7 +103,7 @@ you drive the real cell, not an empty station). Run it on Windows with
 **`.\start.ps1`** (or `start.bat`); dev = backend + Vite hot-reload on :5173,
 `.\start.ps1 prod` builds + serves on :8000. (`start.sh` is the Git Bash equivalent.)
 
-## Roadmap / status (updated 2026-06-19)
+## Roadmap / status (updated 2026-06-22)
 - ✅ Extract macros → monorepo → GitHub (private: `raffitch/robodk`)
 - ✅ Best-practices research → [docs/best-practices-review.md](docs/best-practices-review.md)
 - ✅ **#2 Jetson hardening**: monorepo, systemd service, deploy tool, cron cleanup
@@ -118,11 +118,24 @@ you drive the real cell, not an empty station). Run it on Windows with
   *current* pose and leaves `TasniCalib_*` in RoboDK to inspect.
   Single-source-of-truth **printable board** (default 8×6 @ 30 mm fits A4 1:1) + visual
   preview, no "matching" step. Launches as a **standalone app window** (`.\start.ps1`).
-  - ⚠️ Robot-moving paths NOT yet hardware-tested. Finding: OpenCV's TSAI is fragile
-    near a ~180° camera→flange mount (PARK/HORAUD/ANDREFF stay exact); the metrics make
-    a bad solve visible. See [tasni/README.md](tasni/README.md).
-  - Next ideas: dry "tour" through the created targets; return-to-start/collision checks
-    before real motion; live 3D viewport.
+  - ✅ **Hardware-tested on the KUKA — verdict PASS** (held-out reproj ~0.9 px, board
+    consistency ~0.8 mm). The robot-moving path (Create targets → dry tour → Run →
+    return-to-start) runs on the real cell. TSAI finding retained: OpenCV TSAI is
+    fragile near a ~180° camera→flange mount (PARK/HORAUD/ANDREFF stay exact), so
+    `solver_method="best"` ranks all methods and the metrics expose a bad solve.
+  - ✅ **Camera intrinsics handled under the hood.** The D435i ships its RGB stream
+    with *zero* distortion (Intel calibrates depth/IR, not the RGB lens), which made
+    the hand-eye solve borderline. The first hand-eye Run now **auto-calibrates** K +
+    lens distortion from its own captured `TasniCalib_*` views (k3 fixed), applies
+    them live (no restart) + persists. It refreshes on every sufficiently covered
+    run, so a stale low-coverage marker cannot suppress a better fit. Target
+    generation spreads the board across the frame within the configured orientation
+    cone. The intrinsics self-check compares *recovered vs configured* distortion.
+    `tools/jetson_intrinsics.py` reads the camera's factory intrinsics off the Jetson.
+  - ✅ **Workspace guardrails**: collision-screened pose generation + a SIMULATE
+    **dry tour** (reachability / collision / return-to-start) before the real run.
+  - Next ideas: model the board + table as collision objects (so a pose that would
+    bump the physical board is auto-filtered, not just tool↔arm); live 3D viewport.
 - Then integrate the rest into the same app: scan (with **TSDF fusion** — biggest quality
   win), ArUco-to-plane, target generation. RealSense High-Accuracy preset + filter order
   live in `server/server_unicast_syncronous.py`. Tailscale (off-LAN) deferred.

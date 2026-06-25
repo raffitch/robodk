@@ -22,6 +22,10 @@ dependencies = [
 # Hardware-NVENC H.264 live preview: decodes the Jetson's H.264 byte-stream.
 # Only needed when calibration.preview_codec = "h264" (default is "jpeg").
 h264 = ["av"]                  # PyAV (bundles ffmpeg) — `pip install av`
+# 3D scanning (module #2): TSDF fusion, meshing + plane/oriented-box geometry.
+# Imported lazily in tasni/modules/scan/reconstruct.py, so the package still
+# imports without it — only a scan Run needs it. `pip install -e .[scan]`.
+scan = ["open3d"]              # Open3D — TSDF integrate + marching-cubes + RANSAC plane
 
 [project.scripts]
 tasni = "tasni.__main__:main"

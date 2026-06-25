@@ -82,7 +82,11 @@ export default function StreamStats({ stat }: { stat: StreamStat }) {
     <div className={"stream-stat " + stat.quality} title="live stream rate · inter-frame jitter">
       <span className="ss-dot" />
       <span className="ss-fps">
-        {stat.live ? <>{stat.fps.toFixed(1)}<span className="ss-unit">fps</span></> : "no signal"}
+        {stat.live
+          ? stat.gaps.length > 0
+            ? <>{stat.fps.toFixed(1)}<span className="ss-unit">fps</span></>
+            : "starting…"
+          : "no signal"}
       </span>
       {stat.live && (
         <>

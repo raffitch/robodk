@@ -40,6 +40,19 @@ class CharucoTarget:
         # corner, so distance/aiming should reference this instead. Using the mean
         # of all corners is robust to the origin convention.
         self.board_center = self._all_obj.mean(axis=0).astype(np.float64)
+        w = float(config.squares_x * config.square_size_mm)
+        h = float(config.squares_y * config.square_size_mm)
+        self.board_outline_points = np.array(
+            [[0.0, 0.0, 0.0], [w, 0.0, 0.0], [w, h, 0.0], [0.0, h, 0.0]],
+            dtype=np.float64,
+        )
+
+    @property
+    def all_obj_points(self) -> np.ndarray:
+        """All inner ChArUco corners in the board frame (mm) — the detectable
+        feature cloud. Used by the visibility pre-filter (project these into a
+        candidate camera to predict whether the board stays in frame)."""
+        return self._all_obj
 
     def _detect_corners(self, image: np.ndarray, *, min_corners: int = 1):
         """Detect markers + interpolate ChArUco corners (no pose estimation).
@@ -70,6 +83,18 @@ class CharucoTarget:
         return ViewDetection(corners=corners, ids=ids,
                              obj_points=self._all_obj[ids.flatten()],
                              rvec=rvec, tvec=tvec)
+
+    def detect_points(self, image: np.ndarray, *, min_corners: int = 6
+                      ) -> "tuple[np.ndarray, np.ndarray, np.ndarray] | None":
+        """Detect ChArUco corners and their board-frame coords, with **no** pose
+        estimation (so it needs no K/dist). Returns ``(corners (N,1,2), ids (N,1),
+        obj_points (N,3))`` or ``None``. Used by intrinsic calibration, which solves
+        K/distortion from the raw 2D-3D correspondences."""
+        found = self._detect_corners(image, min_corners=min_corners)
+        if found is None:
+            return None
+        corners, ids = found
+        return corners, ids, self._all_obj[ids.flatten()]
 
     def detect(self, image: np.ndarray, K: np.ndarray, dist: np.ndarray,
                *, min_corners: int = 6) -> ViewDetection | None:

@@ -18,10 +18,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tasni.core import runs  # noqa: E402
+
+
+@pytest.fixture
+def tmp(tmp_path: Path) -> Path:
+    """Alias pytest's builtin ``tmp_path`` so these tests run under pytest as
+    well as via the ``__main__`` block below (which passes ``tmp`` positionally)."""
+    return tmp_path
 from tasni.core.config import AppConfig  # noqa: E402
 from tasni.modules.calibration import service as service_mod  # noqa: E402
 

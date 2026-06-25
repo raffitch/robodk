@@ -39,10 +39,12 @@ class FakeRdk:
     ``is_reachable``/``collisions`` can key off the pose being visited."""
 
     def __init__(self, *, unreachable=(), collisions=None, collisions_on=True,
-                 prior_mode=RUN_ROBOT):
+                 prior_mode=RUN_ROBOT, joint_targets=None, transit=None):
         self._unreachable = set(unreachable)
-        self._collisions = collisions          # name -> colliding-pair count
+        self._collisions = collisions          # name -> resting colliding-pair count
         self._collisions_on = collisions_on
+        self._joint_targets = joint_targets or {}   # name -> stored joint vector
+        self._transit = transit or {}          # dest-joints -> swept colliding-pair count
         self.run_mode = prior_mode             # the cell was left in this mode
         self.mode_calls: list = []
         self.moved: list[str] = []
@@ -63,6 +65,10 @@ class FakeRdk:
     def set_collision_checking(self, active):
         self.collision_toggles.append(active)
         return self._collisions_on
+    def ensure_mounted_tool_collision_pairs(self, skip_trailing=2):
+        self.guard_skip = skip_trailing
+        return {"tools": ["Realsense"], "links": [0, 1, 2, 3, 4],
+                "pairs_enabled": 5, "pairs_failed": 0, "dof": 6}
     def collisions(self):
         if not self._collisions_on or self._collisions is None:
             return None
@@ -76,6 +82,41 @@ class FakeRdk:
         self._current = name
         self.moved.append(name)
     def move_j_joints(self, joints): self.returned = True
+    def target_joints(self, name): return self._joint_targets.get(name)
+    def move_j_test(self, j1, j2, step_deg=None):
+        return self._transit.get(j2, 0)        # j2 is the destination joint vector
+
+    # -- baseline-relative collision API (the fake has no constant artifacts, so its
+    #    baseline is empty and "new collisions" == the modelled resting/transit ones).
+    @staticmethod
+    def _keys(count):
+        return set(frozenset({(f"obj{i}", 0), ("KUKA", i + 1)}) for i in range(int(count)))
+    def ensure_obstacle_collision_pairs(self, ignore_names=None):
+        ignored = {str(n).casefold() for n in (ignore_names or [])}
+        objects = [n for n in ["Pedestal", "WallAll"] if n.casefold() not in ignored]
+        return {"objects": objects, "pairs_enabled": 2 * len(objects),
+                "pairs_failed": 0}
+    def disable_object_collision_pairs(self, names):
+        objects = [n for n in ["WallAll"] if n.casefold() in
+                   {str(x).casefold() for x in names}]
+        return {"objects": objects, "pairs_disabled": 8 * len(objects),
+                "pairs_failed": 0}
+    def collision_pair_keys(self):
+        if not self._collisions_on:
+            return None
+        cnt = 0 if self._collisions is None else self._collisions.get(self._current, 0)
+        return self._keys(cnt)
+    def new_collisions_here(self, baseline):
+        keys = self.collision_pair_keys()
+        if keys is None:
+            return None, []
+        new = keys - (baseline or set())
+        return bool(new), sorted(str(sorted(k)) for k in new)
+    def path_new_collisions(self, j1, j2, baseline, samples=6):
+        if not self._collisions_on:
+            return None
+        self._current = j2                     # the sweep leaves the robot at the dest
+        return self._transit.get(j2, 0) > 0
 
 
 def _run(rdk) -> dict:
@@ -123,6 +164,21 @@ def test_collision_fails_its_pose():
     print("[collision] TasniCalib_05 reachable but colliding -> fail")
 
 
+def test_transit_collision_flags_pose():
+    """A pose whose APPROACH sweep collides (clears the endpoints but the tool
+    passes through an arm link mid-move) is flagged even if its resting pose is
+    clear — the inter-target path the real run actually drives."""
+    rdk = FakeRdk(joint_targets={n: n for n in TARGETS},   # each target -> its own config
+                  transit={"TasniCalib_03": 1})            # sweep INTO _03 collides
+    out = _run(rdk)
+    assert out["transit_collisions"] == 1
+    assert out["all_ok"] is False
+    bad = [p for p in out["poses"] if not p["ok"]]
+    assert len(bad) == 1 and bad[0]["name"] == "TasniCalib_03"
+    assert bad[0]["transit"] is True and bad[0]["reachable"] is True
+    print("[transit] TasniCalib_03 approach collides -> flagged")
+
+
 def test_collisions_not_supported_degrades():
     rdk = FakeRdk(collisions_on=False)
     out = _run(rdk)
@@ -149,6 +205,7 @@ if __name__ == "__main__":
     test_all_reachable_passes()
     test_unreachable_pose_flagged_but_mode_restored()
     test_collision_fails_its_pose()
+    test_transit_collision_flags_pose()
     test_collisions_not_supported_degrades()
     test_no_targets_raises()
     print("\nSim-tour dry-run tests passed.")
