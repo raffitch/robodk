@@ -140,6 +140,34 @@ def test_outline_uv_normalized():
     print("[outline]", [tuple(round(x, 3) for x in c) for c in m.outline_uv])
 
 
+def test_surface_dots_are_a_stable_lattice():
+    """points_uv is a fixed surface-anchored lattice, not a per-frame random pixel
+    subsample — so the HUD dots hold still instead of 'dancing' every frame."""
+    th = SurveyThresholds()
+    d = _render_framed([0, 0, 1], 500)
+    m1 = survey_surface(d, K, th)
+    assert m1.points_uv is not None and len(m1.points_uv) > 20, m1.points_uv
+    for u, v in m1.points_uv:
+        assert 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0, (u, v)
+    # Bounded count: a lattice (hundreds), not thousands of raw inlier pixels.
+    assert len(m1.points_uv) <= 1000, len(m1.points_uv)
+    # Deterministic: identical depth -> identical dots (proves it is NOT re-sampled).
+    m2 = survey_surface(d.copy(), K, th)
+    assert m1.points_uv == m2.points_uv, "same input must yield identical dots"
+    # Steady under small depth noise: the centroid-anchored lattice barely moves, so
+    # the projected dots do not jump (the anti-'dance' property the user asked for).
+    rng = np.random.default_rng(0)
+    noisy = d.astype(np.int32)
+    nz = noisy > 0
+    noisy[nz] += rng.integers(-2, 3, size=int(nz.sum()))
+    mn = survey_surface(np.clip(noisy, 0, None).astype(np.uint16), K, th)
+    A, B = np.asarray(m1.points_uv), np.asarray(mn.points_uv)
+    nn = np.sqrt(((B[:, None, :] - A[None, :, :]) ** 2).sum(-1)).min(axis=1)
+    assert float(np.median(nn)) < 0.01, float(np.median(nn))  # < 1% of the frame
+    print("[surface dots] stable lattice:", len(m1.points_uv),
+          "dots, median jitter", round(float(np.median(nn)) * 100, 3), "% of frame")
+
+
 def test_to_dict_serializable():
     import json
     th = SurveyThresholds()
@@ -163,5 +191,6 @@ if __name__ == "__main__":
     test_extent_approximate()
     test_grid_spacing_nice_number()
     test_outline_uv_normalized()
+    test_surface_dots_are_a_stable_lattice()
     test_to_dict_serializable()
     print("\nsurvey.py tests passed.")

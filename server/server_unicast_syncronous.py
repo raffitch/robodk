@@ -391,14 +391,42 @@ def scan_plane_telemetry(depth, intrinsics, depth_unit_mm=1.0,
                 color_fit_standoff_per_margin_mm = None
             xlo, xhi = np.quantile(ip[:, 0], [0.005, 0.995])
             ylo, yhi = np.quantile(ip[:, 1], [0.005, 0.995])
-            # Decimated detected-surface dots (normalized, already distortion-projected
-            # above) so the live HUD can draw the surface as DOTS over the RGB, not just
-            # the outline. Capped to keep the per-frame telemetry small; diagnostic only.
-            finite_uv = projected_uv[finite]
-            if len(finite_uv) > 0:
-                dot_step = max(1, int(np.ceil(len(finite_uv) / 350.0)))
-                surface_points_uv = np.round(
-                    np.clip(finite_uv[::dot_step], 0.0, 1.0), 4).tolist()
+            # Detected-surface DOTS for the HUD: a STABLE metric lattice in the
+            # surface's own (rectangle) frame — one dot per occupied cell CENTER,
+            # NOT a per-frame random pixel subsample. A subsample re-picks different
+            # points every frame (depth noise + decimation order), so the dots
+            # "dance"; cell centers sit at fixed positions ON the plane, so a steady
+            # camera yields steady dots and a gap is a real coverage hole. Cell COUNT
+            # is bounded, keeping telemetry small without decimating away coverage.
+            long_mm = float(max(len1, len2))
+            if long_mm > 1.0:
+                cell_mm = float(np.clip(long_mm / 26.0, 10.0, 40.0))
+                # Anchor the lattice at the CENTROID (stable frame to frame), not the
+                # min corner (which jitters with fringe noise), so the dots hold still.
+                a1 = (ip - pc) @ ax1
+                a2 = (ip - pc) @ ax2
+                cidx = np.floor(a1 / cell_mm).astype(int)
+                cjdx = np.floor(a2 / cell_mm).astype(int)
+                cells = np.unique(np.column_stack([cidx, cjdx]), axis=0)
+                centers3d = (pc
+                             + ((cells[:, 0] + 0.5) * cell_mm)[:, None] * ax1
+                             + ((cells[:, 1] + 0.5) * cell_mm)[:, None] * ax2)
+                # Diagnostic dots use the cheap BATCH projector (like the point hull);
+                # the precise per-point projector is reserved for the 4 work-rectangle
+                # corners that drive the solid operator overlay.
+                if overlay_project_points is not None:
+                    dot_px = np.asarray(overlay_project_points(centers3d), float)
+                elif overlay_project is not None:
+                    dot_px = np.asarray([overlay_project(p) for p in centers3d], float)
+                else:
+                    dot_px = np.column_stack([
+                        centers3d[:, 0] * fx / centers3d[:, 2] + cx,
+                        centers3d[:, 1] * fy / centers3d[:, 2] + cy,
+                    ])
+                dot_uv = dot_px / np.array([overlay_w, overlay_h])
+                dot_uv = dot_uv[np.all(np.isfinite(dot_uv), axis=1)]
+                surface_points_uv = (np.round(np.clip(dot_uv, 0.0, 1.0), 4).tolist()
+                                     if len(dot_uv) else None)
             else:
                 surface_points_uv = None
             payload.update({

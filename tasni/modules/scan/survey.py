@@ -276,15 +276,28 @@ def survey_surface(
         if uv_s is not None and uv_e is not None:
             grid_uv.append((uv_s, uv_e))
 
-    # 10. Decimated plane-inlier pixels (normalized) so the HUD can draw the detected
-    # surface as DOTS over the live RGB — not just the outline + grid. Capped so the
-    # SVG overlay stays light; these are diagnostic, not used for any measurement.
+    # 10. Detected-surface DOTS for the HUD overlay: a STABLE metric lattice in the
+    # surface's own (rectangle) frame, one dot per occupied cell CENTER — not a
+    # per-frame random pixel subsample (which makes the dots "dance"). A cell lights
+    # only where the plane actually has depth, so a gap is a real coverage hole.
+    # Reuses the rectangle-frame coords (proj1/proj2) computed for the grid above.
     points_uv = None
-    if len(inlier_xs) > 0:
-        step = max(1, int(np.ceil(len(inlier_xs) / 700)))
-        pu = inlier_xs[::step].astype(float) / float(W)
-        pv = inlier_ys[::step].astype(float) / float(H)
-        points_uv = np.round(np.column_stack([pu, pv]), 4).tolist()
+    long_mm = float(max(hi1 - lo1, hi2 - lo2))
+    if len(inlier_pts) > 0 and long_mm > 1.0:
+        cell_mm = float(np.clip(long_mm / 26.0, 10.0, 40.0))
+        # Anchor the lattice at the CENTROID (proj1/proj2 are already centroid-relative,
+        # rel = inlier_pts - centroid), so the dots hold still frame to frame.
+        ci = np.floor(proj1 / cell_mm).astype(int)
+        cj = np.floor(proj2 / cell_mm).astype(int)
+        cells = np.unique(np.column_stack([ci, cj]), axis=0)
+        dots: list = []
+        for i, jc in cells:
+            center = (centroid + (i + 0.5) * cell_mm * ax1
+                      + (jc + 0.5) * cell_mm * ax2)
+            uv = _project(center)
+            if uv is not None:
+                dots.append([round(float(uv[0]), 4), round(float(uv[1]), 4)])
+        points_uv = dots or None
 
     return SurveyMeasurement(
         detected=True,
