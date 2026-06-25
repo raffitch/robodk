@@ -138,7 +138,9 @@ def _convex_hull_2d(pts: np.ndarray) -> np.ndarray:
     return np.array(lower[:-1] + upper[:-1])
 
 
-def _min_area_rectangle(pts2d: np.ndarray):
+def _min_area_rectangle(pts2d: np.ndarray, *,
+                        preferred_axis: np.ndarray | None = None,
+                        area_tolerance: float = 0.02):
     """Minimum-area bounding rectangle of ``(N,2)`` points (rotating calipers over
     the convex-hull edges). Returns ``(ux, uy, w, h, lo_x, lo_y)``: the rectangle's
     unit axes (2D), its size along each, and the lower corner's projections — so the
@@ -150,7 +152,7 @@ def _min_area_rectangle(pts2d: np.ndarray):
         lo, hi = pts2d.min(0), pts2d.max(0)
         return (np.array([1.0, 0]), np.array([0, 1.0]),
                 float(hi[0] - lo[0]), float(hi[1] - lo[1]), float(lo[0]), float(lo[1]))
-    best = None
+    candidates = []
     for i in range(n):
         edge = hull[(i + 1) % n] - hull[i]
         L = float(np.linalg.norm(edge))
@@ -161,8 +163,21 @@ def _min_area_rectangle(pts2d: np.ndarray):
         px, py = pts2d @ ux, pts2d @ uy
         w, h = float(px.max() - px.min()), float(py.max() - py.min())
         area = w * h
-        if best is None or area < best[0]:
-            best = (area, ux, uy, w, h, float(px.min()), float(py.min()))
+        candidates.append((area, ux, uy, w, h, float(px.min()), float(py.min())))
+    min_area = min(c[0] for c in candidates)
+    near_best = [c for c in candidates
+                 if c[0] <= min_area * (1.0 + max(0.0, float(area_tolerance)))]
+    if preferred_axis is not None:
+        pref = np.asarray(preferred_axis, float).reshape(2)
+        pn = float(np.linalg.norm(pref))
+        if pn > 1e-12:
+            pref /= pn
+            best = max(near_best, key=lambda c: max(abs(float(c[1] @ pref)),
+                                                    abs(float(c[2] @ pref))))
+        else:
+            best = min(candidates, key=lambda c: c[0])
+    else:
+        best = min(candidates, key=lambda c: c[0])
     _, ux, uy, w, h, lox, loy = best
     return ux, uy, w, h, lox, loy
 
@@ -176,7 +191,25 @@ def _oriented_rectangle(points: np.ndarray, normal: np.ndarray, centroid: np.nda
     u, v = _plane_basis(normal)
     rel = np.asarray(points, float).reshape(-1, 3) - centroid
     coords = np.column_stack([rel @ u, rel @ v])     # (N,2) in the (u,v) plane basis
-    ux, uy, w, h, lox, loy = _min_area_rectangle(coords)
+    # TSDF silhouettes contain sparse flying pixels and view-dependent edge
+    # fragments. Trim only the extreme fringe so those points cannot rotate the
+    # whole work frame diagonally.
+    if len(coords) >= 100:
+        lo = np.quantile(coords, 0.005, axis=0)
+        hi = np.quantile(coords, 0.995, axis=0)
+        keep = np.all((coords >= lo) & (coords <= hi), axis=1)
+        if int(keep.sum()) >= max(20, int(0.8 * len(coords))):
+            coords = coords[keep]
+
+    # A square or partially observed plane can have multiple effectively equal
+    # minimum-area boxes. Resolve that ambiguity toward the robot-base axes.
+    base_x = np.array([1.0, 0.0, 0.0])
+    preferred_2d = np.array([base_x @ u, base_x @ v])
+    if np.linalg.norm(preferred_2d) < 1e-6:
+        base_y = np.array([0.0, 1.0, 0.0])
+        preferred_2d = np.array([base_y @ u, base_y @ v])
+    ux, uy, w, h, lox, loy = _min_area_rectangle(
+        coords, preferred_axis=preferred_2d)
     # Rectangle axes back in 3D (ux/uy are rotated axes *within* the (u,v) plane).
     ax_a = u * ux[0] + v * ux[1]
     ax_b = u * uy[0] + v * uy[1]
@@ -233,3 +266,45 @@ def work_plane_from_points(points: np.ndarray, *, distance: float = 0.006,
                      size=(max(len1, len2), min(len1, len2)),
                      normal=z, centroid=centroid,
                      inlier_count=int(mask.sum()), inlier_frac=frac)
+
+
+def bounded_work_plane(wp: WorkPlane, center: np.ndarray,
+                       size: tuple[float, float]) -> WorkPlane:
+    """Limit an already-fitted plane to a centered rectangular work region.
+
+    Used when the physical plane extends beyond the camera frame (for example a
+    large table). The plane inclination remains measured; only the programmable
+    footprint is bounded around the surface under the camera reticle.
+    """
+    z = np.asarray(wp.normal, float)
+    z /= np.linalg.norm(z)
+    c = np.asarray(center, float).reshape(3)
+    c = c - float((c - wp.centroid) @ z) * z
+    x = np.asarray(wp.frame_T[:3, 0], float)
+    x -= float(x @ z) * z
+    x /= np.linalg.norm(x)
+    y = np.cross(z, x)
+    length, width = float(size[0]), float(size[1])
+    if width > length:
+        x, y = y, -x
+        length, width = width, length
+    hx, hy = length / 2.0, width / 2.0
+    corners = np.array([
+        c - hx * x - hy * y,
+        c + hx * x - hy * y,
+        c + hx * x + hy * y,
+        c - hx * x + hy * y,
+    ])
+    o = int(np.argmin(np.linalg.norm(corners, axis=1)))
+    origin = corners[o]
+    nxt, prv = corners[(o + 1) % 4], corners[(o - 1) % 4]
+    x_raw = (nxt - origin if np.linalg.norm(nxt - origin) >= np.linalg.norm(prv - origin)
+             else prv - origin)
+    x_axis = x_raw - float(x_raw @ z) * z
+    x_axis /= np.linalg.norm(x_axis)
+    y_axis = np.cross(z, x_axis)
+    frame_T = Rt_to_T(np.column_stack([x_axis, y_axis, z]), origin)
+    return WorkPlane(
+        frame_T=frame_T, corners=corners, size=(length, width),
+        normal=z, centroid=c, inlier_count=wp.inlier_count,
+        inlier_frac=wp.inlier_frac)

@@ -37,19 +37,40 @@ interface GuideProps {
   onConnect: () => void;
   scaleOk: boolean;
   onScaleOk: (v: boolean) => void;
-  board: { square_size_mm: number } | null;
+  board: { square_size_mm: number; paper_size?: string } | null;
+  onBoardChanged: () => void;
 }
 
 export default function CalibrationGuide({ ready, connState, onConnect,
-                                          scaleOk, onScaleOk, board }: GuideProps) {
-  const [page, setPage] = useState("A4");
+                                          scaleOk, onScaleOk, board,
+                                          onBoardChanged }: GuideProps) {
+  const [page, setPage] = useState(board?.paper_size ?? "A4");
   const [spec, setSpec] = useState<BoardSpec | null>(null);
+  const [boardError, setBoardError] = useState("");
   const [done, setDone] = useState<boolean[]>(() => STEPS.map(() => false));
   const [measured, setMeasured] = useState("");   // a printed square measured with a ruler (mm)
 
   const loadSpec = (p: string) =>
     api.get<BoardSpec>(`/board/spec?page=${p}`).then(setSpec).catch(() => setSpec(null));
   useEffect(() => { loadSpec(page); }, [page]);
+  useEffect(() => {
+    if (board?.paper_size && board.paper_size !== page) setPage(board.paper_size);
+  }, [board?.paper_size]);
+
+  const selectPage = async (next: string) => {
+    const previous = page;
+    setPage(next);
+    setBoardError("");
+    onScaleOk(false);
+    try {
+      const selected = await api.post<BoardSpec>("/board/select", { page: next });
+      setSpec(selected);
+      onBoardChanged();
+    } catch (e) {
+      setPage(previous);
+      setBoardError(e instanceof Error ? e.message : "Could not change board");
+    }
+  };
 
   const toggle = (i: number) => setDone((d) => d.map((v, j) => (j === i ? !v : v)));
 
@@ -73,7 +94,8 @@ export default function CalibrationGuide({ ready, connState, onConnect,
 
               {i === 0 && (
                 <div className="board-tools">
-                  <img className="board-preview" src={PNG_URL} alt="calibration board" />
+                  <img className="board-preview" src={`${PNG_URL}?page=${page}`}
+                    key={page} alt={`${page} calibration board`} />
                   {spec && (
                     <div className="board-dims">
                       This exact board is what detection expects <i>and</i> what prints —
@@ -87,16 +109,18 @@ export default function CalibrationGuide({ ready, connState, onConnect,
                   )}
                   <div className="row" style={{ gap: 10, alignItems: "flex-end", marginTop: 8 }}>
                     <div className="field">
-                      <label>Paper</label>
-                      <select value={page} onChange={(e) => setPage(e.target.value)}>
+                      <label>Board / paper</label>
+                      <select value={page} onChange={(e) => selectPage(e.target.value)}>
                         {(spec?.pages ?? ["A4", "A3", "Letter"]).map((p) => <option key={p}>{p}</option>)}
                       </select>
                     </div>
                     <a className="linkbtn" href={`${PDF_URL}?page=${page}`} target="_blank" rel="noreferrer">Open PDF</a>
                     <a className="linkbtn" href={`${PDF_URL}?page=${page}&download=true`}>Download</a>
                   </div>
-                  <div className="hint">Print at 100% (Actual size). The dimensions don't change with
-                    paper size — the page just needs to be big enough; verify with the 100 mm ruler.</div>
+                  {boardError && <div className="warn-text">{boardError}</div>}
+                  <div className="hint">A3 selects the larger 320×240 mm board; A4 and Letter use
+                    the standard 240×180 mm board. Print at 100% (Actual size) and verify with
+                    the 100 mm ruler.</div>
 
                   {/* Measure-a-square scale check — the one error metrics can't catch. */}
                   <div className="scale-check">

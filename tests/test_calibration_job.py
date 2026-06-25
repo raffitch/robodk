@@ -141,6 +141,7 @@ def test_generate_then_run_recovers_truth():
     assert gen["gate"]["ok"] is True
     assert all(n.startswith("TasniCalib_") for n in gen["targets"])
     assert abs(gen["look_distance_mm"] - 450) < 5
+    assert gen["predicted_intrinsics_coverage_pct"] >= 0.9
 
     # Every target is joint-locked to the camera TCP (back-filled here since the
     # fake reports no collision-map joints) — so selecting one drives the CAMERA,
@@ -159,6 +160,10 @@ def test_generate_then_run_recovers_truth():
         assert result["report"]["validation"]["n_views"] == 3
         assert result["report"]["train"]["rms_px"] < 1.0
         assert (Path(tmp) / "report.json").exists()
+        assert (Path(tmp) / "capture_geometry.json").exists()
+        geometry = result["report"]["capture_geometry"]
+        assert len(geometry["views"]) == 15
+        assert geometry["perpendicular_distance_mm"]["min"] > 0
 
         # Phase-1 report additions.
         rep = result["report"]
@@ -183,10 +188,23 @@ def test_generate_then_run_recovers_truth():
         print("[gate->generate->run]\n" + result["summary"])
 
 
-def test_auto_intrinsics_runs_when_missing_and_skips_when_present():
-    """With no intrinsics marker on file, the hand-eye run auto-calibrates K +
-    distortion from its own captured views, applies them (marker written), and the
-    report carries an ``intrinsics_auto`` block. With the marker present it skips."""
+def test_a3_generation_uses_longer_range_and_plane_clearance():
+    services, _rdk, _X, _state = _build_fakes()
+    services.config.board.paper_size = "A3"
+    services.config.board.square_size_mm = 40.0
+    services.config.board.marker_size_mm = 29.3
+
+    gen = service_mod.generate_calibration_targets(services)
+
+    assert gen["board_profile"] == "A3"
+    assert gen["look_distance_mm"] == 600.0
+    assert gen["min_perpendicular_mm"] == 425.0
+    assert gen["distance_jitter"] == 0.08
+
+
+def test_auto_intrinsics_refreshes_even_when_marker_present():
+    """Every well-covered run refreshes K + distortion. A stale marker from an
+    older centered data set must not suppress today's edge-covered fit."""
     from tasni.core import config as cfgmod
 
     services, rdk, _X, _state = _build_fakes()
@@ -212,13 +230,14 @@ def test_auto_intrinsics_runs_when_missing_and_skips_when_present():
             assert "intrinsics" in marker          # marker written -> now "present"
             assert service_mod.intrinsics_present(services) is True
 
-            # Second run: marker present -> auto path skipped (no intrinsics_auto block).
+            # Second run: marker is present, but the fit must run again.
             res2 = service_mod.CalibrationJob(services, service_mod.CalibrationParams())(_Ctx())
-            assert res2["report"].get("intrinsics_auto") is None
+            ia2 = res2["report"].get("intrinsics_auto")
+            assert ia2 is not None and ia2["source"] == "auto"
     finally:
         service_mod.runs, cfgmod.save_overrides = orig_runs, orig_save
-    print(f"[auto intrinsics] applied from {ia['n_views']} views, "
-          f"fit RMS {ia['rms_px']:.3f}px; second run skipped it")
+    print(f"[auto intrinsics] refreshed from {ia['n_views']} views, "
+          f"fit RMS {ia['rms_px']:.3f}px; marker did not suppress second fit")
 
 
 def test_generate_refuses_when_not_aimed():
@@ -341,9 +360,28 @@ def test_generate_refuses_when_all_poses_collide():
     print("[all collide -> refuse]", msg.splitlines()[0])
 
 
+def test_generate_refuses_thin_intrinsic_coverage():
+    """A first-run target set must not silently permit an edge-starved intrinsic
+    fit; generation refuses before writing targets when predicted coverage is low."""
+    services, rdk, _X, _state = _build_fakes()
+    original = service_mod.projected_corner_coverage
+    service_mod.projected_corner_coverage = lambda *a, **k: (
+        0.5, [[0, 1, 1, 0], [0, 1, 1, 0], [0, 1, 1, 0]])
+    try:
+        try:
+            service_mod.generate_calibration_targets(services)
+            raise AssertionError("expected refusal for thin intrinsic coverage")
+        except RuntimeError as e:
+            assert "intrinsic image grid" in str(e) and "Re-seed" in str(e)
+    finally:
+        service_mod.projected_corner_coverage = original
+    assert rdk.list_targets("TasniCalib_") == []
+
+
 if __name__ == "__main__":
     test_generate_then_run_recovers_truth()
-    test_auto_intrinsics_runs_when_missing_and_skips_when_present()
+    test_a3_generation_uses_longer_range_and_plane_clearance()
+    test_auto_intrinsics_refreshes_even_when_marker_present()
     test_generate_refuses_when_not_aimed()
     test_run_without_targets_errors()
     test_generate_drops_colliding_poses()
@@ -351,4 +389,5 @@ if __name__ == "__main__":
     test_generate_skips_guard_when_disabled()
     test_generate_refuses_when_tooling_collides()
     test_generate_refuses_when_all_poses_collide()
+    test_generate_refuses_thin_intrinsic_coverage()
     print("\nGate-gated calibration job tests passed.")

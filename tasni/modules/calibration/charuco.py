@@ -40,6 +40,12 @@ class CharucoTarget:
         # corner, so distance/aiming should reference this instead. Using the mean
         # of all corners is robust to the origin convention.
         self.board_center = self._all_obj.mean(axis=0).astype(np.float64)
+        w = float(config.squares_x * config.square_size_mm)
+        h = float(config.squares_y * config.square_size_mm)
+        self.board_outline_points = np.array(
+            [[0.0, 0.0, 0.0], [w, 0.0, 0.0], [w, h, 0.0], [0.0, h, 0.0]],
+            dtype=np.float64,
+        )
 
     @property
     def all_obj_points(self) -> np.ndarray:

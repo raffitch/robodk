@@ -1,11 +1,10 @@
 """Render the calibration board — the SAME board detection uses.
 
-The board geometry lives in one place (:class:`~tasni.core.config.BoardConfig`).
-We render exactly that board at its true physical size, so a 100%-scale print
-matches the detection config by construction — there is no "match" step. (A
-print/scale mismatch would silently scale the hand-eye translation, and
-reprojection error can't catch it, which is why this must be exact.) The page
-just provides paper to print on; the board dimensions never change with it.
+The active geometry lives in one place
+(:class:`~tasni.core.config.BoardConfig`). We render exactly that board at its
+true physical size, so a 100%-scale print matches detection by construction.
+A3 deliberately selects a larger physical profile; the selection endpoint
+updates the same config used by detection before calibration starts.
 """
 from __future__ import annotations
 
@@ -22,6 +21,13 @@ MM_PER_IN = 25.4
 PAGES_MM: dict[str, tuple[float, float]] = {     # portrait width x height
     "A4": (210.0, 297.0), "A3": (297.0, 420.0), "Letter": (215.9, 279.4),
 }
+
+# Preserve the proven 8x6 topology and marker/square ratio. On A3 landscape,
+# 40 mm is the largest whole-mm square that leaves room for 10 mm outer margins,
+# the identity text, print warning and 100 mm verification ruler.
+A3_SQUARE_SIZE_MM = 40.0
+DEFAULT_SQUARE_SIZE_MM = 30.0
+DEFAULT_MARKER_RATIO = 22.0 / 30.0
 
 
 @dataclass
@@ -46,8 +52,20 @@ def _board_size_mm(b: BoardConfig) -> tuple[float, float]:
     return round(b.squares_x * b.square_size_mm, 1), round(b.squares_y * b.square_size_mm, 1)
 
 
+def board_for_page(board: BoardConfig, page: str) -> BoardConfig:
+    """Return the true board geometry associated with a paper profile."""
+    page = page if page in PAGES_MM else "A4"
+    square = A3_SQUARE_SIZE_MM if page == "A3" else DEFAULT_SQUARE_SIZE_MM
+    return board.model_copy(update={
+        "square_size_mm": square,
+        "marker_size_mm": round(square * DEFAULT_MARKER_RATIO, 1),
+        "paper_size": page,
+    })
+
+
 def board_spec(board: BoardConfig, page: str = "A4", margin_mm: float = 10.0) -> BoardSpec:
     page = page if page in PAGES_MM else "A4"
+    board = board_for_page(board, page)
     bw, bh = _board_size_mm(board)
     pw, ph = PAGES_MM[page]
     # Pick the page orientation that fits the (fixed-size) board best.
@@ -92,6 +110,7 @@ def _font(px: int):
 def render_pdf(board: BoardConfig, page: str = "A4", margin_mm: float = 10.0,
                dpi: int = 300) -> tuple[bytes, BoardSpec]:
     """Render the board at TRUE physical size, centered on the page."""
+    board = board_for_page(board, page)
     spec = board_spec(board, page, margin_mm)
     pw_mm, ph_mm = PAGES_MM[spec.page]
     if spec.landscape:

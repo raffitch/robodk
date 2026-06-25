@@ -37,6 +37,11 @@ class GateThresholds:
     invert_y: bool = False
     invert_z: bool = False
     center_tol_mm: float = 40.0     # |x|,|y| under this counts as centred (advisory)
+    # Seed-view quality. This is intentionally a projected board-area fraction,
+    # not corner count: enough board must fill the image for a precise seed PnP,
+    # while leaving room for the generated tilted/offset calibration views.
+    min_board_area_frac: float = 0.10
+    max_board_area_frac: float = 0.40
 
 
 @dataclass
@@ -66,6 +71,7 @@ class GateReading:
     # ROTATE-TOOL panel reads identically for board aim and surface aim.
     tilt_b_deg: float | None = None      # rotate about camera/TOOL Y (KUKA B): left/right
     tilt_c_deg: float | None = None      # rotate about camera/TOOL X (KUKA C): fwd/back
+    board_area_frac: float | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -83,7 +89,13 @@ class GateReading:
             "center_tol_mm": self.center_tol_mm,
             "tilt_b_deg": self.tilt_b_deg,
             "tilt_c_deg": self.tilt_c_deg,
+            "board_area_frac": self.board_area_frac,
+            "min_board_area_frac": self.min_board_area_frac,
+            "max_board_area_frac": self.max_board_area_frac,
         }
+
+    min_board_area_frac: float = 0.10
+    max_board_area_frac: float = 0.40
 
 
 def board_tilt_deg(R_target2cam: np.ndarray) -> float:
@@ -141,7 +153,8 @@ def board_offset(t_target2cam: np.ndarray, K: np.ndarray,
 
 
 def evaluate_gate(det: ViewDetection | None, K: np.ndarray, image_shape: tuple,
-                  th: GateThresholds, board_center_mm: np.ndarray | None = None) -> GateReading:
+                  th: GateThresholds, board_center_mm: np.ndarray | None = None,
+                  board_obj_points: np.ndarray | None = None) -> GateReading:
     """Build the :class:`GateReading` for one frame (``det`` is ``None`` if the
     board was not found).
 
@@ -149,10 +162,13 @@ def evaluate_gate(det: ViewDetection | None, K: np.ndarray, image_shape: tuple,
     distance / centring / jog all reference the board CENTRE instead of the corner
     origin (so aiming targets the middle of the board)."""
     if det is None:
-        gates = {"detected": False, "distance": False, "angle": False}
+        gates = {"detected": False, "distance": False, "angle": False,
+                 "center": False, "coverage": False}
         return GateReading(False, 0, None, None, None, gates, False,
                            th.ideal_distance_mm, th.distance_tol_mm, th.max_tilt_deg,
-                           None, th.center_tol_mm)
+                           None, th.center_tol_mm,
+                           min_board_area_frac=th.min_board_area_frac,
+                           max_board_area_frac=th.max_board_area_frac)
 
     R = np.asarray(det.R_target2cam, dtype=float)
     t = np.asarray(det.t_target2cam, dtype=float).reshape(3)
@@ -163,6 +179,20 @@ def evaluate_gate(det: ViewDetection | None, K: np.ndarray, image_shape: tuple,
     tilt = board_tilt_deg(R)
     tilt_b, tilt_c = board_tilt_bc_deg(R)
     offset = board_offset(center, K, image_shape)
+    board_area_frac = None
+    if board_obj_points is not None:
+        obj = np.asarray(board_obj_points, dtype=float).reshape(-1, 3)
+        cam = obj @ R.T + t
+        valid = cam[:, 2] > 1e-6
+        if int(valid.sum()) >= 3:
+            uv = np.column_stack([
+                K[0, 0] * cam[valid, 0] / cam[valid, 2] + K[0, 2],
+                K[1, 1] * cam[valid, 1] / cam[valid, 2] + K[1, 2],
+            ])
+            h, w = image_shape[0], image_shape[1]
+            span = np.ptp(uv, axis=0)
+            board_area_frac = float(
+                max(0.0, span[0]) * max(0.0, span[1]) / max(float(w * h), 1.0))
 
     # Translation to bring the board centre to (0, 0, ideal) in the camera frame,
     # with optional per-axis sign flips to match the pendant's TOOL convention.
@@ -174,8 +204,16 @@ def evaluate_gate(det: ViewDetection | None, K: np.ndarray, image_shape: tuple,
         "detected": det.n_corners >= th.min_corners,
         "distance": abs(distance - th.ideal_distance_mm) <= th.distance_tol_mm,
         "angle": tilt <= th.max_tilt_deg,
+        "center": abs(float(center[0])) <= th.center_tol_mm
+                  and abs(float(center[1])) <= th.center_tol_mm,
+        "coverage": (board_area_frac is None
+                     or th.min_board_area_frac <= board_area_frac
+                     <= th.max_board_area_frac),
     }
     return GateReading(True, det.n_corners, distance, tilt, offset, gates,
                        all(gates.values()), th.ideal_distance_mm,
                        th.distance_tol_mm, th.max_tilt_deg, move_cam, th.center_tol_mm,
-                       tilt_b_deg=tilt_b, tilt_c_deg=tilt_c)
+                       tilt_b_deg=tilt_b, tilt_c_deg=tilt_c,
+                       board_area_frac=board_area_frac,
+                       min_board_area_frac=th.min_board_area_frac,
+                       max_board_area_frac=th.max_board_area_frac)

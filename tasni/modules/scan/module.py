@@ -15,9 +15,8 @@ from ...core.rdk_io import link_real_robot
 from ..base import ServiceContainer, WorkflowModule
 from ..calibration.service import SimTourJob
 from .service import (ScanCaptureJob, ScanParams, ScanResult, generate_scan_targets,
-                      insert_scan, scan_gate_thresholds, scan_gate_payload)
-from .depth_gate import evaluate_depth_gate
-from .survey import SurveyThresholds, survey_surface
+                      insert_scan, live_scan_telemetry_payload, LockedScanSurface,
+                      lock_scan_surface)
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
@@ -41,6 +40,8 @@ class ScanModule(WorkflowModule):
         self._active_job: ScanCaptureJob | None = None
         self._reference_result: ScanResult | None = None  # set by reference-mode locate
         self._planned_voxel_m: float | None = None         # set by /poses/generate for /run
+        self._planned_crop_mm: tuple[float, float] | None = None
+        self._locked_surface: LockedScanSurface | None = None
 
     def router(self) -> "APIRouter":
         from fastapi import APIRouter, HTTPException, Response
@@ -120,12 +121,11 @@ class ScanModule(WorkflowModule):
 
         @router.post("/live/start")
         def live_start() -> dict:
-            """Start the live standoff gate. The video streams COLOR-ONLY (fast, like
-            calibration); the depth gate (distance + tilt + tilt-correction) is
-            refreshed on a ~``gate_period_s`` interleave. Camera-only, no robot motion.
+            """Start the uninterrupted color preview using Calibration's transport.
 
-            The frame carries only a thin sampling reticle — all numeric readouts are
-            drawn by the client HUD (no duplicate/overlapping baked-in text)."""
+            Depth is deliberately excluded from this live socket. Create targets
+            performs the authoritative distance/tilt/surface check without coupling
+            those slower readings to video FPS. Camera-only, no robot motion."""
             if services.jobs.running:
                 raise HTTPException(409, "a scan run is in progress")
             if services.live.running:
@@ -136,15 +136,12 @@ class ScanModule(WorkflowModule):
             from ...core.camera_lease import CameraBusy
             c = services.config
             sc = c.scan
-            K = c.camera.K
-            th = scan_gate_thresholds(sc)
-            survey_th = SurveyThresholds(
-                accurate_min_mm=sc.accurate_min_mm, accurate_max_mm=sc.accurate_max_mm,
-                survey_max_tilt_deg=sc.survey_max_tilt_deg, grid_target_px=sc.grid_target_px)
             PREVIEW_W = 960
             enc = [cv2.IMWRITE_JPEG_QUALITY, sc.preview_jpeg_quality]
+            last_ideal_mm = None
 
             def analyze(frame):
+                nonlocal last_ideal_mm
                 # Color-only video: draw ONLY a thin reticle marking where the gate
                 # samples standoff/tilt. The HUD overlays all numbers, so we bake no
                 # text here (that was the overlapping-text bug).
@@ -157,19 +154,28 @@ class ScanModule(WorkflowModule):
                     img = cv2.resize(img, (PREVIEW_W, int(h * PREVIEW_W / w)),
                                      interpolation=cv2.INTER_AREA)
                 ok, jpeg = cv2.imencode(".jpg", img, enc)
-                return (jpeg.tobytes() if ok else b""), {}
+                metrics = live_scan_telemetry_payload(
+                    getattr(frame, "telemetry", None), sc,
+                    previous_ideal_mm=last_ideal_mm,
+                    camera_cfg=c.camera)
+                if metrics:
+                    last_ideal_mm = metrics.get("ideal_distance_mm", last_ideal_mm)
+                return (jpeg.tobytes() if ok else b""), metrics
 
-            # Default: a smooth color-only stream identical to calibration (no depth
-            # sampling, so the framerate is steady). The standoff/tilt gate is checked
-            # on Create targets. Opt-in live_depth_gate samples depth on an interleave
-            # for a live readout (at the cost of a periodic refresh blip).
-            kwargs = dict(fps=sc.preview_fps, timeout_s=sc.preview_timeout_s,
-                          color_only=True, quality=sc.preview_jpeg_quality)
-            if sc.live_depth_gate:
-                kwargs["depth_probe"] = (lambda frame: scan_gate_payload(
-                    evaluate_depth_gate(frame.depth, K, th, depth_scale=sc.depth_scale),
-                    survey_surface(frame.depth, K, survey_th, depth_scale=sc.depth_scale)))
-                kwargs["depth_period_s"] = sc.gate_period_s
+            # Use the exact same proven color transport as Calibration. Scan depth is
+            # intentionally NOT interleaved into this socket: interrupting the video
+            # to obtain HUD values is what caused the repeated FPS/no-signal/timeout
+            # cycle. The authoritative depth reading remains Create targets.
+            preview_codec = c.calibration.preview_codec
+            kwargs = dict(
+                fps=sc.preview_fps,
+                timeout_s=sc.preview_timeout_s,
+                color_only=True,
+                quality=sc.preview_jpeg_quality,
+                codec=preview_codec,
+                bitrate=c.calibration.preview_h264_bitrate_kbps,
+                scan_telemetry=True,
+            )
             try:
                 services.live.start(analyze, **kwargs)
             except CameraBusy as e:
@@ -181,20 +187,54 @@ class ScanModule(WorkflowModule):
             services.live.stop()
             return {"status": "stopped"}
 
+        @router.post("/surface/lock")
+        def surface_lock() -> dict:
+            if services.jobs.running:
+                raise HTTPException(409, "a job is already running")
+            try:
+                self._locked_surface = lock_scan_surface(services)
+                gate = self._locked_surface.gate_payload
+                crop = gate.get("crop_size_mm")
+                extent = gate.get("extent_mm")
+                return {
+                    "status": "locked",
+                    "gate": gate,
+                    "surface_mode": "crop" if crop else "full",
+                    "extent_mm": extent,
+                    "crop_size_mm": crop,
+                }
+            except RuntimeError as e:
+                self._locked_surface = None
+                raise HTTPException(400, str(e))
+            except Exception as e:
+                self._locked_surface = None
+                raise HTTPException(503, f"camera/RoboDK unavailable: {e}")
+
+        @router.post("/surface/unlock")
+        def surface_unlock() -> dict:
+            self._locked_surface = None
+            return {"status": "unlocked"}
+
         @router.post("/poses/generate")
         def poses_generate() -> dict:
             if services.jobs.running:
                 raise HTTPException(409, "a job is already running")
+            if self._locked_surface is None:
+                raise HTTPException(400, "lock and review the surface first")
             try:
-                result_dict = generate_scan_targets(services)
+                result_dict = generate_scan_targets(services, self._locked_surface)
                 # Reference mode returns a ready ScanResult with no targets.
                 if result_dict.get("mode") == "reference" and "_scan_result" in result_dict:
                     self._reference_result = result_dict.pop("_scan_result")
                     self._active_job = None
                     self._planned_voxel_m = None
+                    self._planned_crop_mm = None
                 else:
                     self._reference_result = None
                     self._planned_voxel_m = result_dict.get("voxel_size_m")
+                    crop = result_dict.get("crop_size_mm")
+                    self._planned_crop_mm = tuple(crop) if crop is not None else None
+                self._locked_surface = None
                 return result_dict
             except RuntimeError as e:
                 raise HTTPException(400, str(e))
@@ -237,7 +277,8 @@ class ScanModule(WorkflowModule):
                                     "gate is green and Create targets first")
             services.live.stop()
             self._active_job = ScanCaptureJob(services, ScanParams(
-                voxel_size_m=self._planned_voxel_m))
+                voxel_size_m=self._planned_voxel_m,
+                crop_size_mm=self._planned_crop_mm))
             services.jobs.start(self._active_job, name="scan")
             return {"status": "started"}
 

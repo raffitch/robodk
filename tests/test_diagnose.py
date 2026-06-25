@@ -12,10 +12,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tasni.modules.calibration.quality import (  # noqa: E402
-    CalibrationReport, SplitMetrics, diagnose)
+    CalibrationReport, SplitMetrics, diagnose, transform_repeatability)
 
 _I4 = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
 
@@ -87,6 +89,23 @@ def test_overfit_flagged():
     print("[overfit]", d["causes"][-1][:60])
 
 
+def test_transform_repeatability_reports_lever_arm_error():
+    a = np.eye(4)
+    b = np.eye(4)
+    b[0, 3] = 0.8
+    angle = np.deg2rad(0.1)
+    b[:3, :3] = np.array([
+        [np.cos(angle), -np.sin(angle), 0],
+        [np.sin(angle), np.cos(angle), 0],
+        [0, 0, 1],
+    ])
+    r = transform_repeatability(a, b, 500.0)
+    assert r["high_confidence"]
+    assert 1.6 < r["reference_delta_mm"] < 1.8
+    b[0, 3] = 2.0
+    assert not transform_repeatability(a, b, 500.0)["high_confidence"]
+
+
 if __name__ == "__main__":
     test_pass_when_all_tight()
     test_intrinsics_pattern_high_reproj_tight_spread()
@@ -95,4 +114,5 @@ if __name__ == "__main__":
     test_weak_diversity_is_borderline()
     test_intrinsics_warn_flagged()
     test_overfit_flagged()
+    test_transform_repeatability_reports_lever_arm_error()
     print("\nDiagnose verdict tests passed.")

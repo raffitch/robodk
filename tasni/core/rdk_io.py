@@ -414,6 +414,7 @@ class RdkIO:
         last_link = max(0, dof - max(0, int(skip_trailing)))
         link_ids = list(range(0, last_link + 1))
         tools = self.mounted_tool_items()
+        sibling = self.disable_mounted_body_collision_pairs(tools)
         enabled = failed = 0
         names: list[str] = []
         for it in tools:
@@ -435,9 +436,36 @@ class RdkIO:
                 except Exception:
                     pass
         return {"tools": names, "links": link_ids, "pairs_enabled": enabled,
-                "pairs_failed": failed, "dof": dof}
+                "pairs_failed": failed, "dof": dof,
+                "sibling_pairs_disabled": sibling["pairs_disabled"]}
 
-    def ensure_obstacle_collision_pairs(self) -> dict:
+    def disable_mounted_body_collision_pairs(self, mounted: list | None = None) -> dict:
+        """Disable collisions within the rigid flange-mounted assembly.
+
+        Camera, spindle, tool frames and their model objects move as one rigid
+        assembly. They may overlap by design and must never be tested against one
+        another. Global collision activation can rebuild RoboDK's default map, so
+        these exclusions are re-applied every time the calibration guard is enabled.
+        """
+        import robolink
+
+        bodies = list(self.mounted_tool_items() if mounted is None else mounted)
+        disabled = failed = 0
+        for i, a in enumerate(bodies):
+            for b in bodies[i + 1:]:
+                try:
+                    r = self.rdk.setCollisionActivePair(
+                        robolink.COLLISION_OFF, a, b, 0, 0)
+                    if int(r) == 1:
+                        disabled += 1
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+        return {"pairs_disabled": disabled, "pairs_failed": failed}
+
+    def ensure_obstacle_collision_pairs(self,
+                                        ignore_names: list[str] | None = None) -> dict:
         """Force-enable collision pairs between every flange-mounted body (tools +
         their objects) and every static OBJECT in the station (the board pedestal,
         walls, cabinet, floor, …).
@@ -454,7 +482,25 @@ class RdkIO:
         import robolink
 
         tools = self.mounted_tool_items()
-        objects = self.rdk.ItemList(robolink.ITEM_TYPE_OBJECT)
+        self_pairs = self.disable_mounted_body_collision_pairs(tools)
+        mounted_names = set()
+        for it in tools:
+            try:
+                mounted_names.add(it.Name())
+            except Exception:
+                pass
+        # Mounted model objects are returned by ItemList(OBJECT) too. Exclude them:
+        # enabling tool↔mounted-object pairs would make the rigid flange assembly
+        # collide with itself at every target.
+        ignored = {str(n).casefold() for n in (ignore_names or [])}
+        objects = []
+        for ob in self.rdk.ItemList(robolink.ITEM_TYPE_OBJECT):
+            try:
+                if ob.Name() in mounted_names or ob.Name().casefold() in ignored:
+                    continue
+            except Exception:
+                pass
+            objects.append(ob)
         enabled = failed = 0
         names: list[str] = []
         for ob in objects:
@@ -475,7 +521,50 @@ class RdkIO:
                     names.append(ob.Name())
                 except Exception:
                     pass
-        return {"objects": names, "pairs_enabled": enabled, "pairs_failed": failed}
+        return {"objects": names, "pairs_enabled": enabled, "pairs_failed": failed,
+                "sibling_pairs_disabled": self_pairs["pairs_disabled"]}
+
+    def disable_object_collision_pairs(self, names: list[str]) -> dict:
+        """Disable ignored station objects against the robot and mounted assembly.
+
+        Called after global collision checking is enabled because RoboDK rebuilds
+        its default map at that point. Name matching is case-insensitive.
+        """
+        import robolink
+
+        wanted = {str(n).casefold() for n in names if str(n).strip()}
+        if not wanted:
+            return {"objects": [], "pairs_disabled": 0, "pairs_failed": 0}
+        objects = []
+        for ob in self.rdk.ItemList(robolink.ITEM_TYPE_OBJECT):
+            try:
+                if ob.Name().casefold() in wanted:
+                    objects.append(ob)
+            except Exception:
+                continue
+        robot = self.robot()
+        mounted = self.mounted_tool_items()
+        disabled = failed = 0
+        for ob in objects:
+            # Disable against every robot link, including wrist/flange.
+            for lid in range(self.robot_dof() + 1):
+                try:
+                    r = self.rdk.setCollisionActivePair(
+                        robolink.COLLISION_OFF, ob, robot, 0, lid)
+                    disabled += int(r) == 1
+                    failed += int(r) != 1
+                except Exception:
+                    failed += 1
+            for body in mounted:
+                try:
+                    r = self.rdk.setCollisionActivePair(
+                        robolink.COLLISION_OFF, ob, body, 0, 0)
+                    disabled += int(r) == 1
+                    failed += int(r) != 1
+                except Exception:
+                    failed += 1
+        return {"objects": [ob.Name() for ob in objects],
+                "pairs_disabled": disabled, "pairs_failed": failed}
 
     # Joint step (deg) MoveJ_Test interpolates at while checking the approach — fine
     # enough to catch a thin self-collision, coarse enough to stay quick on the big
@@ -579,6 +668,7 @@ class RdkIO:
 
     def screen_collisions(self, poses: list[np.ndarray], *,
                           guard_skip: int | None = None, obstacle_pairs: bool = False,
+                          ignore_objects: list[str] | None = None,
                           baseline_relative: bool = True, path_samples: int = 6
                           ) -> tuple[list[bool], bool, list]:
         """Test each TCP pose for collisions **in simulation** and record the exact
@@ -626,7 +716,9 @@ class RdkIO:
         if on and guard_skip is not None:
             self.ensure_mounted_tool_collision_pairs(guard_skip)
         if on and obstacle_pairs:
-            self.ensure_obstacle_collision_pairs()
+            self.ensure_obstacle_collision_pairs(ignore_objects)
+        if on and ignore_objects:
+            self.disable_object_collision_pairs(ignore_objects)
         # Record the baseline collision pair-set at the SAFE seed config (the pose the
         # operator aimed from), so the constant modelling artifacts are subtracted out.
         baseline = set()
@@ -675,7 +767,8 @@ class RdkIO:
         return mask, on, joints
 
     def collision_status(self, *, ensure_pairs: bool = False,
-                         skip_trailing: int = 2) -> dict:
+                         skip_trailing: int = 2,
+                         ignore_objects: list[str] | None = None) -> dict:
         """Best-effort snapshot of RoboDK collision checking at the **current** pose
         — no motion. Briefly enables checking to force a recompute, reads the count,
         then **disables it again** (so it doesn't slow every later call). Returns
@@ -691,6 +784,8 @@ class RdkIO:
         on = self.set_collision_checking(True)
         guard = (self.ensure_mounted_tool_collision_pairs(skip_trailing)
                  if on and ensure_pairs else None)
+        ignored = (self.disable_object_collision_pairs(ignore_objects)
+                   if on and ignore_objects else None)
         n = self.collisions() if on else None
         pairs = self.collision_pairs() if n else []
         self.set_collision_checking(False)
@@ -700,6 +795,8 @@ class RdkIO:
         if guard is not None:
             out["guarded_tools"] = guard["tools"]
             out["guarded_pairs"] = guard["pairs_enabled"]
+        if ignored is not None:
+            out["ignored_objects"] = ignored["objects"]
         return out
 
     def collisions(self) -> int | None:

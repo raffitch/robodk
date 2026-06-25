@@ -11,11 +11,14 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tasni.modules.scan.depth_gate import (  # noqa: E402
     ScanGateThresholds, evaluate_depth_gate)
+from tasni.core.config import ScanConfig  # noqa: E402
+from tasni.modules.scan.service import live_scan_telemetry_payload  # noqa: E402
 
 W, H = 320, 240
 K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
@@ -76,9 +79,83 @@ def test_no_surface_not_detected():
     print("[empty] no depth -> not detected")
 
 
+def test_live_telemetry_uses_surface_appropriate_standoff():
+    cfg = ScanConfig()
+    raw = {
+        "detected": True, "distance_mm": 500.0, "tilt_deg": 2.0,
+        "tilt_b_deg": 1.0, "tilt_c_deg": -1.0, "valid_frac": 0.9,
+        "fully_framed": True, "extent_mm": [300.0, 200.0],
+        "rectangle_size_mm": [200.0, 300.0],
+        "surface_mode": "full",
+        "color_fit_standoff_per_margin_mm": 300.0,
+    }
+    p = live_scan_telemetry_payload(raw, cfg)
+    assert abs(p["ideal_distance_mm"] - 390.0) < 1e-6, p
+    assert p["gates"]["angle"] is True
+    assert p["gates"]["framed"] is True
+    assert p["rectangle_size_mm"] == [200.0, 300.0]
+    print("[telemetry] live target standoff derived from framed surface extent")
+
+
+def test_live_target_is_continuous_across_color_frame_boundary():
+    cfg = ScanConfig()
+    base = {
+        "detected": True, "distance_mm": 304.0, "tilt_deg": 1.0,
+        "valid_frac": 0.9, "extent_mm": [363.0, 198.0],
+        "surface_mode": "full",
+        "color_fit_standoff_per_margin_mm": 326.0,
+    }
+    framed = live_scan_telemetry_payload({**base, "fully_framed": True}, cfg)
+    clipped = live_scan_telemetry_payload({**base, "fully_framed": False}, cfg)
+    assert framed["ideal_distance_mm"] == clipped["ideal_distance_mm"] == 420.0
+    chatter = live_scan_telemetry_payload(
+        {**base, "color_fit_standoff_per_margin_mm": 318.0,
+         "fully_framed": True}, cfg, previous_ideal_mm=420.0)
+    assert chatter["ideal_distance_mm"] == 420.0
+
+    crop = live_scan_telemetry_payload({
+        **base, "fully_framed": False, "surface_mode": "crop"}, cfg)
+    assert crop["ideal_distance_mm"] == cfg.accurate_min_mm
+    assert crop["crop_size_mm"] is not None
+    print("[telemetry hysteresis] color clipping keeps target 420 mm; true crop stays 300 mm")
+
+
+def test_live_outline_uses_saved_color_calibration():
+    cfg = ScanConfig()
+    camera = type("Camera", (), {
+        "K": np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]]),
+        "dist": np.array([0.12, -0.25, -0.002, -0.0003, 0.0]).reshape(-1, 1),
+        "size": (320, 240),
+    })()
+    corners = np.array([
+        [-180.0, -110.0, 500.0],
+        [180.0, -110.0, 500.0],
+        [180.0, 110.0, 500.0],
+        [-180.0, 110.0, 500.0],
+    ])
+    raw = {
+        "detected": True, "distance_mm": 500.0, "tilt_deg": 0.0,
+        "valid_frac": 1.0, "fully_framed": True,
+        "depth_fully_framed": True, "surface_mode": "full",
+        "extent_mm": [360.0, 220.0], "rectangle_size_mm": [360.0, 220.0],
+        "rectangle_corners_color_mm": corners.tolist(),
+        "outline_uv": [[0.0, 0.0]] * 4,
+    }
+    p = live_scan_telemetry_payload(raw, cfg, camera_cfg=camera)
+    expected, _ = cv2.projectPoints(
+        corners, np.zeros(3), np.zeros(3), camera.K, camera.dist)
+    expected = expected.reshape(-1, 2) / np.array(camera.size)
+    assert np.allclose(np.asarray(p["outline_uv"]), expected)
+    assert not np.allclose(np.asarray(p["outline_uv"]), 0.0)
+    print("[telemetry calibration] saved RGB K+distortion drives blue outline")
+
+
 if __name__ == "__main__":
     test_frontal_plane_all_green()
     test_tilt_measured_and_gated()
     test_too_far_fails_distance()
     test_no_surface_not_detected()
+    test_live_telemetry_uses_surface_appropriate_standoff()
+    test_live_target_is_continuous_across_color_frame_boundary()
+    test_live_outline_uses_saved_color_calibration()
     print("\ndepth_gate.py tests passed.")

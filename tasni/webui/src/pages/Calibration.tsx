@@ -4,7 +4,6 @@ import { useEvents, type JobEvent } from "../api/events";
 import AimHud, { type GateReading } from "./AimHud";
 import CalibrationGuide from "./CalibrationGuide";
 import ConeDiagram from "./ConeDiagram";
-import IntrinsicsPanel from "./IntrinsicsPanel";
 import StreamStats, { useStreamStats } from "./StreamStats";
 
 const api = moduleApi("calibration");
@@ -26,12 +25,16 @@ export function robotLinkNote(
 interface CalibConfig {
   robot: string;
   camera_tool: string;
-  board: { squares_x: number; squares_y: number; square_size_mm: number; marker_size_mm: number; dictionary: string };
+  board: { squares_x: number; squares_y: number; square_size_mm: number; marker_size_mm: number;
+           dictionary: string; paper_size: string };
   camera: { ip: string; port: number; resolution: string };
   calibration: { holdout_count: number; refine: boolean; pose_count: number;
                  cone_half_angle_deg: number; roll_max_deg: number; distance_jitter: number;
-                 jog_invert_x: boolean; jog_invert_y: boolean; jog_invert_z: boolean };
-  gate: { ideal_distance_mm: number; distance_tol_mm: number; max_tilt_deg: number };
+                 jog_invert_x: boolean; jog_invert_y: boolean; jog_invert_z: boolean;
+                 seed_stable_s: number };
+  gate: { ideal_distance_mm: number; distance_tol_mm: number; max_tilt_deg: number;
+          center_tol_mm: number; min_board_area_frac: number;
+          max_board_area_frac: number; stable_s: number };
 }
 interface Split { rms_px: number; max_px: number; n_views: number; }
 interface Report {
@@ -47,6 +50,11 @@ interface Report {
   cross_val_rms_px?: number | null;
   rejected_views?: string[];
   diagnosis?: { verdict: "pass" | "borderline" | "fail"; headline: string; causes: string[] };
+  repeatability?: { previous_run_id: string; translation_mm: number; rotation_deg: number;
+                    reference_distance_mm: number; reference_delta_mm: number;
+                    high_confidence: boolean; note: string };
+  working_tolerance?: { recommended_mm: number; reference_distance_mm: number;
+                        basis: string; physically_validated: boolean };
 }
 interface RunResult {
   summary: string;
@@ -107,10 +115,6 @@ export default function Calibration() {
     { available: boolean; count: number | null; guarded_tools?: string[]; guarded_pairs?: number } | null>(null);
   const [collisionBusy, setCollisionBusy] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
-  // True while Step-0 intrinsic capture owns the shared camera stream — the main
-  // aiming subscription then ignores frames/gate so the two never cross-feed.
-  const intrinsicsLiveRef = useRef(false);
-
   // Phase 2 — safety & operator trust.
   const [tour, setTour] = useState<TourResult | null>(null);     // last dry-run verdict
   const [thumbs, setThumbs] = useState<string[]>([]);            // per-pose board locks
@@ -211,9 +215,6 @@ export default function Calibration() {
       } else if (ev.type === "log") {
         addLog(ev.payload.message);
       } else if (ev.type === "frame") {
-        // Suppress only the IDLE aiming stream while Step-0 capture owns the camera;
-        // a real run's frames (board-lock thumbnails) must still come through.
-        if (intrinsicsLiveRef.current && runKindRef.current === null) return;
         const src = "data:image/jpeg;base64," + ev.payload.jpeg_b64;
         setFrame(src);
         // During a real run each frame is one pose's board lock — keep the strip.
@@ -221,7 +222,6 @@ export default function Calibration() {
         if (runKindRef.current === "run") setThumbs((t) => [...t, src]);
         else markFrame();
       } else if (ev.type === "gate") {
-        if ((ev.payload as any)?.mode === "intrinsics") return;   // not an aiming gate
         setGate(ev.payload as GateReading);
       } else if (ev.type === "result") {
         if (ev.payload.name === "sim_tour") {
@@ -242,7 +242,6 @@ export default function Calibration() {
   }, [subscribe]);
 
   const beginLive = async (clearGate: boolean) => {
-    intrinsicsLiveRef.current = false;   // aiming reclaims the shared camera stream
     resetStream();
     if (clearGate) setGate(null);
     await api.post("/live/start");
@@ -276,6 +275,7 @@ export default function Calibration() {
         collision_filter_enabled?: boolean;
         collision_filter_bypassed?: boolean;
         visibility_checked?: boolean; poses_offframe_dropped?: number;
+        predicted_intrinsics_coverage_pct?: number;
         camera_tool_offset_mm?: number; targets_cartesian?: number;
         collision_guard?: { tools: string[]; pairs_enabled: number } | null }>("/poses/generate");
       setTargets(r.created);
@@ -312,8 +312,12 @@ export default function Calibration() {
             ? ` ${r.poses_offframe_dropped} pose(s) that would clip the board off-frame were dropped.`
             : " All targets keep the board in frame.")
         : "";
+      const intr = r.predicted_intrinsics_coverage_pct != null
+        ? ` Intrinsic grid coverage ${Math.round(r.predicted_intrinsics_coverage_pct * 100)}%.`
+        : "";
       addLog(`created ${r.created} targets (working distance ~${Math.round(r.look_distance_mm)} mm)`
-        + dropped + guard + vis + offNote + cart + " — inspect them in RoboDK, then Run calibration.");
+        + dropped + guard + vis + intr + offNote + cart
+        + " — inspect them in RoboDK, then Run calibration.");
       beginLive(false).catch(() => setLive(false));
     } catch (e: any) {
       addLog("create targets: " + e.message, true);
@@ -384,6 +388,9 @@ export default function Calibration() {
     ["DETECT", gate?.gates?.detected],
     ["DISTANCE", gate?.gates?.distance],
     ["ANGLE", gate?.gates?.angle],
+    ["CENTER", gate?.gates?.center],
+    ["BOARD SIZE", gate?.gates?.coverage],
+    ["STABLE", gate?.gates?.stable],
   ];
 
   return (
@@ -413,26 +420,16 @@ export default function Calibration() {
             You jog the robot yourself; creating targets stays locked until the gate is green.</div>}
       </div>
 
-      {/* ---- Step 0: camera intrinsics (optional, camera-only) ---------- */}
-      <IntrinsicsPanel
-        disabled={running}
-        onLiveChange={(v) => {
-          intrinsicsLiveRef.current = v;
-          // Stop the aiming gate so the two camera streams don't fight; clear its
-          // stale frame/gate so the aiming HUD doesn't show the last intrinsics view.
-          if (v && live) stopLive();
-          if (v) { setFrame(null); setGate(null); }
-        }}
-        onApplied={loadConfig}
-      />
-
       {/* ---- Aiming gate ------------------------------------------------- */}
       <div className="card">
         <h2>Aim the camera</h2>
         <div className="hint" style={{ marginTop: 0, marginBottom: 10 }}>
           Start the camera and jog the robot until the board sits in the green band — ideal range
           <b> {g ? g.ideal_distance_mm : 450} ± {g ? g.distance_tol_mm : 80} mm</b>, tilt
-          <b> ≤ {g ? g.max_tilt_deg : 25}°</b>. When all three lamps lock green, Create targets unlocks.
+          <b> ≤ {g ? g.max_tilt_deg : 10}°</b>, centred within
+          <b> ±{g ? g.center_tol_mm : 40} mm</b>, with the board filling
+          <b> {Math.round((g?.min_board_area_frac ?? 0.10) * 100)}–{Math.round((g?.max_board_area_frac ?? 0.40) * 100)}%</b>
+          {" "}of the image. Hold it steady for <b>{g?.stable_s ?? 1} s</b>; generated poses add the required tilt, roll and edge coverage.
         </div>
         <div className="aim-wrap">
           {frame ? <img className="preview" src={frame} alt="camera" />
@@ -679,7 +676,8 @@ export default function Calibration() {
       </div>
        </div>
        <CalibrationGuide ready={ready} connState={conn} onConnect={connect}
-                         scaleOk={scaleOk} onScaleOk={setScaleOk} board={config?.board ?? null} />
+                         scaleOk={scaleOk} onScaleOk={setScaleOk} board={config?.board ?? null}
+                         onBoardChanged={loadConfig} />
       </div>
 
       {showConfirm && (
@@ -755,6 +753,18 @@ function Metrics({ result }: { result: RunResult }) {
   if (r.intrinsics_check)
     rows.push(["Intrinsics check", r.intrinsics_check.note,
       r.intrinsics_check.warn ? "warn" : "good"]);
+  if (r.repeatability)
+    rows.push([`Repeatability vs ${r.repeatability.previous_run_id}`,
+      `${r.repeatability.translation_mm.toFixed(2)} mm translation · `
+      + `${r.repeatability.rotation_deg.toFixed(2)}° rotation · `
+      + `~${r.repeatability.reference_delta_mm.toFixed(1)} mm at `
+      + `${Math.round(r.repeatability.reference_distance_mm)} mm`,
+      r.repeatability.high_confidence ? "good" : "warn"]);
+  if (r.working_tolerance)
+    rows.push(["Recommended working tolerance",
+      `±${r.working_tolerance.recommended_mm.toFixed(1)} mm near `
+      + `${Math.round(r.working_tolerance.reference_distance_mm)} mm · ${r.working_tolerance.basis}`,
+      r.repeatability?.high_confidence ? "good" : "warn"]);
   if (r.rejected_views && r.rejected_views.length)
     rows.push([`Outliers rejected (${r.rejected_views.length})`,
       r.rejected_views.join(", "), "warn"]);
@@ -785,6 +795,19 @@ function Metrics({ result }: { result: RunResult }) {
       </tbody></table>
       {result.n_skipped && result.n_skipped.length > 0 &&
         <div className="hint">Skipped (no board): {result.n_skipped.join(", ")}</div>}
+      {r.repeatability && (
+        <div className={r.repeatability.high_confidence ? "ok-text" : "warn-text"}>
+          {r.repeatability.high_confidence
+            ? "High-confidence repeatability: the new mount agrees with the currently applied calibration."
+            : "Repeatability is outside the high-confidence band (1.0 mm / 0.2°). "
+              + "Treat the reference-point delta as a conservative working tolerance until physically validated."}
+        </div>
+      )}
+      {r.diagnosis?.verdict === "fail" && (
+        <div className="warn-text">
+          Apply is disabled for a failed calibration. Correct the reported cause and rerun.
+        </div>
+      )}
       <div className="hint">Artifacts: <code>{result.run_dir}</code></div>
     </>
   );

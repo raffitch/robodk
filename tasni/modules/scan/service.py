@@ -34,16 +34,18 @@ from ...core.jobrunner import JobContext
 from ...core.logging import get_logger, new_run_dir
 from ...core.rdk_io import RdkIO
 # Reuse calibration's shared orchestration helpers (one implementation).
-from ..calibration.poses import (generate_calibration_poses, select_diverse,
+from ..calibration.poses import (generate_calibration_poses, projected_corner_coverage,
+                                  select_diverse, select_diverse_with_coverage,
                                   viewing_angle_span)
 from ..calibration.service import (_camera_hold, dry_tour_required,
                                     ensure_camera_tool, ensure_real_robot_link)
 from .depth_gate import ScanGateThresholds, evaluate_depth_gate
-from .plane import work_plane_from_points
+from .plane import bounded_work_plane, work_plane_from_points
 from .planner import ScanPlan, plan_scan
 from .survey import SurveyThresholds, survey_surface
-from .reconstruct import (ScanView, cloud_points_m, crop_box, decimate_for_preview,
-                          fuse_views, look_point_from_views, save_mesh)
+from .reconstruct import (ScanView, cloud_points_m, crop_box, fuse_views,
+                          look_point_from_views, planar_rectangle_mesh,
+                          planar_surface_points, save_mesh)
 
 log = get_logger("tasni.scan")
 
@@ -55,6 +57,113 @@ SCAN_MIN_VIEWS = 4
 FRAME_NAME = "Tasni Work Frame"
 RECT_NAME = "Tasni Work Surface"
 MESH_NAME = "Tasni Scan Mesh"
+
+
+@dataclass
+class LockedScanSurface:
+    frame: object
+    reading: object
+    survey: object
+    gate_payload: dict
+    seed_T: np.ndarray
+    seed_joints: object
+    locked_at: float
+
+
+def _large_surface_crop_mm(scfg, K, image_size, look_mm: float) -> list[float]:
+    W, H = image_size
+    return [
+        min(float(scfg.large_surface_crop_max_mm),
+            float(look_mm * W / K[0, 0] * scfg.large_surface_crop_fraction)),
+        min(float(scfg.large_surface_crop_max_mm),
+            float(look_mm * H / K[1, 1] * scfg.large_surface_crop_fraction)),
+    ]
+
+
+def _outline_edge_angle_deg(outline_uv) -> float | None:
+    uv = np.asarray(outline_uv, dtype=float).reshape(-1, 2)
+    if len(uv) < 2:
+        return None
+    edges = np.roll(uv, -1, axis=0) - uv
+    edge = edges[int(np.argmax(np.linalg.norm(edges, axis=1)))]
+    angle = float(np.degrees(np.arctan2(edge[1], edge[0])))
+    return ((angle + 45.0) % 90.0) - 45.0
+
+
+def lock_scan_surface(services) -> LockedScanSurface:
+    """Freeze one authoritative RGBD measurement and the matching robot pose."""
+    cfg = services.config
+    scfg = cfg.scan
+    rdk: RdkIO = services.rdk
+    K = cfg.camera.K
+    ensure_camera_tool(services, log=_log_pub(services))
+    if services.live.running:
+        services.live.stop()
+    rdk.use_camera_tool(cfg.robodk.camera_tool)
+
+    with _camera_hold(services, "scan-surface-lock"):
+        frame = services.camera.grab(with_depth=True, timeout=scfg.grab_timeout_s)
+    reading = evaluate_depth_gate(
+        frame.depth, K, scan_gate_thresholds(scfg), depth_scale=scfg.depth_scale)
+    survey = survey_surface(
+        frame.depth, K, _survey_thresholds(scfg), depth_scale=scfg.depth_scale)
+    gate_payload = scan_gate_payload(reading, survey)
+    final_gates = {
+        "detected": bool(reading.gates.get("detected")),
+        "distance": (
+            reading.distance_mm is not None
+            and scfg.accurate_min_mm <= reading.distance_mm <= scfg.accurate_max_mm
+        ),
+        "angle": bool(reading.gates.get("angle")),
+    }
+    if survey.detected and survey.fully_framed:
+        if survey.centroid_cam_mm is not None:
+            final_gates["center"] = bool(
+                abs(float(survey.centroid_cam_mm[0])) <= float(scfg.center_tol_mm)
+                and abs(float(survey.centroid_cam_mm[1])) <= float(scfg.center_tol_mm))
+            gate_payload["move_cam"] = [
+                float(survey.centroid_cam_mm[0]),
+                float(survey.centroid_cam_mm[1]),
+                float((reading.distance_mm or scfg.ideal_distance_mm)
+                      - scfg.ideal_distance_mm),
+            ]
+            gate_payload["center_tol_mm"] = float(scfg.center_tol_mm)
+        if survey.outline_uv and len(survey.outline_uv) >= 2:
+            uv = np.asarray(survey.outline_uv, float)
+            edges = np.roll(uv, -1, axis=0) - uv
+            edge = edges[int(np.argmax(np.linalg.norm(edges, axis=1)))]
+            angle = float(np.degrees(np.arctan2(edge[1], edge[0])))
+            angle = ((angle + 45.0) % 90.0) - 45.0
+            final_gates["edge"] = abs(angle) <= float(scfg.edge_align_tol_deg)
+            gate_payload["yaw_a_deg"] = -angle
+            gate_payload["edge_align_tol_deg"] = float(scfg.edge_align_tol_deg)
+    gate_payload["gates"] = {**gate_payload.get("gates", {}), **final_gates}
+    gate_payload["ok"] = all(final_gates.values())
+    if survey.detected and not survey.fully_framed and reading.distance_mm is not None:
+        gate_payload["crop_size_mm"] = _large_surface_crop_mm(
+            scfg, K, cfg.camera.size, float(reading.distance_mm))
+
+    ok, jpeg = cv2.imencode(".jpg", frame.color)
+    if ok:
+        services.bus.publish(JobEvent("frame", {
+            "jpeg_b64": base64.b64encode(jpeg.tobytes()).decode("ascii")}))
+    services.bus.publish(JobEvent("gate", {**gate_payload, "live": False}))
+
+    if not gate_payload["ok"]:
+        bad = [name for name, good in final_gates.items() if not good]
+        raise RuntimeError(
+            "surface is not ready — fix " + ", ".join(bad)
+            + f" (distance {reading.distance_mm and round(reading.distance_mm)} mm, "
+            + f"tilt {reading.tilt_deg and round(reading.tilt_deg, 1)}°).")
+    seed_T = rdk.camera_pose_T()
+    try:
+        seed_joints = rdk.current_joints()
+    except Exception:
+        seed_joints = None
+    return LockedScanSurface(
+        frame=frame, reading=reading, survey=survey, gate_payload=gate_payload,
+        seed_T=np.asarray(seed_T, float), seed_joints=seed_joints,
+        locked_at=time.monotonic())
 
 
 def scan_gate_thresholds(scfg) -> ScanGateThresholds:
@@ -88,6 +197,69 @@ def _backproject_depth(depth: np.ndarray, K: np.ndarray, *,
         return np.zeros((0, 3), float)
     z_mm = d[ys, xs] / float(depth_scale) * 1000.0
     return np.column_stack([(xs - cx) / fx * z_mm, (ys - cy) / fy * z_mm, z_mm])
+
+
+def _densify_quad(corners: np.ndarray, n: int = 6) -> np.ndarray:
+    """Grid of ``n*n`` points bilinearly filling a cyclic-ordered quad (4,3).
+
+    ``corners`` are the oriented-rectangle corners in consecutive order (as
+    :func:`plane._oriented_rectangle` returns them). Used to turn the 4-corner
+    surface footprint into a point cloud the coverage selector/metric can tile —
+    4 corners alone only land in the grid's corner cells.
+    """
+    c = np.asarray(corners, float).reshape(4, 3)
+    s, t = np.meshgrid(np.linspace(0.0, 1.0, n), np.linspace(0.0, 1.0, n))
+    s = s.ravel()[:, None]
+    t = t.ravel()[:, None]
+    bottom = c[0] + s * (c[1] - c[0])    # edge c0->c1
+    top = c[3] + s * (c[2] - c[3])       # edge c3->c2
+    return bottom + t * (top - bottom)
+
+
+def _surface_footprint_base(survey, seed_T: np.ndarray) -> np.ndarray | None:
+    """The measured surface rectangle as a grid of points in the robot base frame.
+
+    Returns ``None`` when the survey has no trustworthy rectangle (camera-frame
+    corners). ``seed_T`` is the camera pose in base, so it maps the survey's
+    camera-frame corners into base — the frame the candidate poses live in.
+    """
+    corners_cam = getattr(survey, "corners_cam_mm", None)
+    if corners_cam is None:
+        return None
+    corners_cam = np.asarray(corners_cam, float).reshape(-1, 3)
+    if corners_cam.shape[0] != 4:
+        return None
+    R = np.asarray(seed_T[:3, :3], float)
+    t = np.asarray(seed_T[:3, 3], float)
+    corners_base = (R @ corners_cam.T).T + t
+    return _densify_quad(corners_base, n=6)
+
+
+def _save_views(views, K, width, height, run_dir, *, depth_scale, log) -> None:
+    """Persist each captured view (color JPEG + 16-bit depth PNG + camera pose) under
+    ``<run>/views/`` for a later camera-perspective coverage overlay.
+
+    Diagnostic only (``scan.save_views``). The depth is written as a single-channel
+    16-bit PNG (lossless, the raw mm units), color as JPEG; ``views.json`` records K,
+    image size, depth scale and each view's base->camera pose so the fused cloud can
+    be re-projected into any view.
+    """
+    from pathlib import Path
+
+    vdir = Path(run_dir) / "views"
+    vdir.mkdir(parents=True, exist_ok=True)
+    meta = {"K": np.asarray(K, float).tolist(), "size": [int(width), int(height)],
+            "depth_scale": float(depth_scale), "views": []}
+    for i, v in enumerate(views):
+        cv2.imwrite(str(vdir / f"view_{i:02d}.jpg"), v.color,
+                    [cv2.IMWRITE_JPEG_QUALITY, 92])
+        cv2.imwrite(str(vdir / f"depth_{i:02d}.png"),
+                    np.ascontiguousarray(np.asarray(v.depth, np.uint16)))
+        meta["views"].append({"index": i,
+                              "pose_T_mm": np.asarray(v.pose_T, float).tolist()})
+    (vdir / "views.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    log(f"diagnostics: saved {len(views)} per-view color+depth frames to {vdir.name}/ "
+        f"(scan.save_views) — enables the camera-perspective coverage overlay")
 
 
 def _reference_locate(services, frame, survey, seed_T: np.ndarray,
@@ -175,13 +347,147 @@ def scan_gate_payload(reading, survey) -> dict:
             "grid_spacing_mm": survey.grid_spacing_mm,
             "extent_mm": list(survey.extent_mm) if survey.extent_mm is not None else None,
             "fov_deg": list(survey.fov_deg),
+            "points_uv": survey.points_uv,
         })
         payload["gates"] = {**payload.get("gates", {}),
                             "framed": bool(survey.fully_framed)}
     return payload
 
 
-def generate_scan_targets(services) -> dict:
+def live_scan_telemetry_payload(raw: dict | None, scfg,
+                                previous_ideal_mm: float | None = None,
+                                camera_cfg=None) -> dict:
+    """Apply workstation scan thresholds to compact Jetson plane telemetry."""
+    if not raw:
+        return {}
+    stamp = raw.get("timestamp")
+    if stamp is not None and time.time() - float(stamp) > 2.0:
+        return {}
+    th = scan_gate_thresholds(scfg)
+    detected = bool(raw.get("detected"))
+    valid_frac = float(raw.get("valid_frac", 0.0))
+    if not detected:
+        return {
+            "detected": False, "distance_mm": None, "tilt_deg": None,
+            "valid_frac": valid_frac,
+            "gates": {"detected": False, "distance": False, "angle": False},
+            "ok": False,
+            "ideal_distance_mm": th.ideal_distance_mm,
+            "distance_tol_mm": th.distance_tol_mm,
+            "max_tilt_deg": th.max_tilt_deg,
+            "live": True,
+        }
+    distance = float(raw["distance_mm"])
+    tilt = float(raw["tilt_deg"])
+    fully_framed = raw.get("fully_framed")
+    surface_mode = raw.get("surface_mode", "full")
+    outline_uv = raw.get("outline_uv")
+    corners_color = raw.get("rectangle_corners_color_mm")
+    if camera_cfg is not None and corners_color is not None:
+        corners = np.asarray(corners_color, dtype=np.float64).reshape(-1, 3)
+        projected, _ = cv2.projectPoints(
+            corners, np.zeros(3), np.zeros(3), camera_cfg.K, camera_cfg.dist)
+        W, H = camera_cfg.size
+        calibrated_uv = projected.reshape(-1, 2) / np.array([W, H], dtype=float)
+        if np.all(np.isfinite(calibrated_uv)):
+            outline_uv = calibrated_uv.tolist()
+            edge_angle = _outline_edge_angle_deg(calibrated_uv)
+            color_margin = 0.015
+            fully_framed = bool(raw.get("depth_fully_framed")) and bool(np.all(
+                (calibrated_uv[:, 0] >= color_margin)
+                & (calibrated_uv[:, 0] <= 1.0 - color_margin)
+                & (calibrated_uv[:, 1] >= color_margin)
+                & (calibrated_uv[:, 1] <= 1.0 - color_margin)))
+            max_center_span = float(np.max(np.abs(calibrated_uv - 0.5)))
+            raw = {
+                **raw,
+                "edge_angle_deg": edge_angle,
+                "color_fit_standoff_per_margin_mm":
+                    distance * 2.0 * max_center_span,
+            }
+    ideal_distance = float(th.ideal_distance_mm)
+    fit_per_margin = raw.get("color_fit_standoff_per_margin_mm")
+    if surface_mode == "crop":
+        # The plane itself exceeds the depth FOV: do not chase an impossible
+        # whole-table framing distance. Work close, then define a bounded crop.
+        ideal_distance = float(scfg.accurate_min_mm)
+    elif fit_per_margin is not None:
+        # Continuous on both sides of the color-frame boundary, so moving toward
+        # the recommendation cannot flip the policy from 300 to 500 and back.
+        ideal_distance = float(np.clip(
+            float(fit_per_margin) * float(scfg.frame_margin),
+            float(scfg.accurate_min_mm), float(scfg.accurate_max_mm)))
+        candidate = round(ideal_distance / 10.0) * 10.0
+        # Recommendation deadband: 410/420 is sensor/fitting noise, not a useful
+        # instruction. Hold the previous target until the estimate moves >=20 mm.
+        if previous_ideal_mm is not None and abs(candidate - previous_ideal_mm) < 20.0:
+            ideal_distance = float(previous_ideal_mm)
+        else:
+            ideal_distance = candidate
+    extent = raw.get("extent_mm")
+    crop_size = None
+    if surface_mode == "crop" and extent is not None:
+        crop_size = [
+            min(float(scfg.large_surface_crop_max_mm),
+                float(extent[0]) * float(scfg.large_surface_crop_fraction)),
+            min(float(scfg.large_surface_crop_max_mm),
+                float(extent[1]) * float(scfg.large_surface_crop_fraction)),
+        ]
+    gates = {
+        "detected": True,
+        "distance": abs(distance - ideal_distance) <= th.distance_tol_mm,
+        "angle": tilt <= th.max_tilt_deg,
+    }
+    center_cam = raw.get("surface_center_cam_mm")
+    edge_angle = raw.get("edge_angle_deg")
+    finite_surface = surface_mode == "full"
+    if finite_surface and center_cam is not None:
+        gates["center"] = bool(
+            abs(float(center_cam[0])) <= float(scfg.center_tol_mm)
+            and abs(float(center_cam[1])) <= float(scfg.center_tol_mm))
+    if finite_surface and edge_angle is not None:
+        gates["edge"] = abs(float(edge_angle)) <= float(scfg.edge_align_tol_deg)
+    if fully_framed is not None:
+        gates["framed"] = bool(fully_framed)
+    return {
+        "detected": True,
+        "distance_mm": distance,
+        "tilt_deg": tilt,
+        "valid_frac": valid_frac,
+        "gates": gates,
+        # Framing is guidance. A large plane is intentionally allowed to remain
+        # unframed because target creation will define a bounded aimed crop.
+        "ok": all(bool(v) for k, v in gates.items() if k != "framed"),
+        "ideal_distance_mm": ideal_distance,
+        "distance_tol_mm": th.distance_tol_mm,
+        "max_tilt_deg": th.max_tilt_deg,
+        "move_cam": [
+            float(center_cam[0]) if finite_surface and center_cam is not None else 0.0,
+            float(center_cam[1]) if finite_surface and center_cam is not None else 0.0,
+            distance - ideal_distance,
+        ],
+        "center_tol_mm": float(scfg.center_tol_mm),
+        "yaw_a_deg": (-float(edge_angle)
+                      if finite_surface and edge_angle is not None else None),
+        "edge_align_tol_deg": float(scfg.edge_align_tol_deg),
+        "tilt_b_deg": raw.get("tilt_b_deg"),
+        "tilt_c_deg": raw.get("tilt_c_deg"),
+        "normal_cam": raw.get("normal_cam"),
+        "centroid_cam_mm": raw.get("centroid_cam_mm"),
+        "fully_framed": fully_framed,
+        "surface_mode": surface_mode,
+        "extent_mm": extent,
+        "rectangle_size_mm": raw.get("rectangle_size_mm"),
+        "crop_size_mm": crop_size,
+        "outline_uv": outline_uv,
+        "visible_outline_uv": raw.get("visible_outline_uv"),
+        "points_uv": raw.get("points_uv"),
+        "measurement_ts": stamp,
+        "live": True,
+    }
+
+
+def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> dict:
     """Gate-gated scan-target creation (synchronous, no robot motion).
 
     Stops the live preview, grabs one authoritative depth frame, and refuses unless a
@@ -217,58 +523,58 @@ def generate_scan_targets(services) -> dict:
             f"the FLANGE, so the fused mesh + work frame may be off. Run Calibration "
             f"once for an accurate scan; proceeding with the stored offset for now."}))
 
-    # Keep the centre-patch depth gate as the authority for target creation.
-    # The full-frame survey is advisory/planning metadata; it must not move the
-    # seed pose or block targets because its framing test is intentionally strict.
-    th = scan_gate_thresholds(scfg)
-    survey_th = _survey_thresholds(scfg)
-    with _camera_hold(services, "scan-target-creation"):
-        frame = cam.grab(with_depth=True, timeout=scfg.grab_timeout_s)
-
-    ok, jpeg = cv2.imencode(".jpg", frame.color)
-    if ok:
-        services.bus.publish(JobEvent("frame",
-            {"jpeg_b64": base64.b64encode(jpeg.tobytes()).decode("ascii")}))
-
-    reading = evaluate_depth_gate(frame.depth, K, th, depth_scale=scfg.depth_scale)
-    survey = survey_surface(frame.depth, K, survey_th, depth_scale=scfg.depth_scale)
-    gate_payload = scan_gate_payload(reading, survey)
-    services.bus.publish(JobEvent("gate", {**gate_payload, "live": False}))
-
-    if not reading.ok:
-        bad = [name for name, good in reading.gates.items() if not good]
-        dist = reading.distance_mm and round(reading.distance_mm)
-        tilt = reading.tilt_deg and round(reading.tilt_deg, 1)
+    if locked is None:
+        locked = lock_scan_surface(services)
+    elif time.monotonic() - locked.locked_at > 120.0:
+        raise RuntimeError("locked surface expired — reposition and lock it again")
+    frame, reading, survey = locked.frame, locked.reading, locked.survey
+    gate_payload = locked.gate_payload
+    seed_T, seed_joints = locked.seed_T, locked.seed_joints
+    current_T = np.asarray(rdk.camera_pose_T(), float)
+    moved_mm = float(np.linalg.norm(current_T[:3, 3] - seed_T[:3, 3]))
+    rel_R = seed_T[:3, :3].T @ current_T[:3, :3]
+    moved_deg = float(np.degrees(np.arccos(np.clip(
+        (np.trace(rel_R) - 1.0) / 2.0, -1.0, 1.0))))
+    if moved_mm > 5.0 or moved_deg > 1.5:
         raise RuntimeError(
-            "surface not in the ideal band — fix " + ", ".join(bad)
-            + f" (distance {dist} mm, tilt {tilt}°, valid depth "
-            + f"{round(reading.valid_frac * 100)}%). Jog the camera to look down at "
-            + "the surface until the HUD lamps are green, then create targets.")
-
-    seed_T = rdk.camera_pose_T()
-    try:
-        seed_joints = rdk.current_joints()
-    except Exception:
-        seed_joints = None
+            f"robot moved after surface lock ({moved_mm:.1f} mm, {moved_deg:.1f}°) — "
+            "reposition and lock the surface again")
 
     look = float(reading.distance_mm or scfg.look_distance_mm)
+    target_center = None
+    target_count = scfg.pose_count
+    target_cone_deg = scfg.cone_half_angle_deg
     plan = None
     planned_voxel_m = scfg.voxel_size_m
     extent_mm = (list(survey.extent_mm)
                  if survey.detected and survey.extent_mm is not None else None)
+    crop_size_mm = None
     if survey.detected and survey.extent_mm is not None:
         if survey.fully_framed:
             plan = plan_scan(survey, K, (W, H), scfg, cam_to_base_T=seed_T)
             planned_voxel_m = plan.voxel_size_m
+            if plan.mode == "quality" and plan.aims:
+                look = float(plan.standoff_mm)
+                target_center = np.asarray(plan.aims[0].point_base_mm, float)
+                # Preserve an operator-configured denser tour (12 by default), while
+                # still allowing a raised-surface plan to request more viewpoints.
+                target_count = max(int(scfg.pose_count), int(plan.aims[0].n_views))
+                target_cone_deg = float(plan.cone_half_angle_deg)
             pub(f"survey: {survey.extent_mm[0]:.0f}×{survey.extent_mm[1]:.0f} mm surface "
-                f"at {survey.standoff_mm:.0f} mm; using calibration-style cone targets "
-                f"(standoff {look:.0f} mm, cone {scfg.cone_half_angle_deg:.0f}°), "
+                f"at {survey.standoff_mm:.0f} mm; planned scan targets "
+                f"(standoff {look:.0f} mm, cone {target_cone_deg:.0f}°, "
+                f"views {target_count}), "
                 f"voxel={planned_voxel_m*1000:.1f} mm")
             for w in plan.warnings:
                 pub(f"WARNING (survey): {w}")
         else:
+            # The intended surface continues beyond the image. Define a useful,
+            # camera-centred work region instead of pretending the visible border is
+            # the table edge. The final multi-view fit preserves its inclination.
+            crop_size_mm = _large_surface_crop_mm(scfg, K, (W, H), look)
             pub("survey: surface outline touches the image border; using the stable "
-                "centre-patch standoff gate and default cone/voxel settings for targets")
+                f"centre plane and a {crop_size_mm[0]:.0f}×{crop_size_mm[1]:.0f} mm "
+                "camera-centred work crop")
     else:
         pub("survey: no trustworthy full-frame extent; using the stable centre-patch "
             "standoff gate and default cone/voxel settings for targets")
@@ -278,9 +584,10 @@ def generate_scan_targets(services) -> dict:
         rdk.delete_items(prior)
 
     candidates = generate_calibration_poses(
-        seed_T, count=scfg.pose_count, look_distance_mm=look,
-        cone_half_angle_deg=scfg.cone_half_angle_deg,
-        roll_max_deg=scfg.roll_max_deg, distance_jitter=scfg.distance_jitter)
+        seed_T, count=target_count, look_distance_mm=look,
+        cone_half_angle_deg=target_cone_deg,
+        roll_max_deg=scfg.roll_max_deg, distance_jitter=scfg.distance_jitter,
+        target_center=target_center)
     reachable = [(i, T) for i, T in enumerate(candidates) if rdk.is_reachable(T)]
     n_reach = len(reachable)
     reachable_before_collision = list(reachable)
@@ -334,7 +641,20 @@ def generate_scan_targets(services) -> dict:
 
     n_usable = len(reachable)
     reach_T = [T for _, T in reachable]
-    sel = select_diverse(reach_T, min(scfg.pose_count, n_usable), seed_fwd=seed_T[:3, 2])
+    # The scan's whole job is to TILE the surface — every region needs to land in
+    # frame across the kept views. Plain rotation-diversity selection (what hand-eye
+    # calibration wants) maximizes geodesic rotation spread but is azimuth-blind, so
+    # the kept set can cluster to one side and leave a patch of the board uncovered
+    # in every view. When the survey gives a trustworthy rectangle, select for
+    # surface COVERAGE first (rotation spread as the tie-break) — mirroring
+    # calibration's intrinsic-coverage selection.
+    footprint_base = _surface_footprint_base(survey, seed_T)
+    if footprint_base is not None:
+        sel = select_diverse_with_coverage(
+            reach_T, min(target_count, n_usable), footprint_base, K, (W, H),
+            seed_fwd=seed_T[:3, 2])
+    else:
+        sel = select_diverse(reach_T, min(target_count, n_usable), seed_fwd=seed_T[:3, 2])
     chosen = [(reachable[k][0], reachable[k][1], reach_joints[k]) for k in sel]
 
     n_backfilled = 0
@@ -349,6 +669,13 @@ def generate_scan_targets(services) -> dict:
         created.append(name)
 
     _, eff_max, eff_mean = viewing_angle_span([T for _, T, _ in chosen], seed_T[:3, 2])
+    # Predicted surface coverage: fraction of the footprint grid the kept views tile.
+    # A low value is exactly the "one part of the board never captured" failure, so
+    # surface it BEFORE the run rather than discovering the hole in the fused mesh.
+    surface_coverage = None
+    if footprint_base is not None:
+        surface_coverage, _ = projected_corner_coverage(
+            [T for _, T, _ in chosen], footprint_base, K, (W, H))
     extent_txt = (f"; extent {round(extent_mm[0])}×{round(extent_mm[1])} mm"
                   if extent_mm else "")
     collide_note = (f"; collision filter bypassed after {n_collide} reported collision(s)"
@@ -356,22 +683,35 @@ def generate_scan_targets(services) -> dict:
                     (f"; {n_collide} dropped for collision" if col_checked and n_collide
                      else ("; collision-checked" if col_checked
                            else "; collisions NOT checked")))
+    cover_note = (f"; predicted surface coverage {surface_coverage:.0%}"
+                  if surface_coverage is not None else "")
     services.bus.publish(JobEvent("log", {"message":
         f"created {len(created)} scan targets (standoff ~{look:.0f} mm{extent_txt}; "
         f"{n_reach}/{len(candidates)} candidates reachable; effective cone "
-        f"~{eff_max:.0f}° of {scfg.cone_half_angle_deg:.0f}°{collide_note}) — "
+        f"~{eff_max:.0f}° of {target_cone_deg:.0f}°{collide_note}{cover_note}) — "
         f"inspect them in RoboDK"}))
+    if surface_coverage is not None and surface_coverage < scfg.min_surface_coverage:
+        services.bus.publish(JobEvent("log", {"message":
+            f"WARNING: the chosen views tile only {surface_coverage:.0%} of the surface "
+            f"(< {scfg.min_surface_coverage:.0%}) — part of the board may not be captured. "
+            f"Re-seed at a more central/open view, lower scan.cone_half_angle_deg, or "
+            f"raise scan.frame_margin so each view frames the whole surface, then "
+            f"Create targets again."}))
 
     return {"mode": "quality", "created": len(created), "targets": created,
             "look_distance_mm": look,
             "gate": gate_payload, "candidates_reachable": n_reach,
             "candidates_total": len(candidates), "collisions_checked": col_checked,
             "candidates_collided": n_collide, "effective_cone_deg": round(eff_max, 1),
+            "surface_coverage": (round(surface_coverage, 3)
+                                 if surface_coverage is not None else None),
+            "planned_cone_deg": target_cone_deg, "planned_views": target_count,
             "camera_tool_offset_mm": round(tool_offset_mm, 1),
             "calibration_on_file": tool_offset_mm >= 15.0,
             "collision_filter_enabled": scfg.collision_filter,
             "collision_filter_bypassed": collision_filter_bypassed,
             "extent_mm": extent_mm,
+            "crop_size_mm": crop_size_mm,
             "voxel_size_m": planned_voxel_m,
             "plan": plan.to_dict() if plan is not None else None}
 
@@ -381,6 +721,7 @@ def generate_scan_targets(services) -> dict:
 class ScanParams:
     save_artifacts: bool = True
     voxel_size_m: float | None = None   # None → use ScanConfig default
+    crop_size_mm: tuple[float, float] | None = None
 
 
 @dataclass
@@ -468,6 +809,10 @@ class ScanCaptureJob:
                     f"only {len(views)} usable views (need >= {SCAN_MIN_VIEWS}). "
                     f"Skipped (no depth): {skipped}")
 
+            if scfg.save_views and self.params.save_artifacts:
+                _save_views(views, K, width, height, run_dir,
+                            depth_scale=scfg.depth_scale, log=ctx.log)
+
             ctx.progress(len(targets), len(targets), "fusing")
             voxel_m = (self.params.voxel_size_m
                        if self.params.voxel_size_m is not None else scfg.voxel_size_m)
@@ -479,9 +824,9 @@ class ScanCaptureJob:
             # Isolate the work surface (the "top layer"): crop to a box around where the
             # camera was aimed so the FLOOR/walls don't dominate the fit (the cause of a
             # room-sized plane). Falls back to the full cloud if the crop is too thin.
-            mesh, cloud = res.mesh, res.cloud
+            raw_mesh, cloud = res.mesh, res.cloud
+            center_mm = look_point_from_views(views)
             if scfg.roi_enabled:
-                center_mm = look_point_from_views(views)
                 if center_mm is None:
                     ctx.log("ROI: no central depth to locate the aim — using the full cloud")
                 else:
@@ -492,7 +837,7 @@ class ScanCaptureJob:
                     n0, n1 = len(cloud.points), len(c_cloud.points)
                     if n1 >= 500:
                         cloud = c_cloud
-                        mesh = crop_box(mesh, cm, **roi)
+                        raw_mesh = crop_box(raw_mesh, cm, **roi)
                         ctx.log(f"ROI: cropped to a {2 * scfg.roi_radius_m:.1f} m box around the "
                                 f"aim (surface Z≈{center_mm[2]:.0f} mm); kept {n1}/{n0} pts "
                                 f"(floor/walls dropped)")
@@ -509,11 +854,28 @@ class ScanCaptureJob:
             wp = work_plane_from_points(
                 pts, distance=scfg.ransac_distance_m, n_iterations=scfg.ransac_iterations,
                 min_inlier_frac=scfg.min_inlier_frac)
+            if self.params.crop_size_mm is not None and center_mm is not None:
+                wp = bounded_work_plane(
+                    wp, center_mm / 1000.0,
+                    (self.params.crop_size_mm[0] / 1000.0,
+                     self.params.crop_size_mm[1] / 1000.0))
+                ctx.log(
+                    f"large surface: bounded work region to "
+                    f"{self.params.crop_size_mm[0]:.0f}×"
+                    f"{self.params.crop_size_mm[1]:.0f} mm around the camera aim")
+            # The final product is a work surface, not arbitrary free-form geometry.
+            # Flatten the accepted plane samples and generate a dense planar mesh over
+            # the robust footprint so IR/material bumps do not become RoboDK geometry.
+            mesh = planar_rectangle_mesh(
+                wp.corners, spacing_m=scfg.surface_mesh_spacing_m)
             # metres -> mm for RoboDK (rotation is unitless; translation + corners scale)
             frame_T_mm = wp.frame_T.copy()
             frame_T_mm[:3, 3] *= 1000.0
             corners_mm = wp.corners * 1000.0
-            pp_m, cc = decimate_for_preview(cloud, scfg.preview_max_points)
+            pp_m, cc = planar_surface_points(
+                cloud, wp.normal, wp.centroid,
+                distance_m=scfg.ransac_distance_m,
+                max_points=scfg.preview_max_points)
             preview_mm = (pp_m * 1000.0).astype(np.float32)
 
             report = _result_report(wp, frame_T_mm, corners_mm, n_views=len(views),
@@ -523,6 +885,7 @@ class ScanCaptureJob:
             if self.params.save_artifacts:
                 save_mesh(mesh, str(run_dir / "mesh.obj"))
                 save_mesh(mesh, str(run_dir / "mesh.ply"))
+                save_mesh(raw_mesh, str(run_dir / "raw_tsdf_mesh.ply"))
                 mesh_obj = str(run_dir / "mesh.obj")
                 np.savez_compressed(run_dir / "preview.npz",
                                     points_mm=preview_mm, colors=cc)
@@ -538,7 +901,7 @@ class ScanCaptureJob:
 
             sz = report["plane"]["size_mm"]
             ctx.log(f"fused {len(views)} views -> {len(pts)} pts, "
-                    f"{len(res.mesh.vertices)} mesh verts; work surface "
+                    f"{len(mesh.vertices)} clean planar mesh verts; work surface "
                     f"{sz[0]:.0f} x {sz[1]:.0f} mm (plane inliers "
                     f"{report['plane']['inlier_frac']:.0%}). Review, then Insert.")
             return {"kind": "scan", "run_dir": str(run_dir), "can_insert": True,

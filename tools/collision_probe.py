@@ -105,7 +105,13 @@ def main() -> None:
             start_joints = None
         io.set_collision_checking(True)
         guard = io.ensure_mounted_tool_collision_pairs(skip)
+        obstacles = io.ensure_obstacle_collision_pairs(
+            ccfg.collision_ignore_objects)
+        ignored = io.disable_object_collision_pairs(
+            ccfg.collision_ignore_objects)
         print(f"\n=== guard enable result ===\n{guard}")
+        print(f"=== static-obstacle pairs ===\n{obstacles}")
+        print(f"=== ignored objects ===\n{ignored}")
 
         # --- check each created target -------------------------------------
         targets = io.list_targets(TARGET_PREFIX)
@@ -131,7 +137,7 @@ def main() -> None:
                 n = rdk.Collisions()
                 verdict = f"{int(n)} colliding pair(s)"
                 if int(n) > 0:
-                    colliders = _names(rdk.CollisionItems())
+                    colliders = io.collision_pairs(limit=20)
             except Exception as e:
                 verdict = f"<error: {e}>"
             tag = "JOINT" if j is not None else "cartesian"

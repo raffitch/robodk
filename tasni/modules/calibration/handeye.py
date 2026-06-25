@@ -19,7 +19,7 @@ metric in :mod:`quality` is what validates that this chain is correct.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -37,6 +37,7 @@ class CalibrationView:
     t_target2cam: np.ndarray     # (3,)
     corners: np.ndarray          # (N,1,2) detected charuco corner pixels
     obj_points: np.ndarray       # (N,3) board-frame coords (mm)
+    capture: dict = field(default_factory=dict)
 
     @property
     def T_cam_target(self) -> np.ndarray:

@@ -60,6 +60,8 @@ class SurveyMeasurement:
     accurate_min_mm: float               # threshold used (for to_dict serialization)
     accurate_max_mm: float
     survey_max_tilt_deg: float
+    corners_cam_mm: np.ndarray | None = None  # oriented-rectangle corners (4,3) in CAMERA frame (mm)
+    points_uv: list | None = None             # decimated plane-inlier pixels, normalized 0-1, for the HUD dot overlay
 
     def to_dict(self) -> dict:
         return {
@@ -83,6 +85,9 @@ class SurveyMeasurement:
             "accurate_min_mm": self.accurate_min_mm,
             "accurate_max_mm": self.accurate_max_mm,
             "survey_max_tilt_deg": self.survey_max_tilt_deg,
+            "corners_cam_mm": (np.asarray(self.corners_cam_mm, float).tolist()
+                               if self.corners_cam_mm is not None else None),
+            "points_uv": self.points_uv,
             # Backward-compatible fields for the frontend that expects the old
             # ScanGateReading shape (so the HUD can render either reading).
             "ideal_distance_mm": (self.accurate_min_mm + self.accurate_max_mm) / 2,
@@ -271,6 +276,16 @@ def survey_surface(
         if uv_s is not None and uv_e is not None:
             grid_uv.append((uv_s, uv_e))
 
+    # 10. Decimated plane-inlier pixels (normalized) so the HUD can draw the detected
+    # surface as DOTS over the live RGB — not just the outline + grid. Capped so the
+    # SVG overlay stays light; these are diagnostic, not used for any measurement.
+    points_uv = None
+    if len(inlier_xs) > 0:
+        step = max(1, int(np.ceil(len(inlier_xs) / 700)))
+        pu = inlier_xs[::step].astype(float) / float(W)
+        pv = inlier_ys[::step].astype(float) / float(H)
+        points_uv = np.round(np.column_stack([pu, pv]), 4).tolist()
+
     return SurveyMeasurement(
         detected=True,
         standoff_mm=standoff_mm,
@@ -291,4 +306,6 @@ def survey_surface(
         accurate_min_mm=th.accurate_min_mm,
         accurate_max_mm=th.accurate_max_mm,
         survey_max_tilt_deg=th.survey_max_tilt_deg,
+        corners_cam_mm=np.asarray(corners3d, float),
+        points_uv=points_uv,
     )

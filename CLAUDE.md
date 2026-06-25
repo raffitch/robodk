@@ -127,9 +127,10 @@ you drive the real cell, not an empty station). Run it on Windows with
     with *zero* distortion (Intel calibrates depth/IR, not the RGB lens), which made
     the hand-eye solve borderline. The first hand-eye Run now **auto-calibrates** K +
     lens distortion from its own captured `TasniCalib_*` views (k3 fixed), applies
-    them live (no restart) + persists, and gates on a marker so it runs **once**. An
-    optional full-frame capture for best edge accuracy exists (API only; no UI). The
-    intrinsics self-check compares *recovered vs configured* distortion (not vs zero).
+    them live (no restart) + persists. It refreshes on every sufficiently covered
+    run, so a stale low-coverage marker cannot suppress a better fit. Target
+    generation spreads the board across the frame within the configured orientation
+    cone. The intrinsics self-check compares *recovered vs configured* distortion.
     `tools/jetson_intrinsics.py` reads the camera's factory intrinsics off the Jetson.
   - ✅ **Workspace guardrails**: collision-screened pose generation + a SIMULATE
     **dry tour** (reachability / collision / return-to-start) before the real run.

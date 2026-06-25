@@ -9,6 +9,8 @@ import StreamStats, { useStreamStats } from "./StreamStats";
 const api = moduleApi("scan");
 const TARGET_PREFIX = "TasniScan_";          // must match service.py scan.target_prefix
 const PREVIEW_URL = "/api/modules/scan/preview.bin";
+const STABLE_LOCK_MS = 1000;
+const GATE_FRESH_MS = 1600;
 
 interface ScanConfig {
   robot: string;
@@ -61,6 +63,12 @@ export default function Scan() {
 
   const [live, setLive] = useState(false);
   const [gate, setGate] = useState<GateReading | null>(null);
+  const gateReceivedAtRef = useRef(0);
+  const stableSinceRef = useRef<number | null>(null);
+  const [surfaceStable, setSurfaceStable] = useState(false);
+  const [stableProgress, setStableProgress] = useState(0);
+  const [surfaceLocked, setSurfaceLocked] = useState(false);
+  const [locking, setLocking] = useState(false);
   const { mark: markFrame, reset: resetStream, stat: streamStat } = useStreamStats();
   const [targets, setTargets] = useState<number | null>(null);
   const [scanMode, setScanMode] = useState<"quality" | "reference" | null>(null);
@@ -142,10 +150,13 @@ export default function Scan() {
         if (runKindRef.current === "run") setThumbs((t) => [...t, src]);
         else markFrame();
       } else if (ev.type === "gate") {
-        // Only real readings carry `gates`/`error`; ignore the color-only preview's
-        // empty liveness pings so the HUD never shows a misleading SEARCHING.
+        // Accept compact live depth-plane telemetry and authoritative Create-targets
+        // readings. Never replace valid guidance with a color transport error.
         const p = ev.payload as GateReading;
-        if (p && (p.gates || p.error)) setGate(p);
+        if (p?.gates && !p.error) {
+          gateReceivedAtRef.current = performance.now();
+          setGate(p);
+        }
       } else if (ev.type === "result") {
         if (ev.payload.name === "sim_tour") {
           setTour(ev.payload.result as TourResult);
@@ -164,25 +175,82 @@ export default function Scan() {
     });
   }, [subscribe]);
 
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const now = performance.now();
+      const fresh = now - gateReceivedAtRef.current <= GATE_FRESH_MS;
+      const valid = !!(live && fresh && gate?.ok);
+      if (!valid) {
+        stableSinceRef.current = null;
+        setStableProgress(0);
+        setSurfaceStable(false);
+        return;
+      }
+      if (stableSinceRef.current == null) stableSinceRef.current = now;
+      const elapsed = now - stableSinceRef.current;
+      setStableProgress(Math.min(1, elapsed / STABLE_LOCK_MS));
+      setSurfaceStable(elapsed >= STABLE_LOCK_MS);
+    }, 100);
+    return () => window.clearInterval(id);
+  }, [live, gate?.ok]);
+
   // Start (or resume) the smooth color preview. clearGate=true drops stale HUD
   // panels (a fresh "Start camera"); clearGate=false keeps the last depth reading
   // visible (resuming after a Create-targets check, so the operator keeps live
   // video + fps alongside the standoff/tilt guidance).
   const beginLive = async (clearGate: boolean) => {
     resetStream();
-    if (clearGate) setGate(null);
+    if (clearGate) {
+      setGate(null);
+      gateReceivedAtRef.current = 0;
+      setSurfaceLocked(false);
+    }
+    stableSinceRef.current = null;
+    setSurfaceStable(false);
+    setStableProgress(0);
     await api.post("/live/start");
     setLive(true);
   };
   const startLive = async () => {
     try {
       await beginLive(true);
-      addLog("camera started — aim it at the surface to be scanned, then Create targets.");
+      addLog("camera started — jog until the surface guidance is stable, then lock it.");
     } catch (e: any) { setLive(false); addLog("live: " + e.message, true); }
   };
   const stopLive = async () => {
     try { await api.post("/live/stop"); } catch { /* ignore */ }
     setLive(false); resetStream();
+  };
+  const lockSurface = async () => {
+    setLocking(true); setRunError(null);
+    try {
+      const r = await api.post<{
+        status: string; gate: GateReading;
+        surface_mode: "full" | "crop";
+        extent_mm?: [number, number] | null;
+        crop_size_mm?: [number, number] | null;
+      }>("/surface/lock");
+      setLive(false); resetStream();
+      setGate(r.gate);
+      setSurfaceLocked(true);
+      setSurfaceStable(false);
+      addLog(r.surface_mode === "crop" && r.crop_size_mm
+        ? `surface locked — review bounded crop ${Math.round(r.crop_size_mm[0])} × ${Math.round(r.crop_size_mm[1])} mm`
+        : `surface locked — review full detected platform${
+            r.extent_mm ? ` ${Math.round(r.extent_mm[0])} × ${Math.round(r.extent_mm[1])} mm` : ""}`);
+    } catch (e: any) {
+      addLog("lock surface: " + e.message, true);
+      setRunError("Lock surface: " + e.message);
+      beginLive(false).catch(() => setLive(false));
+    } finally {
+      setLocking(false);
+    }
+  };
+  const repositionSurface = async () => {
+    try { await api.post("/surface/unlock"); } catch { /* best effort */ }
+    setSurfaceLocked(false);
+    setGate(null);
+    await beginLive(true);
   };
   const generateTargets = async () => {
     setGenerating(true); setRunError(null);
@@ -201,6 +269,7 @@ export default function Scan() {
       }>("/poses/generate");
       const mode = (r.mode ?? "quality") as "quality" | "reference";
       setScanMode(mode);
+      setSurfaceLocked(false);
       setTargets(r.created > 0 ? r.created : null);
       setTour(null);
 
@@ -285,10 +354,22 @@ export default function Scan() {
   }, [showConfirm]);
 
   const g = config?.gate;
+  const crop = gate?.crop_size_mm;
+  const surfaceDescription = gate?.surface_mode === "crop"
+    ? crop
+      ? `Large surface — bounded crop ${Math.round(crop[0])} × ${Math.round(crop[1])} mm`
+      : "Large surface — bounded crop will be defined around the reticle"
+    : gate?.fully_framed === false
+      ? "Full surface detected — move toward the recommended distance to include every edge"
+    : gate?.fully_framed === true && gate.extent_mm
+      ? `Full surface ${Math.round(gate.extent_mm[0])} × ${Math.round(gate.extent_mm[1])} mm`
+      : "Aim the center reticle at the intended work surface";
   const lamps: [string, boolean | undefined][] = [
     ["DETECT", gate?.gates?.detected],
     ["DISTANCE", gate?.gates?.distance],
     ["ANGLE", gate?.gates?.angle],
+    ["CENTER", gate?.gates?.center],
+    ["EDGE A", gate?.gates?.edge],
     ["FRAMED", gate?.gates?.framed],
   ];
   const pl = result?.plane;
@@ -320,19 +401,17 @@ export default function Scan() {
       <div className="card">
         <h2>Survey the surface</h2>
         <div className="hint" style={{ marginTop: 0, marginBottom: 10 }}>
-          Start the camera and aim it at the work surface. <b>Create targets</b> checks the
-          centre standoff and tilt, then generates calibration-style cone targets from the
-          robot's current pose. The full-frame survey outline and FRAMED lamp are guidance
-          for coverage; they do not block target creation when the centre gate is valid.
-          Tilt correction is shown as KUKA B/C.
+          Start the camera and jog the robot using the live range and tilt guidance.
+          Hold a valid pose for one second, then <b>Lock surface &amp; create targets</b>.
+          A fully visible platform uses its measured boundary; an oversized table uses
+          the bounded crop shown around the center reticle.
         </div>
         <div className="aim-wrap">
           {frame ? <img className="preview" src={frame} alt="camera" />
                  : <div className="preview" />}
-          {/* The HUD panels need depth (slow on Wi-Fi), so they appear from the
-              Create-targets check, not live. During smooth aiming we show just the
-              video + fps; no misleading "SEARCHING". */}
-          {gate && <AimHud gate={gate} mode="scan" />}
+          {/* Video/FPS and compact depth-plane telemetry use separate channels fed by
+              one RealSense capture loop, so the guidance does not interrupt video. */}
+          {(live || gate) && <AimHud gate={gate} mode="scan" />}
           {live && <StreamStats stat={streamStat} />}
           {!live && !gate && <div className="aim-off">camera off — press “Start camera”</div>}
         </div>
@@ -349,18 +428,38 @@ export default function Scan() {
               </span>
             );
           })}
-          <span className={"lamp lock " + (gate?.ok ? "on" : "off")}>
-            {gate?.ok ? "✓ ● LOCK" : "✗ ○ NO LOCK"}
+          <span className={"lamp lock " + (surfaceStable ? "on" : gate?.ok ? "unknown" : "off")}>
+            {surfaceStable ? "✓ ● SURFACE READY"
+              : gate?.ok ? `◌ HOLD ${Math.round(stableProgress * 100)}%`
+              : "✗ ○ POSITION"}
           </span>
         </div>
 
+        <div className={"scan-ready " + (surfaceLocked || surfaceStable ? "ready" : gate?.ok ? "holding" : "")}>
+          <span>{surfaceLocked ? "Surface locked — review region"
+            : surfaceStable ? "Surface ready" : gate?.ok ? "Hold position…" : "Position surface"}</span>
+          <span>{surfaceDescription}</span>
+        </div>
+
         <div className="btn-row">
-          {!live
+          {!live && !surfaceLocked
             ? <button onClick={startLive} disabled={running}>Start camera</button>
-            : <button className="secondary" onClick={stopLive}>Stop camera</button>}
-          <button onClick={generateTargets} disabled={!ready || running || generating || !live}>
-            {generating ? "Creating…" : "Create targets"}
-          </button>
+            : live
+              ? <button className="secondary" onClick={stopLive}>Stop camera</button>
+              : null}
+          {!surfaceLocked
+            ? <button onClick={lockSurface}
+                      disabled={!ready || running || locking || !live || !surfaceStable}>
+                {locking ? "Locking…" : "Lock surface"}
+              </button>
+            : <>
+                <button className="secondary" onClick={repositionSurface}
+                        disabled={running || generating}>Reposition</button>
+                <button onClick={generateTargets}
+                        disabled={!ready || running || generating}>
+                  {generating ? "Creating…" : "Accept region & create targets"}
+                </button>
+              </>}
           {targets != null &&
             <button className="secondary" onClick={clearPoses} disabled={running}>Clear targets</button>}
         </div>
@@ -373,9 +472,12 @@ export default function Scan() {
               ✓ Reference surface detected — rectangle placed directly. Review &amp; Insert below.
               Re-aim closer (300–800 mm) for a quality mesh tour.
             </div>
-          : <div className="hint">Start the camera, aim it at the surface to be scanned, and
-              Create targets — the centre gate measures standoff/tilt and seeds the same cone
-              pose generator used by calibration.</div>}
+          : surfaceLocked
+          ? <div className="hint">Review the frozen selected region. Reposition if the wrong
+              plane or crop is highlighted; otherwise accept it to create the robot targets.</div>
+          : <div className="hint">Jog until RANGE and ANGLE are valid and remain stable for
+              one second. FRAMED may be red for a large table; the scan will use the displayed
+              bounded crop instead.</div>}
       </div>
 
       {/* ---- Run -------------------------------------------------------- */}

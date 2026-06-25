@@ -46,21 +46,24 @@ class FakeRdk:
     """Fake Robolink handle. ItemList(TOOL) returns every tool in the 'station'
     (parentage-independent, like the real API); setCollisionActivePair records each
     call and returns 1 unless the item name is in ``fail``."""
-    def __init__(self, robot, tools, fail=()):
+    def __init__(self, robot, tools, fail=(), objects=()):
         self._robot, self._tools, self._fail = robot, list(tools), set(fail)
+        self._objects = list(objects)
         self.calls: list = []
     def Item(self, name, itemtype=0): return self._robot
     def ItemList(self, filter=None, list_names=False):
         if filter == TOOL:
             return list(self._tools)
+        if filter == OBJECT:
+            return list(self._objects)
         return []
     def setCollisionActivePair(self, state, item1, item2, id1=0, id2=0):
         self.calls.append((state, item1.Name(), item2.Name(), id1, id2))
         return 0 if item1.Name() in self._fail else 1
 
 
-def _io(robot, tools, fail=()):
-    rdk = FakeRdk(robot, tools, fail=fail)
+def _io(robot, tools, fail=(), objects=()):
+    rdk = FakeRdk(robot, tools, fail=fail, objects=objects)
     session = SimpleNamespace(rdk=rdk, config=RoboDKConfig())
     return RdkIO(session), rdk
 
@@ -103,10 +106,59 @@ def test_link_ids_skip_trailing_wrist_and_flange():
     assert out["links"] == [0, 1, 2, 3, 4]          # 6-axis, skip A5+A6 -> base..A4
     assert set(out["tools"]) == {"Realsense", "Spindle", "cam_model", "Fixture"}
     assert out["pairs_enabled"] == 4 * 5 and out["pairs_failed"] == 0
+    assert out["sibling_pairs_disabled"] == 6        # C(4 mounted bodies, 2)
     # every call targets the robot's links 0..4, with id1=0 for the tool body
-    assert all(c[0] == rl.COLLISION_ON and c[2] == RoboDKConfig().robot_name
-               and c[3] == 0 and c[4] in out["links"] for c in rdk.calls)
+    arm_calls = [c for c in rdk.calls if c[0] == rl.COLLISION_ON]
+    assert all(c[2] == RoboDKConfig().robot_name and c[3] == 0
+               and c[4] in out["links"] for c in arm_calls)
     print("[links] dof6 skip2 ->", out["links"], "pairs", out["pairs_enabled"])
+
+
+def test_mounted_siblings_are_explicitly_disabled():
+    """Rigidly attached camera/spindle/model bodies must never collide together."""
+    io, rdk = _io(*_cell())
+    mounted = io.mounted_tool_items()
+    out = io.disable_mounted_body_collision_pairs(mounted)
+    names = {it.Name() for it in mounted}
+    off = [c for c in rdk.calls if c[0] == rl.COLLISION_OFF]
+    assert out["pairs_disabled"] == 6 and len(off) == 6
+    assert all(c[1] in names and c[2] in names for c in off)
+    assert all(c[3:] == (0, 0) for c in off)
+
+
+def test_obstacle_pairs_exclude_mounted_objects_but_keep_static_objects():
+    """Mounted model objects are siblings, while Wall/keep-out remain obstacles."""
+    robot, tools = _cell()
+    cam_model = robot.Childs()[0].Childs()[0]
+    fixture = next(x for x in robot.Childs() if x.Name() == "Fixture")
+    wall = FakeItem(OBJECT, "Wall")
+    keepout = FakeItem(OBJECT, "TasniBoardKeepout")
+    io, rdk = _io(robot, tools, objects=[cam_model, fixture, wall, keepout])
+
+    out = io.ensure_obstacle_collision_pairs()
+
+    assert set(out["objects"]) == {"Wall", "TasniBoardKeepout"}
+    on = [c for c in rdk.calls if c[0] == rl.COLLISION_ON]
+    assert on and all(c[2] in {"Wall", "TasniBoardKeepout"} for c in on)
+    assert not any(c[2] in {"cam_model", "Fixture"} for c in on)
+
+
+def test_wallall_is_excluded_and_all_its_pairs_are_disabled():
+    """WallAll is visual station geometry and must not participate in calibration."""
+    robot, tools = _cell()
+    wall_all = FakeItem(OBJECT, "WallAll")
+    keepout = FakeItem(OBJECT, "TasniBoardKeepout")
+    io, rdk = _io(robot, tools, objects=[wall_all, keepout])
+
+    obstacles = io.ensure_obstacle_collision_pairs(["wallall"])
+    ignored = io.disable_object_collision_pairs(["WallAll"])
+
+    assert obstacles["objects"] == ["TasniBoardKeepout"]
+    assert ignored["objects"] == ["WallAll"]
+    wall_calls = [c for c in rdk.calls if c[1] == "WallAll"]
+    assert wall_calls and all(c[0] == rl.COLLISION_OFF for c in wall_calls)
+    # Six-axis robot links 0..6 plus four rigid mounted bodies.
+    assert ignored["pairs_disabled"] == 11
 
 
 def test_failed_pairs_excluded_from_guarded_names():
@@ -368,6 +420,9 @@ if __name__ == "__main__":
     test_discovers_all_tools_and_subtree_objects()
     test_finds_spindle_even_when_not_a_robot_child()
     test_link_ids_skip_trailing_wrist_and_flange()
+    test_mounted_siblings_are_explicitly_disabled()
+    test_obstacle_pairs_exclude_mounted_objects_but_keep_static_objects()
+    test_wallall_is_excluded_and_all_its_pairs_are_disabled()
     test_failed_pairs_excluded_from_guarded_names()
     test_skip_larger_than_dof_degrades_to_base_only()
     test_skip_one_keeps_the_wrist_link_guarded()

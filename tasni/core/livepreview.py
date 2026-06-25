@@ -52,7 +52,8 @@ class LivePreview:
               quality: int | None = None, codec: str = "jpeg",
               bitrate: int | None = None, with_depth: bool = False,
               depth_probe: "Callable[[object], dict] | None" = None,
-              depth_period_s: float = 1.5) -> None:
+              depth_period_s: float = 1.5,
+              scan_telemetry: bool = False) -> None:
         """Start streaming. Takes the camera lease first (raising
         :class:`~tasni.core.camera_lease.CameraBusy` if a job holds the camera), and
         holds it for the whole run — released in :meth:`stop` after the thread joins.
@@ -79,7 +80,7 @@ class LivePreview:
         self._thread = threading.Thread(
             target=self._loop,
             args=(analyze, fps, timeout_s, color_only, quality, codec, bitrate,
-                  with_depth, depth_probe, depth_period_s),
+                  with_depth, depth_probe, depth_period_s, scan_telemetry),
             name="live-preview", daemon=True)
         self._thread.start()
 
@@ -100,7 +101,8 @@ class LivePreview:
               codec: str = "jpeg", bitrate: int | None = None,
               with_depth: bool = False,
               depth_probe: "Callable[[object], dict] | None" = None,
-              depth_period_s: float = 1.5) -> None:
+              depth_period_s: float = 1.5,
+              scan_telemetry: bool = False) -> None:
         # fps caps the publish rate; reads are paced by frame arrival (the link),
         # so we stay near-realtime rather than draining a backlog.
         min_period = 1.0 / fps if fps > 0 else 0.0
@@ -126,7 +128,8 @@ class LivePreview:
             try:
                 with self.camera.stream(timeout=timeout_s, color_only=vid_color_only,
                                         quality=quality, codec=codec,
-                                        bitrate=bitrate) as stream:
+                                        bitrate=bitrate,
+                                        scan_telemetry=scan_telemetry) as stream:
                     while not self._stop.is_set():
                         # drain to the newest buffered frame so the preview stays
                         # at the live edge even if detection can't keep up

@@ -28,7 +28,7 @@ import cv2
 import numpy as np
 
 from ...core import runs
-from ...core.aiming import GateThresholds, evaluate_gate
+from ...core.aiming import GateThresholds, board_tilt_deg, evaluate_gate
 from ...core.events import JobEvent
 from ...core.geometry import Rt_to_T, transform_points
 from ...core.jobrunner import JobContext
@@ -38,9 +38,10 @@ from .charuco import CharucoTarget
 from .handeye import (CalibrationView, cross_validate, estimate_board_in_base,
                       refine, reject_outliers, solve_best, solve_handeye)
 from .intrinsics import verify_intrinsics
-from .poses import (board_visible_fraction, generate_calibration_poses,
-                    select_diverse, viewing_angle_span)
-from .quality import evaluate
+from .poses import (board_visible_fraction, frame_aim_offsets,
+                    generate_calibration_poses, projected_corner_coverage,
+                    select_diverse_with_coverage, viewing_angle_span)
+from .quality import evaluate, transform_repeatability
 
 log = get_logger("tasni.calibration")
 
@@ -54,6 +55,62 @@ BOARD_KEEPOUT_NAME = "TasniBoardKeepout"
 # Hand-eye needs a minimum well-conditioned training set; below this the linear
 # solve is under-constrained regardless of how good each view's reprojection is.
 MIN_TRAIN_VIEWS = 6
+
+
+def _board_outline_points(board) -> np.ndarray:
+    outline = getattr(board, "board_outline_points", None)
+    if outline is not None:
+        return np.asarray(outline, dtype=float).reshape(-1, 3)
+    pts = np.asarray(board.all_obj_points, dtype=float).reshape(-1, 3)
+    lo, hi = pts.min(axis=0), pts.max(axis=0)
+    return np.array([[lo[0], lo[1], 0.0], [hi[0], lo[1], 0.0],
+                     [hi[0], hi[1], 0.0], [lo[0], hi[1], 0.0]], dtype=float)
+
+
+def _capture_geometry(view: CalibrationView, board: CharucoTarget,
+                      K: np.ndarray, dist: np.ndarray,
+                      image_size: tuple[int, int]) -> dict:
+    """Serializable measured geometry for auditing one saved calibration frame."""
+    R = np.asarray(view.R_target2cam, dtype=float)
+    t = np.asarray(view.t_target2cam, dtype=float).reshape(3)
+    center = R @ np.asarray(board.board_center, dtype=float).reshape(3) + t
+    normal = R[:, 2] / np.linalg.norm(R[:, 2])
+    perpendicular = abs(float(np.dot(normal, center)))
+    rvec, _ = cv2.Rodrigues(R)
+    outline, _ = cv2.projectPoints(
+        _board_outline_points(board).astype(np.float64), rvec, t, K, dist)
+    outline = outline.reshape(-1, 2)
+    detected = np.asarray(view.corners, dtype=float).reshape(-1, 2)
+    w, h = float(image_size[0]), float(image_size[1])
+    margin_x, margin_y = 0.04 * w, 0.04 * h
+    visible = ((outline[:, 0] >= margin_x) & (outline[:, 0] <= w - margin_x)
+               & (outline[:, 1] >= margin_y) & (outline[:, 1] <= h - margin_y))
+
+    def bbox(points: np.ndarray) -> dict:
+        lo, hi = points.min(axis=0), points.max(axis=0)
+        span = np.maximum(hi - lo, 0.0)
+        return {
+            "left_px": float(lo[0]), "top_px": float(lo[1]),
+            "right_px": float(hi[0]), "bottom_px": float(hi[1]),
+            "area_fraction": float(span[0] * span[1] / max(w * h, 1.0)),
+        }
+
+    result = {
+        "name": view.name,
+        "n_corners": int(len(view.corners)),
+        "center_range_mm": float(np.linalg.norm(center)),
+        "perpendicular_distance_mm": perpendicular,
+        "tilt_deg": float(board_tilt_deg(R)),
+        "board_center_camera_mm": center.tolist(),
+        "outer_corners_visible_fraction": float(np.count_nonzero(visible) / 4.0),
+        "projected_board_bbox": bbox(outline),
+        "detected_corner_bbox": bbox(detected),
+        "image_size": [int(image_size[0]), int(image_size[1])],
+        "T_base_gripper": np.asarray(view.T_base_gripper, dtype=float).tolist(),
+    }
+    if view.capture.get("T_base_camera") is not None:
+        result["T_base_camera"] = view.capture["T_base_camera"]
+    return result
 
 
 def _camera_hold(services, owner: str):
@@ -173,6 +230,8 @@ def gate_thresholds(ccfg) -> GateThresholds:
                           distance_tol_mm=ccfg.distance_tol_mm,
                           max_tilt_deg=ccfg.max_tilt_deg,
                           center_tol_mm=ccfg.center_tol_mm,
+                          min_board_area_frac=ccfg.seed_min_board_area_frac,
+                          max_board_area_frac=ccfg.seed_max_board_area_frac,
                           invert_x=ccfg.jog_invert_x,
                           invert_y=ccfg.jog_invert_y,
                           invert_z=ccfg.jog_invert_z)
@@ -221,7 +280,8 @@ def generate_calibration_targets(services) -> dict:
         frame = cam.grab(color_only=True)
     det = board.detect(frame.color, K, dist, min_corners=ccfg.min_charuco_corners)
     reading = evaluate_gate(det, K, frame.color.shape, gate_thresholds(ccfg),
-                            board_center_mm=board.board_center)
+                            board_center_mm=board.board_center,
+                            board_obj_points=board.all_obj_points)
 
     # Show the operator exactly the frame we judged.
     img = (board.annotate(frame.color, det, K, dist, "TARGET CREATION")
@@ -261,6 +321,27 @@ def generate_calibration_targets(services) -> dict:
     # base; det.* is the board in the camera; so seed_T @ T_cam_board = T_base_board.
     T_base_board = seed_T @ Rt_to_T(det.R_target2cam, det.t_target2cam)
     board_pts_base = transform_points(T_base_board, board.all_obj_points)
+    board_outline_base = transform_points(T_base_board, _board_outline_points(board))
+    board_center_base = transform_points(
+        T_base_board, np.asarray(board.board_center, dtype=float).reshape(1, 3))[0]
+    board_width_mm = float(cfg.board.squares_x * cfg.board.square_size_mm)
+    large_board = board_width_mm >= float(ccfg.large_board_width_mm)
+    target_distance = (
+        max(look, float(ccfg.large_board_target_distance_mm))
+        if large_board else look
+    )
+    target_jitter = (
+        float(ccfg.large_board_distance_jitter)
+        if large_board else float(ccfg.distance_jitter)
+    )
+    edge_fraction = (
+        float(ccfg.large_board_intrinsics_edge_fraction)
+        if large_board else float(ccfg.intrinsics_edge_fraction)
+    )
+    min_perpendicular = (
+        float(ccfg.large_board_min_perpendicular_mm)
+        if large_board else None
+    )
 
     # Add a conservative platform stand-in (board footprint + margin, down toward the
     # floor) as a collision object, so a pose that grazes the real platform — bigger
@@ -270,7 +351,7 @@ def generate_calibration_targets(services) -> dict:
     if ccfg.board_keepout:
         try:
             box = rdk.add_keepout_box(
-                BOARD_KEEPOUT_NAME, board_pts_base,
+                BOARD_KEEPOUT_NAME, board_outline_base,
                 margin_mm=ccfg.board_keepout_margin_mm,
                 above_mm=ccfg.board_keepout_above_mm,
                 depth_mm=ccfg.board_keepout_depth_mm)
@@ -286,9 +367,14 @@ def generate_calibration_targets(services) -> dict:
                 f"({type(e).__name__}: {e}); continuing without it"}))
 
     candidates = generate_calibration_poses(
-        seed_T, count=ccfg.pose_count, look_distance_mm=look,
+        seed_T, count=ccfg.pose_count, look_distance_mm=target_distance,
         cone_half_angle_deg=ccfg.cone_half_angle_deg,
-        roll_max_deg=ccfg.roll_max_deg, distance_jitter=ccfg.distance_jitter)
+        roll_max_deg=ccfg.roll_max_deg, distance_jitter=target_jitter,
+        aim_offsets=frame_aim_offsets(
+            K, cfg.camera.size, edge_fraction=edge_fraction),
+        target_center=board_center_base,
+        target_normal=T_base_board[:3, 2],
+        min_perpendicular_mm=min_perpendicular)
     # IK-filter ALL candidates first, then choose a diverse spread — NOT the first
     # N reachable (which clusters at the narrow-cone seed and starves hand-eye
     # conditioning; see select_diverse / the workspace-edge finding in robot_probe).
@@ -325,7 +411,9 @@ def generate_calibration_targets(services) -> dict:
             services.bus.publish(JobEvent("log", {"message":
                 f"collision guard: enabled {n_pairs} tool↔arm pair(s) for "
                 f"{', '.join(guard['tools']) or 'mounted tools'} vs links "
-                f"{guard['links']} (RoboDK omits these by default)"}))
+                f"{guard['links']} and disabled "
+                f"{guard.get('sibling_pairs_disabled', 0)} mounted-body sibling "
+                f"pair(s) (RoboDK omits tool↔arm pairs by default)"}))
         else:
             services.bus.publish(JobEvent("log", {"message":
                 "WARNING: collision guard enabled 0 tool↔arm pairs — no flange "
@@ -346,6 +434,7 @@ def generate_calibration_targets(services) -> dict:
         mask, col_checked, jts = rdk.screen_collisions(
             [T for _, T in reachable], guard_skip=guard_skip,
             obstacle_pairs=ccfg.collision_obstacle_pairs,
+            ignore_objects=ccfg.collision_ignore_objects,
             baseline_relative=ccfg.collision_baseline_relative,
             path_samples=ccfg.collision_path_samples)
         kept = [k for k in range(n_reach) if mask[k]]
@@ -391,11 +480,20 @@ def generate_calibration_targets(services) -> dict:
     vis_checked = False
     if ccfg.visibility_filter and reachable:
         img_size = cfg.camera.size      # board_pts_base computed above (from the seed)
-        vis = [board_visible_fraction(T, board_pts_base, K, img_size,
+        # Use the four PHYSICAL outer board corners here. The old inner-corner
+        # cloud could report 85% visible while the paper and an entire outer row
+        # were cropped, exactly what the saved A3 snapshots exposed.
+        vis = [board_visible_fraction(T, board_outline_base, K, img_size,
                                       margin_frac=ccfg.board_visible_margin_frac)
                for _, T in reachable]
         keep = [k for k, f in enumerate(vis) if f >= ccfg.min_board_visible_frac]
         vis_checked = True
+        if large_board and len(keep) < int(ccfg.large_board_min_full_views):
+            raise RuntimeError(
+                f"only {len(keep)} reachable collision-free A3 pose(s) keep the "
+                f"entire physical board inside the frame (need >= "
+                f"{ccfg.large_board_min_full_views}). Re-seed at a more open view "
+                f"or move farther from the board; cropped A3 targets were not created.")
         if len(keep) >= MIN_TRAIN_VIEWS:
             n_offframe = len(reachable) - len(keep)
             reachable = [reachable[k] for k in keep]
@@ -413,10 +511,25 @@ def generate_calibration_targets(services) -> dict:
 
     n_usable = len(reachable)
     reach_T = [T for _, T in reachable]
-    sel = select_diverse(reach_T, min(ccfg.pose_count, n_usable),
-                         seed_fwd=seed_T[:3, 2])
+    sel = select_diverse_with_coverage(
+        reach_T, min(ccfg.pose_count, n_usable), board_pts_base, K, cfg.camera.size,
+        seed_fwd=seed_T[:3, 2])
     chosen = [(reachable[k][0], reachable[k][1], reach_joints[k])
               for k in sel]                         # index-sorted -> spiral naming
+    predicted_coverage, predicted_cells = projected_corner_coverage(
+        [T for _, T, _ in chosen], board_pts_base, K, cfg.camera.size)
+    if predicted_coverage < ccfg.min_intrinsics_coverage:
+        if keepout_added:
+            try:
+                rdk.delete_items([BOARD_KEEPOUT_NAME])
+            except Exception:
+                pass
+        raise RuntimeError(
+            f"reachable collision-free targets cover only {predicted_coverage:.0%} "
+            f"of the intrinsic image grid (need >= "
+            f"{ccfg.min_intrinsics_coverage:.0%}). Re-seed at a more open view so "
+            f"the robot can place the board near all frame edges, then Create "
+            f"targets again.")
 
     # Lock every target to a joint configuration solved with the *camera* tool
     # active, so selecting/visiting it reproduces the camera (TCP) at the viewpoint
@@ -463,10 +576,14 @@ def generate_calibration_targets(services) -> dict:
                 else ("; board-in-frame checked" if vis_checked else ""))
     services.bus.publish(JobEvent("log",
         {"message": f"created {len(created)} calibration targets "
-                    f"(working distance ~{look:.0f} mm; {n_reach}/{len(candidates)} "
+                    f"(working distance ~{target_distance:.0f} mm"
+                    + (f", perpendicular clearance >= {min_perpendicular:.0f} mm"
+                       if min_perpendicular is not None else "")
+                    + f"; {n_reach}/{len(candidates)} "
                     f"candidates reachable{collide_note}{vis_note}; effective cone "
-                    f"~{eff_max:.0f}° of {ccfg.cone_half_angle_deg:.0f}°) — inspect "
-                    f"them in RoboDK"}))
+                    f"~{eff_max:.0f}° of {ccfg.cone_half_angle_deg:.0f}°; predicted "
+                    f"intrinsic coverage {predicted_coverage:.0%}) — inspect them "
+                    f"in RoboDK"}))
     if eff_max < 0.5 * ccfg.cone_half_angle_deg:
         services.bus.publish(JobEvent("log",
             {"message": f"WARNING: reachable poses span only ~{eff_max:.0f}° "
@@ -481,7 +598,12 @@ def generate_calibration_targets(services) -> dict:
                         f"{MIN_TRAIN_VIEWS} training poses."}))
     _ = tool_pose  # (kept active on the robot for the upcoming run)
     return {"created": len(created), "targets": created,
-            "look_distance_mm": look, "gate": reading.to_dict(),
+            "look_distance_mm": target_distance,
+            "seed_distance_mm": look,
+            "min_perpendicular_mm": min_perpendicular,
+            "distance_jitter": target_jitter,
+            "board_profile": cfg.board.paper_size,
+            "gate": reading.to_dict(),
             "candidates_reachable": n_reach, "candidates_total": len(candidates),
             "collisions_checked": col_checked, "candidates_collided": n_collide,
             "collision_filter_enabled": ccfg.collision_filter,
@@ -489,6 +611,8 @@ def generate_calibration_targets(services) -> dict:
             "visibility_checked": vis_checked,
             "poses_offframe_dropped": n_offframe,
             "board_keepout_added": keepout_added,
+            "predicted_intrinsics_coverage_pct": predicted_coverage,
+            "predicted_intrinsics_cells": predicted_cells,
             "effective_cone_deg": round(eff_max, 1),
             "camera_tool_offset_mm": round(tool_offset_mm, 1),
             "targets_joint_locked": len(created) - n_cartesian,
@@ -551,6 +675,11 @@ def apply_calibration(services, *, job: "CalibrationJob | None" = None,
         stamp_id = Path(job.result.run_dir).name if job.result else None
     else:
         raise RuntimeError("no solved calibration to apply")
+
+    if (report.get("diagnosis") or {}).get("verdict") == "fail":
+        raise RuntimeError(
+            "this calibration failed its quality checks and cannot be applied; "
+            "correct the reported cause and rerun")
 
     rdk.set_tool_pose(tool, X)
     payload = {
@@ -679,15 +808,25 @@ class SimTourJob:
                 self.collision_skip_wrist_links)
             if guard and guard.get("pairs_enabled"):
                 ctx.log(f"collision guard: {guard['pairs_enabled']} tool↔arm pair(s) "
-                        f"enabled ({', '.join(guard['tools']) or 'mounted tools'})")
+                        f"enabled ({', '.join(guard['tools']) or 'mounted tools'}); "
+                        f"{guard.get('sibling_pairs_disabled', 0)} rigid mounted-body "
+                        f"sibling pair(s) disabled")
             # Also check the mounted tools against the static obstacles (board
             # pedestal, walls, …) — RoboDK omits tool↔object pairs by default, the
             # reason a tool dipping into the pedestal mid-tour went unseen.
             if ccfg.collision_obstacle_pairs:
-                obs = rdk.ensure_obstacle_collision_pairs()
+                obs = rdk.ensure_obstacle_collision_pairs(
+                    ccfg.collision_ignore_objects)
                 if obs and obs.get("pairs_enabled"):
                     ctx.log(f"collision guard: {obs['pairs_enabled']} tool↔object "
                             f"pair(s) enabled ({', '.join(obs['objects']) or 'objects'})")
+        if collisions_on:
+            ignored = rdk.disable_object_collision_pairs(
+                ccfg.collision_ignore_objects)
+            if ignored.get("objects"):
+                ctx.log(f"collision guard: ignored "
+                        f"{', '.join(ignored['objects'])} "
+                        f"({ignored['pairs_disabled']} pair(s) disabled)")
         try:
             start_joints = rdk.current_joints()
         except Exception:
@@ -903,20 +1042,27 @@ class CalibrationJob:
                     f"only {len(views)} usable views; need >= {MIN_TRAIN_VIEWS} "
                     f"training poses. Skipped (no board): {skipped}")
 
-            # Auto intrinsic calibration (once, under the hood): if the cell has no
-            # calibrated intrinsics yet, derive K + distortion from THESE captured
-            # board views — no separate step, no extra motion — apply them, then
-            # recompute each view's board pose with the better model so the hand-eye
-            # solve below uses it. Gated on the marker (so it runs only when missing).
-            # Degrades to a no-op (keeps the configured intrinsics) on any failure.
+            # Auto intrinsic calibration (under the hood): derive K + distortion
+            # from THESE captured board views, apply them, then recompute each view's
+            # board pose before hand-eye. Do this on every sufficiently covered run:
+            # a historical marker may come from a centered/edge-starved data set and
+            # must not suppress a better fit from today's frame-spread targets.
             report_intrinsics_auto = None
-            if ccfg.auto_intrinsics and not intrinsics_present(self.services):
+            if ccfg.auto_intrinsics:
                 try:
                     from .intrinsics_calib import solve_intrinsics
                     obj_l = [v.obj_points.astype(np.float32) for v in views]
                     img_l = [v.corners.reshape(-1, 1, 2).astype(np.float32) for v in views]
                     intr = solve_intrinsics(obj_l, img_l, cfg.camera.size, K,
                                             fix_k3=ccfg.intrinsics_fix_k3)
+                    if intr["coverage_pct"] < ccfg.min_intrinsics_coverage:
+                        raise RuntimeError(
+                            f"actual corner coverage {intr['coverage_pct']:.0%} is below "
+                            f"{ccfg.min_intrinsics_coverage:.0%}")
+                    if intr["rms_px"] > ccfg.max_intrinsics_rms_px:
+                        raise RuntimeError(
+                            f"intrinsic fit RMS {intr['rms_px']:.3f}px exceeds "
+                            f"{ccfg.max_intrinsics_rms_px:.3f}px")
                     apply_intrinsics(self.services, intr, source="auto")
                     K, dist = cfg.camera.K, cfg.camera.dist     # reload the applied model
                     for v in views:                              # re-pose with new K/dist
@@ -927,17 +1073,20 @@ class CalibrationJob:
                             v.R_target2cam = cv2.Rodrigues(rvec)[0]
                             v.t_target2cam = tvec.reshape(3)
                     cov = int(round(intr["coverage_pct"] * 100))
-                    ctx.log(f"auto intrinsics (none on file): calibrated K+distortion from "
+                    ctx.log(f"auto intrinsics: calibrated K+distortion from "
                             f"{intr['n_views']} captured views — fit RMS {intr['rms_px']:.3f} px, "
                             f"coverage {cov}% (k3 {'fixed' if intr['fix_k3'] else 'free'}); applied")
                     if intr["coverage_pct"] < 0.6:
-                        ctx.log("NOTE: the board stays centred in hand-eye poses, so intrinsic "
-                                "edge coverage is thin — for best distortion accuracy run the "
-                                "dedicated Camera intrinsics capture (Step 0) and re-run.")
+                        ctx.log("WARNING: captured intrinsic edge coverage is thin despite "
+                                "the frame-spread targets. Re-seed in a more open workspace "
+                                "region, create targets again, and re-run calibration.")
                     report_intrinsics_auto = {**intr, "source": "auto"}
-                except Exception as e:   # noqa: BLE001 - the optional step must never abort a run
-                    ctx.log(f"auto intrinsics skipped ({type(e).__name__}: {e}); "
-                            f"continuing with the configured intrinsics")
+                except Exception as e:
+                    raise RuntimeError(
+                        f"implicit intrinsic calibration failed ({type(e).__name__}: "
+                        f"{e}). The hand-eye solve was not run with stale camera "
+                        f"parameters; re-create targets from a clear centered view "
+                        f"and retry.") from e
 
             # Scale the holdout down so the training set never drops below
             # MIN_TRAIN_VIEWS — a thin capture (poses lost to reachability /
@@ -996,6 +1145,66 @@ class CalibrationJob:
             report_dict = report.to_dict()
             if report_intrinsics_auto is not None:
                 report_dict["intrinsics_auto"] = report_intrinsics_auto
+            capture_geometry = [
+                _capture_geometry(v, board, K, dist, cfg.camera.size) for v in views
+            ]
+            perps = [v["perpendicular_distance_mm"] for v in capture_geometry]
+            ranges = [v["center_range_mm"] for v in capture_geometry]
+            report_dict["capture_geometry"] = {
+                "board_profile": cfg.board.paper_size,
+                "board_size_mm": [
+                    float(cfg.board.squares_x * cfg.board.square_size_mm),
+                    float(cfg.board.squares_y * cfg.board.square_size_mm),
+                ],
+                "views": capture_geometry,
+                "perpendicular_distance_mm": {
+                    "min": min(perps), "max": max(perps),
+                    "mean": float(np.mean(perps)),
+                },
+                "center_range_mm": {
+                    "min": min(ranges), "max": max(ranges),
+                    "mean": float(np.mean(ranges)),
+                },
+            }
+            active = runs.read_active("calibration")
+            previous_run_id = active.get("run_id") if active else None
+            repeatability = None
+            if previous_run_id and previous_run_id != stamp:
+                try:
+                    previous_report = runs.load_report("calibration", previous_run_id)
+                    repeatability = {
+                        **transform_repeatability(
+                            X,
+                            np.asarray(previous_report["X_cam2gripper"], dtype=float),
+                            reference_distance_mm=float(ccfg.ideal_distance_mm)),
+                        "previous_run_id": previous_run_id,
+                    }
+                    report_dict["repeatability"] = repeatability
+                except Exception:
+                    pass
+            honest_px = (
+                report.validation.rms_px if report.validation is not None
+                else report.train.rms_px)
+            lateral_mm = float(
+                honest_px * ccfg.ideal_distance_mm
+                / max(float((K[0, 0] + K[1, 1]) / 2.0), 1.0))
+            metric_floor = max(
+                float(report.board_consistency_mm["max"]),
+                2.0 * float(report.board_consistency_mm["rms"]),
+                2.0 * lateral_mm)
+            if repeatability is None:
+                recommended = max(3.0, metric_floor)
+                tolerance_basis = "provisional; no independent repeat run"
+            else:
+                recommended = max(metric_floor, float(repeatability["reference_delta_mm"]))
+                tolerance_basis = "metrics plus repeat-run transform difference"
+            recommended = float(np.ceil(recommended * 2.0) / 2.0)
+            report_dict["working_tolerance"] = {
+                "recommended_mm": recommended,
+                "reference_distance_mm": float(ccfg.ideal_distance_mm),
+                "basis": tolerance_basis,
+                "physically_validated": False,
+            }
             summary = report.summary()
             for line in summary.splitlines():
                 ctx.log(line)
@@ -1006,6 +1215,9 @@ class CalibrationJob:
                     f"{int(report_intrinsics_auto['coverage_pct'] * 100)}%); applied")
             (run_dir / "report.json").write_text(json.dumps(report_dict, indent=2),
                                                  encoding="utf-8")
+            (run_dir / "capture_geometry.json").write_text(
+                json.dumps(report_dict["capture_geometry"], indent=2),
+                encoding="utf-8")
             (run_dir / "summary.txt").write_text(summary, encoding="utf-8")
             # A tiny sidecar so apply-by-run-id (after a server restart, when the
             # in-memory job is gone) knows which tool this run solved for. The
@@ -1018,10 +1230,11 @@ class CalibrationJob:
             self.result = CalibrationResult(
                 report=report_dict, summary=summary, run_dir=str(run_dir),
                 tool_name=self.tool_name, n_captured=len(views), n_skipped=skipped)
+            can_apply = report.diagnosis.get("verdict") != "fail"
             return {
                 "summary": summary, "report": report_dict, "run_dir": str(run_dir),
                 "tool_name": self.tool_name, "n_captured": len(views),
-                "n_skipped": skipped, "can_apply": True,
+                "n_skipped": skipped, "can_apply": can_apply,
             }
         finally:
             # Return to where the run started. The generated targets are left in
@@ -1081,8 +1294,14 @@ class CalibrationJob:
             # tcp_pose_T() @ inv(tool_pose), which was the FLANGE only if the camera
             # tool happened to be the active TCP).
             flange = rdk.flange_pose_T()
+            try:
+                camera_pose = rdk.camera_pose_T()
+            except Exception:
+                camera_pose = flange @ np.asarray(tool_pose, dtype=float)
             views.append(CalibrationView(name, flange, det.R_target2cam,
-                                         det.t_target2cam, det.corners, det.obj_points))
+                                         det.t_target2cam, det.corners, det.obj_points,
+                                         capture={"T_base_camera":
+                                                  np.asarray(camera_pose, dtype=float).tolist()}))
             n_frames = len(images)
             ctx.log(f"{name}: {det.n_corners} corners"
                     + (f" (median of {n_frames} frames)" if n_frames > 1 else ""))

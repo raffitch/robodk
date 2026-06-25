@@ -88,6 +88,7 @@ class BoardConfig(_Model):
     squares_y: int = 6
     square_size_mm: float = 30.0        # 8x30 = 240 mm wide -> fits A4 landscape
     marker_size_mm: float = 22.0
+    paper_size: str = "A4"              # active print/detection profile
 
 
 class RoboDKConfig(_Model):
@@ -178,12 +179,14 @@ class CalibrationConfig(_Model):
     # intrinsics yet (no "intrinsics applied" marker — still on factory K / zero
     # distortion), derive K + distortion from the SAME captured board views, apply
     # them, and recompute each view's board pose with the better model before the
-    # hand-eye solve. Runs once (the marker gates it) and needs no separate step or
-    # motion. The board stays centred in hand-eye poses, so edge coverage is limited
-    # (k3 is fixed); the dedicated full-frame "Camera intrinsics" capture is still
-    # the most accurate path and supersedes this when run.
+    # hand-eye solve. Runs on every sufficiently covered calibration capture so an
+    # old low-coverage marker can never suppress a better lens fit. Target generation
+    # deliberately spreads the board over the image; no separate operator step.
     auto_intrinsics: bool = True
     intrinsics_fix_k3: bool = True      # fix the overfit-prone high-order radial term
+    intrinsics_edge_fraction: float = 0.30  # board centers near 30%/70% of frame
+    min_intrinsics_coverage: float = 0.75   # refuse target sets below this 4x3 grid coverage
+    max_intrinsics_rms_px: float = 1.0      # reject a noisy intrinsic fit above this
 
     # Robust outlier rejection: after the initial solve, drop training views whose
     # per-view reprojection RMS is an outlier (a mis-detected board / bad pose drags
@@ -200,8 +203,11 @@ class CalibrationConfig(_Model):
     # define when each HUD lamp goes green; all must be green to create targets.
     ideal_distance_mm: float = 450.0    # target working distance (board <-> camera)
     distance_tol_mm: float = 80.0       # +/- band around ideal_distance_mm
-    max_tilt_deg: float = 25.0          # board may be off fronto-parallel by this much
-    center_tol_mm: float = 40.0         # |x|,|y| under this counts as centred (advisory)
+    max_tilt_deg: float = 10.0          # seed view should be nearly fronto-parallel
+    center_tol_mm: float = 40.0         # |x|,|y| under this counts as centred
+    seed_min_board_area_frac: float = 0.10  # projected board bbox / image area
+    seed_max_board_area_frac: float = 0.40  # avoid clipping/noisy edge poses
+    seed_stable_s: float = 1.0          # all seed gates must remain green this long
     preview_fps: float = 6.0            # max live-gate publish rate
     preview_timeout_s: float = 4.0      # per-frame camera timeout while streaming
     # JPEG quality the Jetson encodes the live preview at (10-100). Lower = fewer
@@ -245,6 +251,16 @@ class CalibrationConfig(_Model):
     roll_max_deg: float = 75.0          # roll spread about the optical axis (the 3rd rot axis)
     distance_jitter: float = 0.12       # +/- fraction of working distance
     look_distance_mm: float = 500.0     # fallback if the seed board distance unknown
+    # Large A3 board profile (320x240 mm). Its extra image occupancy needs a longer
+    # target radius than the 240x180 mm A4 board. More importantly, wide cone poses
+    # must preserve board-plane clearance: a 450 mm radial pose at 45 deg has only
+    # 318 mm perpendicular clearance and over-fills/crops the A3 board.
+    large_board_width_mm: float = 300.0
+    large_board_target_distance_mm: float = 600.0
+    large_board_min_perpendicular_mm: float = 425.0
+    large_board_distance_jitter: float = 0.08
+    large_board_intrinsics_edge_fraction: float = 0.34
+    large_board_min_full_views: int = 10
     # Visibility pre-filter: a pose can be reachable AND collision-free yet aim so
     # the board clips the frame edge (or leaves view), which only shows up as a
     # skipped capture after the robot has already driven there. Before writing
@@ -254,7 +270,7 @@ class CalibrationConfig(_Model):
     # the low-distortion D4xx lens). So the pre-run guarantee becomes reachable +
     # collision-free + board-in-frame, not just the first two.
     visibility_filter: bool = True
-    min_board_visible_frac: float = 0.85   # >= this fraction of board corners must land in-frame
+    min_board_visible_frac: float = 0.99   # outer board corners must all land in-frame
     board_visible_margin_frac: float = 0.04  # inset the frame by this fraction (keep off the edge)
     # Derived board keep-out: the physical platform the board sits on is often bigger
     # than (or absent from) the station's CAD, so a pose that grazes it isn't caught
@@ -280,6 +296,9 @@ class CalibrationConfig(_Model):
     # nothing) where the build/station can't evaluate collisions. The dry tour
     # remains the final pre-run gate.
     collision_filter: bool = True
+    # Station objects excluded from calibration collision checking. WallAll is a
+    # visual envelope in this cell, not a physical obstacle the robot can hit.
+    collision_ignore_objects: list[str] = ["WallAll"]
     # Baseline-relative screening: a real cell reports many CONSTANT collisions even
     # at the safe pose the operator aimed from — the robot base overlapping a
     # pedestal, each flange tool touching the wrist it is bolted to, a parked
@@ -356,12 +375,12 @@ class ScanConfig(_Model):
     # The preview is a smooth COLOR-ONLY stream (same as calibration); the standoff +
     # tilt panels (RANGE · TILT · LEVEL) are shown after the depth check on Create
     # targets (it refuses + shows the tilt-fix if out of band, so you adjust and retry).
-    # live_depth_gate=True would sample depth *live* during the preview for continuous
-    # panels — but a depth frame here takes ~8 s over the cell's Wi-Fi, which freezes
-    # the video and tanks the framerate, so it is OFF by default and only sensible on a
-    # WIRED link. Wiring the Jetson (Ethernet) is the single biggest win — see docs.
-    live_depth_gate: bool = True
-    gate_period_s: float = 1.2          # (live_depth_gate only) depth-grab interval
+    # Kept for compatibility with older config files. The scan preview no longer
+    # interleaves depth under any setting: doing so interrupts the unicast color
+    # stream and produces the FPS/no-signal/timeout cycle. Create targets performs
+    # the authoritative depth check instead.
+    live_depth_gate: bool = False
+    gate_period_s: float = 1.2          # deprecated compatibility field
     # Depth grabs are slow + variable over Wi-Fi (measured ~6-11 s), so the socket
     # timeout for a depth-bearing grab must be generous or poses fail/skip. Color-only
     # grabs/streaming keep the shorter ``camera.timeout_s``.
@@ -387,6 +406,8 @@ class ScanConfig(_Model):
     accurate_max_mm: float = 800.0       # far edge; beyond -> reference mode (no tour/mesh)
     frame_margin: float = 1.3            # surface must fit FOV with this margin
     survey_max_tilt_deg: float = 6.0     # survey squareness gate (tighter than max_tilt_deg)
+    center_tol_mm: float = 30.0          # finite-platform centroid offset allowed
+    edge_align_tol_deg: float = 5.0      # finite-platform edge yaw allowed
     voxel_k: float = 0.008               # voxel_size_m = standoff_mm * voxel_k, clamped
     voxel_min_m: float = 0.002           # finest voxel (small / close surfaces)
     voxel_max_m: float = 0.006           # coarsest voxel
@@ -395,11 +416,19 @@ class ScanConfig(_Model):
     flat_views: int = 8                  # view count for flat surfaces
     raised_cone_deg: float = 38.0        # cone half-angle for raised objects
     raised_views: int = 13               # view count for raised objects
+    min_surface_coverage: float = 0.85   # warn if the chosen views tile < this fraction
+                                         # of the surface footprint grid (a missed region)
     grid_target_px: int = 64             # desired on-screen grid cell (px) for live overlay
+    large_surface_crop_fraction: float = 0.75  # fraction of visible FOV used as work crop
+    large_surface_crop_max_mm: float = 800.0   # cap either crop dimension
 
     # -- capture ------------------------------------------------------------
     settle_s: float = 0.4               # pause after MoveJ before grabbing
     frames_per_pose: int = 1            # depth frames per pose (1 = single grab)
+    # Diagnostics: persist each pose's color + 16-bit depth + camera pose under
+    # <run>/views/ so a camera-perspective coverage overlay can be built later.
+    # Off by default (~tens of MB/run); enable for a coverage-debugging scan.
+    save_views: bool = False
     # Burst capture (opt-in; needs the burst-capable Jetson server). Default
     # per-pose capture grabs depth+color over Wi-Fi at EACH pose (~6-11 s each),
     # stalling the robot between poses. Burst mode instead has the Jetson buffer
@@ -421,6 +450,7 @@ class ScanConfig(_Model):
     depth_min_m: float = 0.2            # ignore depth nearer than this
     depth_max_m: float = 1.5            # ignore depth farther than this (table standoff)
     preview_max_points: int = 60000     # decimate the cloud before streaming to the viewer
+    surface_mesh_spacing_m: float = 0.005  # dense flat output mesh grid (5 mm)
 
     # -- region of interest: isolate the work surface (the "top layer") ----
     # Without this, fusing every view captures the whole room and RANSAC locks

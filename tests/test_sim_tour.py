@@ -91,8 +91,16 @@ class FakeRdk:
     @staticmethod
     def _keys(count):
         return set(frozenset({(f"obj{i}", 0), ("KUKA", i + 1)}) for i in range(int(count)))
-    def ensure_obstacle_collision_pairs(self):
-        return {"objects": ["Pedestal", "wallall"], "pairs_enabled": 4, "pairs_failed": 0}
+    def ensure_obstacle_collision_pairs(self, ignore_names=None):
+        ignored = {str(n).casefold() for n in (ignore_names or [])}
+        objects = [n for n in ["Pedestal", "WallAll"] if n.casefold() not in ignored]
+        return {"objects": objects, "pairs_enabled": 2 * len(objects),
+                "pairs_failed": 0}
+    def disable_object_collision_pairs(self, names):
+        objects = [n for n in ["WallAll"] if n.casefold() in
+                   {str(x).casefold() for x in names}]
+        return {"objects": objects, "pairs_disabled": 8 * len(objects),
+                "pairs_failed": 0}
     def collision_pair_keys(self):
         if not self._collisions_on:
             return None

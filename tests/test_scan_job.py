@@ -159,7 +159,11 @@ def test_generate_run_insert():
     assert all(n.startswith("TasniScan_") for n in gen["targets"])
     assert gen["gate"]["ok"] is True
     assert gen["calibration_on_file"] is True
-    assert abs(gen["look_distance_mm"] - 500) < 10
+    # The full-frame survey now drives the actual scan geometry: this 300 mm square
+    # fits best at ~487.5 mm with the configured FOV/margin, not the fixed 500 mm gate.
+    assert abs(gen["look_distance_mm"] - 487.5) < 10
+    assert gen["planned_cone_deg"] == services.config.scan.flat_cone_deg
+    assert gen["planned_views"] == services.config.scan.flat_views
 
     with tempfile.TemporaryDirectory() as t:
         runs.REPO_ROOT = Path(t)
@@ -206,6 +210,48 @@ def test_generate_run_insert():
           tuple(round(s) for s in res["plane"]["size_mm"]), "mm; inserted")
 
 
+def test_lock_then_create_targets_reuses_frozen_surface():
+    services, state = _build_fakes()
+    locked = scan_service.lock_scan_surface(services)
+    assert locked.gate_payload["ok"] is True
+    assert locked.survey.detected is True
+    gen = scan_service.generate_scan_targets(services, locked)
+    assert gen["created"] == 8
+
+    # A moved robot invalidates the frozen measurement instead of generating a
+    # trajectory around stale geometry.
+    locked2 = scan_service.lock_scan_surface(services)
+    state["cam"] = locked2.seed_T.copy()
+    state["cam"][0, 3] += 10.0
+    try:
+        scan_service.generate_scan_targets(services, locked2)
+        raise AssertionError("expected moved robot to invalidate the lock")
+    except RuntimeError as e:
+        assert "moved after surface lock" in str(e), e
+    print("[surface lock] frozen RGBD reused; 10 mm post-lock motion refused")
+
+
+def test_targets_report_surface_coverage_from_footprint():
+    """A fully-framed surface now drives COVERAGE-aware view selection (mirroring
+    calibration), so target creation reports the predicted surface coverage and the
+    survey carries the rectangle corners the footprint grid is built from."""
+    services, _state = _build_fakes()
+    locked = scan_service.lock_scan_surface(services)
+    # The survey exposes the oriented-rectangle corners (camera frame) the scan
+    # transforms to base + densifies into the coverage footprint.
+    corners = np.asarray(locked.survey.corners_cam_mm, float)
+    assert corners.shape == (4, 3), corners.shape
+
+    gen = scan_service.generate_scan_targets(services, locked)
+    assert gen["created"] == 8, gen
+    # Small table, fully framed in every view -> the kept views tile (essentially)
+    # the whole footprint, so coverage is reported and high (no missed region).
+    assert gen["surface_coverage"] is not None, gen
+    assert gen["surface_coverage"] >= 0.85, gen["surface_coverage"]
+    print("[surface coverage] reported", f"{gen['surface_coverage']:.0%}",
+          "from the measured rectangle footprint")
+
+
 def test_burst_capture_path():
     """With scan.burst_capture on, the job captures via the burst session, fuses the
     same table, and CLEARs the Jetson buffer (no data left on the device)."""
@@ -244,6 +290,46 @@ def test_burst_capture_path():
     print("[scan burst] gen 8 ->", res["n_views"], "views fused via burst; buffer cleared")
 
 
+def test_save_views_persists_per_pose_frames():
+    """scan.save_views writes each pose's color+depth+pose under <run>/views/ for a
+    later camera-perspective coverage overlay (off by default, opt-in diagnostic)."""
+    try:
+        import open3d  # noqa: F401
+    except Exception:
+        print("[skip] open3d not installed — `pip install -e .[scan]`")
+        return
+    import json as _json
+
+    services, _state = _build_fakes()
+    services.config.scan.save_views = True
+    scan_service.generate_scan_targets(services)
+
+    with tempfile.TemporaryDirectory() as t:
+        runs.REPO_ROOT = Path(t)
+
+        def fake_new_run_dir(mid, stamp):
+            d = Path(t) / "runs" / mid / stamp
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        orig = scan_service.new_run_dir
+        scan_service.new_run_dir = fake_new_run_dir
+        try:
+            job = scan_service.ScanCaptureJob(services, scan_service.ScanParams())
+            res = job(_Ctx())
+            vdir = Path(res["run_dir"]) / "views"
+            assert vdir.is_dir(), "views/ dir not created"
+            assert len(list(vdir.glob("view_*.jpg"))) == res["n_views"]
+            assert len(list(vdir.glob("depth_*.png"))) == res["n_views"]
+            meta = _json.loads((vdir / "views.json").read_text())
+            assert len(meta["views"]) == res["n_views"]
+            assert meta["size"] == [W, H] and len(meta["K"]) == 3
+            assert len(meta["views"][0]["pose_T_mm"]) == 4   # 4x4 pose persisted
+        finally:
+            scan_service.new_run_dir = orig
+            runs.REPO_ROOT = _ORIG_ROOT
+    print("[save_views] persisted", res["n_views"], "color+depth frames + poses")
+
+
 def test_generate_targets_when_survey_touches_border():
     """A full-frame survey can mark FRAMED red while the old centre gate is valid.
 
@@ -260,6 +346,8 @@ def test_generate_targets_when_survey_touches_border():
         assert gen["gate"]["ok"] is True, gen["gate"]
         assert gen["gate"]["gates"].get("framed") is False, gen["gate"]
         assert abs(gen["look_distance_mm"] - 500) < 10, gen["look_distance_mm"]
+        assert gen["crop_size_mm"] is not None
+        assert gen["crop_size_mm"][0] > gen["crop_size_mm"][1] > 0
     finally:
         TABLE_HALF_MM = saved
     print("[survey border] framed red but centre gate OK -> created", gen["created"])
@@ -315,6 +403,16 @@ def test_generate_refuses_when_too_far():
     print("[gate refusal] too-far standoff refused, nothing created")
 
 
+def test_generate_accepts_dynamic_near_quality_distance():
+    services, state = _build_fakes()
+    state["cam"] = _look_at((0, 0, 310), (0, 0, 0))
+    gen = scan_service.generate_scan_targets(services)
+    assert gen["created"] == 8, gen
+    assert 300 <= gen["look_distance_mm"] <= 800, gen["look_distance_mm"]
+    print("[dynamic distance] near quality-band surface accepted at",
+          round(gen["look_distance_mm"]), "mm")
+
+
 def test_warns_but_proceeds_without_calibration():
     """Decoupling: a near-identity tool offset (no calibration) must NOT block —
     it warns and still creates targets (calibration_on_file=False)."""
@@ -337,11 +435,15 @@ def test_run_without_targets_errors():
 
 if __name__ == "__main__":
     test_generate_run_insert()
+    test_lock_then_create_targets_reuses_frozen_surface()
+    test_targets_report_surface_coverage_from_footprint()
+    test_save_views_persists_per_pose_frames()
     test_burst_capture_path()
     test_generate_targets_when_survey_touches_border()
     test_scan_collision_filter_bypasses_noisy_wall_map_by_default()
     test_scan_collision_filter_hard_fail_can_still_refuse()
     test_generate_refuses_when_too_far()
+    test_generate_accepts_dynamic_near_quality_distance()
     test_warns_but_proceeds_without_calibration()
     test_run_without_targets_errors()
     print("\nScan job (gate -> generate -> run -> insert) tests passed.")

@@ -151,6 +151,56 @@ def cloud_points_m(cloud) -> np.ndarray:
     return np.asarray(cloud.points, dtype=float)
 
 
+def planar_surface_points(cloud, normal: np.ndarray, centroid: np.ndarray, *,
+                          distance_m: float, max_points: int = 60000
+                          ) -> tuple[np.ndarray, np.ndarray]:
+    """Project dominant-plane inliers exactly onto the fitted work plane."""
+    pts = np.asarray(cloud.points, dtype=np.float64)
+    if len(pts) == 0:
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.float32)
+    n = np.asarray(normal, dtype=float)
+    n /= np.linalg.norm(n)
+    c = np.asarray(centroid, dtype=float)
+    signed = (pts - c) @ n
+    keep = np.abs(signed) < float(distance_m)
+    pts = pts[keep] - signed[keep, None] * n
+
+    all_colors = np.asarray(cloud.colors, dtype=np.float32)
+    cols = all_colors[keep] if all_colors.size else np.full((len(pts), 3), 0.62, np.float32)
+    if len(pts) > max_points:
+        step = int(np.ceil(len(pts) / max_points))
+        pts, cols = pts[::step], cols[::step]
+    return pts.astype(np.float32), cols.astype(np.float32)
+
+
+def planar_rectangle_mesh(corners: np.ndarray, *, spacing_m: float = 0.005):
+    """Build a dense, perfectly flat triangle mesh over four cyclic corners."""
+    import open3d as o3d
+
+    c = np.asarray(corners, dtype=float).reshape(4, 3)
+    edge_u = c[1] - c[0]
+    edge_v = c[3] - c[0]
+    nu = max(1, int(np.ceil(np.linalg.norm(edge_u) / max(spacing_m, 1e-4))))
+    nv = max(1, int(np.ceil(np.linalg.norm(edge_v) / max(spacing_m, 1e-4))))
+    us = np.linspace(0.0, 1.0, nu + 1)
+    vs = np.linspace(0.0, 1.0, nv + 1)
+    vertices = np.array([c[0] + u * edge_u + v * edge_v for v in vs for u in us])
+    triangles = []
+    row = nu + 1
+    for j in range(nv):
+        for i in range(nu):
+            a = j * row + i
+            b = a + 1
+            d = a + row
+            e = d + 1
+            triangles.extend(((a, b, e), (a, e, d)))
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices),
+        o3d.utility.Vector3iVector(np.asarray(triangles, dtype=np.int32)))
+    mesh.compute_vertex_normals()
+    return mesh
+
+
 def decimate_for_preview(cloud, max_points: int = 60000
                          ) -> tuple[np.ndarray, np.ndarray]:
     """Down-sample the fused cloud to <= ``max_points`` for the browser viewer.

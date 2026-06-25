@@ -4,7 +4,8 @@ lives in the pure library + the job in :mod:`service`.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import time
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel
 
@@ -41,6 +42,10 @@ class IntrSolveBody(BaseModel):
     fix_k3: bool = True
 
 
+class BoardSelectBody(BaseModel):
+    page: Literal["A4", "A3", "Letter"]
+
+
 class CalibrationModule(WorkflowModule):
     id = "calibration"
     title = "Calibration"
@@ -54,6 +59,7 @@ class CalibrationModule(WorkflowModule):
         # Dedicated RGB intrinsic-calibration session (camera-only; accumulates
         # auto-captured ChArUco views across the frame). Lazily created on first use.
         self._intr = None
+        self._seed_ready_until = 0.0
 
     # -- REST ---------------------------------------------------------------
     def router(self) -> "APIRouter":
@@ -75,7 +81,11 @@ class CalibrationModule(WorkflowModule):
                 "calibration": cc.model_dump(),
                 "gate": {"ideal_distance_mm": cc.ideal_distance_mm,
                          "distance_tol_mm": cc.distance_tol_mm,
-                         "max_tilt_deg": cc.max_tilt_deg},
+                         "max_tilt_deg": cc.max_tilt_deg,
+                         "center_tol_mm": cc.center_tol_mm,
+                         "min_board_area_frac": cc.seed_min_board_area_frac,
+                         "max_board_area_frac": cc.seed_max_board_area_frac,
+                         "stable_s": cc.seed_stable_s},
             }
 
         @router.get("/targets")
@@ -104,7 +114,8 @@ class CalibrationModule(WorkflowModule):
             try:
                 return services.rdk.collision_status(
                     ensure_pairs=cc.collision_self_pairs,
-                    skip_trailing=cc.collision_skip_wrist_links)
+                    skip_trailing=cc.collision_skip_wrist_links,
+                    ignore_objects=cc.collision_ignore_objects)
             except Exception as e:
                 raise HTTPException(503, f"RoboDK unavailable: {e}")
 
@@ -184,11 +195,25 @@ class CalibrationModule(WorkflowModule):
             # overlay sharpness) to keep the WebSocket light.
             PREVIEW_W = 960
             enc = [cv2.IMWRITE_JPEG_QUALITY, 75]
+            stable_since = None
 
             def analyze(frame):
+                nonlocal stable_since
                 det = board.detect(frame.color, K, dist, min_corners=cc.min_charuco_corners)
                 reading = evaluate_gate(det, K, frame.color.shape, th,
-                                        board_center_mm=board.board_center)
+                                        board_center_mm=board.board_center,
+                                        board_obj_points=board.all_obj_points)
+                now = time.monotonic()
+                geometric_ok = reading.ok
+                if geometric_ok:
+                    stable_since = stable_since or now
+                else:
+                    stable_since = None
+                stable_for = (now - stable_since) if stable_since is not None else 0.0
+                reading.gates["stable"] = stable_for >= float(cc.seed_stable_s)
+                reading.ok = geometric_ok and reading.gates["stable"]
+                if reading.ok:
+                    self._seed_ready_until = now + max(2.0, float(cc.seed_stable_s))
                 # corners + axes confirm detection; the HUD draws the status text.
                 img = (board.annotate(frame.color, det, K, dist, "")
                        if det is not None else frame.color)
@@ -197,7 +222,10 @@ class CalibrationModule(WorkflowModule):
                     img = cv2.resize(img, (PREVIEW_W, int(h * PREVIEW_W / w)),
                                      interpolation=cv2.INTER_AREA)
                 ok, jpeg = cv2.imencode(".jpg", img, enc)
-                return (jpeg.tobytes() if ok else b""), reading.to_dict()
+                payload = reading.to_dict()
+                payload["stable_for_s"] = stable_for
+                payload["stable_required_s"] = float(cc.seed_stable_s)
+                return (jpeg.tobytes() if ok else b""), payload
 
             from ...core.camera_lease import CameraBusy
             try:
@@ -222,9 +250,10 @@ class CalibrationModule(WorkflowModule):
             return _spec(services.config.board, page).to_dict()
 
         @router.get("/board.png")
-        def board_png():
-            from .board_pdf import render_png
-            return Response(render_png(services.config.board),
+        def board_png(page: str = "A4"):
+            from .board_pdf import board_for_page, render_png
+            board = board_for_page(services.config.board, page)
+            return Response(render_png(board),
                             media_type="image/png",
                             headers={"Cache-Control": "no-store"})
 
@@ -237,6 +266,24 @@ class CalibrationModule(WorkflowModule):
             return Response(pdf, media_type="application/pdf",
                             headers={"Content-Disposition": f'{disp}; filename="{fname}"'})
 
+        @router.post("/board/select")
+        def board_select(body: BoardSelectBody) -> dict:
+            """Select one physical board profile for both printing and detection."""
+            if services.jobs.running:
+                raise HTTPException(409, "cannot change the calibration board during a run")
+            if services.live.running:
+                raise HTTPException(409, "stop the camera before changing the calibration board")
+
+            from ...core.config import save_overrides
+            from .board_pdf import board_for_page, board_spec as _spec
+
+            selected = board_for_page(services.config.board, body.page)
+            services.config.board = selected
+            save_overrides({"board": selected.model_dump()})
+            self._intr = None
+            self._seed_ready_until = 0.0
+            return _spec(selected, body.page).to_dict()
+
         @router.post("/poses/generate")
         def poses_generate() -> dict:
             """Gate-gated target creation: confirm the board is in the ideal band
@@ -245,6 +292,10 @@ class CalibrationModule(WorkflowModule):
             with 400 if the gate isn't green. No robot motion."""
             if services.jobs.running:
                 raise HTTPException(409, "a job is already running")
+            if time.monotonic() > self._seed_ready_until:
+                raise HTTPException(
+                    400, "hold the centred ChArUco seed view steady until the HUD "
+                    "shows LOCK, then create targets within two seconds")
             try:
                 return generate_calibration_targets(services)
             except RuntimeError as e:

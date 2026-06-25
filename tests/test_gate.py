@@ -52,7 +52,7 @@ def test_tilt_metric():
 def test_all_green_when_ideal():
     g = evaluate_gate(_det(distance=450, tilt_deg=5), K, (H, W), TH)
     assert g.detected and g.ok
-    assert g.gates == {"detected": True, "distance": True, "angle": True}
+    assert all(g.gates.values()), g.gates
     assert abs(g.distance_mm - 450) < 1e-6 and g.tilt_deg < 6
 
 
@@ -116,6 +116,19 @@ def test_board_center_reference():
     assert gc.distance_mm > 450 and g0.distance_mm == 450
 
 
+def test_seed_board_coverage_gate():
+    # 210x150 mm inner-corner footprint at 450 mm occupies ~31% x 42% of this
+    # synthetic image (~13% area), inside the default 10-40% seed band.
+    xs, ys = np.meshgrid(np.linspace(-105, 105, 8), np.linspace(-75, 75, 6))
+    obj = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)])
+    good = evaluate_gate(
+        _det(distance=450), K, (H, W), TH, board_obj_points=obj)
+    assert good.gates["coverage"] and 0.10 < good.board_area_frac < 0.40
+    too_far = evaluate_gate(
+        _det(distance=900), K, (H, W), TH, board_obj_points=obj)
+    assert not too_far.gates["coverage"]
+
+
 if __name__ == "__main__":
     test_tilt_metric()
     test_all_green_when_ideal()
@@ -125,4 +138,5 @@ if __name__ == "__main__":
     test_corner_and_none_gates()
     test_offset_sign()
     test_board_center_reference()
+    test_seed_board_coverage_gate()
     print("All aiming-gate checks passed.")

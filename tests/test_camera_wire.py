@@ -217,6 +217,15 @@ def test_server_parses_quality_handshake():
     print("[handshake] server parse: color-only flag + clamped quality")
 
 
+def test_scan_h264_handshake_requests_telemetry():
+    client = CameraClient(CameraConfig())
+    sock = FakeSocket(b"")
+    client._request_color_only(
+        sock, codec="h264", bitrate=4000, scan_telemetry=True)
+    assert bytes(sock.sent) == b"MODE COLOR H264 B4000 SCAN\n"
+    print("[handshake] scan H264 requests compact depth telemetry")
+
+
 def test_recv_exact_reassembles_across_chunks():
     """The header alone (16 bytes) must be reassembled from 7-byte recv chunks —
     a guard against a future reader that assumes one recv == one logical read."""
@@ -385,6 +394,7 @@ if __name__ == "__main__":
     test_grab_sends_mode_color_handshake()
     test_color_only_quality_handshake_string()
     test_server_parses_quality_handshake()
+    test_scan_h264_handshake_requests_telemetry()
     test_recv_exact_reassembles_across_chunks()
     test_decode_color_cv2_fallback_matches_turbojpeg_path()
     test_burst_session_roundtrip()

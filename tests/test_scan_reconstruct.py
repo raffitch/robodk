@@ -86,9 +86,16 @@ def test_fuse_and_plane_end_to_end():
 
     pp, cc = rc.decimate_for_preview(res.cloud, max_points=1000)
     assert len(pp) <= 1000 and pp.shape[1] == 3 and cc.shape == pp.shape
+    flat_pp, flat_cc = rc.planar_surface_points(
+        res.cloud, wp.normal, wp.centroid, distance_m=0.006, max_points=1000)
+    assert len(flat_pp) > 0 and flat_cc.shape == flat_pp.shape
+    plane_error = np.abs((flat_pp - wp.centroid) @ wp.normal)
+    assert float(plane_error.max()) < 1e-6, plane_error.max()
+    clean_mesh = rc.planar_rectangle_mesh(wp.corners, spacing_m=0.01)
+    assert len(clean_mesh.vertices) > 4 and len(clean_mesh.triangles) > 2
     print("[fuse] views 3 ->", len(pts), "pts; size",
           tuple(round(s, 3) for s in wp.size), "m; inliers",
-          f"{wp.inlier_frac:.0%}; preview", len(pp))
+          f"{wp.inlier_frac:.0%}; planar preview", len(flat_pp))
 
 
 if __name__ == "__main__":

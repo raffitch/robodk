@@ -172,6 +172,33 @@ BOARDCONS_FAIL_MM = 5.0
 OVERFIT_RATIO = 2.5      # validation/train reprojection above this => suspect overfit
 
 
+def transform_repeatability(current: np.ndarray, previous: np.ndarray,
+                            reference_distance_mm: float = 500.0) -> dict:
+    """Difference between two independently solved camera mounts."""
+    a = np.asarray(current, dtype=float)
+    b = np.asarray(previous, dtype=float)
+    translation_mm = float(np.linalg.norm(a[:3, 3] - b[:3, 3]))
+    relative_R = a[:3, :3] @ b[:3, :3].T
+    rotation_deg = float(np.degrees(np.arccos(np.clip(
+        (np.trace(relative_R) - 1.0) / 2.0, -1.0, 1.0))))
+    lever_mm = 2.0 * float(reference_distance_mm) * np.sin(
+        np.deg2rad(rotation_deg) / 2.0)
+    reference_delta_mm = float(translation_mm + lever_mm)
+    high_confidence = translation_mm <= 1.0 and rotation_deg <= 0.2
+    return {
+        "translation_mm": translation_mm,
+        "rotation_deg": rotation_deg,
+        "reference_distance_mm": float(reference_distance_mm),
+        "reference_delta_mm": reference_delta_mm,
+        "high_confidence": bool(high_confidence),
+        "note": (
+            "repeat calibration agrees within the high-confidence band"
+            if high_confidence else
+            "repeat calibration differs beyond 1.0 mm or 0.2 deg; validate "
+            "against a known point before claiming sub-millimetre accuracy"),
+    }
+
+
 def diagnose(report: "CalibrationReport") -> dict:
     """Turn the metric *pattern* into an operator verdict — a pass/borderline/fail
     headline plus the most-likely cause(s), each a next action. Pure function of the

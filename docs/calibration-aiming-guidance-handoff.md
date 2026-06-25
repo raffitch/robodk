@@ -132,9 +132,11 @@ building):
 - **Keep-out margin:** `calibration.board_keepout_margin_mm` defaults to **300 mm**
   (live-validated to catch the 8→9 dip in this cell). It models the platform's
   overhang beyond the board — reduce for a small pedestal, increase for a big table.
-- **Intrinsics Step-0 UI** (option-A leftover): the dedicated RGB intrinsic-capture
-  backend + routes (`/intrinsics/*`, `IntrinsicCalibSession`) exist; only the React
-  panel is missing.
+- **Intrinsics stay implicit:** normal `TasniCalib_*` generation now aims the board
+  across a 3x3 frame pattern and selects targets for both rotation diversity and
+  4x3 image-grid coverage. The first Run solves K + distortion from those same
+  captures; every later well-covered Run refreshes the fit rather than trusting a
+  stale marker. There is no separate operator step.
 
 ---
 
