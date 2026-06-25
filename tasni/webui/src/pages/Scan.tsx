@@ -63,6 +63,15 @@ export default function Scan() {
 
   const [live, setLive] = useState(false);
   const [gate, setGate] = useState<GateReading | null>(null);
+  // Coverage accumulation: each live frame the RealSense reports a slightly
+  // different set of valid-depth points (stereo dropouts at edges/low texture), so
+  // a single frame under-shows coverage. We union the detected-surface dots over the
+  // last COVERAGE_FRAMES live frames (deduped to a fine grid) so the whole board
+  // fills in and a remaining gap is a true hole. Reset when the camera clearly moves.
+  const COVERAGE_FRAMES = 18;
+  const coverageRef = useRef<Array<Array<[number, number]>>>([]);
+  const coverageCenterRef = useRef<[number, number] | null>(null);
+  const [coverageDots, setCoverageDots] = useState<Array<[number, number]> | null>(null);
   const gateReceivedAtRef = useRef(0);
   const stableSinceRef = useRef<number | null>(null);
   const [surfaceStable, setSurfaceStable] = useState(false);
@@ -156,6 +165,13 @@ export default function Scan() {
         if (p?.gates && !p.error) {
           gateReceivedAtRef.current = performance.now();
           setGate(p);
+          // Accumulate only the live aiming stream; an authoritative (non-live)
+          // Create-targets / lock snapshot is a single frame, shown on its own.
+          if (p.live && Array.isArray(p.points_uv) && p.points_uv.length) {
+            accumulateCoverage(p.points_uv as Array<[number, number]>);
+          } else if (p.live === false) {
+            resetCoverage();
+          }
         }
       } else if (ev.type === "result") {
         if (ev.payload.name === "sim_tour") {
@@ -194,12 +210,48 @@ export default function Scan() {
     return () => window.clearInterval(id);
   }, [live, gate?.ok]);
 
+  const resetCoverage = () => {
+    coverageRef.current = [];
+    coverageCenterRef.current = null;
+    setCoverageDots(null);
+  };
+
+  // Fold one live frame's detected-surface dots into the rolling coverage union.
+  const accumulateCoverage = (pts: Array<[number, number]>) => {
+    if (!pts.length) return;
+    let sx = 0, sy = 0;
+    for (const [u, v] of pts) { sx += u; sy += v; }
+    const center: [number, number] = [sx / pts.length, sy / pts.length];
+    const last = coverageCenterRef.current;
+    // A clear camera/surface move invalidates the accumulated dots (they were
+    // anchored to the old view) — start fresh so coverage never smears.
+    if (last && Math.hypot(center[0] - last[0], center[1] - last[1]) > 0.035) {
+      coverageRef.current = [];
+    }
+    coverageCenterRef.current = center;
+    const buf = coverageRef.current;
+    buf.push(pts);
+    while (buf.length > COVERAGE_FRAMES) buf.shift();
+    // Union, snapped to a ~1/180 grid so repeated hits dedupe and the count stays
+    // bounded (and renderable) while still resolving board-edge holes.
+    const seen = new Set<string>();
+    const union: Array<[number, number]> = [];
+    for (const f of buf) {
+      for (const [u, v] of f) {
+        const key = `${Math.round(u * 180)},${Math.round(v * 180)}`;
+        if (!seen.has(key)) { seen.add(key); union.push([u, v]); }
+      }
+    }
+    setCoverageDots(union);
+  };
+
   // Start (or resume) the smooth color preview. clearGate=true drops stale HUD
   // panels (a fresh "Start camera"); clearGate=false keeps the last depth reading
   // visible (resuming after a Create-targets check, so the operator keeps live
   // video + fps alongside the standoff/tilt guidance).
   const beginLive = async (clearGate: boolean) => {
     resetStream();
+    resetCoverage();
     if (clearGate) {
       setGate(null);
       gateReceivedAtRef.current = 0;
@@ -219,7 +271,7 @@ export default function Scan() {
   };
   const stopLive = async () => {
     try { await api.post("/live/stop"); } catch { /* ignore */ }
-    setLive(false); resetStream();
+    setLive(false); resetStream(); resetCoverage();
   };
   const lockSurface = async () => {
     setLocking(true); setRunError(null);
@@ -411,7 +463,8 @@ export default function Scan() {
                  : <div className="preview" />}
           {/* Video/FPS and compact depth-plane telemetry use separate channels fed by
               one RealSense capture loop, so the guidance does not interrupt video. */}
-          {(live || gate) && <AimHud gate={gate} mode="scan" />}
+          {(live || gate) && <AimHud gate={gate} mode="scan"
+                                     coverageDots={live ? coverageDots : null} />}
           {live && <StreamStats stat={streamStat} />}
           {!live && !gate && <div className="aim-off">camera off — press “Start camera”</div>}
         </div>

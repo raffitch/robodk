@@ -100,7 +100,9 @@ function cropQuad(
   ];
 }
 
-function Hud({ gate, mode = "scan" }: { gate: GateReading | null; mode?: "calibration" | "scan" }) {
+function Hud({ gate, mode = "scan", coverageDots = null }:
+  { gate: GateReading | null; mode?: "calibration" | "scan";
+    coverageDots?: Array<[number, number]> | null }) {
   const detected = !!gate?.detected;
   const locked = !!gate?.ok;
   const main = locked ? OK : detected ? WARN : BAD;
@@ -139,15 +141,21 @@ function Hud({ gate, mode = "scan" }: { gate: GateReading | null; mode?: "calibr
       </g>
 
       {/* detected-surface dots over the RGB — where depth actually landed on the plane.
-          Sparse gaps here are real coverage holes (e.g. an unseen far edge). Drawn
-          behind the outline/grid; capped defensively so the SVG stays light. */}
-      {mode === "scan" && gate?.points_uv && gate.points_uv.length > 0 && (
-        <g fill="#ff453a" opacity={0.62}>
-          {gate.points_uv.slice(0, 800).map(([u, v], i) => (
-            <circle key={i} cx={u * W} cy={v * H} r={2.4} />
-          ))}
-        </g>
-      )}
+          Prefer the accumulated coverage (union of the last N frames) so per-frame
+          RealSense dropouts fill in and a remaining gap is a TRUE hole; fall back to
+          the single live frame. Capped defensively so the SVG stays light. */}
+      {mode === "scan" && (() => {
+        const dots = (coverageDots && coverageDots.length)
+          ? coverageDots : gate?.points_uv;
+        if (!dots || dots.length === 0) return null;
+        return (
+          <g fill="#ff453a" opacity={0.6}>
+            {dots.slice(0, 2400).map(([u, v], i) => (
+              <circle key={i} cx={u * W} cy={v * H} r={2.1} />
+            ))}
+          </g>
+        );
+      })()}
 
       {/* survey surface overlay (outline + metric grid) — behind all other HUD elements */}
       {mode === "scan" && gate?.outline_uv && gate.outline_uv.length >= 3 && (() => {
@@ -367,7 +375,8 @@ function JogBar({ move, ctol, dtol }:
 
 // -- error boundary: never let a bad frame blank the page; self-heal next frame.
 export default class AimHud extends Component<
-  { gate: GateReading | null; mode?: "calibration" | "scan" },
+  { gate: GateReading | null; mode?: "calibration" | "scan";
+    coverageDots?: Array<[number, number]> | null },
   { err: boolean }
 > {
   state = { err: false };
@@ -377,6 +386,7 @@ export default class AimHud extends Component<
   }
   render(): ReactNode {
     if (this.state.err) return null;
-    return <Hud gate={this.props.gate} mode={this.props.mode} />;
+    return <Hud gate={this.props.gate} mode={this.props.mode}
+                coverageDots={this.props.coverageDots} />;
   }
 }
