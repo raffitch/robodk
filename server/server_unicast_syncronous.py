@@ -10,6 +10,7 @@ import numpy as np
 import lz4.frame as lz4f
 import io
 import turbojpeg
+import scan_overlay  # pure-numpy live-rectangle trim + colour edge cross-check
 
 port = 1024
 
@@ -219,7 +220,7 @@ def scan_plane_telemetry(depth, intrinsics, depth_unit_mm=1.0,
                          patch_frac=0.25, min_valid_frac=0.25,
                          overlay_project=None, overlay_project_points=None,
                          overlay_transform_points=None, overlay_size=None,
-                         depth_deproject_points=None):
+                         depth_deproject_points=None, color_image=None):
     """Fit the central depth patch locally and return compact live-guidance data."""
     d = np.asarray(depth)
     h, w = d.shape[:2]
@@ -389,6 +390,73 @@ def scan_plane_telemetry(depth, intrinsics, depth_unit_mm=1.0,
                     float(np.median(selected_z)) * 2.0 * max_center_span)
             else:
                 color_fit_standoff_per_margin_mm = None
+
+            # --- DISPLAY rectangle: density-cliff trim + colour edge confirmation ---
+            # The raw rectangle above still drives EVERY gate (framing, standoff,
+            # corners) unchanged. Only the operator's overlay box is tightened: pull
+            # each edge in to the dense body so it hugs the real surface instead of a
+            # sparse coplanar halo just past the edge, then VETO any edge whose trim
+            # the colour image does not corroborate (uniform colour across the cliff =
+            # a depth hole on a continuing surface, not a real edge — so do not cut it).
+            pa = plane_coords @ rect_u
+            pb = plane_coords @ rect_v
+            raw_hi1, raw_hi2 = lo1 + len1, lo2 + len2
+            tlo1, thi1 = scan_overlay.density_extent_1d(pa, lo1, raw_hi1)
+            tlo2, thi2 = scan_overlay.density_extent_1d(pb, lo2, raw_hi2)
+
+            def _edge_intensity(points3d):
+                """Mean colour-image intensity at the projection of plane points
+                (empty on any failure -> the colour veto simply abstains)."""
+                if color_image is None or overlay_project_points is None:
+                    return np.empty(0)
+                try:
+                    px = np.rint(np.asarray(overlay_project_points(points3d), float))
+                    hc, wc = color_image.shape[:2]
+                    ok = (np.all(np.isfinite(px), axis=1)
+                          & (px[:, 0] >= 0) & (px[:, 0] < wc)
+                          & (px[:, 1] >= 0) & (px[:, 1] < hc))
+                    if not bool(ok.any()):
+                        return np.empty(0)
+                    idx = px[ok].astype(int)
+                    s = color_image[idx[:, 1], idx[:, 0]]
+                    return s.mean(axis=1) if s.ndim == 2 else s.astype(float)
+                except Exception:
+                    return np.empty(0)
+
+            def _confirm(raw_edge, cand, ax_a, ax_c, c_lo, c_hi, sign):
+                if abs(cand - raw_edge) < 1.0:
+                    return cand                       # nothing trimmed on this side
+                inset = 10.0
+                inside = _edge_intensity(scan_overlay.side_sample_points(
+                    pc, ax_a, ax_c, cand - sign * inset, c_lo, c_hi))
+                outside = _edge_intensity(scan_overlay.side_sample_points(
+                    pc, ax_a, ax_c, 0.5 * (cand + raw_edge), c_lo, c_hi))
+                return raw_edge if scan_overlay.edge_continues(inside, outside) else cand
+
+            thi1 = _confirm(raw_hi1, thi1, ax1, ax2, tlo2, thi2, +1.0)
+            tlo1 = _confirm(lo1, tlo1, ax1, ax2, tlo2, thi2, -1.0)
+            thi2 = _confirm(raw_hi2, thi2, ax2, ax1, tlo1, thi1, +1.0)
+            tlo2 = _confirm(lo2, tlo2, ax2, ax1, tlo1, thi1, -1.0)
+            tlen1, tlen2 = thi1 - tlo1, thi2 - tlo2
+
+            trimmed_corners = [
+                pc + tlo1 * ax1 + tlo2 * ax2,
+                pc + thi1 * ax1 + tlo2 * ax2,
+                pc + thi1 * ax1 + thi2 * ax2,
+                pc + tlo1 * ax1 + thi2 * ax2,
+            ]
+            if overlay_project is not None:
+                tpc = np.asarray([overlay_project(p) for p in trimmed_corners], float)
+            elif overlay_project_points is not None:
+                tpc = np.asarray(
+                    overlay_project_points(np.asarray(trimmed_corners)), float)
+            else:
+                tca = np.asarray(trimmed_corners)
+                tpc = np.column_stack([tca[:, 0] * fx / tca[:, 2] + cx,
+                                       tca[:, 1] * fy / tca[:, 2] + cy])
+            trimmed_outline = np.clip(
+                tpc / np.array([overlay_w, overlay_h]), 0.0, 1.0).tolist()
+
             xlo, xhi = np.quantile(ip[:, 0], [0.005, 0.995])
             ylo, yhi = np.quantile(ip[:, 1], [0.005, 0.995])
             # Detected-surface DOTS for the HUD: the ACTUAL measured surface points
@@ -422,12 +490,16 @@ def scan_plane_telemetry(depth, intrinsics, depth_unit_mm=1.0,
                 "depth_fully_framed": depth_fully_framed,
                 "surface_mode": "full" if depth_fully_framed else "crop",
                 "extent_mm": [max(len1, len2), min(len1, len2)],
-                # Physical lengths corresponding to outline edges 0->1 and 1->2.
-                # Unlike extent_mm, this deliberately preserves corner order.
-                "rectangle_size_mm": [float(len1), float(len2)],
+                # Physical lengths of the trimmed DISPLAY rectangle (edges 0->1, 1->2),
+                # i.e. the real board, not the halo-inflated raw extent. Corner order
+                # preserved (unlike extent_mm, which stays raw for framing/planning).
+                "rectangle_size_mm": [float(tlen1), float(tlen2)],
                 "rectangle_corners_color_mm": (
                     corners_color.tolist() if corners_color is not None else None),
-                "outline_uv": outline if len(outline) >= 3 else None,
+                # Operator overlay = the density/colour-trimmed box (hugs the surface);
+                # falls back to the raw outline if trimming degenerated.
+                "outline_uv": (trimmed_outline if len(trimmed_outline) >= 3
+                               else (outline if len(outline) >= 3 else None)),
                 "visible_outline_uv": (
                     visible_outline if len(visible_outline) >= 3 else None),
                 "surface_center_cam_mm": [float(x) for x in pc],
@@ -747,7 +819,8 @@ def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
                                 overlay_project_points=overlay_project_points,
                                 overlay_transform_points=overlay_transform_points,
                                 depth_deproject_points=depth_deproject_points,
-                                overlay_size=(color.get_width(), color.get_height()))
+                                overlay_size=(color.get_width(), color.get_height()),
+                                color_image=np.asanyarray(color.get_data()))
                             publish_scan_telemetry(payload)
                         except Exception as e:
                             publish_scan_telemetry({

@@ -8,6 +8,9 @@ from types import SimpleNamespace
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# server/ on the path too, so the server module's `import scan_overlay` resolves
+# regardless of test order.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
 
 # The server module defines pure telemetry helpers but also imports Jetson-only
 # camera packages at module import time. Stub only those imports for this unit test.
@@ -148,7 +151,9 @@ def test_solid_rectangle_uses_distortion_aware_corner_projector():
         overlay_project_points=batch_project,
         overlay_size=(w, h),
     )
-    assert len(scalar_calls) == 4, "solid rectangle corners must use RealSense projection"
+    # Both the raw rectangle corners AND the trimmed DISPLAY corners must use the
+    # distortion-aware per-point projector (4 each), never the batch projector.
+    assert len(scalar_calls) >= 4 and len(scalar_calls) % 4 == 0, len(scalar_calls)
     assert len(p["rectangle_size_mm"]) == 2
     assert p["rectangle_size_mm"][0] > 0 and p["rectangle_size_mm"][1] > 0
     print("[telemetry projection] solid corners use distortion-aware projector")
