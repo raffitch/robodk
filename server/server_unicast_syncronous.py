@@ -216,6 +216,13 @@ def fit_nearest_plane(points, *, distance_mm=5.0, min_inlier_frac=0.12,
     return normal, centroid, mask
 
 
+# Generic work-square size (mm) drawn on the plane, centred on the reticle, when the
+# surface overruns the view (its real edges are off-frame, so a fitted board rectangle
+# would over-run the table). Matches the workstation's scan.work_crop_mm default so the
+# live overlay and the locked/inserted box agree.
+WORK_CROP_MM = 1000.0
+
+
 def scan_plane_telemetry(depth, intrinsics, depth_unit_mm=1.0,
                          patch_frac=0.25, min_valid_frac=0.25,
                          overlay_project=None, overlay_project_points=None,
@@ -457,6 +464,30 @@ def scan_plane_telemetry(depth, intrinsics, depth_unit_mm=1.0,
             trimmed_outline = np.clip(
                 tpc / np.array([overlay_w, overlay_h]), 0.0, 1.0).tolist()
 
+            # When the surface overruns the view (not depth_fully_framed), its real
+            # edges are off-frame, so the board rectangle above would over-run the
+            # table. Draw a GENERIC fixed work square on the plane, centred on the
+            # reticle (the aim point), projected to colour — matching the host lock/run
+            # crop. Fully-framed surfaces keep the measured (trimmed) board rectangle.
+            crop_outline = None
+            if not depth_fully_framed:
+                sq = scan_overlay.reticle_plane_square(
+                    normal, pc, (WORK_CROP_MM, WORK_CROP_MM))[0]
+                if overlay_project is not None:
+                    sq_px = np.asarray([overlay_project(p) for p in sq], float)
+                elif overlay_project_points is not None:
+                    sq_px = np.asarray(overlay_project_points(sq), float)
+                else:
+                    sq_px = np.column_stack([sq[:, 0] * fx / sq[:, 2] + cx,
+                                             sq[:, 1] * fy / sq[:, 2] + cy])
+                sq_uv = sq_px / np.array([overlay_w, overlay_h])
+                if np.all(np.isfinite(sq_uv)):
+                    # Sent UN-clipped (unlike the in-frame board outline): the 1 m
+                    # square overruns the view, so the browser SVG clips it for display
+                    # while the corners keep true edge directions (a per-corner clamp
+                    # would bend the box). Matches the host survey's unclipped square.
+                    crop_outline = sq_uv.tolist()
+
             xlo, xhi = np.quantile(ip[:, 0], [0.005, 0.995])
             ylo, yhi = np.quantile(ip[:, 1], [0.005, 0.995])
             # Detected-surface DOTS for the HUD: the ACTUAL measured surface points
@@ -490,15 +521,21 @@ def scan_plane_telemetry(depth, intrinsics, depth_unit_mm=1.0,
                 "depth_fully_framed": depth_fully_framed,
                 "surface_mode": "full" if depth_fully_framed else "crop",
                 "extent_mm": [max(len1, len2), min(len1, len2)],
-                # Physical lengths of the trimmed DISPLAY rectangle (edges 0->1, 1->2),
-                # i.e. the real board, not the halo-inflated raw extent. Corner order
-                # preserved (unlike extent_mm, which stays raw for framing/planning).
-                "rectangle_size_mm": [float(tlen1), float(tlen2)],
+                # Physical lengths of the DISPLAY rectangle (edges 0->1, 1->2): the
+                # generic crop square when the surface overruns the view, else the
+                # trimmed real board. extent_mm stays raw for framing/planning.
+                "rectangle_size_mm": ([WORK_CROP_MM, WORK_CROP_MM]
+                                      if not depth_fully_framed
+                                      else [float(tlen1), float(tlen2)]),
                 "rectangle_corners_color_mm": (
                     corners_color.tolist() if corners_color is not None else None),
-                # Operator overlay = the density/colour-trimmed box (hugs the surface);
-                # falls back to the raw outline if trimming degenerated.
-                "outline_uv": (trimmed_outline if len(trimmed_outline) >= 3
+                # Operator overlay: the generic reticle-centred work square when the
+                # surface overruns the view (edges off-frame), else the density/colour-
+                # trimmed board box (hugs the surface). Falls back to the raw outline
+                # if trimming/projection degenerated.
+                "outline_uv": (crop_outline
+                               if crop_outline is not None and len(crop_outline) >= 3
+                               else trimmed_outline if len(trimmed_outline) >= 3
                                else (outline if len(outline) >= 3 else None)),
                 "visible_outline_uv": (
                     visible_outline if len(visible_outline) >= 3 else None),

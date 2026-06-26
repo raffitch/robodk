@@ -72,6 +72,41 @@ def edge_continues(inside, outside, *, min_contrast=22.0, min_samples=5) -> bool
     return abs(float(np.median(a)) - float(np.median(b))) < float(min_contrast)
 
 
+def reticle_plane_square(normal, centroid, size, *, axis_hint=(1.0, 0.0, 0.0)):
+    """Four corners of a ``size=(sx, sy)`` rectangle lying on the plane (``normal``
+    through ``centroid``), centred where the camera optical axis — the +Z ray through
+    the origin, i.e. the image reticle — pierces that plane. Camera frame, same units
+    as the inputs.
+
+    Used for the LIVE overlay when the surface overruns the view: instead of drawing a
+    board rectangle that over-runs the table, draw a GENERIC work square of a fixed
+    size centred on where the operator is aiming. Kept textually identical to the
+    workstation's ``tasni.modules.scan.plane.reticle_plane_square`` so the live box and
+    the locked/inserted box behave the same. Returns ``(corners (4,3), u, v, reticle)``;
+    falls back to centring on ``centroid`` if the plane is too edge-on to intersect.
+    """
+    n = np.asarray(normal, float)
+    n = n / max(float(np.linalg.norm(n)), 1e-9)
+    c = np.asarray(centroid, float).reshape(3)
+    nz = float(n[2])
+    t = float(c @ n) / nz if abs(nz) > 1e-6 else 0.0
+    reticle = np.array([0.0, 0.0, t]) if t > 0.0 else c.copy()
+    hint = np.asarray(axis_hint, float)
+    if abs(float(hint @ n)) > 0.99 * max(float(np.linalg.norm(hint)), 1e-9):
+        hint = np.array([0.0, 1.0, 0.0])
+    u = hint - float(hint @ n) * n
+    u = u / max(float(np.linalg.norm(u)), 1e-9)
+    v = np.cross(n, u)
+    sx, sy = float(size[0]) / 2.0, float(size[1]) / 2.0
+    corners = np.array([
+        reticle - sx * u - sy * v,
+        reticle + sx * u - sy * v,
+        reticle + sx * u + sy * v,
+        reticle - sx * u + sy * v,
+    ])
+    return corners, u, v, reticle
+
+
 def side_sample_points(pc, ax_along, ax_cross, along_pos, cross_lo, cross_hi,
                        n=9):
     """3D points across one rectangle side: ``n`` points at a fixed ``along_pos`` on
