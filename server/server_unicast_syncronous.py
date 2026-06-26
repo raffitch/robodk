@@ -391,42 +391,29 @@ def scan_plane_telemetry(depth, intrinsics, depth_unit_mm=1.0,
                 color_fit_standoff_per_margin_mm = None
             xlo, xhi = np.quantile(ip[:, 0], [0.005, 0.995])
             ylo, yhi = np.quantile(ip[:, 1], [0.005, 0.995])
-            # Detected-surface DOTS for the HUD: a STABLE metric lattice in the
-            # surface's own (rectangle) frame — one dot per occupied cell CENTER,
-            # NOT a per-frame random pixel subsample. A subsample re-picks different
-            # points every frame (depth noise + decimation order), so the dots
-            # "dance"; cell centers sit at fixed positions ON the plane, so a steady
-            # camera yields steady dots and a gap is a real coverage hole. Cell COUNT
-            # is bounded, keeping telemetry small without decimating away coverage.
-            long_mm = float(max(len1, len2))
-            if long_mm > 1.0:
-                cell_mm = float(np.clip(long_mm / 26.0, 10.0, 40.0))
-                # Anchor the lattice at the CENTROID (stable frame to frame), not the
-                # min corner (which jitters with fringe noise), so the dots hold still.
-                a1 = (ip - pc) @ ax1
-                a2 = (ip - pc) @ ax2
-                cidx = np.floor(a1 / cell_mm).astype(int)
-                cjdx = np.floor(a2 / cell_mm).astype(int)
-                cells = np.unique(np.column_stack([cidx, cjdx]), axis=0)
-                centers3d = (pc
-                             + ((cells[:, 0] + 0.5) * cell_mm)[:, None] * ax1
-                             + ((cells[:, 1] + 0.5) * cell_mm)[:, None] * ax2)
-                # Diagnostic dots use the cheap BATCH projector (like the point hull);
-                # the precise per-point projector is reserved for the 4 work-rectangle
-                # corners that drive the solid operator overlay.
-                if overlay_project_points is not None:
-                    dot_px = np.asarray(overlay_project_points(centers3d), float)
-                elif overlay_project is not None:
-                    dot_px = np.asarray([overlay_project(p) for p in centers3d], float)
-                else:
-                    dot_px = np.column_stack([
-                        centers3d[:, 0] * fx / centers3d[:, 2] + cx,
-                        centers3d[:, 1] * fy / centers3d[:, 2] + cy,
-                    ])
-                dot_uv = dot_px / np.array([overlay_w, overlay_h])
-                dot_uv = dot_uv[np.all(np.isfinite(dot_uv), axis=1)]
-                surface_points_uv = (np.round(np.clip(dot_uv, 0.0, 1.0), 4).tolist()
-                                     if len(dot_uv) else None)
+            # Detected-surface DOTS for the HUD: the ACTUAL measured surface points
+            # (where depth truly landed), snapped to a FIXED image grid and sent as
+            # the occupied cells. `projected_uv[finite]` is exactly the inlier cloud
+            # `ip` in screen position, so each dot marks a real measurement — not an
+            # idealized cell center derived from a per-frame surface estimate (which
+            # drifts with depth noise, so its dots slide apart between frames and an
+            # accumulated union never overlaps). The grid is fixed in the IMAGE, so a
+            # steady camera yields steady dots; a cell appears only if a real point
+            # fell in it, so an empty cell is a genuine coverage hole. Each frame
+            # carries that frame's own dropouts, which is what lets the frontend's
+            # multi-frame union fill stochastic stereo gaps. `np.unique` bounds the
+            # count; a coarse stride caps telemetry for very large surfaces.
+            real_uv = projected_uv[finite]
+            if len(real_uv):
+                in_frame = np.all((real_uv >= 0.0) & (real_uv <= 1.0), axis=1)
+                real_uv = real_uv[in_frame]
+            if len(real_uv):
+                GRID = 180  # matches the frontend's coverage-dedupe resolution
+                cells = np.unique(np.floor(real_uv * GRID).astype(int), axis=0)
+                if len(cells) > 4000:
+                    cells = cells[:: int(np.ceil(len(cells) / 4000.0))]
+                dot_uv = (cells + 0.5) / float(GRID)
+                surface_points_uv = np.round(dot_uv, 4).tolist()
             else:
                 surface_points_uv = None
             payload.update({
