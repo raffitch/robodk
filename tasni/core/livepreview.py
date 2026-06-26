@@ -142,7 +142,17 @@ class LivePreview:
                             # misleading SEARCHING. Calibration always yields a
                             # populated reading, so it is unaffected.
                             _publish_gate(metrics)
-                        elif time.monotonic() - last_depth >= depth_period_s:
+                        elif interleave and time.monotonic() - last_depth >= depth_period_s:
+                            # ONLY the interleave (depth-probe) path breaks the color
+                            # stream to grab a fresh depth frame. The scan path gets its
+                            # gate from a SEPARATE telemetry channel piggybacked on this
+                            # same stream (~0.4 s cadence), so it must hold the stream
+                            # OPEN — without the `interleave` guard, last_depth stays 0
+                            # so this fired on every metrics-less frame (every frame
+                            # before the first telemetry arrived), tearing the stream
+                            # down and reconnecting in a loop: telemetry never landed,
+                            # the gate went stale ("hold"), and the video flapped
+                            # ("no signal" <-> "streaming").
                             break    # leave the color stream to refresh the depth gate
                         if min_period:
                             self._stop.wait(min_period)
