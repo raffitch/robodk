@@ -11,6 +11,11 @@ const TARGET_PREFIX = "TasniScan_";          // must match service.py scan.targe
 const PREVIEW_URL = "/api/modules/scan/preview.bin";
 const STABLE_LOCK_MS = 1000;
 const GATE_FRESH_MS = 1600;
+// At ~1.5-2 fps a single noisy frame (one gate dipping below tolerance, or one
+// slightly late frame) must NOT tear down a held "Surface ready": only a sustained
+// loss of validity longer than this breaks the 1 s streak. Bridges ~one slow frame,
+// so the readout stops bouncing "Surface ready" <-> "Hold position" on sensor noise.
+const GATE_GRACE_MS = 1000;
 
 interface ScanConfig {
   robot: string;
@@ -74,6 +79,7 @@ export default function Scan() {
   const [coverageDots, setCoverageDots] = useState<Array<[number, number]> | null>(null);
   const gateReceivedAtRef = useRef(0);
   const stableSinceRef = useRef<number | null>(null);
+  const lastValidRef = useRef<number | null>(null);
   const [surfaceStable, setSurfaceStable] = useState(false);
   const [stableProgress, setStableProgress] = useState(0);
   const [surfaceLocked, setSurfaceLocked] = useState(false);
@@ -196,7 +202,13 @@ export default function Scan() {
       const now = performance.now();
       const fresh = now - gateReceivedAtRef.current <= GATE_FRESH_MS;
       const valid = !!(live && fresh && gate?.ok);
-      if (!valid) {
+      if (valid) lastValidRef.current = now;
+      // Debounce the lock streak: tolerate brief single-frame dips so the readout
+      // does not bounce on sensor noise at low fps. Only a real loss of the pose
+      // (invalid for longer than GATE_GRACE_MS) resets the 1 s "ready" timer.
+      const recentlyValid = lastValidRef.current != null
+        && now - lastValidRef.current <= GATE_GRACE_MS;
+      if (!valid && !recentlyValid) {
         stableSinceRef.current = null;
         setStableProgress(0);
         setSurfaceStable(false);
@@ -258,6 +270,7 @@ export default function Scan() {
       setSurfaceLocked(false);
     }
     stableSinceRef.current = null;
+    lastValidRef.current = null;
     setSurfaceStable(false);
     setStableProgress(0);
     await api.post("/live/start");
