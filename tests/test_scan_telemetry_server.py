@@ -61,6 +61,27 @@ def test_rough_top_expands_beyond_clean_center():
           "mm at tolerance", round(p["plane_tolerance_mm"], 1), "mm")
 
 
+def test_overrun_surface_draws_generic_reticle_square():
+    """When the surface overruns the view (depth fills the frame, touching every
+    border), the live overlay is a GENERIC fixed work square centred on the reticle —
+    not the over-running board rectangle. surface_mode flips to 'crop' and the reported
+    rectangle size is the configured square (WORK_CROP_MM)."""
+    from server.server_unicast_syncronous import WORK_CROP_MM
+    h, w = 240, 320
+    rng = np.random.default_rng(7)
+    depth = (500 + rng.integers(-2, 3, size=(h, w))).astype(np.uint16)  # fills the frame
+    intr = SimpleNamespace(fx=300.0, fy=300.0, ppx=160.0, ppy=120.0)
+    p = scan_plane_telemetry(depth, intr)
+    assert p["detected"]
+    assert p["fully_framed"] is False and p["surface_mode"] == "crop", p["surface_mode"]
+    assert p["rectangle_size_mm"] == [WORK_CROP_MM, WORK_CROP_MM], p["rectangle_size_mm"]
+    out = np.asarray(p["outline_uv"], float)
+    assert out.shape == (4, 2)
+    # The square is symmetric about the reticle (image centre).
+    assert np.allclose(out.mean(axis=0), [0.5, 0.5], atol=0.05), out.mean(axis=0)
+    print("[telemetry crop] generic reticle square drawn when the surface overruns the view")
+
+
 def test_visible_hull_follows_points_and_stays_inside_image():
     pts = np.array([
         [-0.05, 0.20], [0.75, 0.15], [0.80, 0.85], [-0.02, 0.90],
@@ -162,6 +183,7 @@ def test_solid_rectangle_uses_distortion_aware_corner_projector():
 if __name__ == "__main__":
     test_center_connected_component_excludes_remote_plane()
     test_rough_top_expands_beyond_clean_center()
+    test_overrun_surface_draws_generic_reticle_square()
     test_nearest_coherent_plane_wins_over_lower_base()
     test_nearest_plane_helper_selects_smallest_depth_layer()
     test_visible_hull_follows_points_and_stays_inside_image()

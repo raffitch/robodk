@@ -419,6 +419,13 @@ class ScanConfig(_Model):
     min_surface_coverage: float = 0.85   # warn if the chosen views tile < this fraction
                                          # of the surface footprint grid (a missed region)
     grid_target_px: int = 64             # desired on-screen grid cell (px) for live overlay
+    # When the surface overruns the view (edges not fully framed) its real edges are
+    # untrustworthy, so we stop fitting the board and project a GENERIC fixed work
+    # square on the plane, centred on the camera reticle (the aim point). This is its
+    # size; the run crops to it around the aim (bounded_work_plane).
+    work_crop_mm: tuple[float, float] = (1000.0, 1000.0)
+    # Legacy adaptive-crop knobs (superseded by the fixed work_crop_mm above); kept so
+    # an existing tasni.config.json that still sets them loads without error.
     large_surface_crop_fraction: float = 0.75  # fraction of visible FOV used as work crop
     large_surface_crop_max_mm: float = 800.0   # cap either crop dimension
 

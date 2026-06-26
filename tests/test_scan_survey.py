@@ -132,12 +132,40 @@ def test_grid_spacing_nice_number():
 
 
 def test_outline_uv_normalized():
+    # A FULLY-FRAMED surface keeps the board rectangle, whose 4 corners are inside the
+    # image -> normalized to [0,1]. (An overrunning surface intentionally projects a
+    # generic square that exceeds the frame; that path is covered separately below.)
     th = SurveyThresholds()
-    m = survey_surface(_render([0, 0, 1], 500), K, th)
+    m = survey_surface(_render_framed([0, 0, 1], 500), K, th)
+    assert m.fully_framed, "centered surface should be fully framed (board-hug path)"
     assert m.outline_uv is not None and len(m.outline_uv) == 4, m.outline_uv
     for u, v in m.outline_uv:
         assert 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0, (u, v)
     print("[outline]", [tuple(round(x, 3) for x in c) for c in m.outline_uv])
+
+
+def test_crop_mode_uses_generic_reticle_square():
+    """When the surface overruns the view (inliers touch the border -> not fully
+    framed), the work region is a GENERIC fixed square on the plane centred on the
+    reticle (the optical axis), not the over-running board rectangle. extent_mm stays
+    the raw measured extent (used to decide the surface is large)."""
+    th = SurveyThresholds(work_crop_mm=(600.0, 600.0))
+    m = survey_surface(_render([0, 0, 1], 500), K, th)   # plane fills frame -> not framed
+    assert m.detected and not m.fully_framed, (m.detected, m.fully_framed)
+    c = np.asarray(m.corners_cam_mm, float)
+    assert c.shape == (4, 3), c.shape
+    centre = c.mean(axis=0)
+    assert abs(centre[0]) < 1e-6 and abs(centre[1]) < 1e-6, centre   # on the optical axis
+    assert abs(centre[2] - 500.0) < 6.0, centre                       # at the surface depth
+    edges = np.linalg.norm(np.roll(c, -1, axis=0) - c, axis=1)
+    assert np.allclose(edges, 600.0, atol=2.0), edges                # the configured square
+    # extent_mm stays the RAW measured rectangle (~the frame-spanned extent at 500 mm,
+    # 320 px / fx 300 ≈ 533 mm), distinct from the 600 mm work square — i.e. it is the
+    # real measurement used to decide the surface is large, not the crop.
+    assert m.extent_mm is not None and 450.0 < m.extent_mm[0] < 580.0, m.extent_mm
+    assert abs(m.extent_mm[0] - edges[0]) > 50.0, (m.extent_mm, edges[0])
+    print("[crop] generic", round(float(edges[0]), 1), "mm reticle square; raw extent",
+          tuple(round(x, 1) for x in m.extent_mm))
 
 
 def test_surface_dots_are_a_stable_lattice():
@@ -193,6 +221,7 @@ if __name__ == "__main__":
     test_extent_approximate()
     test_grid_spacing_nice_number()
     test_outline_uv_normalized()
+    test_crop_mode_uses_generic_reticle_square()
     test_surface_dots_are_a_stable_lattice()
     test_to_dict_serializable()
     print("\nsurvey.py tests passed.")

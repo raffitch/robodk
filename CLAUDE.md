@@ -8,6 +8,17 @@ Intel **RealSense** camera for ArUco-referenced **Open3D** 3D auto-scanning.
 The `.rdk` is binary, so its embedded Python cannot be edited directly. The two bridge
 scripts below extract that Python to `macros/*.py` (editable here) and push edits back in.
 
+## Working agreement: COMMIT + PUSH every change (so the user can see it)
+After finishing a change, **always `git commit` and `git push`** — do not leave work
+sitting uncommitted. The user reviews progress from the pushed history (and the Jetson
+deploys from it), so unpushed local commits are invisible to them. Concretely:
+- Commit + push the working branch (today: `calibration-improvements`).
+- If the change touches **`server/`**, that code must also reach **`main`** for the
+  Jetson to auto-pull it (the Jetson tracks `origin/main`). Keep `server/` edits in their
+  own commit and **cherry-pick that commit to `main` + push `main`** (the established
+  pattern), so the live camera/overlay actually updates on the device.
+- Mention the pushed commit hashes (branch + any `main` cherry-pick) in the summary.
+
 ## The editing loop
 
 1. **Extract** embedded macros to `macros/*.py` (overwrites them from the station):

@@ -55,51 +55,6 @@ const MONO = "ui-monospace, Consolas, monospace";
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const r = (n: number) => Math.round(n);
 
-function projectivePoint(
-  quad: Array<[number, number]>, x: number, y: number,
-): [number, number] {
-  const [p0, p1, p2, p3] = quad;
-  const dx1 = p1[0] - p2[0], dx2 = p3[0] - p2[0];
-  const dy1 = p1[1] - p2[1], dy2 = p3[1] - p2[1];
-  const dx3 = p0[0] - p1[0] + p2[0] - p3[0];
-  const dy3 = p0[1] - p1[1] + p2[1] - p3[1];
-  const det = dx1 * dy2 - dx2 * dy1;
-  if (Math.abs(det) < 1e-12 || (Math.abs(dx3) < 1e-12 && Math.abs(dy3) < 1e-12)) {
-    return [
-      p0[0] + x * (p1[0] - p0[0]) + y * (p3[0] - p0[0]),
-      p0[1] + x * (p1[1] - p0[1]) + y * (p3[1] - p0[1]),
-    ];
-  }
-  const g = (dx3 * dy2 - dx2 * dy3) / det;
-  const h = (dx1 * dy3 - dx3 * dy1) / det;
-  const a = p1[0] - p0[0] + g * p1[0];
-  const b = p3[0] - p0[0] + h * p3[0];
-  const d = p1[1] - p0[1] + g * p1[1];
-  const e = p3[1] - p0[1] + h * p3[1];
-  const den = g * x + h * y + 1;
-  return [(a * x + b * y + p0[0]) / den, (d * x + e * y + p0[1]) / den];
-}
-
-function cropQuad(
-  source: Array<[number, number]>,
-  crop: [number, number],
-  rectangleSize: [number, number],
-): Array<[number, number]> {
-  const edge0IsLong = rectangleSize[0] >= rectangleSize[1];
-  const crop0 = edge0IsLong ? crop[0] : crop[1];
-  const crop1 = edge0IsLong ? crop[1] : crop[0];
-  const sx = Math.min(1, crop0 / Math.max(rectangleSize[0], 1e-9));
-  const sy = Math.min(1, crop1 / Math.max(rectangleSize[1], 1e-9));
-  const x0 = (1 - sx) / 2, x1 = 1 - x0;
-  const y0 = (1 - sy) / 2, y1 = 1 - y0;
-  return [
-    projectivePoint(source, x0, y0),
-    projectivePoint(source, x1, y0),
-    projectivePoint(source, x1, y1),
-    projectivePoint(source, x0, y1),
-  ];
-}
-
 function Hud({ gate, mode = "scan", coverageDots = null }:
   { gate: GateReading | null; mode?: "calibration" | "scan";
     coverageDots?: Array<[number, number]> | null }) {
@@ -157,16 +112,14 @@ function Hud({ gate, mode = "scan", coverageDots = null }:
         );
       })()}
 
-      {/* survey surface overlay (outline + metric grid) — behind all other HUD elements */}
+      {/* survey surface overlay (work region + metric grid) — behind all other HUD
+          elements. outline_uv IS the final work region already: the generic reticle-
+          centred square when the surface overruns the view, else the trimmed board
+          rectangle. Drawn directly (no client-side cropping). visible_outline_uv is
+          the raw depth silhouette, kept dashed as a diagnostic. */}
       {mode === "scan" && gate?.outline_uv && gate.outline_uv.length >= 3 && (() => {
-        const source = gate.outline_uv!;
-        const selected = gate.fully_framed === false && gate.crop_size_mm
-          && gate.rectangle_size_mm && source.length === 4
-          ? cropQuad(source, gate.crop_size_mm, gate.rectangle_size_mm)
-          : source;
-        const pts = source.map(([u, v]) =>
-          `${(u * W).toFixed(1)},${(v * H).toFixed(1)}`).join(" ");
-        const selectedPts = selected.map(([u, v]) =>
+        const region = gate.outline_uv!;
+        const regionPts = region.map(([u, v]) =>
           `${(u * W).toFixed(1)},${(v * H).toFixed(1)}`).join(" ");
         const visiblePts = gate.visible_outline_uv?.map(([u, v]) =>
           `${(u * W).toFixed(1)},${(v * H).toFixed(1)}`).join(" ");
@@ -178,9 +131,7 @@ function Hud({ gate, mode = "scan", coverageDots = null }:
               <polygon points={visiblePts} fill="none" stroke={DIM} strokeWidth={1.5}
                        strokeDasharray="4 7" opacity={0.45} />
             )}
-            <polygon points={pts} fill="none" stroke={col} strokeWidth={2.5}
-                     strokeDasharray="10 6" opacity={0.8} />
-            <polygon points={selectedPts} fill="rgba(53,194,255,.16)"
+            <polygon points={regionPts} fill="rgba(53,194,255,.16)"
                      stroke="#35c2ff" strokeWidth={4} opacity={0.95} />
             {gate.grid_uv && gate.grid_uv.map(([[u1, v1], [u2, v2]], i) => (
               <line key={i} x1={u1 * W} y1={v1 * H} x2={u2 * W} y2={v2 * H}

@@ -318,6 +318,45 @@ def work_plane_from_points(points: np.ndarray, *, distance: float = 0.006,
                      inlier_count=int(mask.sum()), inlier_frac=frac)
 
 
+def reticle_plane_square(normal: np.ndarray, centroid: np.ndarray,
+                         size: tuple[float, float],
+                         *, axis_hint: tuple[float, float, float] = (1.0, 0.0, 0.0)):
+    """Four corners of a ``size=(sx, sy)`` rectangle lying on the plane (``normal``
+    through ``centroid``), centred where the camera optical axis — the +Z ray through
+    the origin, i.e. the image reticle — pierces that plane.
+
+    Used when the surface OVERRUNS the view, so its real edges are not trustworthy:
+    instead of fitting (and over-running) the board, project a GENERIC work square of
+    a fixed size centred on where the operator is aiming. The first in-plane axis is
+    ``axis_hint`` (camera +X) projected onto the plane, so the square is screen-stable
+    (edges stay roughly horizontal/vertical) rather than chasing a noisy dominant
+    direction. Camera frame, same units as the inputs.
+
+    Returns ``(corners (4,3) cyclic, u, v, reticle (3,))``. Falls back to centring on
+    ``centroid`` if the plane is too edge-on to intersect the optical axis.
+    """
+    n = np.asarray(normal, float)
+    n = n / max(float(np.linalg.norm(n)), 1e-9)
+    c = np.asarray(centroid, float).reshape(3)
+    nz = float(n[2])
+    t = float(c @ n) / nz if abs(nz) > 1e-6 else 0.0
+    reticle = np.array([0.0, 0.0, t]) if t > 0.0 else c.copy()
+    hint = np.asarray(axis_hint, float)
+    if abs(float(hint @ n)) > 0.99 * max(float(np.linalg.norm(hint)), 1e-9):
+        hint = np.array([0.0, 1.0, 0.0])            # hint ~parallel to normal -> swap
+    u = hint - float(hint @ n) * n
+    u = u / max(float(np.linalg.norm(u)), 1e-9)
+    v = np.cross(n, u)
+    sx, sy = float(size[0]) / 2.0, float(size[1]) / 2.0
+    corners = np.array([
+        reticle - sx * u - sy * v,
+        reticle + sx * u - sy * v,
+        reticle + sx * u + sy * v,
+        reticle - sx * u + sy * v,
+    ])
+    return corners, u, v, reticle
+
+
 def bounded_work_plane(wp: WorkPlane, center: np.ndarray,
                        size: tuple[float, float]) -> WorkPlane:
     """Limit an already-fitted plane to a centered rectangular work region.

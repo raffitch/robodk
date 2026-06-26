@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 
 from scan_overlay import (  # noqa: E402
-    density_extent_1d, edge_continues, side_sample_points)
+    density_extent_1d, edge_continues, reticle_plane_square, side_sample_points)
 
 
 def test_density_trim_drops_sparse_halo():
@@ -69,6 +69,24 @@ def test_edge_continues_no_veto_without_evidence():
     assert edge_continues(np.full(2, 100.0), np.full(9, 100.0)) is False
 
 
+def test_reticle_square_matches_host_and_is_centred():
+    """The server's reticle_plane_square mirror must be numerically identical to the
+    workstation's plane.reticle_plane_square (so the live overlay and the locked box
+    agree), and centre the square on the +Z optical axis."""
+    sys.path.insert(0, str(ROOT))
+    from tasni.modules.scan.plane import reticle_plane_square as host_square
+
+    a = np.deg2rad(15.0)
+    normal = np.array([np.sin(a), 0.0, -np.cos(a)])
+    centroid = np.array([30.0, -20.0, 550.0])
+    sc, su, sv, sr = reticle_plane_square(normal, centroid, (1000.0, 1000.0))
+    hc, hu, hv, hr = host_square(normal, centroid, (1000.0, 1000.0))
+    assert np.allclose(sc, hc) and np.allclose(sr, hr), "server/host squares diverge"
+    assert abs(sr[0]) < 1e-9 and abs(sr[1]) < 1e-9, sr     # reticle on the optical axis
+    assert np.allclose((sc - centroid) @ normal, 0.0, atol=1e-6)  # corners on the plane
+    print("[overlay] reticle square matches host + centred on the optical axis")
+
+
 def test_side_sample_points_geometry():
     pc = np.array([0.0, 0.0, 500.0])
     ax_along = np.array([1.0, 0.0, 0.0])
@@ -89,5 +107,6 @@ if __name__ == "__main__":
     test_edge_continues_detects_real_edge()
     test_edge_continues_vetoes_on_continuing_surface()
     test_edge_continues_no_veto_without_evidence()
+    test_reticle_square_matches_host_and_is_centred()
     test_side_sample_points_geometry()
     print("\nscan_overlay tests passed.")

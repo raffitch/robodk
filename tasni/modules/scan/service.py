@@ -71,13 +71,13 @@ class LockedScanSurface:
 
 
 def _large_surface_crop_mm(scfg, K, image_size, look_mm: float) -> list[float]:
-    W, H = image_size
-    return [
-        min(float(scfg.large_surface_crop_max_mm),
-            float(look_mm * W / K[0, 0] * scfg.large_surface_crop_fraction)),
-        min(float(scfg.large_surface_crop_max_mm),
-            float(look_mm * H / K[1, 1] * scfg.large_surface_crop_fraction)),
-    ]
+    """The generic work-square size used when the surface overruns the view.
+
+    Fixed (``scfg.work_crop_mm``, default 1.0×1.0 m) rather than a fraction of the FOV:
+    the operator aims the reticle at the work area and we project a standard square on
+    the plane around it. ``K``/``image_size``/``look_mm`` are unused now (kept so the
+    call sites — which have them handy — need not change)."""
+    return [float(scfg.work_crop_mm[0]), float(scfg.work_crop_mm[1])]
 
 
 def _outline_edge_angle_deg(outline_uv) -> float | None:
@@ -183,6 +183,7 @@ def _survey_thresholds(scfg) -> SurveyThresholds:
         accurate_max_mm=scfg.accurate_max_mm,
         survey_max_tilt_deg=scfg.survey_max_tilt_deg,
         grid_target_px=scfg.grid_target_px,
+        work_crop_mm=tuple(scfg.work_crop_mm),
     )
 
 
@@ -408,8 +409,8 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
     ideal_distance = float(th.ideal_distance_mm)
     fit_per_margin = raw.get("color_fit_standoff_per_margin_mm")
     if surface_mode == "crop":
-        # The plane itself exceeds the depth FOV: do not chase an impossible
-        # whole-table framing distance. Work close, then define a bounded crop.
+        # The surface overruns the view: do not chase an impossible whole-table
+        # framing distance. Work close, then project the generic reticle work square.
         ideal_distance = float(scfg.accurate_min_mm)
     elif fit_per_margin is not None:
         # Continuous on both sides of the color-frame boundary, so moving toward
@@ -426,13 +427,10 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
             ideal_distance = candidate
     extent = raw.get("extent_mm")
     crop_size = None
-    if surface_mode == "crop" and extent is not None:
-        crop_size = [
-            min(float(scfg.large_surface_crop_max_mm),
-                float(extent[0]) * float(scfg.large_surface_crop_fraction)),
-            min(float(scfg.large_surface_crop_max_mm),
-                float(extent[1]) * float(scfg.large_surface_crop_fraction)),
-        ]
+    if surface_mode == "crop":
+        # Generic fixed work square (the surface overruns the view; its edges are not
+        # trustworthy). Matches the host lock/run crop and the server's live overlay.
+        crop_size = [float(scfg.work_crop_mm[0]), float(scfg.work_crop_mm[1])]
     gates = {
         "detected": True,
         "distance": abs(distance - ideal_distance) <= th.distance_tol_mm,

@@ -346,11 +346,14 @@ def test_generate_targets_when_survey_touches_border():
         assert gen["gate"]["ok"] is True, gen["gate"]
         assert gen["gate"]["gates"].get("framed") is False, gen["gate"]
         assert abs(gen["look_distance_mm"] - 500) < 10, gen["look_distance_mm"]
+        # The surface overruns the view, so the work region is the generic fixed
+        # square (scan.work_crop_mm default 1000×1000), not an adaptive FOV-fraction.
         assert gen["crop_size_mm"] is not None
-        assert gen["crop_size_mm"][0] > gen["crop_size_mm"][1] > 0
+        assert gen["crop_size_mm"] == [1000.0, 1000.0], gen["crop_size_mm"]
     finally:
         TABLE_HALF_MM = saved
-    print("[survey border] framed red but centre gate OK -> created", gen["created"])
+    print("[survey border] framed red but centre gate OK -> created", gen["created"],
+          "crop", gen["crop_size_mm"])
 
 
 def test_scan_collision_filter_bypasses_noisy_wall_map_by_default():

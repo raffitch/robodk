@@ -171,12 +171,14 @@ export default function Scan() {
         if (p?.gates && !p.error) {
           gateReceivedAtRef.current = performance.now();
           setGate(p);
-          // Accumulate only the live aiming stream; an authoritative (non-live)
-          // Create-targets / lock snapshot is a single frame, shown on its own.
+          // Accumulate the live aiming stream. On the authoritative (non-live) lock
+          // snapshot we deliberately do NOT reset: a single frame's depth lands only
+          // where the surface has texture (edges/low-texture drop out), so its dots
+          // collapse toward the centre. Keeping the accumulated multi-frame union
+          // frozen shows the real coverage the operator just saw. It is reset on the
+          // next Start camera / Reposition / Create-targets (beginLive/stopLive).
           if (p.live && Array.isArray(p.points_uv) && p.points_uv.length) {
             accumulateCoverage(p.points_uv as Array<[number, number]>);
-          } else if (p.live === false) {
-            resetCoverage();
           }
         }
       } else if (ev.type === "result") {
@@ -300,7 +302,7 @@ export default function Scan() {
       setSurfaceLocked(true);
       setSurfaceStable(false);
       addLog(r.surface_mode === "crop" && r.crop_size_mm
-        ? `surface locked — review bounded crop ${Math.round(r.crop_size_mm[0])} × ${Math.round(r.crop_size_mm[1])} mm`
+        ? `surface locked — review generic ${Math.round(r.crop_size_mm[0])} × ${Math.round(r.crop_size_mm[1])} mm work area (surface overruns the view)`
         : `surface locked — review full detected platform${
             r.extent_mm ? ` ${Math.round(r.extent_mm[0])} × ${Math.round(r.extent_mm[1])} mm` : ""}`);
     } catch (e: any) {
@@ -422,8 +424,8 @@ export default function Scan() {
   const crop = gate?.crop_size_mm;
   const surfaceDescription = gate?.surface_mode === "crop"
     ? crop
-      ? `Large surface — bounded crop ${Math.round(crop[0])} × ${Math.round(crop[1])} mm`
-      : "Large surface — bounded crop will be defined around the reticle"
+      ? `Surface overruns view — generic ${Math.round(crop[0])} × ${Math.round(crop[1])} mm work area on the reticle`
+      : "Surface overruns view — a generic work area will be projected on the reticle"
     : gate?.fully_framed === false
       ? "Full surface detected — move toward the recommended distance to include every edge"
     : gate?.fully_framed === true && gate.extent_mm
@@ -468,16 +470,20 @@ export default function Scan() {
         <div className="hint" style={{ marginTop: 0, marginBottom: 10 }}>
           Start the camera and jog the robot using the live range and tilt guidance.
           Hold a valid pose for one second, then <b>Lock surface &amp; create targets</b>.
-          A fully visible platform uses its measured boundary; an oversized table uses
-          the bounded crop shown around the center reticle.
+          A fully visible platform (clear edges) uses its measured boundary; otherwise
+          a generic 1 m work square is projected around the center reticle.
         </div>
         <div className="aim-wrap">
           {frame ? <img className="preview" src={frame} alt="camera" />
                  : <div className="preview" />}
           {/* Video/FPS and compact depth-plane telemetry use separate channels fed by
               one RealSense capture loop, so the guidance does not interrupt video. */}
+          {/* Pass the accumulated coverage union whenever it exists — including the
+              frozen union on the locked snapshot (live=false), so the locked dots show
+              the real multi-frame coverage, not a sparse single-frame set. It is null
+              once the camera is stopped / restarted (resetCoverage). */}
           {(live || gate) && <AimHud gate={gate} mode="scan"
-                                     coverageDots={live ? coverageDots : null} />}
+                                     coverageDots={coverageDots} />}
           {live && <StreamStats stat={streamStat} />}
           {!live && !gate && <div className="aim-off">camera off — press “Start camera”</div>}
         </div>
@@ -542,8 +548,8 @@ export default function Scan() {
           ? <div className="hint">Review the frozen selected region. Reposition if the wrong
               plane or crop is highlighted; otherwise accept it to create the robot targets.</div>
           : <div className="hint">Jog until RANGE and ANGLE are valid and remain stable for
-              one second. FRAMED may be red for a large table; the scan will use the displayed
-              bounded crop instead.</div>}
+              one second. FRAMED may be red when the surface overruns the view; the scan
+              will use the displayed generic 1 m work square instead.</div>}
       </div>
 
       {/* ---- Run -------------------------------------------------------- */}
