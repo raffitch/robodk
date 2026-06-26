@@ -182,6 +182,44 @@ def _min_area_rectangle(pts2d: np.ndarray, *,
     return ux, uy, w, h, lox, loy
 
 
+def _density_extent_1d(values: np.ndarray, lo: float, hi: float, *,
+                       core_frac: float = 0.20, max_trim_frac: float = 0.15,
+                       min_bin_mm: float = 4.0, min_points: int = 60):
+    """Shrink a rectangle side's raw span ``[lo, hi]`` (1D positions along one axis,
+    mm) inward to where point density rises to ``core_frac`` of the body's typical
+    density.
+
+    A symmetric quantile trim cuts the same small fraction off every edge, so a
+    *sparse coplanar halo* just past the real board edge (flying TSDF pixels, depth
+    spill — more than the 0.5% the quantile removes) survives and inflates the box,
+    making it over-run the physical board. A real edge is a sharp density CLIFF: the
+    first populated bin sits right at the board, and the halo bins beyond it are far
+    below the body density, so thresholding at a fraction of the body keeps the board
+    and drops the halo. Guarded so it cannot eat a real, fully-sampled edge: each side
+    trims at most ``max_trim_frac`` of the span, and the whole step is skipped below
+    ``min_points`` (too few points to estimate density)."""
+    span = float(hi - lo)
+    n = int(np.size(values))
+    if span <= 0.0 or n < min_points:
+        return float(lo), float(hi)
+    n_bins = max(8, int(round(span / max(min_bin_mm, span / 80.0))))
+    counts, edges = np.histogram(values, bins=n_bins, range=(float(lo), float(hi)))
+    occupied = counts[counts > 0]
+    if len(occupied) == 0:
+        return float(lo), float(hi)
+    core = float(np.median(occupied))            # typical density of a populated bin
+    thresh = max(1.0, core_frac * core)          # a halo bin sits well below the body
+    above = np.where(counts >= thresh)[0]
+    if len(above) == 0:
+        return float(lo), float(hi)
+    new_lo = float(edges[int(above[0])])
+    new_hi = float(edges[int(above[-1]) + 1])
+    cap = max_trim_frac * span                   # never trim more than this per side
+    new_lo = min(new_lo, lo + cap)
+    new_hi = max(new_hi, hi - cap)
+    return new_lo, new_hi
+
+
 def _oriented_rectangle(points: np.ndarray, normal: np.ndarray, centroid: np.ndarray):
     """Minimum-area oriented rectangle of ``points`` projected onto the plane.
 
@@ -213,6 +251,18 @@ def _oriented_rectangle(points: np.ndarray, normal: np.ndarray, centroid: np.nda
     # Rectangle axes back in 3D (ux/uy are rotated axes *within* the (u,v) plane).
     ax_a = u * ux[0] + v * ux[1]
     ax_b = u * uy[0] + v * uy[1]
+
+    # Refine the extent per edge: pull each side in to the density cliff, dropping a
+    # sparse coplanar halo just past the real board edge that the symmetric quantile
+    # trim above leaves in (which makes the box over-run the board). Orientation is
+    # already fixed by the min-area rectangle on the fringe-trimmed cloud; this only
+    # tightens how far each side reaches, and is guarded so it cannot eat a real edge.
+    pa = coords @ ux
+    pb = coords @ uy
+    lo_a, hi_a = _density_extent_1d(pa, lox, lox + w)
+    lo_b, hi_b = _density_extent_1d(pb, loy, loy + h)
+    lox, w = lo_a, hi_a - lo_a
+    loy, h = lo_b, hi_b - lo_b
 
     def to3d(coord2d: np.ndarray) -> np.ndarray:
         # coord2d is in the (u,v) plane basis -> back to 3D.

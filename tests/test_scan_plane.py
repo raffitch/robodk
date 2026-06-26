@@ -101,6 +101,33 @@ def test_sparse_edge_noise_does_not_make_diagonal_frame():
     print("[robust footprint] sparse fringe retained an axis-aligned frame")
 
 
+def test_density_trim_hugs_dense_board_not_halo():
+    """A sparse coplanar halo just past the real edge must NOT inflate the rectangle.
+    The board is 400 mm on its long axis; a sparse band of points extends ~30 mm
+    past the +x edge — too many for the 0.5% quantile to remove, but far less dense
+    than the board. The per-edge density trim should pull the long edge back to ~400,
+    not the ~430 over-run the quantile-only box produced."""
+    board = _rect_grid((200.0, 600.0), (100.0, 400.0), nx=80, ny=60, z_noise=0.2)
+    # Sparse halo: 6 columns x 8 rows over (600..630) x (100..400) => ~1.0% of points,
+    # ~8 per x-bin vs ~60 on the board, so it is a clear sub-threshold fringe.
+    ghx, ghy = np.meshgrid(np.linspace(600.0, 630.0, 6), np.linspace(100.0, 400.0, 8))
+    halo = np.column_stack([ghx.ravel(), ghy.ravel(), np.zeros(ghx.size)])
+    wp = work_plane_from_points(np.vstack([board, halo]),
+                                distance=3.0, min_inlier_frac=0.5)
+    assert abs(wp.size[0] - 400) < 18, wp.size  # hugs the board, not 400+30 over-run
+    print("[density trim] long edge", round(wp.size[0], 1),
+          "mm (board 400 + 30 mm halo)")
+
+
+def test_density_trim_keeps_uniform_board():
+    """A uniformly dense board (no halo) is preserved: the trim must not eat a real,
+    fully-sampled edge — only a genuine density cliff is trimmed."""
+    pts = _rect_grid((0.0, 500.0), (0.0, 350.0), nx=90, ny=70, z_noise=0.2)
+    wp = work_plane_from_points(pts, distance=3.0, min_inlier_frac=0.5)
+    assert abs(wp.size[0] - 500) < 12 and abs(wp.size[1] - 350) < 12, wp.size
+    print("[density trim] uniform board preserved", tuple(round(s, 1) for s in wp.size))
+
+
 def test_large_surface_can_be_bounded_around_camera_aim():
     surface = _rect_grid((-1000.0, 1000.0), (-800.0, 800.0), nx=80, ny=60)
     wp = work_plane_from_points(surface, distance=2.0, min_inlier_frac=0.8)
@@ -116,5 +143,7 @@ if __name__ == "__main__":
     test_tilted_plane_normal_recovered()
     test_no_dominant_plane_raises()
     test_sparse_edge_noise_does_not_make_diagonal_frame()
+    test_density_trim_hugs_dense_board_not_halo()
+    test_density_trim_keeps_uniform_board()
     test_large_surface_can_be_bounded_around_camera_aim()
     print("\nplane.py convention + fit tests passed.")
