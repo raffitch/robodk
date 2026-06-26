@@ -141,16 +141,18 @@ def test_outline_uv_normalized():
 
 
 def test_surface_dots_are_a_stable_lattice():
-    """points_uv is a fixed surface-anchored lattice, not a per-frame random pixel
-    subsample — so the HUD dots hold still instead of 'dancing' every frame."""
+    """points_uv is the actual measured surface hits snapped to a FIXED image grid
+    (one dot per occupied cell), not a per-frame random pixel subsample — so the HUD
+    dots mark where depth truly landed and hold still instead of 'dancing'."""
     th = SurveyThresholds()
     d = _render_framed([0, 0, 1], 500)
     m1 = survey_surface(d, K, th)
     assert m1.points_uv is not None and len(m1.points_uv) > 20, m1.points_uv
     for u, v in m1.points_uv:
         assert 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0, (u, v)
-    # Bounded count: a lattice (hundreds), not thousands of raw inlier pixels.
-    assert len(m1.points_uv) <= 1000, len(m1.points_uv)
+    # Bounded count: occupied cells on a fixed 1/180 image grid (capped at 4000),
+    # not the full raw inlier cloud.
+    assert len(m1.points_uv) <= 4000, len(m1.points_uv)
     # Deterministic: identical depth -> identical dots (proves it is NOT re-sampled).
     m2 = survey_surface(d.copy(), K, th)
     assert m1.points_uv == m2.points_uv, "same input must yield identical dots"

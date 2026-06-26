@@ -276,28 +276,30 @@ def survey_surface(
         if uv_s is not None and uv_e is not None:
             grid_uv.append((uv_s, uv_e))
 
-    # 10. Detected-surface DOTS for the HUD overlay: a STABLE metric lattice in the
-    # surface's own (rectangle) frame, one dot per occupied cell CENTER — not a
-    # per-frame random pixel subsample (which makes the dots "dance"). A cell lights
-    # only where the plane actually has depth, so a gap is a real coverage hole.
-    # Reuses the rectangle-frame coords (proj1/proj2) computed for the grid above.
+    # 10. Detected-surface DOTS for the HUD overlay: the ACTUAL measured surface
+    # points (the plane inliers, where depth truly landed), snapped to a FIXED image
+    # grid and emitted as the occupied cells — NOT idealized cell centers derived
+    # from the surface estimate. The grid is fixed in the IMAGE, so the dots hold
+    # still; a cell appears only where a real point fell in it, so an empty cell is a
+    # genuine coverage hole. Matches the live server's coverage dots (same GRID), so
+    # the locked snapshot and the live aiming stream show the same kind of marker.
     points_uv = None
-    long_mm = float(max(hi1 - lo1, hi2 - lo2))
-    if len(inlier_pts) > 0 and long_mm > 1.0:
-        cell_mm = float(np.clip(long_mm / 26.0, 10.0, 40.0))
-        # Anchor the lattice at the CENTROID (proj1/proj2 are already centroid-relative,
-        # rel = inlier_pts - centroid), so the dots hold still frame to frame.
-        ci = np.floor(proj1 / cell_mm).astype(int)
-        cj = np.floor(proj2 / cell_mm).astype(int)
-        cells = np.unique(np.column_stack([ci, cj]), axis=0)
-        dots: list = []
-        for i, jc in cells:
-            center = (centroid + (i + 0.5) * cell_mm * ax1
-                      + (jc + 0.5) * cell_mm * ax2)
-            uv = _project(center)
-            if uv is not None:
-                dots.append([round(float(uv[0]), 4), round(float(uv[1]), 4)])
-        points_uv = dots or None
+    if len(inlier_pts) > 0:
+        Zc = inlier_pts[:, 2]
+        valid = Zc > 0
+        real_uv = np.column_stack([
+            (inlier_pts[valid, 0] * fx / Zc[valid] + cx) / W,
+            (inlier_pts[valid, 1] * fy / Zc[valid] + cy) / H,
+        ])
+        in_frame = np.all((real_uv >= 0.0) & (real_uv <= 1.0), axis=1)
+        real_uv = real_uv[in_frame]
+        if len(real_uv):
+            GRID = 180  # matches the live server / frontend coverage-dedupe resolution
+            cells = np.unique(np.floor(real_uv * GRID).astype(int), axis=0)
+            if len(cells) > 4000:
+                cells = cells[:: int(np.ceil(len(cells) / 4000.0))]
+            dot_uv = (cells + 0.5) / float(GRID)
+            points_uv = np.round(dot_uv, 4).tolist()
 
     return SurveyMeasurement(
         detected=True,
