@@ -451,7 +451,7 @@ class ScanConfig(_Model):
     # OFF until the burst-capable server is deployed: a pre-burst server would
     # mishandle the handshake, so the client probes for support and FALLS BACK to
     # per-pose grab if the server doesn't advertise it.
-    burst_capture: bool = False
+    burst_capture: bool = True
 
     # -- TSDF fusion (Open3D ScalableTSDFVolume) ----------------------------
     # Per-view RGBD is integrated with the camera pose as extrinsic; the volume is
@@ -468,7 +468,10 @@ class ScanConfig(_Model):
     measured_mesh_support_tolerance_m: float = 0.008  # per-view depth agreement tolerance
     measured_mesh_min_support_views: int = 2  # require repeated depth support for real mesh
     measured_mesh_min_support_ratio: float = 0.35  # supported / observed view confidence
+    measured_mesh_min_normal_dot: float = 0.35  # reject near-vertical side walls/edge thickness
     measured_mesh_keep_largest_component: bool = True  # drop disconnected TSDF islands
+    measured_mesh_project_to_plane: bool = True  # output top-surface mesh as a single plane
+    measured_mesh_neutral_color: bool = True  # do not show printed ChArUco/color texture
     actual_coverage_bin_m: float = 0.004  # post-run occupancy cell for measured surface
     actual_coverage_edge_band_m: float = 0.024  # edge band width for coverage warnings
     min_actual_edge_coverage: float = 0.60  # warn below this weakest-edge fill

@@ -302,9 +302,12 @@ def clean_measured_surface_mesh(mesh, views: list[ScanView], wp, K: np.ndarray,
                                 width: int, height: int, *, plane_band_m: float,
                                 rect_margin_m: float, support_tolerance_m: float,
                                 min_support_views: int, min_support_ratio: float,
+                                min_normal_dot: float,
                                 depth_scale: float, depth_min_m: float,
                                 depth_max_m: float,
-                                keep_largest_component: bool = True):
+                                keep_largest_component: bool = True,
+                                project_to_plane: bool = True,
+                                neutral_color: bool = True):
     """Extract the measured work-surface mesh from the raw TSDF mesh.
 
     Filtering has three stages:
@@ -312,11 +315,14 @@ def clean_measured_surface_mesh(mesh, views: list[ScanView], wp, K: np.ndarray,
          rectangle plus a small margin,
       2. keep only vertices with enough camera-depth support, using support/visible
          counts as a confidence proxy,
-      3. drop disconnected islands so loose fragments not attached to the rectangle
+      3. reject near-vertical side walls by normal direction,
+      4. drop disconnected islands so loose fragments not attached to the rectangle
          are not imported into RoboDK.
     """
     vertices = np.asarray(mesh.vertices, dtype=float)
     triangles = np.asarray(mesh.triangles, dtype=np.int32)
+    nrm = np.asarray(wp.normal, dtype=float)
+    nrm /= max(float(np.linalg.norm(nrm)), 1e-12)
     stats = {
         "input_vertices": int(len(vertices)),
         "input_triangles": int(len(triangles)),
@@ -325,6 +331,9 @@ def clean_measured_surface_mesh(mesh, views: list[ScanView], wp, K: np.ndarray,
         "support_tolerance_mm": float(support_tolerance_m * 1000.0),
         "min_support_views": int(min_support_views),
         "min_support_ratio": float(min_support_ratio),
+        "min_normal_dot": float(min_normal_dot),
+        "project_to_plane": bool(project_to_plane),
+        "neutral_color": bool(neutral_color),
     }
     if len(vertices) == 0 or len(triangles) == 0:
         stats.update({"kept_vertices": 0, "kept_triangles": 0, "components": 0})
@@ -343,6 +352,14 @@ def clean_measured_surface_mesh(mesh, views: list[ScanView], wp, K: np.ndarray,
         & (local[:, 1] >= ymin - float(rect_margin_m))
         & (local[:, 1] <= ymax + float(rect_margin_m))
     )
+    normals = np.asarray(mesh.vertex_normals, dtype=float)
+    if len(normals) != len(vertices):
+        mesh.compute_vertex_normals()
+        normals = np.asarray(mesh.vertex_normals, dtype=float)
+    if len(normals) == len(vertices):
+        normal_mask = np.abs(normals @ nrm) >= float(min_normal_dot)
+    else:
+        normal_mask = np.ones(len(vertices), dtype=bool)
 
     supported, observable = _view_support_counts(
         vertices, views, K, width, height, depth_scale=depth_scale,
@@ -355,25 +372,41 @@ def clean_measured_surface_mesh(mesh, views: list[ScanView], wp, K: np.ndarray,
         (supported >= max(1, int(min_support_views)))
         & (ratio >= float(min_support_ratio))
     )
-    combined = geometry_mask & confidence_mask
+    combined = geometry_mask & normal_mask & confidence_mask
     # If the depth-support gate is too strict for a sparse edge case, fall back to
     # geometry-only instead of silently exporting no measured mesh.
     stats.update({
         "geometry_vertices": int(geometry_mask.sum()),
+        "normal_vertices": int((geometry_mask & normal_mask).sum()),
         "support_vertices": int((geometry_mask & confidence_mask).sum()),
+        "combined_vertices": int(combined.sum()),
         "support_mean_views": float(supported[geometry_mask].mean()) if np.any(geometry_mask) else 0.0,
         "support_mean_ratio": float(ratio[geometry_mask & (observable > 0)].mean())
         if np.any(geometry_mask & (observable > 0)) else 0.0,
         "support_fallback": False,
     })
     if int(combined.sum()) < 100:
-        combined = geometry_mask
+        combined = geometry_mask & normal_mask
         stats["support_fallback"] = True
 
     out = _mesh_from_vertex_mask(mesh, combined)
     components, component_area = 0, 0.0
     if keep_largest_component and len(out.triangles):
         out, components, component_area = _keep_largest_component(out)
+    if project_to_plane and len(out.vertices):
+        out_vertices = np.asarray(out.vertices, dtype=float)
+        signed = (out_vertices - np.asarray(wp.centroid, dtype=float)) @ nrm
+        out.vertices = type(out.vertices)(out_vertices - signed[:, None] * nrm)
+        out.remove_degenerate_triangles()
+        out.remove_duplicated_triangles()
+        out.remove_unreferenced_vertices()
+        if len(out.triangles):
+            out.compute_vertex_normals()
+    if neutral_color and len(out.vertices):
+        import open3d as o3d
+
+        out.vertex_colors = o3d.utility.Vector3dVector(
+            np.full((len(out.vertices), 3), (0.45, 0.72, 0.62), dtype=float))
     stats.update({
         "components": int(components),
         "largest_component_area_mm2": float(component_area * 1_000_000.0),

@@ -127,10 +127,13 @@ def test_measured_mesh_cleaner_drops_disconnected_island():
         support_tolerance_m=0.005,
         min_support_views=2,
         min_support_ratio=0.35,
+        min_normal_dot=0.35,
         depth_scale=1000.0,
         depth_min_m=0.2,
         depth_max_m=1.5,
-        keep_largest_component=True)
+        keep_largest_component=True,
+        project_to_plane=True,
+        neutral_color=True)
     assert stats["support_fallback"] is True
     assert stats["components"] == 2, stats
     assert len(cleaned.triangles) == 2, len(cleaned.triangles)

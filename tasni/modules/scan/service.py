@@ -958,6 +958,11 @@ class ScanCaptureJob:
                     f"only {len(views)} usable views (need >= {SCAN_MIN_VIEWS}). "
                     f"Skipped (no depth): {skipped}")
 
+            if start_joints is not None:
+                ctx.log("returning to start pose before fusion")
+                rdk.move_j_joints(start_joints)
+                start_joints = None
+
             if scfg.save_views and self.params.save_artifacts:
                 _save_views(views, K, width, height, run_dir,
                             depth_scale=scfg.depth_scale, log=ctx.log)
@@ -1034,10 +1039,13 @@ class ScanCaptureJob:
                 support_tolerance_m=scfg.measured_mesh_support_tolerance_m,
                 min_support_views=scfg.measured_mesh_min_support_views,
                 min_support_ratio=scfg.measured_mesh_min_support_ratio,
+                min_normal_dot=scfg.measured_mesh_min_normal_dot,
                 depth_scale=scfg.depth_scale,
                 depth_min_m=scfg.depth_min_m,
                 depth_max_m=scfg.depth_max_m,
-                keep_largest_component=scfg.measured_mesh_keep_largest_component)
+                keep_largest_component=scfg.measured_mesh_keep_largest_component,
+                project_to_plane=scfg.measured_mesh_project_to_plane,
+                neutral_color=scfg.measured_mesh_neutral_color)
             if len(mesh.triangles) == 0:
                 ctx.log("WARNING: measured mesh cleaning produced no triangles; "
                         "falling back to the reference rectangle mesh")
