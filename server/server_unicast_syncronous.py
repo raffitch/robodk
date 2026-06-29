@@ -13,6 +13,7 @@ import turbojpeg
 import scan_overlay  # pure-numpy live-rectangle trim + colour edge cross-check
 
 port = 1024
+SCAN_COLOR_JPEG_QUALITY = 100
 
 _telemetry_cond = threading.Condition()
 _telemetry_seq = 0
@@ -608,13 +609,35 @@ def getFrames(pipeline, align, depth_filters):
 
 width = 1280;
 height = 720;
+
+
+def set_high_accuracy_preset(profile):
+    """Apply the D4xx High Accuracy preset when the connected sensor supports it."""
+    try:
+        device = profile.get_device()
+        sensor = device.first_depth_sensor()
+        if sensor.supports(rs.option.visual_preset):
+            preset = getattr(
+                getattr(rs, 'rs400_visual_preset', object),
+                'high_accuracy',
+                3,
+            )
+            sensor.set_option(rs.option.visual_preset, float(int(preset)))
+            print("RealSense visual preset: High Accuracy")
+    except Exception as e:
+        # Preset support varies by firmware/model. Keep serving frames, but make the
+        # capture quality state visible in the service log.
+        print(f"WARNING: could not set High Accuracy visual preset: {e}")
+
+
 def openPipeline():
     cfg = rs.config()
     cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, 30)
     cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, 30)
     cfg.enable_stream(rs.stream.infrared, 1)
     pipeline = rs.pipeline()
-    pipeline.start(cfg)
+    profile = pipeline.start(cfg)
+    set_high_accuracy_preset(profile)
     align = rs.align(rs.stream.color)
     return pipeline, align
 
@@ -732,7 +755,7 @@ def handle_client(conn, addr):
 
         length_depth = struct.pack('<I', len(depth_compressed))
         data_color = (jpeg.encode(color, quality=quality) if quality is not None
-                      else jpeg.encode(color))
+                      else jpeg.encode(color, quality=SCAN_COLOR_JPEG_QUALITY))
         length_color = struct.pack('<I', len(data_color))
         ts = struct.pack('<d', timestamp)
 
@@ -972,7 +995,7 @@ def stream_burst(conn, addr, max_frames=64):
                 np.save(depth_buffer, depth)
                 depth_buffer.seek(0)
                 depth_compressed = lz4f.compress(depth_buffer.read())
-                color_jpeg = jpeg.encode(color)
+                color_jpeg = jpeg.encode(color, quality=SCAN_COLOR_JPEG_QUALITY)
                 idx = len(buffer)
                 buffer.append((depth_compressed, color_jpeg, _ts))
                 # Small thumbnail (~4x downscale) for the live per-pose strip.
@@ -1006,26 +1029,14 @@ def stream_burst(conn, addr, max_frames=64):
 
 
 def setup_depth_filters():
-    # Decimation Filter
-    # decimation = rs.decimation_filter()
-    # decimation.set_option(rs.option.filter_magnitude, 2)
-
-    # Spatial Filter
+    # Full-resolution scan data: do NOT decimate. Work in disparity space for the
+    # filters that benefit from roughly uniform stereo noise, then return to depth.
+    depth_to_disparity = rs.disparity_transform(True)
     spatial = rs.spatial_filter()
-
-
-    # Temporal Filter with the desired settings
-    # smooth_alpha = 0.4
-    # smooth_delta = 20
-    # persistence_control = 7  # Valid in 1 / last 8
-    #
-    # temporal = rs.temporal_filter(smooth_alpha, smooth_delta, persistence_control)
-
-
-    # Hole filling
-    # hole_filling = rs.hole_filling_filter()
-
-    return [spatial]
+    temporal = rs.temporal_filter()
+    disparity_to_depth = rs.disparity_transform(False)
+    hole_filling = rs.hole_filling_filter()
+    return [depth_to_disparity, spatial, temporal, disparity_to_depth, hole_filling]
 
 def main():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

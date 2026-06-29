@@ -20,7 +20,7 @@ authoritative server.
 
 | File | Role |
 |------|------|
-| **`server_unicast_syncronous.py`** | **Production server.** Binds `0.0.0.0:1024`, RealSense 1280×720 depth+color @30, aligns depth→color, `spatial` filter only, streams continuously. |
+| **`server_unicast_syncronous.py`** | **Production server.** Binds `0.0.0.0:1024`, RealSense 1280×720 depth+color @30, aligns depth→color, applies the D4xx High Accuracy preset when available, filters depth in disparity space, streams continuously. |
 | `server_unicast_syncronous_dynamicRes.py` | Server variant with selectable resolution |
 | `server_unicast_asyncio.py` | Asyncio server variant (the "Async Server" shortcut) |
 | `robodk_3dscanning.py` | Jetson-side counterpart of `macros/3DScan.py` |
@@ -48,9 +48,12 @@ read keep getting byte-identical full frames. (`tasni.core.camera.CameraClient` 
 `MODE COLOR` only when `color_only=True`.)
 
 ## Known improvement targets (from docs/best-practices-review.md)
-- No visual preset is set — apply **High Accuracy** for object scanning.
-- Only `spatial` is enabled; decimation/temporal/hole-filling are commented out — adopt
-  Intel's disparity-domain filter order.
+- Scan/full captures use lossless LZ4-compressed `.npy` depth and JPEG quality 100 color.
+  Preview paths may still use lower JPEG quality or H.264 for responsiveness.
+- The production server applies **High Accuracy** when the D4xx sensor exposes the preset.
+- Depth filtering preserves the full 1280×720 resolution: disparity transform → spatial →
+  temporal → depth transform → hole filling. Decimation is intentionally skipped for
+  high-definition scan data.
 
 ## Deployment
 This code is meant to run on the Jetson. See the planned systemd service + deploy flow
