@@ -14,6 +14,7 @@ import scan_overlay  # pure-numpy live-rectangle trim + colour edge cross-check
 
 port = 1024
 SCAN_COLOR_JPEG_QUALITY = 100
+SCAN_TELEMETRY_PERIOD_S = 1.0
 
 _telemetry_cond = threading.Condition()
 _telemetry_seq = 0
@@ -829,7 +830,7 @@ def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
                 color = frames.get_color_frame()
                 if not color:
                     continue
-                if scan_telemetry and time.monotonic() - last_telemetry >= 0.40:
+                if scan_telemetry and time.monotonic() - last_telemetry >= SCAN_TELEMETRY_PERIOD_S:
                     depth = frames.get_depth_frame()
                     if depth:
                         try:
