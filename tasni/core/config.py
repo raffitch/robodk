@@ -463,6 +463,15 @@ class ScanConfig(_Model):
     depth_max_m: float = 1.5            # ignore depth farther than this (table standoff)
     preview_max_points: int = 300000    # decimate the cloud before streaming to the viewer
     surface_mesh_spacing_m: float = 0.001  # dense flat output mesh grid (1 mm)
+    measured_mesh_plane_band_m: float = 0.012  # keep real mesh vertices this close to work plane
+    measured_mesh_rect_margin_m: float = 0.010  # allow slight TSDF edge overhang past rectangle
+    measured_mesh_support_tolerance_m: float = 0.008  # per-view depth agreement tolerance
+    measured_mesh_min_support_views: int = 2  # require repeated depth support for real mesh
+    measured_mesh_min_support_ratio: float = 0.35  # supported / observed view confidence
+    measured_mesh_keep_largest_component: bool = True  # drop disconnected TSDF islands
+    actual_coverage_bin_m: float = 0.004  # post-run occupancy cell for measured surface
+    actual_coverage_edge_band_m: float = 0.024  # edge band width for coverage warnings
+    min_actual_edge_coverage: float = 0.60  # warn below this weakest-edge fill
 
     # -- region of interest: isolate the work surface (the "top layer") ----
     # Without this, fusing every view captures the whole room and RANSAC locks

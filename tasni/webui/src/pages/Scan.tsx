@@ -43,6 +43,14 @@ interface ScanResult {
   n_points: number;
   mesh_vertices: number;
   mesh_triangles: number;
+  mesh_kind?: string;
+  coverage?: {
+    weakest_edge: number;
+    interior: number;
+    fill: number;
+    bin_mm?: number;
+    edges?: Record<string, number>;
+  };
   quality?: { voxel_size_mm: number; surface_mesh_spacing_mm: number; frames_per_pose: number };
   stamp?: string;
   plane: Plane;
@@ -723,13 +731,21 @@ export default function Scan() {
                 <>
                   <div className="k">Fused</div>
                   <div className="v">{result.n_views} views · {result.n_points.toLocaleString()} points ·
-                    {result.mesh_vertices.toLocaleString()} mesh verts</div>
+                    {result.mesh_vertices.toLocaleString()} measured mesh verts ·
+                    {result.mesh_triangles.toLocaleString()} tris</div>
                   {result.quality && (
                     <>
                       <div className="k">Quality</div>
                       <div className="v">{result.quality.voxel_size_mm.toFixed(1)} mm TSDF ·
-                        {result.quality.surface_mesh_spacing_mm.toFixed(1)} mm mesh grid ·
+                        measured mesh insert ·
                         {result.quality.frames_per_pose} frame{result.quality.frames_per_pose === 1 ? "" : "s"}/target</div>
+                    </>
+                  )}
+                  {result.coverage && (
+                    <>
+                      <div className="k">Coverage</div>
+                      <div className="v">weakest edge {Math.round(result.coverage.weakest_edge * 100)}% ·
+                        interior {Math.round(result.coverage.interior * 100)}%</div>
                     </>
                   )}
                 </>

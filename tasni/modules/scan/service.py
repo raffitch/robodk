@@ -45,9 +45,9 @@ from .depth_gate import ScanGateThresholds, evaluate_depth_gate
 from .plane import bounded_work_plane, work_plane_from_points
 from .planner import ScanPlan, plan_scan
 from .survey import SurveyThresholds, survey_surface
-from .reconstruct import (ScanView, cloud_points_m, crop_box, fuse_views,
-                          look_point_from_views, planar_rectangle_mesh,
-                          planar_surface_points, save_mesh)
+from .reconstruct import (ScanView, clean_measured_surface_mesh, cloud_points_m,
+                          crop_box, fuse_views, look_point_from_views,
+                          mesh_preview_points, planar_rectangle_mesh, save_mesh)
 
 log = get_logger("tasni.scan")
 
@@ -798,6 +798,7 @@ class ScanParams:
     save_artifacts: bool = True
     voxel_size_m: float | None = None   # None → use ScanConfig default
     crop_size_mm: tuple[float, float] | None = None
+    surface_size_mm: tuple[float, float] | None = None
 
 
 @dataclass
@@ -813,13 +814,19 @@ class ScanResult:
 
 def _result_report(wp, frame_T_mm, corners_mm, *, n_views, n_points, mesh,
                    run_dir, stamp, voxel_size_m: float, mesh_spacing_m: float,
-                   frames_per_pose: int) -> dict:
+                   frames_per_pose: int, mesh_stats: dict | None = None,
+                   coverage: dict | None = None) -> dict:
     return {
         "module": "scan", "stamp": stamp, "run_dir": str(run_dir),
         "n_views": int(n_views), "n_points": int(n_points),
         "mesh_vertices": int(len(mesh.vertices)),
         "mesh_triangles": int(len(mesh.triangles)),
         "mesh_file": "mesh.obj",
+        "mesh_kind": "measured_tsdf_surface",
+        "reference_mesh_file": "work_surface_rect.obj",
+        "raw_mesh_file": "raw_tsdf_mesh.ply",
+        "mesh_cleaning": mesh_stats or {},
+        "coverage": coverage or {},
         "quality": {
             "voxel_size_mm": float(voxel_size_m * 1000.0),
             "surface_mesh_spacing_mm": float(mesh_spacing_m * 1000.0),
@@ -833,6 +840,53 @@ def _result_report(wp, frame_T_mm, corners_mm, *, n_views, n_points, mesh,
             "inlier_frac": float(wp.inlier_frac),
             "inlier_count": int(wp.inlier_count),
         },
+    }
+
+
+def _surface_coverage(points_m: np.ndarray, wp, *, bin_m: float,
+                      edge_band_m: float) -> dict:
+    """Occupancy of measured mesh vertices inside the work rectangle."""
+    pts = np.asarray(points_m, dtype=float).reshape(-1, 3)
+    empty_edges = {"x_min": 0.0, "x_max": 0.0, "y_min": 0.0, "y_max": 0.0}
+    if len(pts) == 0:
+        return {"point_count": 0, "fill": 0.0, "interior": 0.0,
+                "edges": empty_edges, "weakest_edge": 0.0}
+    R = np.asarray(wp.frame_T[:3, :3], dtype=float)
+    origin = np.asarray(wp.frame_T[:3, 3], dtype=float)
+    local = (pts - origin) @ R
+    corners_local = (np.asarray(wp.corners, dtype=float) - origin) @ R
+    xmin, xmax = float(corners_local[:, 0].min()), float(corners_local[:, 0].max())
+    ymin, ymax = float(corners_local[:, 1].min()), float(corners_local[:, 1].max())
+    inside = ((local[:, 0] >= xmin) & (local[:, 0] <= xmax)
+              & (local[:, 1] >= ymin) & (local[:, 1] <= ymax))
+    if not np.any(inside):
+        return {"point_count": int(len(pts)), "fill": 0.0, "interior": 0.0,
+                "edges": empty_edges, "weakest_edge": 0.0}
+    B = max(float(bin_m), 1e-6)
+    nx = max(1, int(np.ceil((xmax - xmin) / B)))
+    ny = max(1, int(np.ceil((ymax - ymin) / B)))
+    ix = np.floor((local[inside, 0] - xmin) / B).astype(int)
+    iy = np.floor((local[inside, 1] - ymin) / B).astype(int)
+    ix = np.clip(ix, 0, nx - 1)
+    iy = np.clip(iy, 0, ny - 1)
+    occ = np.zeros((nx, ny), bool)
+    occ[ix, iy] = True
+    band = max(1, int(round(float(edge_band_m) / B)))
+    interior = occ[band:-band, band:-band].mean() if nx > 2 * band and ny > 2 * band else occ.mean()
+    edges = {
+        "x_min": float(occ[:band, :].mean()),
+        "x_max": float(occ[-band:, :].mean()),
+        "y_min": float(occ[:, :band].mean()),
+        "y_max": float(occ[:, -band:].mean()),
+    }
+    return {
+        "point_count": int(len(pts)),
+        "bin_mm": float(B * 1000.0),
+        "edge_band_mm": float(band * B * 1000.0),
+        "fill": float(occ.mean()),
+        "interior": float(interior),
+        "edges": edges,
+        "weakest_edge": float(min(edges.values())),
     }
 
 
@@ -958,30 +1012,65 @@ class ScanCaptureJob:
                     f"large surface: bounded work region to "
                     f"{self.params.crop_size_mm[0]:.0f}×"
                     f"{self.params.crop_size_mm[1]:.0f} mm around the camera aim")
-            # The final product is a work surface, not arbitrary free-form geometry.
-            # Flatten the accepted plane samples and generate a dense planar mesh over
-            # the robust footprint so IR/material bumps do not become RoboDK geometry.
-            mesh = planar_rectangle_mesh(
+            elif self.params.surface_size_mm is not None and center_mm is not None:
+                wp = bounded_work_plane(
+                    wp, center_mm / 1000.0,
+                    (self.params.surface_size_mm[0] / 1000.0,
+                     self.params.surface_size_mm[1] / 1000.0))
+                ctx.log(
+                    f"locked surface: bounded work region to "
+                    f"{self.params.surface_size_mm[0]:.0f}×"
+                    f"{self.params.surface_size_mm[1]:.0f} mm from the surface lock")
+
+            # Keep the work rectangle as a reference, but insert the measured TSDF
+            # surface after clipping it to the rectangle and removing weakly
+            # supported/disconnected fragments.
+            reference_mesh = planar_rectangle_mesh(
                 wp.corners, spacing_m=scfg.surface_mesh_spacing_m)
+            mesh, mesh_stats = clean_measured_surface_mesh(
+                raw_mesh, views, wp, K, width, height,
+                plane_band_m=scfg.measured_mesh_plane_band_m,
+                rect_margin_m=scfg.measured_mesh_rect_margin_m,
+                support_tolerance_m=scfg.measured_mesh_support_tolerance_m,
+                min_support_views=scfg.measured_mesh_min_support_views,
+                min_support_ratio=scfg.measured_mesh_min_support_ratio,
+                depth_scale=scfg.depth_scale,
+                depth_min_m=scfg.depth_min_m,
+                depth_max_m=scfg.depth_max_m,
+                keep_largest_component=scfg.measured_mesh_keep_largest_component)
+            if len(mesh.triangles) == 0:
+                ctx.log("WARNING: measured mesh cleaning produced no triangles; "
+                        "falling back to the reference rectangle mesh")
+                mesh = reference_mesh
+                mesh_stats["fallback_mesh"] = "reference_rectangle"
             # metres -> mm for RoboDK (rotation is unitless; translation + corners scale)
             frame_T_mm = wp.frame_T.copy()
             frame_T_mm[:3, 3] *= 1000.0
             corners_mm = wp.corners * 1000.0
-            pp_m, cc = planar_surface_points(
-                cloud, wp.normal, wp.centroid,
-                distance_m=scfg.ransac_distance_m,
-                max_points=scfg.preview_max_points)
+            pp_m, cc = mesh_preview_points(mesh, max_points=scfg.preview_max_points)
             preview_mm = (pp_m * 1000.0).astype(np.float32)
+            coverage = _surface_coverage(
+                np.asarray(mesh.vertices, dtype=float), wp,
+                bin_m=scfg.actual_coverage_bin_m,
+                edge_band_m=scfg.actual_coverage_edge_band_m)
+            if coverage["weakest_edge"] < float(scfg.min_actual_edge_coverage):
+                ctx.log(
+                    f"WARNING: measured mesh edge support is weak "
+                    f"(weakest edge {coverage['weakest_edge']:.0%}, "
+                    f"interior {coverage['interior']:.0%}); expect visible gaps "
+                    f"or re-scan with better edge coverage")
 
             report = _result_report(wp, frame_T_mm, corners_mm, n_views=len(views),
                                      n_points=len(pts), mesh=mesh, run_dir=run_dir,
                                      stamp=stamp, voxel_size_m=voxel_m,
                                      mesh_spacing_m=scfg.surface_mesh_spacing_m,
-                                     frames_per_pose=scfg.frames_per_pose)
+                                     frames_per_pose=scfg.frames_per_pose,
+                                     mesh_stats=mesh_stats, coverage=coverage)
             mesh_obj = None
             if self.params.save_artifacts:
                 save_mesh(mesh, str(run_dir / "mesh.obj"))
                 save_mesh(mesh, str(run_dir / "mesh.ply"))
+                save_mesh(reference_mesh, str(run_dir / "work_surface_rect.obj"))
                 save_mesh(raw_mesh, str(run_dir / "raw_tsdf_mesh.ply"))
                 mesh_obj = str(run_dir / "mesh.obj")
                 np.savez_compressed(run_dir / "preview.npz",
@@ -998,8 +1087,8 @@ class ScanCaptureJob:
 
             sz = report["plane"]["size_mm"]
             ctx.log(f"fused {len(views)} views -> {len(pts)} pts, "
-                    f"{len(mesh.vertices)} clean planar mesh verts "
-                    f"({scfg.surface_mesh_spacing_m * 1000:.1f} mm grid); work surface "
+                    f"{len(mesh.vertices)} measured mesh verts "
+                    f"({len(mesh.triangles)} tris); work surface "
                     f"{sz[0]:.0f} x {sz[1]:.0f} mm (plane inliers "
                     f"{report['plane']['inlier_frac']:.0%}). Review, then Insert.")
             return {"kind": "scan", "run_dir": str(run_dir), "can_insert": True,

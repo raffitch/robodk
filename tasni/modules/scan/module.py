@@ -45,6 +45,7 @@ class ScanModule(WorkflowModule):
         self._reference_result: ScanResult | None = None  # set by reference-mode locate
         self._planned_voxel_m: float | None = None         # set by /poses/generate for /run
         self._planned_crop_mm: tuple[float, float] | None = None
+        self._planned_surface_size_mm: tuple[float, float] | None = None
         self._locked_surface: LockedScanSurface | None = None
 
     def router(self) -> "APIRouter":
@@ -253,11 +254,15 @@ class ScanModule(WorkflowModule):
                     self._active_job = None
                     self._planned_voxel_m = None
                     self._planned_crop_mm = None
+                    self._planned_surface_size_mm = None
                 else:
                     self._reference_result = None
                     self._planned_voxel_m = result_dict.get("voxel_size_m")
                     crop = result_dict.get("crop_size_mm")
                     self._planned_crop_mm = tuple(crop) if crop is not None else None
+                    extent = result_dict.get("extent_mm")
+                    self._planned_surface_size_mm = (
+                        tuple(extent) if crop is None and extent is not None else None)
                 self._locked_surface = None
                 return result_dict
             except RuntimeError as e:
@@ -302,7 +307,8 @@ class ScanModule(WorkflowModule):
             services.live.stop()
             self._active_job = ScanCaptureJob(services, ScanParams(
                 voxel_size_m=self._planned_voxel_m,
-                crop_size_mm=self._planned_crop_mm))
+                crop_size_mm=self._planned_crop_mm,
+                surface_size_mm=self._planned_surface_size_mm))
             services.jobs.start(self._active_job, name="scan")
             return {"status": "started"}
 

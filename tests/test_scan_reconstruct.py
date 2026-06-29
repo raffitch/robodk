@@ -98,6 +98,48 @@ def test_fuse_and_plane_end_to_end():
           f"{wp.inlier_frac:.0%}; planar preview", len(flat_pp))
 
 
+def test_measured_mesh_cleaner_drops_disconnected_island():
+    try:
+        import open3d as o3d
+    except Exception:
+        print("[skip] open3d not installed — `pip install -e .[scan]`")
+        return
+
+    surface = np.array([
+        [-0.15, -0.15, 0.0], [0.15, -0.15, 0.0],
+        [0.15, 0.15, 0.0], [-0.15, 0.15, 0.0],
+        [0.05, 0.05, 0.0], [0.08, 0.05, 0.0], [0.05, 0.08, 0.0],
+    ], dtype=float)
+    triangles = np.array([
+        [0, 1, 2], [0, 2, 3],     # main work surface
+        [4, 5, 6],                # disconnected island inside the rectangle
+    ], dtype=np.int32)
+    raw = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(surface),
+        o3d.utility.Vector3iVector(triangles))
+    raw.compute_vertex_normals()
+
+    wp = work_plane_from_points(surface[:4], distance=0.002, min_inlier_frac=0.9)
+    cleaned, stats = rc.clean_measured_surface_mesh(
+        raw, [], wp, K, W, H,
+        plane_band_m=0.01,
+        rect_margin_m=0.0,
+        support_tolerance_m=0.005,
+        min_support_views=2,
+        min_support_ratio=0.35,
+        depth_scale=1000.0,
+        depth_min_m=0.2,
+        depth_max_m=1.5,
+        keep_largest_component=True)
+    assert stats["support_fallback"] is True
+    assert stats["components"] == 2, stats
+    assert len(cleaned.triangles) == 2, len(cleaned.triangles)
+    assert len(cleaned.vertices) == 4, len(cleaned.vertices)
+    print("[clean mesh] disconnected island dropped;",
+          len(cleaned.vertices), "verts", len(cleaned.triangles), "tris")
+
+
 if __name__ == "__main__":
     test_fuse_and_plane_end_to_end()
+    test_measured_mesh_cleaner_drops_disconnected_island()
     print("\nreconstruct.py fusion chain test passed.")

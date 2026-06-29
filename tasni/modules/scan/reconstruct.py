@@ -201,6 +201,203 @@ def planar_rectangle_mesh(corners: np.ndarray, *, spacing_m: float = 0.005):
     return mesh
 
 
+def _mesh_from_vertex_mask(mesh, vertex_mask: np.ndarray):
+    """Return a copy of ``mesh`` containing only triangles whose vertices pass."""
+    import open3d as o3d
+
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    triangles = np.asarray(mesh.triangles, dtype=np.int32)
+    if len(vertices) == 0 or len(triangles) == 0:
+        return o3d.geometry.TriangleMesh()
+    keep_tri = np.asarray(vertex_mask, bool)[triangles].all(axis=1)
+    if not np.any(keep_tri):
+        return o3d.geometry.TriangleMesh()
+    old_used = np.unique(triangles[keep_tri].reshape(-1))
+    remap = np.full(len(vertices), -1, dtype=np.int32)
+    remap[old_used] = np.arange(len(old_used), dtype=np.int32)
+    out = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices[old_used]),
+        o3d.utility.Vector3iVector(remap[triangles[keep_tri]]))
+    colors = np.asarray(mesh.vertex_colors, dtype=float)
+    if len(colors) == len(vertices):
+        out.vertex_colors = o3d.utility.Vector3dVector(colors[old_used])
+    out.remove_duplicated_vertices()
+    out.remove_duplicated_triangles()
+    out.remove_degenerate_triangles()
+    out.remove_unreferenced_vertices()
+    if len(out.triangles):
+        out.compute_vertex_normals()
+    return out
+
+
+def _keep_largest_component(mesh):
+    """Drop disconnected islands, keeping the dominant attached surface patch."""
+    if len(mesh.triangles) == 0:
+        return mesh, 0, 0.0
+    labels, counts, areas = mesh.cluster_connected_triangles()
+    labels = np.asarray(labels, dtype=np.int32)
+    counts = np.asarray(counts, dtype=np.int64)
+    areas = np.asarray(areas, dtype=float)
+    if len(counts) <= 1:
+        return mesh, int(len(counts)), float(areas[0]) if len(areas) else 0.0
+    keep_label = int(np.argmax(areas))
+    mesh.remove_triangles_by_mask(labels != keep_label)
+    mesh.remove_unreferenced_vertices()
+    if len(mesh.triangles):
+        mesh.compute_vertex_normals()
+    return mesh, int(len(counts)), float(areas[keep_label])
+
+
+def _view_support_counts(vertices_m: np.ndarray, views: list[ScanView], K: np.ndarray,
+                         width: int, height: int, *, depth_scale: float,
+                         tolerance_m: float, depth_min_m: float,
+                         depth_max_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Count how many camera views actually support each mesh vertex.
+
+    A vertex is considered supported by a view when it projects inside the image and
+    the measured depth at that pixel is close to the vertex's projected camera-Z.
+    This is a pragmatic confidence/probability proxy for TSDF meshes: random flying
+    surfaces usually have weak multi-view support, while real surface patches are
+    confirmed by repeated observations.
+    """
+    n = len(vertices_m)
+    supported = np.zeros(n, dtype=np.uint16)
+    observable = np.zeros(n, dtype=np.uint16)
+    if n == 0 or not views:
+        return supported, observable
+
+    fx, fy, cx, cy = map(float, (K[0, 0], K[1, 1], K[0, 2], K[1, 2]))
+    verts_mm = np.asarray(vertices_m, dtype=float) * 1000.0
+    tol_m = float(tolerance_m)
+    for v in views:
+        depth = np.asarray(v.depth)
+        if depth.ndim != 2 or depth.size == 0:
+            continue
+        h, w = depth.shape[:2]
+        T = np.asarray(v.pose_T, dtype=float).reshape(4, 4)
+        R, t = T[:3, :3], T[:3, 3]
+        pc_mm = (verts_mm - t) @ R
+        z_m = pc_mm[:, 2] / 1000.0
+        in_front = (z_m >= float(depth_min_m)) & (z_m <= float(depth_max_m))
+        if not np.any(in_front):
+            continue
+        with np.errstate(divide="ignore", invalid="ignore"):
+            u = np.rint(fx * (pc_mm[:, 0] / pc_mm[:, 2]) + cx).astype(np.int32)
+            vv = np.rint(fy * (pc_mm[:, 1] / pc_mm[:, 2]) + cy).astype(np.int32)
+        inside = in_front & (u >= 0) & (u < min(width, w)) & (vv >= 0) & (vv < min(height, h))
+        idx = np.flatnonzero(inside)
+        if len(idx) == 0:
+            continue
+        d_m = depth[vv[idx], u[idx]].astype(float) / float(depth_scale)
+        has_depth = d_m > 0.0
+        if not np.any(has_depth):
+            continue
+        obs_idx = idx[has_depth]
+        observable[obs_idx] += 1
+        supported[obs_idx[np.abs(d_m[has_depth] - z_m[obs_idx]) <= tol_m]] += 1
+    return supported, observable
+
+
+def clean_measured_surface_mesh(mesh, views: list[ScanView], wp, K: np.ndarray,
+                                width: int, height: int, *, plane_band_m: float,
+                                rect_margin_m: float, support_tolerance_m: float,
+                                min_support_views: int, min_support_ratio: float,
+                                depth_scale: float, depth_min_m: float,
+                                depth_max_m: float,
+                                keep_largest_component: bool = True):
+    """Extract the measured work-surface mesh from the raw TSDF mesh.
+
+    Filtering has three stages:
+      1. keep only vertices near the fitted work plane and inside the locked/fitted
+         rectangle plus a small margin,
+      2. keep only vertices with enough camera-depth support, using support/visible
+         counts as a confidence proxy,
+      3. drop disconnected islands so loose fragments not attached to the rectangle
+         are not imported into RoboDK.
+    """
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    triangles = np.asarray(mesh.triangles, dtype=np.int32)
+    stats = {
+        "input_vertices": int(len(vertices)),
+        "input_triangles": int(len(triangles)),
+        "plane_band_mm": float(plane_band_m * 1000.0),
+        "rect_margin_mm": float(rect_margin_m * 1000.0),
+        "support_tolerance_mm": float(support_tolerance_m * 1000.0),
+        "min_support_views": int(min_support_views),
+        "min_support_ratio": float(min_support_ratio),
+    }
+    if len(vertices) == 0 or len(triangles) == 0:
+        stats.update({"kept_vertices": 0, "kept_triangles": 0, "components": 0})
+        return _mesh_from_vertex_mask(mesh, np.zeros(len(vertices), bool)), stats
+
+    R = np.asarray(wp.frame_T[:3, :3], dtype=float)
+    origin = np.asarray(wp.frame_T[:3, 3], dtype=float)
+    local = (vertices - origin) @ R
+    corners_local = (np.asarray(wp.corners, dtype=float) - origin) @ R
+    xmin, xmax = float(corners_local[:, 0].min()), float(corners_local[:, 0].max())
+    ymin, ymax = float(corners_local[:, 1].min()), float(corners_local[:, 1].max())
+    geometry_mask = (
+        (np.abs(local[:, 2]) <= float(plane_band_m))
+        & (local[:, 0] >= xmin - float(rect_margin_m))
+        & (local[:, 0] <= xmax + float(rect_margin_m))
+        & (local[:, 1] >= ymin - float(rect_margin_m))
+        & (local[:, 1] <= ymax + float(rect_margin_m))
+    )
+
+    supported, observable = _view_support_counts(
+        vertices, views, K, width, height, depth_scale=depth_scale,
+        tolerance_m=support_tolerance_m, depth_min_m=depth_min_m,
+        depth_max_m=depth_max_m)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.divide(supported, observable, out=np.zeros_like(supported, dtype=float),
+                          where=observable > 0)
+    confidence_mask = (
+        (supported >= max(1, int(min_support_views)))
+        & (ratio >= float(min_support_ratio))
+    )
+    combined = geometry_mask & confidence_mask
+    # If the depth-support gate is too strict for a sparse edge case, fall back to
+    # geometry-only instead of silently exporting no measured mesh.
+    stats.update({
+        "geometry_vertices": int(geometry_mask.sum()),
+        "support_vertices": int((geometry_mask & confidence_mask).sum()),
+        "support_mean_views": float(supported[geometry_mask].mean()) if np.any(geometry_mask) else 0.0,
+        "support_mean_ratio": float(ratio[geometry_mask & (observable > 0)].mean())
+        if np.any(geometry_mask & (observable > 0)) else 0.0,
+        "support_fallback": False,
+    })
+    if int(combined.sum()) < 100:
+        combined = geometry_mask
+        stats["support_fallback"] = True
+
+    out = _mesh_from_vertex_mask(mesh, combined)
+    components, component_area = 0, 0.0
+    if keep_largest_component and len(out.triangles):
+        out, components, component_area = _keep_largest_component(out)
+    stats.update({
+        "components": int(components),
+        "largest_component_area_mm2": float(component_area * 1_000_000.0),
+        "kept_vertices": int(len(out.vertices)),
+        "kept_triangles": int(len(out.triangles)),
+    })
+    return out, stats
+
+
+def mesh_preview_points(mesh, *, max_points: int = 300000
+                        ) -> tuple[np.ndarray, np.ndarray]:
+    """Use mesh vertices as the browser preview point set."""
+    pts = np.asarray(mesh.vertices, dtype=np.float32)
+    if len(pts) == 0:
+        return pts.reshape(0, 3), np.zeros((0, 3), np.float32)
+    colors = np.asarray(mesh.vertex_colors, dtype=np.float32)
+    if len(colors) != len(pts):
+        colors = np.full((len(pts), 3), (0.45, 0.72, 0.62), dtype=np.float32)
+    if len(pts) > max_points:
+        step = int(np.ceil(len(pts) / max_points))
+        pts, colors = pts[::step], colors[::step]
+    return pts, colors
+
+
 def decimate_for_preview(cloud, max_points: int = 60000
                          ) -> tuple[np.ndarray, np.ndarray]:
     """Down-sample the fused cloud to <= ``max_points`` for the browser viewer.
