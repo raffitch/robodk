@@ -61,6 +61,22 @@ interface RdkStatus {
   robot_link?: { connected: boolean; message: string; ip: string; configured: boolean } | null;
 }
 
+function lockDisplayGate(next: GateReading, prev: GateReading | null): GateReading {
+  if (next.live === true || !prev) return next;
+  // The lock snapshot is the authoritative measurement, but the live telemetry
+  // overlay is already projected into the color-preview coordinate system. Keep
+  // that display geometry so the HUD does not visibly rescale when lock publishes
+  // depth-derived snapshot UVs.
+  return {
+    ...next,
+    outline_uv: prev.outline_uv ?? next.outline_uv,
+    points_uv: prev.points_uv ?? next.points_uv,
+    visible_outline_uv: prev.visible_outline_uv ?? next.visible_outline_uv,
+    grid_uv: prev.grid_uv ?? next.grid_uv,
+    grid_spacing_mm: prev.grid_spacing_mm ?? next.grid_spacing_mm,
+  };
+}
+
 export default function Scan() {
   const { subscribe } = useEvents();
   const [config, setConfig] = useState<ScanConfig | null>(null);
@@ -220,7 +236,7 @@ export default function Scan() {
         const p = ev.payload as GateReading;
         if (p?.gates && !p.error) {
           gateReceivedAtRef.current = performance.now();
-          setGate(p);
+          setGate((prev) => lockDisplayGate(p, prev));
           // Accumulate the live aiming stream. On the authoritative (non-live) lock
           // snapshot we deliberately do NOT reset: a single frame's depth lands only
           // where the surface has texture (edges/low-texture drop out), so its dots
@@ -421,7 +437,7 @@ export default function Scan() {
         crop_size_mm?: [number, number] | null;
       }>("/surface/lock");
       setLive(false); resetStream();
-      setGate(r.gate);
+      setGate((prev) => lockDisplayGate(r.gate, prev));
       setSurfaceLocked(true);
       setSurfaceStable(false);
       addLog(r.surface_mode === "crop" && r.crop_size_mm
