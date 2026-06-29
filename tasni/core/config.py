@@ -409,13 +409,13 @@ class ScanConfig(_Model):
     # Old knobs (cone_half_angle_deg, pose_count, voxel_size_m) remain as fallbacks.
     accurate_min_mm: float = 300.0       # near edge of D435i accurate depth band
     accurate_max_mm: float = 800.0       # far edge; beyond -> reference mode (no tour/mesh)
-    frame_margin: float = 1.3            # surface must fit FOV with this margin
+    frame_margin: float = 1.05           # keep just enough border; closer standoff = better depth resolution
     survey_max_tilt_deg: float = 6.0     # survey squareness gate (tighter than max_tilt_deg)
     center_tol_mm: float = 30.0          # finite-platform centroid offset allowed
     edge_align_tol_deg: float = 5.0      # finite-platform edge yaw allowed
-    voxel_k: float = 0.004               # voxel_size_m = standoff_mm * voxel_k, clamped
-    voxel_min_m: float = 0.0015          # finest voxel (small / close surfaces)
-    voxel_max_m: float = 0.003           # coarsest voxel
+    voxel_k: float = 0.003               # voxel_size_m = standoff_mm * voxel_k, clamped
+    voxel_min_m: float = 0.001           # finest voxel (small / close surfaces)
+    voxel_max_m: float = 0.002           # coarsest voxel
     surface_type: str = "flat"           # "flat" | "raised" → cone/count preset
     flat_cone_deg: float = 18.0          # cone half-angle for flat surfaces
     flat_views: int = 12                 # view count for flat surfaces
@@ -456,13 +456,13 @@ class ScanConfig(_Model):
     # -- TSDF fusion (Open3D ScalableTSDFVolume) ----------------------------
     # Per-view RGBD is integrated with the camera pose as extrinsic; the volume is
     # a 3D weighted average -> denoised mesh. voxel_size drives resolution/cost.
-    voxel_size_m: float = 0.002         # 2 mm TSDF voxel fallback
-    sdf_trunc_m: float = 0.012          # truncation distance (~4-6 voxels)
+    voxel_size_m: float = 0.0015        # 1.5 mm TSDF voxel fallback
+    sdf_trunc_m: float = 0.008          # truncation distance (~4-8 voxels)
     depth_scale: float = 1000.0         # RealSense depth units -> metres (uint16 mm)
     depth_min_m: float = 0.2            # ignore depth nearer than this
     depth_max_m: float = 1.5            # ignore depth farther than this (table standoff)
-    preview_max_points: int = 200000    # decimate the cloud before streaming to the viewer
-    surface_mesh_spacing_m: float = 0.002  # dense flat output mesh grid (2 mm)
+    preview_max_points: int = 300000    # decimate the cloud before streaming to the viewer
+    surface_mesh_spacing_m: float = 0.001  # dense flat output mesh grid (1 mm)
 
     # -- region of interest: isolate the work surface (the "top layer") ----
     # Without this, fusing every view captures the whole room and RANSAC locks

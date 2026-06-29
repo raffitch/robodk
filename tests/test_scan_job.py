@@ -165,8 +165,8 @@ def test_generate_run_insert():
     assert gen["gate"]["ok"] is True
     assert gen["calibration_on_file"] is True
     # The full-frame survey now drives the actual scan geometry: this 300 mm square
-    # fits best at ~487.5 mm with the configured FOV/margin, not the fixed 500 mm gate.
-    assert abs(gen["look_distance_mm"] - 487.5) < 10
+    # fits close at ~394 mm with the configured FOV/margin, not the fixed 500 mm gate.
+    assert abs(gen["look_distance_mm"] - 393.75) < 10
     assert gen["planned_cone_deg"] == services.config.scan.flat_cone_deg
     assert gen["planned_views"] == services.config.scan.flat_views
 
