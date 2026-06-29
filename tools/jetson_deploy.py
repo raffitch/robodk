@@ -8,7 +8,7 @@ back to password. sudo uses JETSON_SUDO_PASSWORD.
 Commands:
     python tools/jetson_deploy.py bootstrap     # one-time: clone repo, install+enable service, auto-pull, retire dead cron
     python tools/jetson_deploy.py deploy        # git pull on Jetson + restart service
-    python tools/jetson_deploy.py setup-autopull # install/refresh the auto-pull timer (Jetson follows origin/main)
+    python tools/jetson_deploy.py setup-autopull # install/refresh the auto-pull timer
     python tools/jetson_deploy.py status        # service + auto-pull timer + port + recent logs
     python tools/jetson_deploy.py logs          # tail journal
     python tools/jetson_deploy.py start|stop|restart
@@ -216,7 +216,7 @@ def bootstrap(j):
     setup_autopull(j)
 
     print("\nBOOTSTRAP COMPLETE. The camera server is a systemd service (auto-start on "
-          "boot) and the Jetson now auto-pulls origin/main every ~2 min.")
+          "boot) and the Jetson now auto-pulls its checked-out branch every ~2 min.")
 
 
 def _test_run_server(j):
@@ -233,14 +233,15 @@ def _test_run_server(j):
 
 
 def setup_autopull(j):
-    """Install/refresh the auto-pull timer so the Jetson follows origin/main on its
-    own: every couple of minutes it fetches, and if main moved it hard-resets to it
+    """Install/refresh the auto-pull timer so the Jetson follows its checked-out
+    branch on its own: every couple of minutes it fetches, and if the branch moved
+    it hard-resets to it
     (restarting the camera only when server/ changed and no client is mid-capture).
 
     The puller script is installed to /usr/local/bin (not run from the repo) so that
     even a broken pull can't disable the mechanism that would fix it. Idempotent —
     safe to re-run to push an updated script/units."""
-    step("Install the auto-pull timer (Jetson follows origin/main automatically)")
+    step("Install the auto-pull timer (Jetson follows its checked-out branch)")
     # CRLF guard: this repo lives on Windows; a \r in the shebang line breaks exec.
     j.put(os.path.abspath(AUTOPULL_SH_LOCAL), "/tmp/jetson-autopull.sh")
     j.put(os.path.abspath(AUTOPULL_SVC_LOCAL), f"/tmp/{AUTOPULL_NAME}.service")
