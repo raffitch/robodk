@@ -14,6 +14,7 @@ Commands:
     python tools/jetson_deploy.py start|stop|restart
 """
 import os
+import subprocess
 import sys
 import time
 import paramiko
@@ -38,6 +39,21 @@ SERVER = "/home/jetson/robodk/server/server_unicast_syncronous.py"
 UNIT_NAME = "realsense-camera"
 AUTOPULL_NAME = "jetson-autopull"
 AUTOPULL_BIN = "/usr/local/bin/jetson-autopull.sh"
+
+
+def current_branch():
+    override = os.environ.get("JETSON_BRANCH")
+    if override:
+        return override
+    try:
+        branch = subprocess.check_output(
+            ["git", "branch", "--show-current"],
+            cwd=os.path.join(HERE, ".."),
+            text=True,
+            stderr=subprocess.DEVNULL).strip()
+        return branch or "main"
+    except Exception:
+        return "main"
 
 
 def load_env(path):
@@ -245,8 +261,12 @@ def setup_autopull(j):
 
 
 def deploy(j):
-    step("Pulling latest on the Jetson and restarting the service")
-    j.run(f"cd {REPO_DIR} && git fetch --quiet origin && git checkout main && git pull origin main", check=True)
+    branch = current_branch()
+    step(f"Pulling latest origin/{branch} on the Jetson and restarting the service")
+    j.run(
+        f"cd {REPO_DIR} && git fetch --quiet origin "
+        f"&& git checkout {shq(branch)} && git pull origin {shq(branch)}",
+        check=True)
     j.sudo(f"systemctl restart {UNIT_NAME}", check=True)
     time.sleep(5)
     j.run(f"systemctl is-active {UNIT_NAME}")

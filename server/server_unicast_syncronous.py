@@ -854,8 +854,8 @@ def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
                                 return rs.rs2_project_point_to_pixel(
                                     color_intr, color_point)
 
-                            def overlay_project_points(points):
-                                cp = np.asarray(points, float) @ R_dc.T + t_dc_mm
+                            def project_color_points(points_color):
+                                cp = np.asarray(points_color, float)
                                 zc = cp[:, 2]
                                 return np.column_stack([
                                     cp[:, 0] * float(color_intr.fx) / zc
@@ -864,8 +864,27 @@ def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
                                     + float(color_intr.ppy),
                                 ])
 
+                            valid_vertices = depth_vertices_mm.reshape(-1, 3)
+                            valid_vertices = valid_vertices[
+                                np.isfinite(valid_vertices).all(axis=1)
+                                & (valid_vertices[:, 2] > 0)]
+                            if len(valid_vertices):
+                                sample = valid_vertices[::max(1, len(valid_vertices) // 8)][:8]
+                                sdk_px = np.asarray([overlay_project(p) for p in sample], float)
+                                cand_a = project_color_points(sample @ R_dc.T + t_dc_mm)
+                                cand_b = project_color_points(sample @ R_dc + t_dc_mm)
+                                R_vec = R_dc.T if (
+                                    np.nanmean(np.linalg.norm(cand_a - sdk_px, axis=1))
+                                    <= np.nanmean(np.linalg.norm(cand_b - sdk_px, axis=1))
+                                ) else R_dc
+                            else:
+                                R_vec = R_dc.T
+
+                            def overlay_project_points(points):
+                                return project_color_points(np.asarray(points, float) @ R_vec + t_dc_mm)
+
                             def overlay_transform_points(points):
-                                return np.asarray(points, float) @ R_dc.T + t_dc_mm
+                                return np.asarray(points, float) @ R_vec + t_dc_mm
 
                             def depth_deproject_points(pixels, depths_mm):
                                 uv = np.rint(np.asarray(pixels, float)).astype(int)
