@@ -107,10 +107,10 @@ regress from the trim.
 
 ---
 
-## 4. Deploy state (Jetson)
+## 4. Deploy state (Jetson, historical)
 
-The Jetson tracks `origin/main` and **auto-pulls every ~2 min** (root systemd timer),
-restarting the camera only when `server/` changed **and no client is on :1024**.
+This section describes the 2026-06-25 deployment state. For current branch-aware
+Jetson deployment behavior, read `docs/agent-debug-map.md` and `docs/jetson-scanner.md`.
 
 - **Both server commits are deployed + verified:** after `3f0a967` →
   Jetson HEAD flipped, `real_uv` marker present; after `f88b44d` → Jetson `HEAD=f88b44d`,

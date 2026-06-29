@@ -1,5 +1,5 @@
 [Unit]
-Description=Periodically auto-pull the robodk monorepo (origin/main)
+Description=Periodically auto-pull the checked-out robodk monorepo branch
 
 [Timer]
 # First check shortly after boot, then every 2 minutes while up.

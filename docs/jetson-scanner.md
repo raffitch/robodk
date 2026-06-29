@@ -157,15 +157,18 @@ sudo systemctl status realsense-camera
 journalctl -u realsense-camera -f
 ```
 Unit file: `server/realsense-camera.service` (installed to
-`/etc/systemd/system/`). The Jetson tracks this repo's `main`; server code is in `server/`.
+`/etc/systemd/system/`). The Jetson tracks the branch checked out in
+`/home/jetson/robodk`; server code is in `server/`.
 The legacy `/etc/crontab` autostart (39 broken lines) has been removed
 (backup: `/etc/crontab.pre-cleanup.bak`).
 
-### Auto-pull — the Jetson follows `origin/main` on its own (2026-06-21)
+### Auto-pull — the Jetson follows its checked-out branch (updated 2026-06-29)
 A **systemd timer** (`jetson-autopull.timer`, every ~2 min) keeps the Jetson's clone
-in lock-step with `origin/main`, so **push to `main` and the Jetson deploys itself** —
-no manual `deploy` needed. Each tick fetches and, if `main` moved, hard-resets the clone
-to it. Safety: it **defers the whole update if a client is connected on :1024** (never
+in lock-step with the remote branch currently checked out in `/home/jetson/robodk`
+(falling back to `main` only if that branch has no remote). Push that branch and the
+Jetson can deploy itself; use `tools/jetson_deploy.py deploy` when you need an immediate
+pull-and-restart. Each tick fetches and, if the branch moved, hard-resets the clone to
+it. Safety: it **defers the whole update if a client is connected on :1024** (never
 interrupts a live capture — code and running service can't drift), and it **only
 restarts `realsense-camera` when the pulled change touched `server/`** (an unrelated
 commit doesn't blip the camera). Any failure (flaky link) just retries next tick.
@@ -180,8 +183,8 @@ Puller script is installed to `/usr/local/bin/jetson-autopull.sh` (not run from 
 repo, so a broken pull can't disable the thing that would fix it); it runs as root for
 `systemctl` but does git as `jetson` (its GitHub credentials). Source of truth:
 `server/jetson-autopull.{sh,service,timer}`. Manual `deploy` still works for an
-immediate push-and-restart; the timer just makes it automatic. NOTE: it tracks
-**`main`** — work on a feature branch lands on the Jetson only once merged to `main`.
+immediate push-and-restart; the timer just makes it automatic. Current active branch is
+`calibration-improvements`.
 
 ### Legacy manual start (fallback only — don't run alongside the service)
 The old desktop shortcuts still exist; both run the venv Python against a script in
