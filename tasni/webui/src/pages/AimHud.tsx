@@ -54,6 +54,13 @@ const DIM = "rgba(125,235,160,.55)", INK = "rgba(6,11,8,.64)";
 const MONO = "ui-monospace, Consolas, monospace";
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const r = (n: number) => Math.round(n);
+const spreadSample = <T,>(items: T[], max: number) => {
+  if (items.length <= max) return items;
+  const out: T[] = [];
+  const step = (items.length - 1) / (max - 1);
+  for (let i = 0; i < max; i++) out.push(items[Math.round(i * step)]);
+  return out;
+};
 
 function Hud({ gate, mode = "scan", coverageDots = null }:
   { gate: GateReading | null; mode?: "calibration" | "scan";
@@ -103,9 +110,10 @@ function Hud({ gate, mode = "scan", coverageDots = null }:
         const dots = (coverageDots && coverageDots.length)
           ? coverageDots : gate?.points_uv;
         if (!dots || dots.length === 0) return null;
+        const renderDots = spreadSample(dots, 2400);
         return (
           <g fill="#ff453a" opacity={0.6}>
-            {dots.slice(0, 2400).map(([u, v], i) => (
+            {renderDots.map(([u, v], i) => (
               <circle key={i} cx={u * W} cy={v * H} r={2.1} />
             ))}
           </g>
