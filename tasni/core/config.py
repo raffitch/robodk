@@ -363,9 +363,9 @@ class ScanConfig(_Model):
     # The operator jogs the camera to look down at the surface from a neutral
     # standoff; these bands decide when the HUD lamps go green (all green ->
     # Create targets). Distance is the median depth of a central image patch.
-    ideal_distance_mm: float = 500.0    # target camera<->surface standoff
-    distance_tol_mm: float = 150.0      # +/- band around ideal_distance_mm
-    max_tilt_deg: float = 35.0          # surface normal may be this far off the optical axis
+    ideal_distance_mm: float = 500.0    # fallback camera<->surface standoff
+    distance_tol_mm: float = 50.0       # +/- band around the live planned standoff
+    max_tilt_deg: float = 6.0           # surface normal must be close to fronto-parallel
     center_patch_frac: float = 0.25     # central image fraction sampled for depth/normal
     min_valid_depth_frac: float = 0.5   # >= this fraction of the patch must have valid depth
 

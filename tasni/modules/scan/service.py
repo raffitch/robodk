@@ -92,6 +92,27 @@ def _outline_edge_angle_deg(outline_uv) -> float | None:
     return ((angle + 45.0) % 90.0) - 45.0
 
 
+def _planned_surface_standoff_mm(
+    scfg, K, image_size, reading, survey, full_frame_valid_frac: float | None = None
+) -> float:
+    """Best standoff for the measured surface, matching the target planner."""
+    if survey is not None and getattr(survey, "detected", False):
+        if (not getattr(survey, "fully_framed", False)
+                and full_frame_valid_frac is not None
+                and full_frame_valid_frac >= 0.95):
+            return float(scfg.accurate_min_mm)
+        try:
+            plan = plan_scan(survey, K, image_size, scfg, cam_to_base_T=None)
+            return float(plan.standoff_mm)
+        except Exception:
+            pass
+    if getattr(reading, "distance_mm", None) is not None:
+        return float(np.clip(float(reading.distance_mm),
+                             float(scfg.accurate_min_mm),
+                             float(scfg.accurate_max_mm)))
+    return float(scfg.ideal_distance_mm)
+
+
 def lock_scan_surface(services) -> LockedScanSurface:
     """Freeze one authoritative RGBD measurement and the matching robot pose."""
     cfg = services.config
@@ -109,12 +130,21 @@ def lock_scan_surface(services) -> LockedScanSurface:
         frame.depth, K, scan_gate_thresholds(scfg), depth_scale=scfg.depth_scale)
     survey = survey_surface(
         frame.depth, K, _survey_thresholds(scfg), depth_scale=scfg.depth_scale)
+    depth = np.asarray(frame.depth) if frame.depth is not None else np.zeros((0, 0))
+    full_frame_valid_frac = float(np.mean(depth > 0)) if depth.size else 0.0
+    surface_overruns_view = bool(
+        survey.detected and not survey.fully_framed and full_frame_valid_frac >= 0.95)
     gate_payload = scan_gate_payload(reading, survey)
+    ideal_distance = _planned_surface_standoff_mm(
+        scfg, K, cfg.camera.size, reading, survey, full_frame_valid_frac)
+    gate_payload["ideal_distance_mm"] = ideal_distance
+    gate_payload["distance_tol_mm"] = float(scfg.distance_tol_mm)
+    gate_payload["surface_mode"] = "crop" if surface_overruns_view else "full"
     final_gates = {
         "detected": bool(reading.gates.get("detected")),
         "distance": (
             reading.distance_mm is not None
-            and scfg.accurate_min_mm <= reading.distance_mm <= scfg.accurate_max_mm
+            and abs(float(reading.distance_mm) - ideal_distance) <= float(scfg.distance_tol_mm)
         ),
         "angle": bool(reading.gates.get("angle")),
     }
@@ -126,8 +156,7 @@ def lock_scan_surface(services) -> LockedScanSurface:
             gate_payload["move_cam"] = [
                 float(survey.centroid_cam_mm[0]),
                 float(survey.centroid_cam_mm[1]),
-                float((reading.distance_mm or scfg.ideal_distance_mm)
-                      - scfg.ideal_distance_mm),
+                float((reading.distance_mm or ideal_distance) - ideal_distance),
             ]
             gate_payload["center_tol_mm"] = float(scfg.center_tol_mm)
         if survey.outline_uv and len(survey.outline_uv) >= 2:
@@ -139,9 +168,11 @@ def lock_scan_surface(services) -> LockedScanSurface:
             final_gates["edge"] = abs(angle) <= float(scfg.edge_align_tol_deg)
             gate_payload["yaw_a_deg"] = -angle
             gate_payload["edge_align_tol_deg"] = float(scfg.edge_align_tol_deg)
+    elif survey.detected and not surface_overruns_view:
+        final_gates["framed"] = False
     gate_payload["gates"] = {**gate_payload.get("gates", {}), **final_gates}
     gate_payload["ok"] = all(final_gates.values())
-    if survey.detected and not survey.fully_framed and reading.distance_mm is not None:
+    if surface_overruns_view and reading.distance_mm is not None:
         gate_payload["crop_size_mm"] = _large_surface_crop_mm(
             scfg, K, cfg.camera.size, float(reading.distance_mm))
 
@@ -156,6 +187,7 @@ def lock_scan_surface(services) -> LockedScanSurface:
         raise RuntimeError(
             "surface is not ready — fix " + ", ".join(bad)
             + f" (distance {reading.distance_mm and round(reading.distance_mm)} mm, "
+            + f"target {round(ideal_distance)} mm, "
             + f"tilt {reading.tilt_deg and round(reading.tilt_deg, 1)}°).")
     seed_T = rdk.camera_pose_T()
     try:
@@ -410,6 +442,7 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
             }
     ideal_distance = float(th.ideal_distance_mm)
     fit_per_margin = raw.get("color_fit_standoff_per_margin_mm")
+    extent = raw.get("extent_mm")
     if surface_mode == "crop":
         # The surface overruns the view: do not chase an impossible whole-table
         # framing distance. Work close, then project the generic reticle work square.
@@ -427,7 +460,17 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
             ideal_distance = float(previous_ideal_mm)
         else:
             ideal_distance = candidate
-    extent = raw.get("extent_mm")
+    elif extent is not None and camera_cfg is not None:
+        try:
+            sx, sy = [float(v) for v in extent]
+            W, H = camera_cfg.size
+            K = camera_cfg.K
+            ideal_distance = float(np.clip(
+                max(float(scfg.frame_margin) * sx * float(K[0, 0]) / float(W),
+                    float(scfg.frame_margin) * sy * float(K[1, 1]) / float(H)),
+                float(scfg.accurate_min_mm), float(scfg.accurate_max_mm)))
+        except Exception:
+            pass
     crop_size = None
     if surface_mode == "crop":
         # Generic fixed work square (the surface overruns the view; its edges are not
@@ -449,15 +492,18 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
         gates["edge"] = abs(float(edge_angle)) <= float(scfg.edge_align_tol_deg)
     if fully_framed is not None:
         gates["framed"] = bool(fully_framed)
+    ok_gates = dict(gates)
+    if surface_mode == "crop":
+        ok_gates.pop("framed", None)
     return {
         "detected": True,
         "distance_mm": distance,
         "tilt_deg": tilt,
         "valid_frac": valid_frac,
         "gates": gates,
-        # Framing is guidance. A large plane is intentionally allowed to remain
-        # unframed because target creation will define a bounded aimed crop.
-        "ok": all(bool(v) for k, v in gates.items() if k != "framed"),
+        # Large crop planes intentionally remain unframed; finite platforms must
+        # frame their measured edges before the one-second lock hold can complete.
+        "ok": all(bool(v) for v in ok_gates.values()),
         "ideal_distance_mm": ideal_distance,
         "distance_tol_mm": th.distance_tol_mm,
         "max_tilt_deg": th.max_tilt_deg,

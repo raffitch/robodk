@@ -212,6 +212,26 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
   background: rgba(210,153,34,.08); }
 .scan-ready.ready { color: var(--ok); border-color: rgba(63,185,80,.5);
   background: rgba(63,185,80,.10); }
+.surface-guide { max-width: 760px; margin-top: 10px; border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; background: var(--panel-2); }
+.surface-guide.ready { border-left: 3px solid var(--ok); background: rgba(63,185,80,.08); }
+.surface-guide.holding { border-left: 3px solid var(--warn); background: rgba(210,153,34,.07); }
+.surface-guide-head { display: flex; justify-content: space-between; gap: 12px;
+  align-items: baseline; font-size: 13px; margin-bottom: 8px; }
+.surface-guide-head span { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+.surface-guide-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.surface-guide-chip { min-width: 0; border: 1px solid var(--border); border-radius: 7px;
+  padding: 7px 8px; background: rgba(0,0,0,.12); }
+.surface-guide-chip span { display: block; color: var(--muted); font-size: 10px;
+  text-transform: uppercase; letter-spacing: .7px; margin-bottom: 3px; }
+.surface-guide-chip b { display: block; font-family: var(--mono); font-size: 13px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.surface-guide-chip.ok b { color: var(--ok); }
+.surface-guide-chip.fix b { color: var(--warn); }
+@media (max-width: 760px) {
+  .surface-guide-head { flex-direction: column; gap: 3px; }
+  .surface-guide-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 
 /* print-scale hard gate (Run card) + measure helper (guide) */
 .scale-gate { margin-top: 12px; background: rgba(210,153,34,.07); border: 1px solid var(--border);

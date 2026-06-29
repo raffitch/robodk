@@ -71,7 +71,7 @@ def _render(T_base_cam):
 
 
 def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
-    seed_T = _look_at((0, 0, 500), (0, 0, 0))           # straight down, 500 mm
+    seed_T = _look_at((0, 0, 420), (0, 0, 0))           # straight down, close framed standoff
     state = {"cam": seed_T, "targets": {}, "joints": {}}
     mount = Rt_to_T(np.eye(3), np.asarray(mount_mm, float))
 
@@ -165,8 +165,8 @@ def test_generate_run_insert():
     assert gen["gate"]["ok"] is True
     assert gen["calibration_on_file"] is True
     # The full-frame survey now drives the actual scan geometry: this 300 mm square
-    # fits close at ~394 mm with the configured FOV/margin, not the fixed 500 mm gate.
-    assert abs(gen["look_distance_mm"] - 393.75) < 10
+    # scans near the closest standoff that still frames its measured boundary.
+    assert 380 < gen["look_distance_mm"] < 405
     assert gen["planned_cone_deg"] == services.config.scan.flat_cone_deg
     assert gen["planned_views"] == services.config.scan.flat_views
 
@@ -345,12 +345,13 @@ def test_generate_targets_when_survey_touches_border():
     saved = TABLE_HALF_MM
     TABLE_HALF_MM = 1000.0
     try:
-        services, _state = _build_fakes()
+        services, state = _build_fakes()
+        state["cam"] = _look_at((0, 0, 310), (0, 0, 0))
         gen = scan_service.generate_scan_targets(services)
         assert gen["created"] == 8, gen
         assert gen["gate"]["ok"] is True, gen["gate"]
         assert gen["gate"]["gates"].get("framed") is False, gen["gate"]
-        assert abs(gen["look_distance_mm"] - 500) < 10, gen["look_distance_mm"]
+        assert 300 <= gen["look_distance_mm"] <= 340, gen["look_distance_mm"]
         # The surface overruns the view, so the work region is the generic fixed
         # square (scan.work_crop_mm default 1000×1000), not an adaptive FOV-fraction.
         assert gen["crop_size_mm"] is not None
@@ -419,10 +420,10 @@ def test_generate_refuses_when_too_far():
 
 def test_generate_accepts_dynamic_near_quality_distance():
     services, state = _build_fakes()
-    state["cam"] = _look_at((0, 0, 310), (0, 0, 0))
+    state["cam"] = _look_at((0, 0, 420), (0, 0, 0))
     gen = scan_service.generate_scan_targets(services)
     assert gen["created"] == 8, gen
-    assert 300 <= gen["look_distance_mm"] <= 800, gen["look_distance_mm"]
+    assert 380 < gen["look_distance_mm"] < 405, gen["look_distance_mm"]
     print("[dynamic distance] near quality-band surface accepted at",
           round(gen["look_distance_mm"]), "mm")
 

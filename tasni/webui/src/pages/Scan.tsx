@@ -77,6 +77,8 @@ export default function Scan() {
 
   const [live, setLive] = useState(false);
   const liveRef = useRef(false);
+  const autoConnectRef = useRef(false);
+  const autoPreviewRef = useRef(false);
   const [gate, setGate] = useState<GateReading | null>(null);
   // Coverage accumulation: each live frame the RealSense reports a slightly
   // different set of valid-depth points (stereo dropouts at edges/low texture), so
@@ -190,6 +192,12 @@ export default function Scan() {
       }
     } catch (e: any) { setConn("error"); setConnInfo(e.message); }
   }, [refreshTargets, refreshJob]);
+
+  useEffect(() => {
+    if (conn !== "idle" || autoConnectRef.current) return;
+    autoConnectRef.current = true;
+    connect();
+  }, [conn, connect]);
 
   useEffect(() => {
     return subscribe((ev: JobEvent) => {
@@ -323,43 +331,18 @@ export default function Scan() {
   const startLive = async () => {
     try {
       await beginLive(true);
-      addLog("camera started — jog until the surface guidance is stable, then lock it.");
+      addLog("surface feed started — jog TOOL X/Y/Z and A/B/C until the guidance is stable.");
     } catch (e: any) { setLive(false); addLog("live: " + e.message, true); }
   };
   useEffect(() => {
-    if (!ready || live || running) return;
-    if (sessionStorage.getItem("tasni:autoStartCamera") !== "scan") return;
+    if (!ready || live || running || autoPreviewRef.current) return;
+    autoPreviewRef.current = true;
     sessionStorage.removeItem("tasni:autoStartCamera");
     startLive();
   }, [ready, live, running]);
   const stopLive = async () => {
     try { await api.post("/live/stop"); } catch { /* ignore */ }
     setLive(false); resetStream(); resetCoverage();
-  };
-  const lockSurface = async () => {
-    setLocking(true); setRunError(null);
-    try {
-      const r = await api.post<{
-        status: string; gate: GateReading;
-        surface_mode: "full" | "crop";
-        extent_mm?: [number, number] | null;
-        crop_size_mm?: [number, number] | null;
-      }>("/surface/lock");
-      setLive(false); resetStream();
-      setGate(r.gate);
-      setSurfaceLocked(true);
-      setSurfaceStable(false);
-      addLog(r.surface_mode === "crop" && r.crop_size_mm
-        ? `surface locked — review generic ${Math.round(r.crop_size_mm[0])} × ${Math.round(r.crop_size_mm[1])} mm work area (surface overruns the view)`
-        : `surface locked — review full detected platform${
-            r.extent_mm ? ` ${Math.round(r.extent_mm[0])} × ${Math.round(r.extent_mm[1])} mm` : ""}`);
-    } catch (e: any) {
-      addLog("lock surface: " + e.message, true);
-      setRunError("Lock surface: " + e.message);
-      beginLive(false).catch(() => setLive(false));
-    } finally {
-      setLocking(false);
-    }
   };
   const repositionSurface = async () => {
     try { await api.post("/surface/unlock"); } catch { /* best effort */ }
@@ -424,8 +407,36 @@ export default function Scan() {
     } catch (e: any) {
       addLog("create targets: " + e.message, true);
       setRunError("Create targets: " + e.message);
+      setSurfaceLocked(false);
       beginLive(false).catch(() => setLive(false));
     } finally { setGenerating(false); }
+  };
+  const lockAndCreateTargets = async () => {
+    setLocking(true); setRunError(null);
+    try {
+      const r = await api.post<{
+        status: string; gate: GateReading;
+        surface_mode: "full" | "crop";
+        extent_mm?: [number, number] | null;
+        crop_size_mm?: [number, number] | null;
+      }>("/surface/lock");
+      setLive(false); resetStream();
+      setGate(r.gate);
+      setSurfaceLocked(true);
+      setSurfaceStable(false);
+      addLog(r.surface_mode === "crop" && r.crop_size_mm
+        ? `surface locked — generic ${Math.round(r.crop_size_mm[0])} x ${Math.round(r.crop_size_mm[1])} mm work area; creating targets`
+        : `surface locked — detected platform${
+            r.extent_mm ? ` ${Math.round(r.extent_mm[0])} x ${Math.round(r.extent_mm[1])} mm` : ""}; creating targets`);
+    } catch (e: any) {
+      addLog("lock surface: " + e.message, true);
+      setRunError("Lock surface: " + e.message);
+      beginLive(false).catch(() => setLive(false));
+      setLocking(false);
+      return;
+    }
+    setLocking(false);
+    await generateTargets();
   };
   const dryRun = async () => {
     setTour(null); setPct(0); setStatus("starting dry run…"); setRunError(null);
@@ -519,10 +530,9 @@ export default function Scan() {
       <div className="card">
         <h2>Survey the surface</h2>
         <div className="hint" style={{ marginTop: 0, marginBottom: 10 }}>
-          Start the camera and jog the robot using the live range and tilt guidance.
-          Hold a valid pose for one second, then <b>Lock surface &amp; create targets</b>.
-          A fully visible platform (clear edges) uses its measured boundary; otherwise
-          a generic 1 m work square is projected around the center reticle.
+          The surface feed starts automatically. Jog in the robot TOOL frame until
+          the live X/Y/Z and A/B/C guides are green, hold steady for one second, then
+          lock the measured platform and create scan targets.
         </div>
         <div className="aim-wrap">
           {frame ? <img className="preview" src={frame} alt="camera" />
@@ -538,6 +548,8 @@ export default function Scan() {
           {live && <StreamStats stat={streamStat} />}
           {!live && !gate && <div className="aim-off">camera off — press “Start camera”</div>}
         </div>
+
+        <SurfaceGuide gate={gate} stable={surfaceStable} />
 
         <div className="lamps">
           {lamps.map(([name, on]) => {
@@ -576,9 +588,9 @@ export default function Scan() {
               ? <button className="secondary" onClick={stopLive}>Stop camera</button>
               : null}
           {!surfaceLocked
-            ? <button onClick={lockSurface}
-                      disabled={!ready || running || locking || !live || !surfaceStable}>
-                {locking ? "Locking…" : "Lock surface"}
+            ? <button onClick={lockAndCreateTargets}
+                      disabled={!ready || running || locking || generating || !live || !surfaceStable}>
+                {locking ? "Locking…" : generating ? "Creating…" : "Lock & create targets"}
               </button>
             : <>
                 <button className="secondary" onClick={repositionSurface}
@@ -601,11 +613,11 @@ export default function Scan() {
               Re-aim closer (300–800 mm) for a quality mesh tour.
             </div>
           : surfaceLocked
-          ? <div className="hint">Review the frozen selected region. Reposition if the wrong
-              plane or crop is highlighted; otherwise accept it to create the robot targets.</div>
-          : <div className="hint">Jog until RANGE and ANGLE are valid and remain stable for
-              one second. FRAMED may be red when the surface overruns the view; the scan
-              will use the displayed generic 1 m work square instead.</div>}
+          ? <div className="hint">Surface is locked. Reposition if the wrong plane or crop
+              is highlighted; otherwise create the targets.</div>
+          : <div className="hint">Jog until RANGE, TILT, CENTER and EDGE are valid and
+              remain stable for one second. FRAMED may be red when the surface overruns
+              the view; in that case the scan uses the displayed generic 1 m work square.</div>}
       </div>
 
       {/* ---- Run -------------------------------------------------------- */}
@@ -762,4 +774,54 @@ export default function Scan() {
       )}
     </div>
   );
+}
+
+function SurfaceGuide({ gate, stable }: { gate: GateReading | null; stable: boolean }) {
+  const move = gate?.move_cam ?? null;
+  const cropSurface = gate?.surface_mode === "crop";
+  const distanceTol = gate?.distance_tol_mm ?? 50;
+  const centerTol = gate?.center_tol_mm ?? 30;
+  const range = move ? axisInstruction("Z", move[2], distanceTol, "mm") : "waiting for depth";
+  const centerX = move ? axisInstruction("X", move[0], centerTol, "mm") : "waiting";
+  const centerY = move ? axisInstruction("Y", move[1], centerTol, "mm") : "waiting";
+  const tiltB = rotationInstruction("B", gate?.tilt_b_deg ?? null);
+  const tiltC = rotationInstruction("C", gate?.tilt_c_deg ?? null);
+  const yawA = rotationInstruction("A", gate?.yaw_a_deg ?? null);
+  const chips = [
+    ["Range", range, !!gate?.gates?.distance],
+    ["Center X", centerX, !!gate && (gate.gates?.center ?? cropSurface)],
+    ["Center Y", centerY, !!gate && (gate.gates?.center ?? cropSurface)],
+    ["Level B", tiltB, !!gate?.gates?.angle],
+    ["Level C", tiltC, !!gate?.gates?.angle],
+    ["Edge A", yawA, !!gate && (gate.gates?.edge ?? cropSurface)],
+  ] as const;
+  return (
+    <div className={"surface-guide " + (stable ? "ready" : gate?.ok ? "holding" : "")}>
+      <div className="surface-guide-head">
+        <b>{stable ? "Ready to lock" : gate?.detected ? "Position with TOOL jog" : "Move near the platform"}</b>
+        <span>{gate?.distance_mm != null
+          ? `${Math.round(gate.distance_mm)} mm from surface, target ${Math.round(gate.ideal_distance_mm ?? 0)} mm`
+          : "Depth feed will appear when the surface is visible"}</span>
+      </div>
+      <div className="surface-guide-grid">
+        {chips.map(([label, text, ok]) => (
+          <div key={label} className={"surface-guide-chip " + (ok ? "ok" : "fix")}>
+            <span>{label}</span>
+            <b>{text}</b>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function axisInstruction(axis: string, value: number, tol: number, unit: string) {
+  if (Math.abs(value) <= tol) return "OK";
+  return `${axis}${value >= 0 ? "+" : "-"} ${Math.round(Math.abs(value))} ${unit}`;
+}
+
+function rotationInstruction(axis: string, value: number | null) {
+  if (value == null) return "OK";
+  if (Math.abs(value) < 1) return "OK";
+  return `${axis}${value >= 0 ? "+" : "-"} ${Math.round(Math.abs(value))} deg`;
 }
