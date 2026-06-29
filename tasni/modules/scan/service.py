@@ -766,13 +766,19 @@ class ScanResult:
 
 
 def _result_report(wp, frame_T_mm, corners_mm, *, n_views, n_points, mesh,
-                   run_dir, stamp) -> dict:
+                   run_dir, stamp, voxel_size_m: float, mesh_spacing_m: float,
+                   frames_per_pose: int) -> dict:
     return {
         "module": "scan", "stamp": stamp, "run_dir": str(run_dir),
         "n_views": int(n_views), "n_points": int(n_points),
         "mesh_vertices": int(len(mesh.vertices)),
         "mesh_triangles": int(len(mesh.triangles)),
         "mesh_file": "mesh.obj",
+        "quality": {
+            "voxel_size_mm": float(voxel_size_m * 1000.0),
+            "surface_mesh_spacing_mm": float(mesh_spacing_m * 1000.0),
+            "frames_per_pose": int(frames_per_pose),
+        },
         "plane": {
             "frame_T_mm": np.asarray(frame_T_mm, float).tolist(),
             "corners_mm": np.asarray(corners_mm, float).tolist(),
@@ -782,6 +788,19 @@ def _result_report(wp, frame_T_mm, corners_mm, *, n_views, n_points, mesh,
             "inlier_count": int(wp.inlier_count),
         },
     }
+
+
+def _combine_depth_frames(frames) -> tuple[np.ndarray, np.ndarray]:
+    """Median-fuse same-pose RGBD frames, ignoring zero-depth holes."""
+    colors = [np.asarray(f.color, dtype=np.float32) for f in frames]
+    color = np.clip(np.mean(np.stack(colors, axis=0), axis=0), 0, 255).astype(np.uint8)
+    depths = [np.asarray(f.depth) for f in frames if f.depth is not None]
+    if len(depths) == 1:
+        return color, np.ascontiguousarray(depths[0])
+    stack = np.stack(depths, axis=0)
+    masked = np.ma.masked_equal(stack, 0)
+    depth = np.ma.median(masked, axis=0).filled(0)
+    return color, np.ascontiguousarray(depth.astype(stack.dtype, copy=False))
 
 
 class ScanCaptureJob:
@@ -846,7 +865,7 @@ class ScanCaptureJob:
             ctx.progress(len(targets), len(targets), "fusing")
             voxel_m = (self.params.voxel_size_m
                        if self.params.voxel_size_m is not None else scfg.voxel_size_m)
-            ctx.log(f"fusing {len(views)} views (TSDF voxel {voxel_m * 1000:.0f} mm)…")
+            ctx.log(f"fusing {len(views)} views (TSDF voxel {voxel_m * 1000:.1f} mm)…")
             res = fuse_views(views, K, width, height, voxel_size_m=voxel_m,
                              sdf_trunc_m=scfg.sdf_trunc_m, depth_scale=scfg.depth_scale,
                              depth_min_m=scfg.depth_min_m, depth_max_m=scfg.depth_max_m)
@@ -910,7 +929,9 @@ class ScanCaptureJob:
 
             report = _result_report(wp, frame_T_mm, corners_mm, n_views=len(views),
                                      n_points=len(pts), mesh=mesh, run_dir=run_dir,
-                                     stamp=stamp)
+                                     stamp=stamp, voxel_size_m=voxel_m,
+                                     mesh_spacing_m=scfg.surface_mesh_spacing_m,
+                                     frames_per_pose=scfg.frames_per_pose)
             mesh_obj = None
             if self.params.save_artifacts:
                 save_mesh(mesh, str(run_dir / "mesh.obj"))
@@ -931,7 +952,8 @@ class ScanCaptureJob:
 
             sz = report["plane"]["size_mm"]
             ctx.log(f"fused {len(views)} views -> {len(pts)} pts, "
-                    f"{len(mesh.vertices)} clean planar mesh verts; work surface "
+                    f"{len(mesh.vertices)} clean planar mesh verts "
+                    f"({scfg.surface_mesh_spacing_m * 1000:.1f} mm grid); work surface "
                     f"{sz[0]:.0f} x {sz[1]:.0f} mm (plane inliers "
                     f"{report['plane']['inlier_frac']:.0%}). Review, then Insert.")
             return {"kind": "scan", "run_dir": str(run_dir), "can_insert": True,
@@ -960,22 +982,29 @@ class ScanCaptureJob:
         views: list[ScanView] = []
         skipped: list[str] = []
         total = len(targets)
+        frames_per_pose = max(1, int(scfg.frames_per_pose))
         for i, name in enumerate(targets):
             ctx.check_cancel()
             ctx.progress(i + 1, total, f"capturing {name}")
             rdk.move_j(name)
             time.sleep(scfg.settle_s)
-            frame = cam.grab(with_depth=True, timeout=scfg.grab_timeout_s)
-            if frame.depth is None:
+            frames = []
+            for _ in range(frames_per_pose):
+                frame = cam.grab(with_depth=True, timeout=scfg.grab_timeout_s)
+                if frame.depth is not None:
+                    frames.append(frame)
+            if not frames:
                 ctx.log(f"{name}: no depth — skipped")
                 skipped.append(name)
                 continue
+            color, depth = _combine_depth_frames(frames)
             pose = rdk.camera_pose_T()                 # uses the STORED tool offset
-            views.append(ScanView(color=frame.color, depth=frame.depth, pose_T=pose))
-            ok, jpeg = cv2.imencode(".jpg", frame.color)
+            views.append(ScanView(color=color, depth=depth, pose_T=pose))
+            ok, jpeg = cv2.imencode(".jpg", color)
             if ok:
                 ctx.frame(jpeg.tobytes())
-            ctx.log(f"{name}: captured ({np.count_nonzero(frame.depth)} depth px)")
+            suffix = f", median of {len(frames)} frame(s)" if frames_per_pose > 1 else ""
+            ctx.log(f"{name}: captured ({np.count_nonzero(depth)} depth px{suffix})")
         return views, skipped
 
     def _capture_burst(self, ctx, rdk, cam, targets, scfg):
@@ -993,24 +1022,32 @@ class ScanCaptureJob:
         skipped: list[str] = []
         captured: list = []          # (name, pose) for each CAP that buffered a frame
         total = len(targets)
+        frames_per_pose = max(1, int(scfg.frames_per_pose))
         with cam.burst(timeout=scfg.grab_timeout_s) as bs:
             for i, name in enumerate(targets):
                 ctx.check_cancel()
                 ctx.progress(i + 1, total, f"capturing {name}")
                 rdk.move_j(name)
                 time.sleep(scfg.settle_s)
-                thumb = bs.capture()                   # Jetson grabs + buffers the frame
-                if thumb is None:                      # server skipped -> not in fetch_all
+                buffered = 0
+                for rep in range(frames_per_pose):
+                    thumb = bs.capture()               # Jetson grabs + buffers the frame
+                    if thumb is None:
+                        continue
+                    try:
+                        pose = rdk.camera_pose_T()     # uses the STORED tool offset
+                    except Exception:
+                        pose = None
+                    captured.append((name, pose))
+                    buffered += 1
+                    if rep == 0:
+                        ctx.frame(thumb)               # one thumbnail per target
+                if buffered == 0:
                     ctx.log(f"{name}: no frame buffered — skipped")
                     skipped.append(name)
-                    continue
-                try:
-                    pose = rdk.camera_pose_T()         # uses the STORED tool offset
-                except Exception:
-                    pose = None
-                captured.append((name, pose))
-                ctx.frame(thumb)                       # live per-pose thumbnail strip
-                ctx.log(f"{name}: captured (buffered on Jetson)")
+                else:
+                    suffix = f" x{buffered}" if frames_per_pose > 1 else ""
+                    ctx.log(f"{name}: captured (buffered on Jetson{suffix})")
             ctx.progress(total, total, "downloading buffered frames…")
             ctx.log("transferring all buffered frames from the Jetson in one burst…")
             frames = bs.fetch_all()
@@ -1019,13 +1056,21 @@ class ScanCaptureJob:
         if len(frames) != len(captured):
             ctx.log(f"WARNING: Jetson returned {len(frames)} frame(s) but {len(captured)} "
                     f"were buffered — pairing the overlap (some views may be dropped)")
-        views: list[ScanView] = []
+        grouped: dict[str, dict] = {}
         for (name, pose), fr in zip(captured, frames):
-            if fr is None or fr.depth is None or pose is None:
+            if pose is None:
+                continue
+            g = grouped.setdefault(name, {"pose": pose, "frames": []})
+            if fr is not None and fr.depth is not None:
+                g["frames"].append(fr)
+        views: list[ScanView] = []
+        for name, g in grouped.items():
+            if not g["frames"]:
                 ctx.log(f"{name}: no depth/pose — skipped")
                 skipped.append(name)
                 continue
-            views.append(ScanView(color=fr.color, depth=fr.depth, pose_T=pose))
+            color, depth = _combine_depth_frames(g["frames"])
+            views.append(ScanView(color=color, depth=depth, pose_T=g["pose"]))
         ctx.log(f"burst transfer complete: {len(frames)} frame(s), {len(views)} usable")
         return views, skipped
 

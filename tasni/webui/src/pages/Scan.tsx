@@ -43,6 +43,7 @@ interface ScanResult {
   n_points: number;
   mesh_vertices: number;
   mesh_triangles: number;
+  quality?: { voxel_size_mm: number; surface_mesh_spacing_mm: number; frames_per_pose: number };
   stamp?: string;
   plane: Plane;
 }
@@ -695,6 +696,14 @@ export default function Scan() {
                   <div className="k">Fused</div>
                   <div className="v">{result.n_views} views · {result.n_points.toLocaleString()} points ·
                     {result.mesh_vertices.toLocaleString()} mesh verts</div>
+                  {result.quality && (
+                    <>
+                      <div className="k">Quality</div>
+                      <div className="v">{result.quality.voxel_size_mm.toFixed(1)} mm TSDF ·
+                        {result.quality.surface_mesh_spacing_mm.toFixed(1)} mm mesh grid ·
+                        {result.quality.frames_per_pose} frame{result.quality.frames_per_pose === 1 ? "" : "s"}/target</div>
+                    </>
+                  )}
                 </>
               )}
             </div>

@@ -138,8 +138,10 @@ def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
     cfg.camera.intrinsics = {"320x240": K.tolist()}
     cfg.camera.resolution = "320x240"
     cfg.scan.pose_count = 8
+    cfg.scan.flat_views = 8
     cfg.scan.cone_half_angle_deg = 30.0
     cfg.scan.voxel_size_m = 0.005
+    cfg.scan.frames_per_pose = 1
     services = SimpleNamespace(config=cfg, rdk=FakeRdk(), camera=FakeCamera(),
                                camera_lease=CameraLease(),
                                bus=SimpleNamespace(publish=lambda *a, **k: None),

@@ -413,12 +413,12 @@ class ScanConfig(_Model):
     survey_max_tilt_deg: float = 6.0     # survey squareness gate (tighter than max_tilt_deg)
     center_tol_mm: float = 30.0          # finite-platform centroid offset allowed
     edge_align_tol_deg: float = 5.0      # finite-platform edge yaw allowed
-    voxel_k: float = 0.008               # voxel_size_m = standoff_mm * voxel_k, clamped
-    voxel_min_m: float = 0.002           # finest voxel (small / close surfaces)
-    voxel_max_m: float = 0.006           # coarsest voxel
+    voxel_k: float = 0.004               # voxel_size_m = standoff_mm * voxel_k, clamped
+    voxel_min_m: float = 0.0015          # finest voxel (small / close surfaces)
+    voxel_max_m: float = 0.003           # coarsest voxel
     surface_type: str = "flat"           # "flat" | "raised" → cone/count preset
     flat_cone_deg: float = 18.0          # cone half-angle for flat surfaces
-    flat_views: int = 8                  # view count for flat surfaces
+    flat_views: int = 12                 # view count for flat surfaces
     raised_cone_deg: float = 38.0        # cone half-angle for raised objects
     raised_views: int = 13               # view count for raised objects
     min_surface_coverage: float = 0.85   # warn if the chosen views tile < this fraction
@@ -436,7 +436,7 @@ class ScanConfig(_Model):
 
     # -- capture ------------------------------------------------------------
     settle_s: float = 0.4               # pause after MoveJ before grabbing
-    frames_per_pose: int = 1            # depth frames per pose (1 = single grab)
+    frames_per_pose: int = 3            # depth frames per pose, median-fused before TSDF
     # Diagnostics: persist each pose's color + 16-bit depth + camera pose under
     # <run>/views/ so a camera-perspective coverage overlay can be built later.
     # Off by default (~tens of MB/run); enable for a coverage-debugging scan.
@@ -456,13 +456,13 @@ class ScanConfig(_Model):
     # -- TSDF fusion (Open3D ScalableTSDFVolume) ----------------------------
     # Per-view RGBD is integrated with the camera pose as extrinsic; the volume is
     # a 3D weighted average -> denoised mesh. voxel_size drives resolution/cost.
-    voxel_size_m: float = 0.004         # 4 mm TSDF voxel
-    sdf_trunc_m: float = 0.02           # truncation distance (~5 voxels)
+    voxel_size_m: float = 0.002         # 2 mm TSDF voxel fallback
+    sdf_trunc_m: float = 0.012          # truncation distance (~4-6 voxels)
     depth_scale: float = 1000.0         # RealSense depth units -> metres (uint16 mm)
     depth_min_m: float = 0.2            # ignore depth nearer than this
     depth_max_m: float = 1.5            # ignore depth farther than this (table standoff)
-    preview_max_points: int = 60000     # decimate the cloud before streaming to the viewer
-    surface_mesh_spacing_m: float = 0.005  # dense flat output mesh grid (5 mm)
+    preview_max_points: int = 200000    # decimate the cloud before streaming to the viewer
+    surface_mesh_spacing_m: float = 0.002  # dense flat output mesh grid (2 mm)
 
     # -- region of interest: isolate the work surface (the "top layer") ----
     # Without this, fusing every view captures the whole room and RANSAC locks
