@@ -67,6 +67,40 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "job": {"status": services.jobs.status, "running": services.jobs.running},
         }
 
+    @app.get("/api/rdk/status")
+    def rdk_status() -> dict:
+        """Current shared RoboDK session state without opening the station.
+
+        Module pages use this on mount so switching Calibration -> Scan keeps the
+        UI connected when the backend already has a live RoboDK handle.
+        """
+        c = services.config.robodk
+        if not services.session.is_open:
+            return {"connected": False, "ready": False, "robot": c.robot_name,
+                    "tool": c.camera_tool, "missing": [c.robot_name]}
+        try:
+            robot_ok = services.rdk.robot().Valid()
+            tool_ok = services.rdk.item_exists(c.camera_tool) if robot_ok else False
+            missing = [n for n, ok in (
+                (c.robot_name, robot_ok),
+                (f"tool {c.camera_tool!r}", tool_ok)) if not ok]
+            try:
+                link_ok, link_msg = services.rdk.robot_connected()
+            except Exception:
+                link_ok, link_msg = False, ""
+            params = services.rdk.robot_connection_params()
+            return {"connected": True, "ready": robot_ok and tool_ok,
+                    "robot": c.robot_name, "robot_valid": robot_ok,
+                    "tool": c.camera_tool, "tool_present": tool_ok,
+                    "missing": missing,
+                    "robot_link": {"connected": link_ok, "message": link_msg,
+                                   "ip": params.get("ip", ""),
+                                   "configured": bool(params.get("ip"))}}
+        except Exception as e:
+            return {"connected": False, "ready": False, "robot": c.robot_name,
+                    "tool": c.camera_tool, "missing": [c.robot_name],
+                    "error": str(e)}
+
     @app.get("/api/runs")
     def runs(limit: int = 20) -> dict:
         """Recent run-artifact folders across all modules, newest first."""

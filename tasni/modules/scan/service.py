@@ -37,8 +37,10 @@ from ...core.rdk_io import RdkIO
 from ..calibration.poses import (generate_calibration_poses, projected_corner_coverage,
                                   select_diverse, select_diverse_with_coverage,
                                   viewing_angle_span)
-from ..calibration.service import (_camera_hold, dry_tour_required,
-                                    ensure_camera_tool, ensure_real_robot_link)
+from ..calibration.service import (
+    BOARD_KEEPOUT_NAME as CALIB_BOARD_KEEPOUT_NAME,
+    TARGET_PREFIX as CALIB_TARGET_PREFIX,
+    _camera_hold, dry_tour_required, ensure_camera_tool, ensure_real_robot_link)
 from .depth_gate import ScanGateThresholds, evaluate_depth_gate
 from .plane import bounded_work_plane, work_plane_from_points
 from .planner import ScanPlan, plan_scan
@@ -580,6 +582,17 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
     prior = rdk.list_targets(prefix)
     if prior:
         rdk.delete_items(prior)
+    calib_prior = rdk.list_targets(CALIB_TARGET_PREFIX)
+    removed_calib_keepout = False
+    if calib_prior:
+        rdk.delete_items(calib_prior)
+    if rdk.item_exists(CALIB_BOARD_KEEPOUT_NAME):
+        rdk.delete_items([CALIB_BOARD_KEEPOUT_NAME])
+        removed_calib_keepout = True
+    if calib_prior or removed_calib_keepout:
+        pub(f"cleared {len(calib_prior)} calibration target(s)"
+            + (" and board keep-out" if removed_calib_keepout else "")
+            + " before creating scan targets")
 
     candidates = generate_calibration_poses(
         seed_T, count=target_count, look_distance_mm=look,

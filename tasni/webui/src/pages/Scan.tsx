@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { moduleApi } from "../api/client";
+import { apiGet, moduleApi } from "../api/client";
 import { useEvents, type JobEvent } from "../api/events";
 import AimHud, { type GateReading } from "./AimHud";
 import { robotLinkNote } from "./Calibration";
@@ -52,6 +52,13 @@ interface TourResult {
   collisions: number; transit_collisions?: number; collisions_checked: boolean;
   returned_to_start: boolean; all_ok: boolean; poses: TourPose[];
 }
+interface RdkStatus {
+  connected: boolean;
+  ready: boolean;
+  tool: string;
+  missing: string[];
+  robot_link?: { connected: boolean; message: string; ip: string; configured: boolean } | null;
+}
 
 export default function Scan() {
   const { subscribe } = useEvents();
@@ -68,6 +75,7 @@ export default function Scan() {
   const [runError, setRunError] = useState<string | null>(null);
 
   const [live, setLive] = useState(false);
+  const liveRef = useRef(false);
   const [gate, setGate] = useState<GateReading | null>(null);
   // Coverage accumulation: each live frame the RealSense reports a slightly
   // different set of valid-depth points (stereo dropouts at edges/low texture), so
@@ -126,6 +134,17 @@ export default function Scan() {
       setTargets(n > 0 ? n : null);
     } catch { /* RoboDK not ready */ }
   }, []);
+  const hydrateConnection = useCallback(async () => {
+    try {
+      const r = await apiGet<RdkStatus>("/api/rdk/status");
+      if (r.ready) {
+        setConn("ready");
+        setConnInfo(`Ready — robot and the '${r.tool}' camera tool are present.`
+          + robotLinkNote(r.robot_link));
+        refreshTargets(); refreshJob();
+      }
+    } catch { /* status hydration is opportunistic */ }
+  }, [refreshTargets, refreshJob]);
   const checkCollision = useCallback(async () => {
     setCollisionBusy(true);
     try {
@@ -140,8 +159,13 @@ export default function Scan() {
     addLog(`ignored collision pair: ${pair}`);
   }, []);
 
-  useEffect(() => { loadConfig(); refreshJob(); }, [loadConfig, refreshJob]);
-  useEffect(() => () => { api.post("/live/stop").catch(() => {}); }, []);
+  useEffect(() => { loadConfig(); refreshJob(); hydrateConnection(); },
+            [loadConfig, refreshJob, hydrateConnection]);
+  useEffect(() => { liveRef.current = live; }, [live]);
+  useEffect(() => () => {
+    if (liveRef.current) sessionStorage.setItem("tasni:autoStartCamera", "calibration");
+    api.post("/live/stop").catch(() => {});
+  }, []);
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [logs]);
@@ -301,6 +325,12 @@ export default function Scan() {
       addLog("camera started — jog until the surface guidance is stable, then lock it.");
     } catch (e: any) { setLive(false); addLog("live: " + e.message, true); }
   };
+  useEffect(() => {
+    if (!ready || live || running) return;
+    if (sessionStorage.getItem("tasni:autoStartCamera") !== "scan") return;
+    sessionStorage.removeItem("tasni:autoStartCamera");
+    startLive();
+  }, [ready, live, running]);
   const stopLive = async () => {
     try { await api.post("/live/stop"); } catch { /* ignore */ }
     setLive(false); resetStream(); resetCoverage();

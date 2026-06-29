@@ -45,6 +45,16 @@ class RdkSession:
         self._rdk: "Robolink | None" = None
 
     @property
+    def is_open(self) -> bool:
+        """True once this process has an attached RoboDK handle.
+
+        This is intentionally only local state: checking it must not trigger the
+        heavy station load. The UI uses it to preserve "connected" state when
+        switching modules inside the same Tasni server process.
+        """
+        return self._rdk is not None
+
+    @property
     def rdk(self) -> "Robolink":
         """The live ``Robolink`` handle, connecting (and loading the station on
         first access)."""

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { moduleApi } from "../api/client";
+import { apiGet, moduleApi } from "../api/client";
 import { useEvents, type JobEvent } from "../api/events";
 import AimHud, { type GateReading } from "./AimHud";
 import CalibrationGuide from "./CalibrationGuide";
@@ -79,6 +79,13 @@ interface TourResult {
   all_ok: boolean;
   poses: TourPose[];
 }
+interface RdkStatus {
+  connected: boolean;
+  ready: boolean;
+  tool: string;
+  missing: string[];
+  robot_link?: { connected: boolean; message: string; ip: string; configured: boolean } | null;
+}
 
 const band = (px: number) => (px < 1 ? "good" : px < 3 ? "warn" : "bad");
 
@@ -104,6 +111,7 @@ export default function Calibration() {
   const [runError, setRunError] = useState<string | null>(null);
 
   const [live, setLive] = useState(false);
+  const liveRef = useRef(false);
   const [gate, setGate] = useState<GateReading | null>(null);
   const { mark: markFrame, reset: resetStream, stat: streamStat } = useStreamStats();
   const [targets, setTargets] = useState<number | null>(null);   // null = none created
@@ -160,6 +168,18 @@ export default function Calibration() {
     } catch { /* RoboDK not ready — leave targets unknown */ }
   }, []);
 
+  const hydrateConnection = useCallback(async () => {
+    try {
+      const r = await apiGet<RdkStatus>("/api/rdk/status");
+      if (r.ready) {
+        setConn("ready");
+        setConnInfo(`Ready — robot and the '${r.tool}' camera tool are present.`
+          + robotLinkNote(r.robot_link));
+        refreshTargets(); refreshJob();
+      }
+    } catch { /* status hydration is opportunistic */ }
+  }, [refreshTargets, refreshJob]);
+
   // Ask RoboDK whether it's actually evaluating collisions (current pose, no
   // motion). Safe to call any time a connection is expected.
   const checkCollision = useCallback(async () => {
@@ -176,10 +196,15 @@ export default function Calibration() {
     addLog(`ignored collision pair: ${pair}`);
   }, []);
 
-  useEffect(() => { loadConfig(); refreshJob(); }, [loadConfig, refreshJob]);
+  useEffect(() => { loadConfig(); refreshJob(); hydrateConnection(); },
+            [loadConfig, refreshJob, hydrateConnection]);
 
   // Stop the live gate if we leave the page (frees the unicast camera).
-  useEffect(() => () => { api.post("/live/stop").catch(() => {}); }, []);
+  useEffect(() => { liveRef.current = live; }, [live]);
+  useEffect(() => () => {
+    if (liveRef.current) sessionStorage.setItem("tasni:autoStartCamera", "scan");
+    api.post("/live/stop").catch(() => {});
+  }, []);
 
   const connect = useCallback(async () => {
     setConn("connecting");
@@ -264,6 +289,12 @@ export default function Calibration() {
       addLog("live: " + e.message, true);
     }
   };
+  useEffect(() => {
+    if (!ready || live || running) return;
+    if (sessionStorage.getItem("tasni:autoStartCamera") !== "calibration") return;
+    sessionStorage.removeItem("tasni:autoStartCamera");
+    startLive();
+  }, [ready, live, running]);
   const stopLive = async () => {
     try { await api.post("/live/stop"); } catch { /* ignore */ }
     setLive(false);
