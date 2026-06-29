@@ -5,6 +5,7 @@ import AimHud, { type GateReading } from "./AimHud";
 import CalibrationGuide from "./CalibrationGuide";
 import ConeDiagram from "./ConeDiagram";
 import StreamStats, { useStreamStats } from "./StreamStats";
+import CollisionPanel, { type CollisionStatus } from "../components/CollisionPanel";
 
 const api = moduleApi("calibration");
 const TARGET_PREFIX = "TasniCalib_";   // must match service.py TARGET_PREFIX
@@ -111,9 +112,9 @@ export default function Calibration() {
   // means RoboDK has no effective collision map, so Create targets can't filter
   // colliding poses. guarded_tools lists the flange tools now force-checked
   // against the arm (RoboDK omits those pairs by default). null = not checked yet.
-  const [collision, setCollision] = useState<
-    { available: boolean; count: number | null; guarded_tools?: string[]; guarded_pairs?: number } | null>(null);
+  const [collision, setCollision] = useState<CollisionStatus | null>(null);
   const [collisionBusy, setCollisionBusy] = useState(false);
+  const [recentCollisionPairs, setRecentCollisionPairs] = useState<string[]>([]);
   const logRef = useRef<HTMLDivElement>(null);
   // Phase 2 — safety & operator trust.
   const [tour, setTour] = useState<TourResult | null>(null);     // last dry-run verdict
@@ -164,11 +165,15 @@ export default function Calibration() {
   const checkCollision = useCallback(async () => {
     setCollisionBusy(true);
     try {
-      const r = await api.get<{ available: boolean; count: number | null;
-        guarded_tools?: string[]; guarded_pairs?: number }>("/collision/status");
+      const r = await api.get<CollisionStatus>("/collision/status");
       setCollision(r);
     } catch { setCollision(null); }
     finally { setCollisionBusy(false); }
+  }, []);
+  const ignoreCollisionPair = useCallback(async (pair: string) => {
+    const r = await api.post<CollisionStatus>("/collision/ignore", { pair });
+    setCollision(r);
+    addLog(`ignored collision pair: ${pair}`);
   }, []);
 
   useEffect(() => { loadConfig(); refreshJob(); }, [loadConfig, refreshJob]);
@@ -277,10 +282,12 @@ export default function Calibration() {
         visibility_checked?: boolean; poses_offframe_dropped?: number;
         predicted_intrinsics_coverage_pct?: number;
         camera_tool_offset_mm?: number; targets_cartesian?: number;
-        collision_guard?: { tools: string[]; pairs_enabled: number } | null }>("/poses/generate");
+        collision_guard?: { tools: string[]; pairs_enabled: number } | null;
+        collision_pairs?: string[] }>("/poses/generate");
       setTargets(r.created);
       setTour(null);    // a fresh target set invalidates any prior dry-run verdict
       setLive(false);   // generate stops the live gate server-side
+      setRecentCollisionPairs(r.collision_pairs ?? []);
       checkCollision(); // re-probe the chip (generation disables checking again afterwards)
       const dropped = r.collision_filter_bypassed
         ? ` (RoboDK reported ${r.candidates_collided ?? 0} colliding pose${(r.candidates_collided ?? 0) === 1 ? "" : "s"}; filter bypassed for calibration)`
@@ -476,27 +483,10 @@ export default function Calibration() {
           );
         })()}
 
-        {/* Collision-map readiness: Create targets can only filter colliding poses
-            (the spindle hitting the arm) when RoboDK is evaluating a collision map. */}
-        <div className={"collision-chip " + (collision == null ? "unknown"
-            : collision.available ? "ok" : "bad")}>
-          {collision == null ? (
-            <span>Collision check: <b>unknown</b> — connect, or recheck.</span>
-          ) : collision.available ? (
-            <span>✓ Collision checking <b>active</b> — colliding poses are filtered when you Create targets.
-              {collision.guarded_tools && collision.guarded_tools.length
-                ? ` Guarding ${collision.guarded_tools.join(", ")} against the arm.`
-                : ""}
-              {collision.count ? ` (current pose: ${collision.count} colliding pair${collision.count === 1 ? "" : "s"})` : ""}</span>
-          ) : (
-            <span>⚠ <b>No collision map detected</b> — Create targets cannot filter colliding poses.
-              Set it up in RoboDK (<b>Tools → Collision Map</b>), enable the spindle↔arm pairs, and save the station.</span>
-          )}
-          <button className="secondary" onClick={checkCollision}
-                  disabled={collisionBusy || !ready} style={{ marginLeft: "auto" }}>
-            {collisionBusy ? "Checking…" : "Recheck"}
-          </button>
-        </div>
+        <CollisionPanel ready={ready} busy={collisionBusy} status={collision}
+                        onRecheck={checkCollision}
+                        onIgnore={ignoreCollisionPair}
+                        recentPairs={recentCollisionPairs} />
 
         <div className="btn-row">
           {!live

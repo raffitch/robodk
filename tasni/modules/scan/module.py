@@ -28,6 +28,10 @@ class InsertBody(BaseModel):
     run_id: str | None = None
 
 
+class CollisionIgnoreBody(BaseModel):
+    pair: str
+
+
 class ScanModule(WorkflowModule):
     id = "scan"
     title = "Scan"
@@ -115,7 +119,27 @@ class ScanModule(WorkflowModule):
             try:
                 return services.rdk.collision_status(
                     ensure_pairs=sc.collision_self_pairs,
-                    skip_trailing=sc.collision_skip_wrist_links)
+                    skip_trailing=sc.collision_skip_wrist_links,
+                    ignore_pairs=sc.collision_ignore_pairs)
+            except Exception as e:
+                raise HTTPException(503, f"RoboDK unavailable: {e}")
+
+        @router.post("/collision/ignore")
+        def collision_ignore(body: CollisionIgnoreBody) -> dict:
+            pair = body.pair.strip()
+            if not pair or "↔" not in pair:
+                raise HTTPException(400, "invalid collision pair")
+            sc = services.config.scan
+            if pair not in sc.collision_ignore_pairs:
+                sc.collision_ignore_pairs.append(pair)
+                from ...core.config import save_overrides
+                save_overrides({"scan": {
+                    "collision_ignore_pairs": sc.collision_ignore_pairs}})
+            try:
+                return services.rdk.collision_status(
+                    ensure_pairs=sc.collision_self_pairs,
+                    skip_trailing=sc.collision_skip_wrist_links,
+                    ignore_pairs=sc.collision_ignore_pairs)
             except Exception as e:
                 raise HTTPException(503, f"RoboDK unavailable: {e}")
 

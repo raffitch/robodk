@@ -299,6 +299,11 @@ class CalibrationConfig(_Model):
     # Station objects excluded from calibration collision checking. WallAll is a
     # visual envelope in this cell, not a physical obstacle the robot can hit.
     collision_ignore_objects: list[str] = ["WallAll"]
+    # Exact collision pairs the operator has marked as modelling artifacts from the
+    # Tasni UI. Format matches RdkIO.collision_pairs(), e.g.
+    # "WallAll ↔ KUKA KR150 R2700:L2". These are disabled after RoboDK rebuilds the
+    # collision map, so Recheck/Create targets do not require closing the app.
+    collision_ignore_pairs: list[str] = []
     # Baseline-relative screening: a real cell reports many CONSTANT collisions even
     # at the safe pose the operator aimed from — the robot base overlapping a
     # pedestal, each flange tool touching the wrist it is bolted to, a parked
@@ -481,6 +486,7 @@ class ScanConfig(_Model):
 
     # -- collision guard + dry tour (same semantics as calibration) --------
     collision_filter: bool = True
+    collision_ignore_pairs: list[str] = []
     # Same soft default as calibration: if RoboDK's collision map reports so many
     # collisions that target creation would fail (common with stale/oversized wall
     # or fixture geometry), keep the reachable targets and make the operator inspect

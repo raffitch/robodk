@@ -609,10 +609,14 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
     n_collide = 0
     col_checked = False
     collision_filter_bypassed = False
+    pair_examples: list[str] = []
     reach_joints: list = [None] * n_reach
     if scfg.collision_filter:
-        mask, col_checked, jts = rdk.screen_collisions([T for _, T in reachable],
-                                                       guard_skip=guard_skip)
+        mask, col_checked, jts, col_details = rdk.screen_collisions(
+            [T for _, T in reachable],
+            guard_skip=guard_skip,
+            ignore_pairs=scfg.collision_ignore_pairs,
+            return_details=True)
         kept = [k for k in range(n_reach) if mask[k]]
         if col_checked:
             n_collide = n_reach - len(kept)
@@ -621,6 +625,20 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
         services.bus.publish(JobEvent("log", {"message":
             f"collision screen: {'ACTIVE' if col_checked else 'unavailable'}; swept "
             f"{n_reach} reachable pose(s), {n_collide} collided and were dropped"}))
+        if col_checked and n_collide:
+            for d in col_details.get("poses", []):
+                if d.get("collides") and d.get("pairs"):
+                    for p in d["pairs"]:
+                        if p not in pair_examples:
+                            pair_examples.append(p)
+                        if len(pair_examples) >= 8:
+                            break
+                if len(pair_examples) >= 8:
+                    break
+            if pair_examples:
+                services.bus.publish(JobEvent("log", {"message":
+                    "collision pairs causing dropped scan targets: "
+                    + "; ".join(pair_examples)}))
         if col_checked and len(reachable) < SCAN_MIN_VIEWS:
             if scfg.collision_filter_hard_fail:
                 raise RuntimeError(
@@ -701,6 +719,7 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
             "gate": gate_payload, "candidates_reachable": n_reach,
             "candidates_total": len(candidates), "collisions_checked": col_checked,
             "candidates_collided": n_collide, "effective_cone_deg": round(eff_max, 1),
+            "collision_pairs": pair_examples,
             "surface_coverage": (round(surface_coverage, 3)
                                  if surface_coverage is not None else None),
             "planned_cone_deg": target_cone_deg, "planned_views": target_count,

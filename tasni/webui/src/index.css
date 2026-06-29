@@ -73,6 +73,7 @@ select, input { background: var(--panel-2); border: 1px solid var(--border); col
 button { background: var(--accent); color: #fff; border: 0; border-radius: 6px;
   padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
 button.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+button.mini { padding: 4px 8px; font-size: 11px; border-radius: 6px; }
 button:disabled { opacity: .45; cursor: not-allowed; }
 .btn-row { display: flex; gap: 10px; margin-top: 12px; }
 
@@ -230,14 +231,19 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .tour-bad { margin-top: 4px; color: var(--warn); font-family: var(--mono); font-size: 12px; }
 
 /* collision-map readiness chip (gates the Create-targets collision filter) */
-.collision-chip { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px;
+.collision-chip { display: flex; align-items: flex-start; gap: 10px; margin: 10px 0 4px;
   border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;
   font-size: 13px; line-height: 1.45; }
-.collision-chip > span { flex: 1; }
+.collision-main { flex: 1; min-width: 0; }
 .collision-chip.ok { border-left: 3px solid var(--ok); background: rgba(63,185,80,.07); }
 .collision-chip.bad { border-left: 3px solid var(--warn); background: rgba(210,153,34,.07); }
 .collision-chip.unknown { border-left: 3px solid var(--border); color: var(--muted); }
 .collision-chip button { white-space: nowrap; }
+.collision-pairs { display: grid; gap: 6px; margin-top: 8px; }
+.collision-pair { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.collision-pair code { max-width: min(620px, 100%); overflow-wrap: anywhere; white-space: normal; }
+.ignored-tag { color: var(--ok); border: 1px solid rgba(63,185,80,.35);
+  border-radius: 999px; padding: 2px 7px; font-size: 11px; font-weight: 700; }
 
 /* live per-pose board-lock thumbnails during a run */
 .thumb-strip { display: flex; gap: 6px; overflow-x: auto; padding: 8px 0 2px; }

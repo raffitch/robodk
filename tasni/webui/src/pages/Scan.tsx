@@ -3,6 +3,7 @@ import { moduleApi } from "../api/client";
 import { useEvents, type JobEvent } from "../api/events";
 import AimHud, { type GateReading } from "./AimHud";
 import { robotLinkNote } from "./Calibration";
+import CollisionPanel, { type CollisionStatus } from "../components/CollisionPanel";
 import ScanViewer from "./ScanViewer";
 import StreamStats, { useStreamStats } from "./StreamStats";
 
@@ -89,6 +90,9 @@ export default function Scan() {
   const [scanMode, setScanMode] = useState<"quality" | "reference" | null>(null);
   const [generating, setGenerating] = useState(false);
   const [thumbs, setThumbs] = useState<string[]>([]);   // per-pose captures during a run
+  const [collision, setCollision] = useState<CollisionStatus | null>(null);
+  const [collisionBusy, setCollisionBusy] = useState(false);
+  const [recentCollisionPairs, setRecentCollisionPairs] = useState<string[]>([]);
 
   const [result, setResult] = useState<ScanResult | null>(null);
   const [viewerNonce, setViewerNonce] = useState(0);
@@ -121,6 +125,19 @@ export default function Scan() {
       const n = r.targets.filter((t) => t.startsWith(TARGET_PREFIX)).length;
       setTargets(n > 0 ? n : null);
     } catch { /* RoboDK not ready */ }
+  }, []);
+  const checkCollision = useCallback(async () => {
+    setCollisionBusy(true);
+    try {
+      const r = await api.get<CollisionStatus>("/collision/status");
+      setCollision(r);
+    } catch { setCollision(null); }
+    finally { setCollisionBusy(false); }
+  }, []);
+  const ignoreCollisionPair = useCallback(async (pair: string) => {
+    const r = await api.post<CollisionStatus>("/collision/ignore", { pair });
+    setCollision(r);
+    addLog(`ignored collision pair: ${pair}`);
   }, []);
 
   useEffect(() => { loadConfig(); refreshJob(); }, [loadConfig, refreshJob]);
@@ -332,6 +349,7 @@ export default function Scan() {
         candidates_collided?: number;
         collisions_checked?: boolean;
         collision_filter_bypassed?: boolean;
+        collision_pairs?: string[];
         can_insert?: boolean;
       }>("/poses/generate");
       const mode = (r.mode ?? "quality") as "quality" | "reference";
@@ -339,6 +357,8 @@ export default function Scan() {
       setSurfaceLocked(false);
       setTargets(r.created > 0 ? r.created : null);
       setTour(null);
+      setRecentCollisionPairs(r.collision_pairs ?? []);
+      checkCollision();
 
       if (mode === "reference") {
         const extTxt = r.extent_mm
@@ -512,6 +532,11 @@ export default function Scan() {
             : surfaceStable ? "Surface ready" : gate?.ok ? "Hold position…" : "Position surface"}</span>
           <span>{surfaceDescription}</span>
         </div>
+
+        <CollisionPanel ready={ready} busy={collisionBusy} status={collision}
+                        onRecheck={checkCollision}
+                        onIgnore={ignoreCollisionPair}
+                        recentPairs={recentCollisionPairs} />
 
         <div className="btn-row">
           {!live && !surfaceLocked

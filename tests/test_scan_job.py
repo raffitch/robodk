@@ -87,8 +87,11 @@ def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
         def current_joints(self): return "HOME"
         def move_j_joints(self, j): state["cam"] = seed_T
         def is_reachable(self, T): return True
-        def screen_collisions(self, poses, *, guard_skip=None):
-            return [True] * len(poses), False, [None] * len(poses)
+        def screen_collisions(self, poses, *, guard_skip=None, **kw):
+            out = [True] * len(poses), False, [None] * len(poses)
+            if kw.get("return_details"):
+                return (*out, {"poses": []})
+            return out
         def solve_joints_for_pose(self, T, seed=None):
             return ("joints", float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
         def ensure_mounted_tool_collision_pairs(self, skip_trailing=2):
@@ -365,8 +368,11 @@ def test_scan_collision_filter_bypasses_noisy_wall_map_by_default():
     """
     services, _state = _build_fakes()
 
-    def all_collide(poses, *, guard_skip=None):
-        return [False] * len(poses), True, [None] * len(poses)
+    def all_collide(poses, *, guard_skip=None, **kw):
+        out = [False] * len(poses), True, [None] * len(poses)
+        if kw.get("return_details"):
+            return (*out, {"poses": []})
+        return out
 
     services.rdk.screen_collisions = all_collide
     gen = scan_service.generate_scan_targets(services)
@@ -381,8 +387,11 @@ def test_scan_collision_filter_hard_fail_can_still_refuse():
     services, _state = _build_fakes()
     services.config.scan.collision_filter_hard_fail = True
 
-    def all_collide(poses, *, guard_skip=None):
-        return [False] * len(poses), True, [None] * len(poses)
+    def all_collide(poses, *, guard_skip=None, **kw):
+        out = [False] * len(poses), True, [None] * len(poses)
+        if kw.get("return_details"):
+            return (*out, {"poses": []})
+        return out
 
     services.rdk.screen_collisions = all_collide
     try:

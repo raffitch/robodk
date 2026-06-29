@@ -566,6 +566,68 @@ class RdkIO:
         return {"objects": [ob.Name() for ob in objects],
                 "pairs_disabled": disabled, "pairs_failed": failed}
 
+    @staticmethod
+    def _parse_pair_endpoint(text: str) -> tuple[str, int]:
+        """Parse ``Name[:Lid]`` as displayed by :meth:`collision_pairs`."""
+        s = str(text).strip()
+        if ":L" in s:
+            name, lid = s.rsplit(":L", 1)
+            try:
+                return name.strip(), int(lid)
+            except ValueError:
+                return s, 0
+        return s, 0
+
+    def _item_by_name_any_type(self, name: str):
+        """Best-effort RoboDK item lookup by name, independent of item type."""
+        try:
+            return self.rdk.Item(name)
+        except Exception:
+            return None
+
+    def disable_collision_pair_strings(self, pairs: list[str] | None) -> dict:
+        """Disable exact pair strings such as ``A:L1 ↔ B``.
+
+        These strings are what the UI shows from RoboDK's current collision report.
+        Applying them after collision checking is enabled lets an operator suppress
+        station-model false positives without opening RoboDK's Collision Map.
+        """
+        import robolink
+
+        disabled = failed = 0
+        applied: list[str] = []
+        for pair in pairs or []:
+            text = str(pair).strip()
+            if not text or "↔" not in text:
+                continue
+            left, right = [p.strip() for p in text.split("↔", 1)]
+            n1, id1 = self._parse_pair_endpoint(left)
+            n2, id2 = self._parse_pair_endpoint(right)
+            it1, it2 = self._item_by_name_any_type(n1), self._item_by_name_any_type(n2)
+            try:
+                if it1 is None or it2 is None or not it1.Valid() or not it2.Valid():
+                    failed += 1
+                    continue
+            except Exception:
+                failed += 1
+                continue
+            ok = False
+            # Try both orders. RoboDK usually accepts either, but this makes link IDs
+            # robust when the pair was reported opposite to our lookup order.
+            for a, b, aid, bid in ((it1, it2, id1, id2), (it2, it1, id2, id1)):
+                try:
+                    r = self.rdk.setCollisionActivePair(
+                        robolink.COLLISION_OFF, a, b, aid, bid)
+                    ok = ok or int(r) == 1
+                except Exception:
+                    pass
+            if ok:
+                disabled += 1
+                applied.append(text)
+            else:
+                failed += 1
+        return {"pairs": applied, "pairs_disabled": disabled, "pairs_failed": failed}
+
     # Joint step (deg) MoveJ_Test interpolates at while checking the approach — fine
     # enough to catch a thin self-collision, coarse enough to stay quick on the big
     # station. The destination config is always checked regardless of this.
@@ -624,7 +686,7 @@ class RdkIO:
         new = keys - (baseline or set())
         return bool(new), self._format_pair_keys(new)
 
-    def path_new_collisions(self, j1, j2, baseline, samples: int = 6):
+    def path_new_collision_details(self, j1, j2, baseline, samples: int = 6):
         """Does interpolating the joint move ``j1 -> j2`` introduce a colliding pair
         not present in ``baseline``? Samples the path (endpoints + interior points),
         reading the canonical pair-set at each. Returns ``True`` (a new collision
@@ -640,7 +702,7 @@ class RdkIO:
         try:
             b = np.asarray(j2.list(), dtype=float).ravel()
         except Exception:
-            return None
+            return None, []
         a = None
         if j1 is not None:
             try:
@@ -658,19 +720,27 @@ class RdkIO:
             try:
                 robot.setJoints(robomath.Mat([float(x) for x in cfg]))
             except Exception:
-                return None
+                return None, []
             keys = self.collision_pair_keys()
             if keys is None:
-                return None
-            if keys - base:
-                return True
-        return False
+                return None, []
+            new = keys - base
+            if new:
+                return True, self._format_pair_keys(new)
+        return False, []
+
+    def path_new_collisions(self, j1, j2, baseline, samples: int = 6):
+        """Backward-compatible bool-only wrapper for swept new-collision checks."""
+        collides, _pairs = self.path_new_collision_details(j1, j2, baseline, samples)
+        return collides
 
     def screen_collisions(self, poses: list[np.ndarray], *,
                           guard_skip: int | None = None, obstacle_pairs: bool = False,
                           ignore_objects: list[str] | None = None,
-                          baseline_relative: bool = True, path_samples: int = 6
-                          ) -> tuple[list[bool], bool, list]:
+                          ignore_pairs: list[str] | None = None,
+                          baseline_relative: bool = True, path_samples: int = 6,
+                          return_details: bool = False
+                          ):
         """Test each TCP pose for collisions **in simulation** and record the exact
         joint configuration used.
 
@@ -719,6 +789,8 @@ class RdkIO:
             self.ensure_obstacle_collision_pairs(ignore_objects)
         if on and ignore_objects:
             self.disable_object_collision_pairs(ignore_objects)
+        ignored_pairs = (self.disable_collision_pair_strings(ignore_pairs)
+                         if on and ignore_pairs else None)
         # Record the baseline collision pair-set at the SAFE seed config (the pose the
         # operator aimed from), so the constant modelling artifacts are subtracted out.
         baseline = set()
@@ -731,10 +803,12 @@ class RdkIO:
             baseline = bk if bk is not None else set()
         mask: list[bool] = []
         joints: list = []
+        details: list[dict] = []
         try:
-            for T in poses:
+            for idx, T in enumerate(poses):
                 sol = None
                 collides: bool | None = None
+                pairs: list[str] = []
                 try:
                     # Anchor every solve to the seed config so the chosen IK branch is
                     # deterministic, and pass the camera tool EXPLICITLY so the joints
@@ -744,7 +818,7 @@ class RdkIO:
                     sol = self._ik_to_joints(ik, seed_joints)
                     if sol is not None and on:
                         if baseline_relative:
-                            collides = self.path_new_collisions(
+                            collides, pairs = self.path_new_collision_details(
                                 seed_joints, sol, baseline, path_samples)
                         else:
                             j1 = seed_joints if seed_joints is not None else sol
@@ -752,10 +826,17 @@ class RdkIO:
                             collides = int(ncol) > 0
                             if not collides:
                                 collides = bool(self.collisions())
+                            if collides:
+                                pairs = self.collision_pairs(limit=20)
                 except Exception:
                     sol, collides = sol, None
                 joints.append(sol)
                 mask.append(True if collides is None else not collides)
+                details.append({
+                    "index": idx,
+                    "collides": collides,
+                    "pairs": pairs,
+                })
         finally:
             if seed_joints is not None:
                 try:
@@ -764,11 +845,18 @@ class RdkIO:
                     pass
             self.set_run_mode_raw(prior_mode)
             self.set_collision_checking(False)   # don't leave the station heavy
+        if return_details:
+            return mask, on, joints, {
+                "baseline_pairs": self._format_pair_keys(baseline),
+                "ignored_pairs": ignored_pairs or {"pairs": [], "pairs_disabled": 0, "pairs_failed": 0},
+                "poses": details,
+            }
         return mask, on, joints
 
     def collision_status(self, *, ensure_pairs: bool = False,
                          skip_trailing: int = 2,
-                         ignore_objects: list[str] | None = None) -> dict:
+                         ignore_objects: list[str] | None = None,
+                         ignore_pairs: list[str] | None = None) -> dict:
         """Best-effort snapshot of RoboDK collision checking at the **current** pose
         — no motion. Briefly enables checking to force a recompute, reads the count,
         then **disables it again** (so it doesn't slow every later call). Returns
@@ -786,8 +874,10 @@ class RdkIO:
                  if on and ensure_pairs else None)
         ignored = (self.disable_object_collision_pairs(ignore_objects)
                    if on and ignore_objects else None)
+        ignored_pairs = (self.disable_collision_pair_strings(ignore_pairs)
+                         if on and ignore_pairs else None)
         n = self.collisions() if on else None
-        pairs = self.collision_pairs() if n else []
+        pairs = self.collision_pairs(limit=50) if n else []
         self.set_collision_checking(False)
         out = {"available": n is not None, "count": n}
         if pairs:
@@ -797,6 +887,9 @@ class RdkIO:
             out["guarded_pairs"] = guard["pairs_enabled"]
         if ignored is not None:
             out["ignored_objects"] = ignored["objects"]
+        if ignored_pairs is not None:
+            out["ignored_pairs"] = ignored_pairs["pairs"]
+            out["ignored_pair_count"] = ignored_pairs["pairs_disabled"]
         return out
 
     def collisions(self) -> int | None:
