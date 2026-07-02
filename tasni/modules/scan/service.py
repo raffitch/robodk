@@ -792,14 +792,28 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg,
     """
     if not current or current.get("live") is not True:
         return current
+    static_frames = 0
     if (robot_static and previous is not None
             and previous.get("detected") and current.get("detected")
             and previous.get("live") is True
             and not _vision_says_moved(current, previous, scfg)):
-        # The robot is parked and both frames see the surface: hold, don't chase.
-        return _hold_scan_payload(current, previous)
+        # Robot parked with the surface in view. Do NOT freeze the FIRST static frame:
+        # right after a move the plane/rectangle fit is often half-settled, and hard-
+        # locking it gives the "never frames the object properly" snapshot. Instead let
+        # a few projected frames settle (the smoothing path below averages the rectangle
+        # corners/tilt across them), THEN hard-hold — enough frames to build a good
+        # rectangle, and rock-steady once locked.
+        static_frames = int(previous.get("static_frames", 0)) + 1
+        settle = max(1, int(getattr(scfg, "live_hold_settle_frames", 5)))
+        if static_frames >= settle:
+            out = _hold_scan_payload(current, previous)
+            out["static_frames"] = static_frames
+            return out
+        # else: fall through to smoothing to keep settling; counter carried below.
     if previous is None or _should_reset_live_smoothing(previous, current, scfg):
-        return current
+        res = dict(current)
+        res["static_frames"] = static_frames
+        return res
 
     out = dict(current)
     rect_consistent = _rectangles_consistent(previous, current, scfg)
@@ -896,6 +910,8 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg,
     out["gates"] = gates
     out["ok"] = all(bool(v) for v in ok_gates.values())
     out["stabilized"] = True
+    # Carry the settle counter so the hold engages after N consecutive static frames.
+    out["static_frames"] = static_frames
     return out
 
 

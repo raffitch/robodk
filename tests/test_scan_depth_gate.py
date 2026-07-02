@@ -383,17 +383,29 @@ def _jittery_pair(cfg):
     return prev, noisy
 
 
-def test_pose_hold_freezes_all_axes_when_robot_static():
+def test_pose_hold_settles_then_freezes_all_axes():
     cfg = ScanConfig()
     prev, noisy = _jittery_pair(cfg)
-    held = stabilize_live_scan_payload(noisy, prev, cfg, robot_static=True)
-    assert held.get("held") is True, held
-    # Every pose-derived readout is pinned to the previous reading — zero jitter.
+    settle = int(cfg.live_hold_settle_frames)
+    cur, held, unheld = prev, None, 0
+    for _ in range(settle + 3):
+        out = stabilize_live_scan_payload(noisy, cur, cfg, robot_static=True)
+        if out.get("held"):
+            held = out
+            break
+        unheld += 1
+        cur = out
+    # A few projected frames settle first (building the rectangle) before locking.
+    assert unheld >= 1, "should settle at least one frame before locking"
+    assert held is not None and held.get("held") is True, held
+    # Once locked, another static frame changes nothing — zero jitter on every axis.
+    frozen = stabilize_live_scan_payload(noisy, held, cfg, robot_static=True)
+    assert frozen.get("held") is True, frozen
     for key in ("distance_mm", "tilt_deg", "tilt_b_deg", "tilt_c_deg",
                 "yaw_a_deg", "move_cam", "outline_uv", "extent_mm",
                 "rectangle_size_mm", "gates", "ok"):
-        assert held[key] == prev[key], (key, held[key], prev[key])
-    print("[pose hold] parked robot -> X/Y/Z + A/B/C held rock-steady")
+        assert frozen[key] == held[key], (key, frozen[key], held[key])
+    print("[pose hold] settles a few frames, then locks rock-steady on all axes")
 
 
 def test_pose_hold_releases_and_tracks_when_robot_moves():
@@ -463,7 +475,7 @@ if __name__ == "__main__":
     test_framed_rectangle_center_is_advisory_for_readiness()
     test_stable_rectangle_latches_center_jitter()
     test_live_scan_near_square_skips_edge_gate()
-    test_pose_hold_freezes_all_axes_when_robot_static()
+    test_pose_hold_settles_then_freezes_all_axes()
     test_pose_hold_releases_and_tracks_when_robot_moves()
     test_pose_hold_vision_escape_releases_on_real_dolly()
     test_camera_pose_moved_tolerances()
