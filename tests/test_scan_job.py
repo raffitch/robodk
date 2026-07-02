@@ -150,6 +150,11 @@ def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
     return services, state
 
 
+def _expected_framed_views(services) -> int:
+    scfg = services.config.scan
+    return max(int(scfg.pose_count), int(scfg.flat_views)) + int(scfg.boundary_views)
+
+
 def test_generate_run_insert():
     try:
         import open3d  # noqa: F401
@@ -160,7 +165,8 @@ def test_generate_run_insert():
     rdk = services.rdk
 
     gen = scan_service.generate_scan_targets(services)
-    assert gen["created"] == 8, gen
+    expected_views = _expected_framed_views(services)
+    assert gen["created"] == expected_views, gen
     assert all(n.startswith("TasniScan_") for n in gen["targets"])
     assert gen["gate"]["ok"] is True
     assert gen["calibration_on_file"] is True
@@ -169,8 +175,12 @@ def test_generate_run_insert():
     assert 380 < gen["look_distance_mm"] < 405
     target_z = [float(state["targets"][name][2, 3]) for name in gen["targets"]]
     assert min(target_z) >= gen["look_distance_mm"] - 1.0, target_z
-    assert gen["planned_cone_deg"] == services.config.scan.flat_cone_deg
-    assert gen["planned_views"] == services.config.scan.flat_views
+    assert gen["planned_cone_deg"] == min(
+        services.config.scan.raised_cone_deg,
+        services.config.scan.flat_cone_deg + services.config.scan.boundary_cone_extra_deg)
+    assert gen["planned_views"] == expected_views
+    assert gen["boundary_views_enabled"] is True
+    assert gen["boundary_aim_offsets"] == 9
 
     with tempfile.TemporaryDirectory() as t:
         runs.REPO_ROOT = Path(t)
@@ -185,7 +195,7 @@ def test_generate_run_insert():
             job = scan_service.ScanCaptureJob(services, scan_service.ScanParams())
             res = job(_Ctx())
             assert res["kind"] == "scan" and res["can_insert"] is True
-            assert res["n_views"] == 8
+            assert res["n_views"] == expected_views
             assert res["mesh_vertices"] > 0
             sz = res["plane"]["size_mm"]
             assert 240 < sz[0] < 360 and 240 < sz[1] < 360, sz   # ~300 x 300 mm table
@@ -194,7 +204,7 @@ def test_generate_run_insert():
             fT = np.asarray(res["plane"]["frame_T_mm"], float)
             assert float(fT[:3, 2] @ [0, 0, 1]) > 0.99, fT[:3, 2]
             # targets persist (user-created)
-            assert len(rdk.list_targets("TasniScan_")) == 8
+            assert len(rdk.list_targets("TasniScan_")) == expected_views
 
             # Insert from the in-memory result -> frame + rectangle + mesh created.
             out = scan_service.insert_scan(services, job=job)
@@ -212,7 +222,7 @@ def test_generate_run_insert():
         finally:
             scan_service.new_run_dir = orig
             runs.REPO_ROOT = _ORIG_ROOT
-    print("[scan] gen 8 ->", res["n_views"], "views fused;",
+    print(f"[scan] gen {expected_views} ->", res["n_views"], "views fused;",
           res["mesh_vertices"], "verts; surface",
           tuple(round(s) for s in res["plane"]["size_mm"]), "mm; inserted")
 
@@ -223,7 +233,7 @@ def test_lock_then_create_targets_reuses_frozen_surface():
     assert locked.gate_payload["ok"] is True
     assert locked.survey.detected is True
     gen = scan_service.generate_scan_targets(services, locked)
-    assert gen["created"] == 8
+    assert gen["created"] == _expected_framed_views(services)
 
     # A moved robot invalidates the frozen measurement instead of generating a
     # trajectory around stale geometry.
@@ -250,7 +260,8 @@ def test_targets_report_surface_coverage_from_footprint():
     assert corners.shape == (4, 3), corners.shape
 
     gen = scan_service.generate_scan_targets(services, locked)
-    assert gen["created"] == 8, gen
+    assert gen["created"] == _expected_framed_views(services), gen
+    assert gen["boundary_views_enabled"] is True, gen
     # Small table, fully framed in every view -> the kept views tile (essentially)
     # the whole footprint, so coverage is reported and high (no missed region).
     assert gen["surface_coverage"] is not None, gen
@@ -271,7 +282,8 @@ def test_burst_capture_path():
     services.config.scan.burst_capture = True
 
     gen = scan_service.generate_scan_targets(services)
-    assert gen["created"] == 8, gen
+    expected_views = _expected_framed_views(services)
+    assert gen["created"] == expected_views, gen
 
     with tempfile.TemporaryDirectory() as t:
         runs.REPO_ROOT = Path(t)
@@ -285,7 +297,7 @@ def test_burst_capture_path():
         try:
             job = scan_service.ScanCaptureJob(services, scan_service.ScanParams())
             res = job(_Ctx())
-            assert res["kind"] == "scan" and res["n_views"] == 8, res
+            assert res["kind"] == "scan" and res["n_views"] == expected_views, res
             sz = res["plane"]["size_mm"]
             assert 240 < sz[0] < 360 and 240 < sz[1] < 360, sz   # ~300 x 300 mm table
             assert res["plane"]["inlier_frac"] > 0.8
@@ -294,7 +306,8 @@ def test_burst_capture_path():
         finally:
             scan_service.new_run_dir = orig
             runs.REPO_ROOT = _ORIG_ROOT
-    print("[scan burst] gen 8 ->", res["n_views"], "views fused via burst; buffer cleared")
+    print(f"[scan burst] gen {expected_views} ->", res["n_views"],
+          "views fused via burst; buffer cleared")
 
 
 def test_save_views_persists_per_pose_frames():
@@ -351,6 +364,8 @@ def test_generate_targets_when_survey_touches_border():
         state["cam"] = _look_at((0, 0, 310), (0, 0, 0))
         gen = scan_service.generate_scan_targets(services)
         assert gen["created"] == 8, gen
+        assert gen["boundary_views_enabled"] is False, gen
+        assert gen["boundary_aim_offsets"] == 0, gen
         assert gen["gate"]["ok"] is True, gen["gate"]
         assert gen["gate"]["gates"].get("framed") is False, gen["gate"]
         assert 300 <= gen["look_distance_mm"] <= 340, gen["look_distance_mm"]
@@ -381,10 +396,10 @@ def test_scan_collision_filter_bypasses_noisy_wall_map_by_default():
 
     services.rdk.screen_collisions = all_collide
     gen = scan_service.generate_scan_targets(services)
-    assert gen["created"] == 8, gen
+    assert gen["created"] == _expected_framed_views(services), gen
     assert gen["collision_filter_bypassed"] is True, gen
     assert gen["candidates_collided"] == gen["candidates_reachable"], gen
-    assert len(services.rdk.list_targets("TasniScan_")) == 8
+    assert len(services.rdk.list_targets("TasniScan_")) == _expected_framed_views(services)
     print("[scan collision bypass] wall/noisy map reported all colliding -> created", gen["created"])
 
 
@@ -424,7 +439,7 @@ def test_generate_accepts_dynamic_near_quality_distance():
     services, state = _build_fakes()
     state["cam"] = _look_at((0, 0, 420), (0, 0, 0))
     gen = scan_service.generate_scan_targets(services)
-    assert gen["created"] == 8, gen
+    assert gen["created"] == _expected_framed_views(services), gen
     assert 380 < gen["look_distance_mm"] < 405, gen["look_distance_mm"]
     print("[dynamic distance] near quality-band surface accepted at",
           round(gen["look_distance_mm"]), "mm")
@@ -435,7 +450,7 @@ def test_warns_but_proceeds_without_calibration():
     it warns and still creates targets (calibration_on_file=False)."""
     services, state = _build_fakes(mount_mm=(0.0, 0.0, 2.0))   # ~no offset
     gen = scan_service.generate_scan_targets(services)
-    assert gen["created"] == 8
+    assert gen["created"] == _expected_framed_views(services)
     assert gen["calibration_on_file"] is False
     print("[decoupled] no calibration on file -> warned, still created", gen["created"])
 

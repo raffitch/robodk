@@ -421,6 +421,9 @@ class ScanConfig(_Model):
     flat_views: int = 12                 # view count for flat surfaces
     raised_cone_deg: float = 38.0        # cone half-angle for raised objects
     raised_views: int = 13               # view count for raised objects
+    boundary_views: int = 4              # extra edge/oblique views when the platform is fully framed
+    boundary_cone_extra_deg: float = 8.0 # widen framed scans a little for boundary evidence
+    boundary_aim_edge_fraction: float = 0.30  # 3x3 frame aim grid inset for boundary-biased views
     min_surface_coverage: float = 0.85   # warn if the chosen views tile < this fraction
                                          # of the surface footprint grid (a missed region)
     surface_coverage_hard_fail: bool = True  # refuse target sets that cannot tile the surface

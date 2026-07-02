@@ -34,9 +34,9 @@ from ...core.jobrunner import JobContext
 from ...core.logging import get_logger, new_run_dir
 from ...core.rdk_io import RdkIO
 # Reuse calibration's shared orchestration helpers (one implementation).
-from ..calibration.poses import (generate_calibration_poses, projected_corner_coverage,
-                                  select_diverse, select_diverse_with_coverage,
-                                  viewing_angle_span)
+from ..calibration.poses import (frame_aim_offsets, generate_calibration_poses,
+                                  projected_corner_coverage, select_diverse,
+                                  select_diverse_with_coverage, viewing_angle_span)
 from ..calibration.service import (
     BOARD_KEEPOUT_NAME as CALIB_BOARD_KEEPOUT_NAME,
     TARGET_PREFIX as CALIB_TARGET_PREFIX,
@@ -778,6 +778,8 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
     target_cone_deg = scfg.cone_half_angle_deg
     target_normal = None
     min_perpendicular_mm = None
+    boundary_aim_offsets = None
+    boundary_views_enabled = False
     plan = None
     planned_voxel_m = scfg.voxel_size_m
     extent_mm = (list(survey.extent_mm)
@@ -796,10 +798,22 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
                 # still allowing a raised-surface plan to request more viewpoints.
                 target_count = max(int(scfg.pose_count), int(plan.aims[0].n_views))
                 target_cone_deg = float(plan.cone_half_angle_deg)
+                boundary_views = max(0, int(getattr(scfg, "boundary_views", 0)))
+                if boundary_views:
+                    boundary_aim_offsets = frame_aim_offsets(
+                        K, (W, H),
+                        edge_fraction=float(getattr(scfg, "boundary_aim_edge_fraction", 0.30)))
+                    target_count += boundary_views
+                    target_cone_deg = min(
+                        float(getattr(scfg, "raised_cone_deg", target_cone_deg)),
+                        target_cone_deg + float(getattr(scfg, "boundary_cone_extra_deg", 0.0)))
+                    boundary_views_enabled = True
             pub(f"survey: {survey.extent_mm[0]:.0f}×{survey.extent_mm[1]:.0f} mm surface "
                 f"at {survey.standoff_mm:.0f} mm; planned scan targets "
                 f"(standoff {look:.0f} mm, cone {target_cone_deg:.0f}°, "
-                f"views {target_count}), "
+                f"views {target_count}"
+                + (f", +{scfg.boundary_views} boundary" if boundary_views_enabled else "")
+                + "), "
                 f"voxel={planned_voxel_m*1000:.1f} mm")
             for w in plan.warnings:
                 pub(f"WARNING (survey): {w}")
@@ -835,7 +849,8 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
         cone_half_angle_deg=target_cone_deg,
         roll_max_deg=scfg.roll_max_deg, distance_jitter=scfg.distance_jitter,
         target_center=target_center, target_normal=target_normal,
-        min_perpendicular_mm=min_perpendicular_mm)
+        min_perpendicular_mm=min_perpendicular_mm,
+        aim_offsets=boundary_aim_offsets)
     reachable = [(i, T) for i, T in enumerate(candidates) if rdk.is_reachable(T)]
     n_reach = len(reachable)
     reachable_before_collision = list(reachable)
@@ -964,6 +979,9 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
                            else "; collisions NOT checked")))
     cover_note = (f"; predicted surface coverage {surface_coverage:.0%}"
                   if surface_coverage is not None else "")
+    boundary_note = ("; boundary-biased views enabled"
+                     if boundary_views_enabled else "")
+    cover_note += boundary_note
     services.bus.publish(JobEvent("log", {"message":
         f"created {len(created)} scan targets (standoff ~{look:.0f} mm{extent_txt}; "
         f"{n_reach}/{len(candidates)} candidates reachable; effective cone "
@@ -978,6 +996,9 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
             "surface_coverage": (round(surface_coverage, 3)
                                  if surface_coverage is not None else None),
             "planned_cone_deg": target_cone_deg, "planned_views": target_count,
+            "boundary_views_enabled": boundary_views_enabled,
+            "boundary_aim_offsets": (len(boundary_aim_offsets)
+                                     if boundary_aim_offsets is not None else 0),
             "camera_tool_offset_mm": round(tool_offset_mm, 1),
             "calibration_on_file": tool_offset_mm >= 15.0,
             "collision_filter_enabled": scfg.collision_filter,
