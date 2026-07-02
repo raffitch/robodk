@@ -134,6 +134,8 @@ Read only when needed:
 
 - `docs/jetson-scanner.md`: Jetson hardware/software/server details.
 - `docs/scan-workbox-handoff.md`: scan dots and rectangle trim history.
+- `docs/flat-workframe-validation-handoff.md`: current recommendation for the next
+  milestone after fitted flat scan mesh.
 - `docs/scan-coverage-dots-handoff.md`: older coverage-dot investigation.
 - `docs/scan-survey-planner-handoff.md`: original surface-aware planner design; some status is stale.
 - `docs/calibration-aiming-guidance-handoff.md`: calibration aiming UX.
