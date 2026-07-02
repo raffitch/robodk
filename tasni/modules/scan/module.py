@@ -14,9 +14,9 @@ from pydantic import BaseModel
 from ...core.rdk_io import link_real_robot
 from ..base import ServiceContainer, WorkflowModule
 from ..calibration.service import SimTourJob
-from .service import (ScanCaptureJob, ScanParams, ScanResult, generate_scan_targets,
-                      insert_scan, live_scan_telemetry_payload, LockedScanSurface,
-                      lock_scan_surface, stabilize_live_scan_payload)
+from .service import (camera_pose_moved, ScanCaptureJob, ScanParams, ScanResult,
+                      generate_scan_targets, insert_scan, live_scan_telemetry_payload,
+                      LockedScanSurface, lock_scan_surface, stabilize_live_scan_payload)
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
@@ -169,9 +169,10 @@ class ScanModule(WorkflowModule):
             enc = [cv2.IMWRITE_JPEG_QUALITY, sc.preview_jpeg_quality]
             last_ideal_mm = None
             last_metrics = None
+            anchor_pose_T = None
 
             def analyze(frame):
-                nonlocal last_ideal_mm, last_metrics
+                nonlocal last_ideal_mm, last_metrics, anchor_pose_T
                 # Color-only video: draw ONLY a thin reticle marking where the gate
                 # samples standoff/tilt. The HUD overlays all numbers, so we bake no
                 # text here (that was the overlapping-text bug).
@@ -189,7 +190,24 @@ class ScanModule(WorkflowModule):
                     previous_ideal_mm=last_ideal_mm,
                     camera_cfg=c.camera)
                 if metrics:
-                    metrics = stabilize_live_scan_payload(metrics, last_metrics, sc)
+                    # HARD anti-jitter gate: RoboDK mirrors the physical arm, so the
+                    # camera pose is the true "did the robot move" signal. While it
+                    # sits inside the tolerance of the anchor pose (where the current
+                    # reading was taken), hold the reading instead of chasing the
+                    # RealSense plane-fit noise. Re-anchor the moment the arm moves.
+                    pose_T = None
+                    try:
+                        pose_T = services.rdk.camera_pose_T()
+                    except Exception:
+                        pose_T = None
+                    moved = camera_pose_moved(
+                        pose_T, anchor_pose_T,
+                        sc.live_hold_pose_trans_mm, sc.live_hold_pose_rot_deg)
+                    if moved:
+                        anchor_pose_T = pose_T
+                    metrics = stabilize_live_scan_payload(
+                        metrics, last_metrics, sc,
+                        robot_static=(not moved and pose_T is not None))
                     last_metrics = metrics
                     last_ideal_mm = metrics.get("ideal_distance_mm", last_ideal_mm)
                 return (jpeg.tobytes() if ok else b""), metrics

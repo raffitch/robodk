@@ -440,6 +440,13 @@ class ScanConfig(_Model):
     edge_gate_min_aspect: float = 1.80  # below this yaw edge is advisory; it is too ambiguous for lock
     live_rect_latch_frames: int = 3      # stable full-rectangle frames before X/Y is treated as locked
     live_rect_latch_outline_uv: float = 0.04  # max mean normalized corner motion for a static rectangle
+    # Robot-pose HOLD: while the arm is parked, every pose-derived HUD readout
+    # (X/Y/Z + tilt A/B/C + the rectangle) must stay constant — per-frame RealSense
+    # plane-fit noise otherwise makes a still robot look like it is jittering. The
+    # live gate holds the previous reading until the camera pose moves beyond these
+    # tolerances (RoboDK mirrors the physical arm, so this is the true motion signal).
+    live_hold_pose_trans_mm: float = 0.8   # camera translation that releases the hold
+    live_hold_pose_rot_deg: float = 0.15   # camera rotation that releases the hold
     # When the surface overruns the view (edges not fully framed) its real edges are
     # untrustworthy, so we stop fitting the board and project a GENERIC fixed work
     # square on the plane, centred on the camera reticle (the aim point). This is its

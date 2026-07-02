@@ -359,6 +359,74 @@ def test_live_scan_near_square_skips_edge_gate():
     print("[telemetry square] EDGE A is advisory, not a lock gate")
 
 
+def _jittery_pair(cfg):
+    """A settled reading + the next, wildly-noisier live reading (static robot)."""
+    base = {
+        "detected": True, "distance_mm": 789.0, "tilt_deg": 2.4,
+        "tilt_b_deg": 1.2, "tilt_c_deg": -2.6, "valid_frac": 0.9,
+        "fully_framed": True, "depth_fully_framed": True,
+        "extent_mm": [420.0, 300.0], "rectangle_size_mm": [420.0, 300.0],
+        "surface_mode": "full", "color_fit_standoff_per_margin_mm": 780.0,
+        "surface_center_cam_mm": [20.0, -35.0, 789.0], "edge_angle_deg": 5.0,
+        "outline_uv": [[0.30, 0.30], [0.70, 0.30], [0.70, 0.70], [0.30, 0.70]],
+    }
+    prev = live_scan_telemetry_payload(base, cfg)
+    prev["live"] = True
+    # Same parked robot, but the RealSense plane fit swings hard (the measured bug:
+    # X ~83 mm, edge angle ~73 deg, tilt a few deg — all with no real motion).
+    noisy = live_scan_telemetry_payload({
+        **base, "distance_mm": 789.6, "tilt_deg": 3.9, "tilt_b_deg": 3.4,
+        "tilt_c_deg": -1.7, "surface_center_cam_mm": [-15.0, -48.0, 789.6],
+        "edge_angle_deg": 40.0,
+        "outline_uv": [[0.33, 0.27], [0.72, 0.31], [0.66, 0.73], [0.28, 0.69]],
+    }, cfg, previous_ideal_mm=prev["ideal_distance_mm"])
+    return prev, noisy
+
+
+def test_pose_hold_freezes_all_axes_when_robot_static():
+    cfg = ScanConfig()
+    prev, noisy = _jittery_pair(cfg)
+    held = stabilize_live_scan_payload(noisy, prev, cfg, robot_static=True)
+    assert held.get("held") is True, held
+    # Every pose-derived readout is pinned to the previous reading — zero jitter.
+    for key in ("distance_mm", "tilt_deg", "tilt_b_deg", "tilt_c_deg",
+                "yaw_a_deg", "move_cam", "outline_uv", "extent_mm",
+                "rectangle_size_mm", "gates", "ok"):
+        assert held[key] == prev[key], (key, held[key], prev[key])
+    print("[pose hold] parked robot -> X/Y/Z + A/B/C held rock-steady")
+
+
+def test_pose_hold_releases_and_tracks_when_robot_moves():
+    cfg = ScanConfig()
+    prev, noisy = _jittery_pair(cfg)
+    moved = stabilize_live_scan_payload(noisy, prev, cfg, robot_static=False)
+    # Not held: the normal smoothing path runs so the HUD tracks the new pose.
+    assert moved.get("held") is not True, moved
+    assert moved.get("stabilized") is True, moved
+    assert moved["tilt_deg"] != prev["tilt_deg"], moved["tilt_deg"]
+    print("[pose hold] real motion -> released, readouts track again")
+
+
+def test_camera_pose_moved_tolerances():
+    import numpy as _np
+    from tasni.modules.scan.service import camera_pose_moved
+    ref = _np.eye(4)
+    # Sub-tolerance sensor/encoder dither -> not moved.
+    near = _np.eye(4); near[:3, 3] = [0.4, 0.0, 0.3]
+    assert camera_pose_moved(near, ref, 0.8, 0.15) is False
+    # A real jog past the translation tolerance -> moved.
+    jog = _np.eye(4); jog[0, 3] = 5.0
+    assert camera_pose_moved(jog, ref, 0.8, 0.15) is True
+    # A real rotation past the angular tolerance -> moved.
+    th = _np.radians(1.0)
+    rot = _np.eye(4)
+    rot[:3, :3] = [[_np.cos(th), -_np.sin(th), 0], [_np.sin(th), _np.cos(th), 0], [0, 0, 1]]
+    assert camera_pose_moved(rot, ref, 0.8, 0.15) is True
+    # Missing pose fails open (treated as moved -> falls back to smoothing).
+    assert camera_pose_moved(None, ref, 0.8, 0.15) is True
+    print("[pose hold] motion tolerances gate hold vs track correctly")
+
+
 if __name__ == "__main__":
     test_frontal_plane_all_green()
     test_tilt_measured_and_gated()
@@ -375,4 +443,7 @@ if __name__ == "__main__":
     test_framed_rectangle_center_is_advisory_for_readiness()
     test_stable_rectangle_latches_center_jitter()
     test_live_scan_near_square_skips_edge_gate()
+    test_pose_hold_freezes_all_axes_when_robot_static()
+    test_pose_hold_releases_and_tracks_when_robot_moves()
+    test_camera_pose_moved_tolerances()
     print("\ndepth_gate.py tests passed.")

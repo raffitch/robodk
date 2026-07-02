@@ -711,15 +711,69 @@ def _should_reset_live_smoothing(prev: dict, cur: dict, scfg) -> bool:
     return False
 
 
-def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg) -> dict:
+def camera_pose_moved(cur_T, ref_T, trans_tol_mm: float, rot_tol_deg: float) -> bool:
+    """True when the camera pose left ``ref_T`` by more than the given tolerances.
+
+    RoboDK mirrors the physical arm (position monitoring is on after connect), so
+    the camera pose is the authoritative "did the robot actually move" signal —
+    unlike the RealSense plane fit, whose per-frame noise makes a parked arm look
+    like it is drifting. ``ref_T`` is the pose the current live reading was anchored
+    to; a real jog crosses these tolerances, sensor noise never does. ``None`` on
+    either side reads as *moved* (fail open → fall back to plain smoothing).
+    """
+    if cur_T is None or ref_T is None:
+        return True
+    cur = np.asarray(cur_T, float)
+    ref = np.asarray(ref_T, float)
+    if cur.shape != (4, 4) or ref.shape != (4, 4):
+        return True
+    if float(np.linalg.norm(cur[:3, 3] - ref[:3, 3])) > float(trans_tol_mm):
+        return True
+    rel = ref[:3, :3].T @ cur[:3, :3]
+    ang = float(np.degrees(np.arccos(np.clip((np.trace(rel) - 1.0) / 2.0, -1.0, 1.0))))
+    return ang > float(rot_tol_deg)
+
+
+def _hold_scan_payload(current: dict, previous: dict) -> dict:
+    """Freeze every pose-derived readout at the previous live reading.
+
+    Used when the robot is parked: the operator must see rock-steady X/Y/Z + tilt
+    A/B/C + rectangle. Only the liveness bookkeeping (timestamp, valid fraction) and
+    the config-driven tolerances refresh, so the frame never goes stale and the HUD
+    stays green without chasing sensor noise. The gates/ok are held too — a static
+    scene cannot change readiness.
+    """
+    out = dict(previous)
+    out["live"] = True
+    out["held"] = True
+    # Keep the frame fresh (>2 s stale telemetry is dropped elsewhere) but hold
+    # everything geometry/pose derived.
+    for key in ("measurement_ts", "valid_frac"):
+        if current.get(key) is not None:
+            out[key] = current[key]
+    return out
+
+
+def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg,
+                                *, robot_static: bool = False) -> dict:
     """Temporal smoothing for live scan HUD telemetry only.
 
     The lock/create-target path still grabs an authoritative raw RGBD frame. This
     filter prevents per-frame RealSense plane/edge noise from making a static robot
     look like it is moving in the live aiming UI.
+
+    ``robot_static`` (from the camera pose, see :func:`camera_pose_moved`) is the
+    hard gate: when the arm has not moved, every pose-derived readout is *held* at
+    the previous reading rather than merely smoothed, so a parked robot shows zero
+    jitter on X/Y/Z and A/B/C. Smoothing/hysteresis still runs while the arm moves.
     """
     if not current or current.get("live") is not True:
         return current
+    if (robot_static and previous is not None
+            and previous.get("detected") and current.get("detected")
+            and previous.get("live") is True):
+        # The robot is parked and both frames see the surface: hold, don't chase.
+        return _hold_scan_payload(current, previous)
     if previous is None or _should_reset_live_smoothing(previous, current, scfg):
         return current
 
