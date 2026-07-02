@@ -407,6 +407,26 @@ def test_pose_hold_releases_and_tracks_when_robot_moves():
     print("[pose hold] real motion -> released, readouts track again")
 
 
+def test_pose_hold_vision_escape_releases_on_real_dolly():
+    # Even if RoboDK is NOT mirroring the arm (pose gate wrongly says static), a real
+    # dolly-in that drops the standoff far past the noise floor must release the hold
+    # so the depth-derived rectangle keeps tracking.
+    cfg = ScanConfig()
+    prev, _ = _jittery_pair(cfg)          # settled at ~789 mm
+    dolly = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 729.0, "tilt_deg": 2.4,
+        "tilt_b_deg": 1.2, "tilt_c_deg": -2.6, "valid_frac": 0.9,
+        "fully_framed": True, "depth_fully_framed": True,
+        "extent_mm": [420.0, 300.0], "rectangle_size_mm": [420.0, 300.0],
+        "surface_mode": "full", "color_fit_standoff_per_margin_mm": 720.0,
+        "surface_center_cam_mm": [20.0, -35.0, 729.0], "edge_angle_deg": 5.0,
+        "outline_uv": [[0.30, 0.30], [0.70, 0.30], [0.70, 0.70], [0.30, 0.70]],
+    }, cfg, previous_ideal_mm=prev["ideal_distance_mm"])
+    out = stabilize_live_scan_payload(dolly, prev, cfg, robot_static=True)
+    assert out.get("held") is not True, out
+    print("[pose hold] real dolly releases the hold via the vision escape")
+
+
 def test_camera_pose_moved_tolerances():
     import numpy as _np
     from tasni.modules.scan.service import camera_pose_moved
@@ -445,5 +465,6 @@ if __name__ == "__main__":
     test_live_scan_near_square_skips_edge_gate()
     test_pose_hold_freezes_all_axes_when_robot_static()
     test_pose_hold_releases_and_tracks_when_robot_moves()
+    test_pose_hold_vision_escape_releases_on_real_dolly()
     test_camera_pose_moved_tolerances()
     print("\ndepth_gate.py tests passed.")

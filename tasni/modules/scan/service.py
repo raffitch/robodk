@@ -734,6 +734,29 @@ def camera_pose_moved(cur_T, ref_T, trans_tol_mm: float, rot_tol_deg: float) -> 
     return ang > float(rot_tol_deg)
 
 
+def _vision_says_moved(current: dict, previous: dict, scfg) -> bool:
+    """True when the depth reading shifted far more than static sensor noise.
+
+    A safety net for the hold: the live rectangle is computed on the Jetson from
+    depth, so it reprojects when the camera physically moves even if RoboDK is not
+    mirroring the arm (driver not monitoring) and the pose gate would wrongly read
+    "static". Uses only the STABLE signals — standoff and tilt magnitude (≈1 mm /
+    ≈0.5° noise) — which have a clean gap above the noise floor, unlike the ~80 mm
+    rectangle-centroid jitter. A real dolly-in/out or level change releases the
+    hold; per-frame noise never does. (A pure lateral jog with the driver off is the
+    one case neither signal catches, and is an accepted degraded-mode limitation.)
+    """
+    pd, cd = previous.get("distance_mm"), current.get("distance_mm")
+    if pd is not None and cd is not None:
+        if abs(float(cd) - float(pd)) > float(scfg.live_hold_vision_distance_mm):
+            return True
+    pt, ct = previous.get("tilt_deg"), current.get("tilt_deg")
+    if pt is not None and ct is not None:
+        if abs(float(ct) - float(pt)) > float(scfg.live_hold_vision_tilt_deg):
+            return True
+    return False
+
+
 def _hold_scan_payload(current: dict, previous: dict) -> dict:
     """Freeze every pose-derived readout at the previous live reading.
 
@@ -771,7 +794,8 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg,
         return current
     if (robot_static and previous is not None
             and previous.get("detected") and current.get("detected")
-            and previous.get("live") is True):
+            and previous.get("live") is True
+            and not _vision_says_moved(current, previous, scfg)):
         # The robot is parked and both frames see the surface: hold, don't chase.
         return _hold_scan_payload(current, previous)
     if previous is None or _should_reset_live_smoothing(previous, current, scfg):

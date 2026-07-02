@@ -447,6 +447,12 @@ class ScanConfig(_Model):
     # tolerances (RoboDK mirrors the physical arm, so this is the true motion signal).
     live_hold_pose_trans_mm: float = 0.8   # camera translation that releases the hold
     live_hold_pose_rot_deg: float = 0.15   # camera rotation that releases the hold
+    # Vision safety net for the hold: the live rectangle is depth-derived, so it must
+    # still track a physical camera move even if RoboDK is not mirroring the arm. A
+    # standoff/tilt shift past these (well above the ~1 mm / ~0.5° noise floor)
+    # releases the hold regardless of the pose gate.
+    live_hold_vision_distance_mm: float = 12.0
+    live_hold_vision_tilt_deg: float = 4.0
     # When the surface overruns the view (edges not fully framed) its real edges are
     # untrustworthy, so we stop fitting the board and project a GENERIC fixed work
     # square on the plane, centred on the camera reticle (the aim point). This is its
