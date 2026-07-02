@@ -32,6 +32,10 @@ class CollisionIgnoreBody(BaseModel):
     pair: str
 
 
+class SurfaceLockBody(BaseModel):
+    mode: str = "auto"       # "auto" | "crop"
+
+
 class ScanModule(WorkflowModule):
     id = "scan"
     title = "Scan"
@@ -216,11 +220,14 @@ class ScanModule(WorkflowModule):
             return {"status": "stopped"}
 
         @router.post("/surface/lock")
-        def surface_lock() -> dict:
+        def surface_lock(body: SurfaceLockBody) -> dict:
             if services.jobs.running:
                 raise HTTPException(409, "a job is already running")
+            force_crop = body.mode == "crop"
+            if body.mode not in ("auto", "crop"):
+                raise HTTPException(400, "surface lock mode must be 'auto' or 'crop'")
             try:
-                self._locked_surface = lock_scan_surface(services)
+                self._locked_surface = lock_scan_surface(services, force_crop=force_crop)
                 gate = self._locked_surface.gate_payload
                 crop = gate.get("crop_size_mm")
                 extent = gate.get("extent_mm")

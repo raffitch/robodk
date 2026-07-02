@@ -292,6 +292,56 @@ def test_live_scan_payload_hysteresis_holds_green_gate():
     print("[telemetry smoothing] live gate hysteresis holds near-threshold center")
 
 
+def test_framed_rectangle_center_is_advisory_for_readiness():
+    cfg = ScanConfig()
+    raw = {
+        "detected": True, "distance_mm": 500.0, "tilt_deg": 1.0,
+        "valid_frac": 0.9, "fully_framed": True, "depth_fully_framed": True,
+        "surface_mode": "full", "extent_mm": [300.0, 200.0],
+        "rectangle_size_mm": [300.0, 200.0],
+        "color_fit_standoff_per_margin_mm": 476.0,
+        "surface_center_cam_mm": [95.0, 0.0, 500.0],
+        "outline_uv": [[0.3, 0.3], [0.7, 0.3], [0.7, 0.7], [0.3, 0.7]],
+    }
+    p = live_scan_telemetry_payload(raw, cfg)
+    assert p["gates"]["center"] is False, p
+    assert p["ok"] is True, p
+    print("[telemetry rectangle] framed surface center is guidance, not readiness")
+
+
+def test_stable_rectangle_latches_center_jitter():
+    cfg = ScanConfig()
+    base = {
+        "detected": True, "distance_mm": 500.0, "tilt_deg": 1.0,
+        "valid_frac": 0.9, "fully_framed": True, "depth_fully_framed": True,
+        "surface_mode": "full", "extent_mm": [300.0, 200.0],
+        "rectangle_size_mm": [300.0, 200.0],
+        "color_fit_standoff_per_margin_mm": 476.0,
+        "surface_center_cam_mm": [0.0, 0.0, 500.0],
+        "outline_uv": [[0.3, 0.3], [0.7, 0.3], [0.7, 0.7], [0.3, 0.7]],
+    }
+    prev = live_scan_telemetry_payload(base, cfg)
+    noisy_1 = live_scan_telemetry_payload({
+        **base,
+        "distance_mm": 501.0,
+        "surface_center_cam_mm": [400.0, -320.0, 501.0],
+        "outline_uv": [[0.302, 0.301], [0.702, 0.300], [0.700, 0.701], [0.301, 0.700]],
+    }, cfg, previous_ideal_mm=prev["ideal_distance_mm"])
+    stable_1 = stabilize_live_scan_payload(noisy_1, prev, cfg)
+    noisy_2 = live_scan_telemetry_payload({
+        **base,
+        "distance_mm": 502.0,
+        "surface_center_cam_mm": [405.0, -315.0, 502.0],
+        "outline_uv": [[0.301, 0.302], [0.701, 0.300], [0.700, 0.702], [0.300, 0.700]],
+    }, cfg, previous_ideal_mm=stable_1["ideal_distance_mm"])
+    stable_2 = stabilize_live_scan_payload(noisy_2, stable_1, cfg)
+    assert stable_2["rect_stable_frames"] >= cfg.live_rect_latch_frames, stable_2
+    assert stable_2["center_latched"] is True, stable_2
+    assert stable_2["gates"]["center"] is True, stable_2
+    assert stable_2["move_cam"][0] == stable_1["move_cam"][0], stable_2["move_cam"]
+    print("[telemetry rectangle] stable rectangle latches noisy X/Y guidance")
+
+
 def test_live_scan_near_square_skips_edge_gate():
     cfg = ScanConfig()
     raw = {
@@ -322,5 +372,7 @@ if __name__ == "__main__":
     test_live_scan_payload_aligns_rectangle_corner_order()
     test_live_scan_payload_does_not_shrink_to_partial_depth()
     test_live_scan_payload_hysteresis_holds_green_gate()
+    test_framed_rectangle_center_is_advisory_for_readiness()
+    test_stable_rectangle_latches_center_jitter()
     test_live_scan_near_square_skips_edge_gate()
     print("\ndepth_gate.py tests passed.")

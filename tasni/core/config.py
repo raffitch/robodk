@@ -390,6 +390,7 @@ class ScanConfig(_Model):
     # timeout for a depth-bearing grab must be generous or poses fail/skip. Color-only
     # grabs/streaming keep the shorter ``camera.timeout_s``.
     grab_timeout_s: float = 25.0
+    surface_measure_frames: int = 5      # depth frames fused for one frozen surface measurement
     # HUD jog hints are in the camera optical frame (X right, Y down, Z forward).
     jog_invert_x: bool = False
     jog_invert_y: bool = False
@@ -437,6 +438,8 @@ class ScanConfig(_Model):
     live_aim_angle_hysteresis_deg: float = 1.0
     live_aim_edge_hysteresis_deg: float = 10.0
     edge_gate_min_aspect: float = 1.80  # below this yaw edge is advisory; it is too ambiguous for lock
+    live_rect_latch_frames: int = 3      # stable full-rectangle frames before X/Y is treated as locked
+    live_rect_latch_outline_uv: float = 0.04  # max mean normalized corner motion for a static rectangle
     # When the surface overruns the view (edges not fully framed) its real edges are
     # untrustworthy, so we stop fitting the board and project a GENERIC fixed work
     # square on the plane, centred on the camera reticle (the aim point). This is its

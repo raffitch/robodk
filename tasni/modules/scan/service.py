@@ -23,6 +23,7 @@ import base64
 import json
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -42,7 +43,7 @@ from ..calibration.service import (
     TARGET_PREFIX as CALIB_TARGET_PREFIX,
     _camera_hold, dry_tour_required, ensure_camera_tool, ensure_real_robot_link)
 from .depth_gate import ScanGateThresholds, evaluate_depth_gate
-from .plane import bounded_work_plane, work_plane_from_points
+from .plane import bounded_work_plane, reticle_plane_square, work_plane_from_points
 from .planner import ScanPlan, plan_scan
 from .survey import SurveyThresholds, survey_surface
 from .reconstruct import (ScanView, clean_measured_surface_mesh, cloud_points_m,
@@ -70,6 +71,49 @@ class LockedScanSurface:
     seed_T: np.ndarray
     seed_joints: object
     locked_at: float
+
+
+def _crop_gate_payload(gate_payload: dict, scfg, K, image_size, look_mm: float,
+                       survey=None) -> dict:
+    """Force the locked surface into reticle-crop mode.
+
+    This is the operator escape hatch for cases where a finite rectangle/dot overlay
+    jitters or is partially missing even though the center depth plane is usable.
+    """
+    out = dict(gate_payload)
+    gates = dict(out.get("gates") or {})
+    gates.pop("center", None)
+    gates.pop("edge", None)
+    gates["framed"] = False
+    out["gates"] = gates
+    out["ok"] = all(bool(gates.get(k)) for k in ("detected", "distance", "angle"))
+    out["surface_mode"] = "crop"
+    out["fully_framed"] = False
+    out["crop_size_mm"] = _large_surface_crop_mm(scfg, K, image_size, look_mm)
+    out["rectangle_size_mm"] = list(out["crop_size_mm"])
+    if survey is not None and getattr(survey, "detected", False):
+        try:
+            corners, _u, _v, _reticle = reticle_plane_square(
+                np.asarray(survey.normal_cam, float),
+                np.asarray(survey.centroid_cam_mm, float),
+                tuple(out["crop_size_mm"]))
+            W, H = image_size
+            fx, fy = float(K[0, 0]), float(K[1, 1])
+            cx, cy = float(K[0, 2]), float(K[1, 2])
+            outline = []
+            for p in np.asarray(corners, float):
+                if float(p[2]) <= 0:
+                    continue
+                outline.append([
+                    (float(p[0]) * fx / float(p[2]) + cx) / float(W),
+                    (float(p[1]) * fy / float(p[2]) + cy) / float(H),
+                ])
+            if len(outline) >= 3:
+                out["outline_uv"] = outline
+                out["grid_uv"] = None
+        except Exception:
+            pass
+    return out
 
 
 def _large_surface_crop_mm(scfg, K, image_size, look_mm: float) -> list[float]:
@@ -122,7 +166,7 @@ def _planned_surface_standoff_mm(
     return float(scfg.ideal_distance_mm)
 
 
-def lock_scan_surface(services) -> LockedScanSurface:
+def lock_scan_surface(services, *, force_crop: bool = False) -> LockedScanSurface:
     """Freeze one authoritative RGBD measurement and the matching robot pose."""
     cfg = services.config
     scfg = cfg.scan
@@ -133,8 +177,19 @@ def lock_scan_surface(services) -> LockedScanSurface:
         services.live.stop()
     rdk.use_camera_tool(cfg.robodk.camera_tool)
 
+    measure_frames = max(1, int(getattr(scfg, "surface_measure_frames", 1)))
+    frames = []
     with _camera_hold(services, "scan-surface-lock"):
-        frame = services.camera.grab(with_depth=True, timeout=scfg.grab_timeout_s)
+        for _ in range(measure_frames):
+            fr = services.camera.grab(with_depth=True, timeout=scfg.grab_timeout_s)
+            if fr.depth is not None:
+                frames.append(fr)
+    if not frames:
+        raise RuntimeError("surface measurement failed - no depth frames received")
+    color, depth = _combine_depth_frames(frames)
+    frame = SimpleNamespace(
+        color=color, depth=depth,
+        timestamp=getattr(frames[-1], "timestamp", time.time()))
     reading = evaluate_depth_gate(
         frame.depth, K, scan_gate_thresholds(scfg), depth_scale=scfg.depth_scale)
     survey = survey_surface(
@@ -143,12 +198,13 @@ def lock_scan_surface(services) -> LockedScanSurface:
     full_frame_valid_frac = float(np.mean(depth > 0)) if depth.size else 0.0
     surface_overruns_view = bool(
         survey.detected and not survey.fully_framed and full_frame_valid_frac >= 0.95)
+    crop_mode = force_crop or surface_overruns_view
     gate_payload = scan_gate_payload(reading, survey)
     ideal_distance = _planned_surface_standoff_mm(
         scfg, K, cfg.camera.size, reading, survey, full_frame_valid_frac)
     gate_payload["ideal_distance_mm"] = ideal_distance
     gate_payload["distance_tol_mm"] = float(scfg.distance_tol_mm)
-    gate_payload["surface_mode"] = "crop" if surface_overruns_view else "full"
+    gate_payload["surface_mode"] = "crop" if crop_mode else "full"
     final_gates = {
         "detected": bool(reading.gates.get("detected")),
         "distance": (
@@ -157,7 +213,7 @@ def lock_scan_surface(services) -> LockedScanSurface:
         ),
         "angle": bool(reading.gates.get("angle")),
     }
-    if survey.detected and survey.fully_framed:
+    if not force_crop and survey.detected and survey.fully_framed:
         if survey.centroid_cam_mm is not None:
             final_gates["center"] = bool(
                 abs(float(survey.centroid_cam_mm[0])) <= float(scfg.center_tol_mm)
@@ -176,19 +232,27 @@ def lock_scan_surface(services) -> LockedScanSurface:
             angle = ((angle + 45.0) % 90.0) - 45.0
             gate_payload["yaw_a_deg"] = -angle
             gate_payload["edge_align_tol_deg"] = float(scfg.edge_align_tol_deg)
-    elif survey.detected and not surface_overruns_view:
+    elif survey.detected and not crop_mode:
         final_gates["framed"] = False
     gate_payload["gates"] = {**gate_payload.get("gates", {}), **final_gates}
-    gate_payload["ok"] = all(final_gates.values())
-    if surface_overruns_view and reading.distance_mm is not None:
-        gate_payload["crop_size_mm"] = _large_surface_crop_mm(
-            scfg, K, cfg.camera.size, float(reading.distance_mm))
+    ok_gates = dict(final_gates)
+    if survey.detected and survey.fully_framed:
+        # Once a finite rectangle is fully framed, its measured centroid is the
+        # target center used by the planner. Reticle-centering is useful guidance,
+        # but it should not make the operator chase per-frame X/Y jitter.
+        ok_gates.pop("center", None)
+    gate_payload["ok"] = all(ok_gates.values())
+    if crop_mode and reading.distance_mm is not None:
+        gate_payload = _crop_gate_payload(
+            gate_payload, scfg, K, cfg.camera.size, float(reading.distance_mm),
+            survey=survey)
 
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:
         services.bus.publish(JobEvent("frame", {
             "jpeg_b64": base64.b64encode(jpeg.tobytes()).decode("ascii")}))
-    services.bus.publish(JobEvent("gate", {**gate_payload, "live": False}))
+    services.bus.publish(JobEvent("gate", {
+        **gate_payload, "live": False, "measure_frames": len(frames)}))
 
     if not gate_payload["ok"]:
         bad = [name for name, good in final_gates.items() if not good]
@@ -501,6 +565,10 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
     ok_gates = dict(gates)
     if surface_mode == "crop":
         ok_gates.pop("framed", None)
+    elif fully_framed:
+        # For a finite platform, the rectangle centroid is the planning target.
+        # Keep X/Y as guidance, not a hard readiness gate.
+        ok_gates.pop("center", None)
     return {
         "detected": True,
         "distance_mm": distance,
@@ -617,6 +685,23 @@ def _polygon_area(poly: np.ndarray | None) -> float:
     return abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))) * 0.5
 
 
+def _rectangles_consistent(prev: dict, cur: dict, scfg) -> bool:
+    """True when live full-rectangle telemetry looks like the same static view."""
+    if prev.get("surface_mode") != "full" or cur.get("surface_mode") != "full":
+        return False
+    if prev.get("fully_framed") is not True or cur.get("fully_framed") is not True:
+        return False
+    prev_poly = _payload_outline_uv(prev)
+    cur_poly = _payload_outline_uv(cur)
+    if prev_poly is None or cur_poly is None or prev_poly.shape != cur_poly.shape:
+        return False
+    aligned = _align_polygon_like(prev_poly, cur_poly)
+    mean_corner_motion = float(np.mean(np.linalg.norm(aligned - prev_poly, axis=1)))
+    if mean_corner_motion > float(getattr(scfg, "live_rect_latch_outline_uv", 0.04)):
+        return False
+    return True
+
+
 def _should_reset_live_smoothing(prev: dict, cur: dict, scfg) -> bool:
     if not prev or not prev.get("detected") or not cur.get("detected"):
         return True
@@ -639,6 +724,10 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg) -> d
         return current
 
     out = dict(current)
+    rect_consistent = _rectangles_consistent(previous, current, scfg)
+    stable_frames = (int(previous.get("rect_stable_frames", 1)) + 1
+                     if rect_consistent else 1)
+    out["rect_stable_frames"] = stable_frames
     if previous.get("surface_mode") != current.get("surface_mode"):
         out["surface_mode"] = previous.get("surface_mode")
         out["crop_size_mm"] = previous.get("crop_size_mm", out.get("crop_size_mm"))
@@ -707,12 +796,25 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg) -> d
             gates["center"] = (
                 abs(float(mv[0])) <= tol
                 and abs(float(mv[1])) <= tol)
+            latch_frames = int(getattr(scfg, "live_rect_latch_frames", 3))
+            if (out.get("surface_mode") == "full"
+                    and out.get("fully_framed") is True
+                    and stable_frames >= latch_frames
+                    and previous.get("ok")
+                    and not gates["center"]):
+                prev_mv = _as_float_array(previous.get("move_cam"), 3)
+                if prev_mv is not None:
+                    out["move_cam"] = [float(prev_mv[0]), float(prev_mv[1]), float(mv[2])]
+                    gates["center"] = True
+                    out["center_latched"] = True
     gates.pop("edge", None)
     if out.get("fully_framed") is not None:
         gates["framed"] = bool(out.get("fully_framed"))
     ok_gates = dict(gates)
     if out.get("surface_mode") == "crop":
         ok_gates.pop("framed", None)
+    elif out.get("fully_framed") is True:
+        ok_gates.pop("center", None)
     out["gates"] = gates
     out["ok"] = all(bool(v) for v in ok_gates.values())
     out["stabilized"] = True
@@ -785,8 +887,18 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
     extent_mm = (list(survey.extent_mm)
                  if survey.detected and survey.extent_mm is not None else None)
     crop_size_mm = None
+    force_crop_plan = gate_payload.get("surface_mode") == "crop"
     if survey.detected and survey.extent_mm is not None:
-        if survey.fully_framed:
+        if force_crop_plan:
+            # Operator chose / auto detected large-platform crop. Do not chase the
+            # measured finite rectangle; use the current reticle plane as the work
+            # region and keep the seed-pose cone.
+            crop_size_mm = gate_payload.get("crop_size_mm") or _large_surface_crop_mm(
+                scfg, K, (W, H), look)
+            pub("survey: using reticle crop mode; ignoring unstable/full rectangle "
+                f"edges and creating a {crop_size_mm[0]:.0f}×{crop_size_mm[1]:.0f} mm "
+                "camera-centred work crop")
+        elif survey.fully_framed:
             plan = plan_scan(survey, K, (W, H), scfg, cam_to_base_T=seed_T)
             planned_voxel_m = plan.voxel_size_m
             if plan.mode == "quality" and plan.aims:

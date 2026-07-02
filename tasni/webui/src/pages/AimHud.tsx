@@ -46,6 +46,8 @@ export interface GateReading {
   crop_size_mm?: [number, number] | null;        // bounded region for an oversized plane
   surface_mode?: "full" | "crop" | null;
   measurement_ts?: number | null;
+  rect_stable_frames?: number;
+  center_latched?: boolean;
 }
 
 const W = 1280, H = 720, CX = W / 2, CY = H / 2;
@@ -77,7 +79,7 @@ function Hud({ gate, mode = "scan", coverageDots = null }:
     && !!gate.gates.detected && !!gate.gates.distance && !!gate.gates.angle
     && !!gate.gates.center && !!gate.gates.coverage;
   const status = gate?.error ? "NO SIGNAL"
-    : waitingForScanCheck ? "DEPTH STARTING"
+    : waitingForScanCheck ? "AIMING"
     : calibrationGeometryReady && !gate?.gates?.stable ? "HOLD STEADY"
     : locked ? (mode === "scan" ? "IN RANGE" : "● LOCK")
     : detected ? "AIMING" : "SEARCHING";
@@ -167,10 +169,10 @@ function Hud({ gate, mode = "scan", coverageDots = null }:
       {/* readouts */}
       {waitingForScanCheck && (
         <>
-          <PendingReadout y={104} label="RANGE" text="WAITING FOR DEPTH" />
-          <PendingReadout y={200} label="TILT" text="WAITING FOR DEPTH" />
-          <PendingReadout y={296} label="LEVEL" text="WAITING FOR DEPTH" tall />
-          <PendingReadout y={440} label="FRAMED" text="FINAL SNAPSHOT" />
+          <PendingReadout y={104} label="RANGE" text="WAITING FOR SURFACE" />
+          <PendingReadout y={200} label="TILT" text="WAITING FOR SURFACE" />
+          <PendingReadout y={296} label="LEVEL" text="WAITING FOR SURFACE" tall />
+          <PendingReadout y={440} label="FRAMED" text="WAITING FOR SURFACE" />
         </>
       )}
       {detected && gate && (

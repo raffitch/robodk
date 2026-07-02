@@ -125,8 +125,9 @@ def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
         def clear(self): self.cleared = True
 
     class FakeCamera:
-        def __init__(self): self.last_burst = None
+        def __init__(self): self.last_burst = None; self.grabs = 0
         def grab(self, with_depth=False, timeout=None, color_only=False):
+            self.grabs += 1
             return _render(state["cam"])
         @contextmanager
         def burst(self, timeout=None):
@@ -232,6 +233,7 @@ def test_lock_then_create_targets_reuses_frozen_surface():
     locked = scan_service.lock_scan_surface(services)
     assert locked.gate_payload["ok"] is True
     assert locked.survey.detected is True
+    assert services.camera.grabs == services.config.scan.surface_measure_frames
     gen = scan_service.generate_scan_targets(services, locked)
     assert gen["created"] == _expected_framed_views(services)
 
@@ -379,6 +381,24 @@ def test_generate_targets_when_survey_touches_border():
           "crop", gen["crop_size_mm"])
 
 
+def test_manual_crop_ignores_unstable_framed_rectangle():
+    services, _state = _build_fakes()
+    locked = scan_service.lock_scan_surface(services, force_crop=True)
+    assert locked.gate_payload["ok"] is True, locked.gate_payload
+    assert locked.gate_payload["surface_mode"] == "crop", locked.gate_payload
+    assert locked.gate_payload["crop_size_mm"] == [1000.0, 1000.0]
+    assert locked.gate_payload["gates"].get("framed") is False
+
+    gen = scan_service.generate_scan_targets(services, locked)
+    assert gen["created"] == services.config.scan.pose_count, gen
+    assert gen["crop_size_mm"] == [1000.0, 1000.0], gen
+    assert gen["boundary_views_enabled"] is False, gen
+    # The normal framed-rectangle path plans a closer standoff from the measured
+    # extent; manual crop keeps the reticle/center-plane fallback.
+    assert abs(gen["look_distance_mm"] - 420.0) < 1.0, gen["look_distance_mm"]
+    print("[manual crop] fully framed but unstable rectangle -> reticle crop targets")
+
+
 def test_scan_collision_filter_bypasses_noisy_wall_map_by_default():
     """Scan should match calibration's soft default for noisy collision maps.
 
@@ -491,6 +511,7 @@ if __name__ == "__main__":
     test_save_views_persists_per_pose_frames()
     test_burst_capture_path()
     test_generate_targets_when_survey_touches_border()
+    test_manual_crop_ignores_unstable_framed_rectangle()
     test_scan_collision_filter_bypasses_noisy_wall_map_by_default()
     test_scan_collision_filter_hard_fail_can_still_refuse()
     test_generate_refuses_when_too_far()

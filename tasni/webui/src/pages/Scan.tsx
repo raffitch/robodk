@@ -85,6 +85,68 @@ function lockDisplayGate(next: GateReading, prev: GateReading | null): GateReadi
   };
 }
 
+function meanUv(points: Array<[number, number]> | null | undefined): [number, number] | null {
+  if (!points?.length) return null;
+  let sx = 0, sy = 0;
+  for (const [u, v] of points) { sx += u; sy += v; }
+  return [sx / points.length, sy / points.length];
+}
+
+// A tool rotation that levels the plane barely moves the projected rectangle's
+// centroid, so the distance/centroid tests below miss it. Detect a genuine tilt
+// change directly (signed B/C, so a flip through level also counts) with a
+// deadband: per-frame RealSense plane noise stays under it (stays frozen), a real
+// leveling move exceeds it (releases the freeze so the rectangle + tilt update).
+const TILT_SHIFT_DEG = 1.5;
+function tiltShifted(a: GateReading, b: GateReading): boolean {
+  const ab = a.tilt_b_deg, bb = b.tilt_b_deg, ac = a.tilt_c_deg, bc = b.tilt_c_deg;
+  if (ab != null && bb != null && ac != null && bc != null)
+    return Math.hypot(bb - ab, bc - ac) > TILT_SHIFT_DEG;
+  const at = a.tilt_deg, bt = b.tilt_deg;
+  return at != null && bt != null && Math.abs(bt - at) > TILT_SHIFT_DEG;
+}
+
+function surfaceShifted(a: GateReading | null, b: GateReading): boolean {
+  if (!a) return false;
+  if (a.surface_mode !== b.surface_mode) return true;
+  const da = a.distance_mm, db = b.distance_mm;
+  if (da != null && db != null && Math.abs(db - da) > 80) return true;
+  const ca = meanUv(a.outline_uv ?? a.points_uv);
+  const cb = meanUv(b.outline_uv ?? b.points_uv);
+  if (ca && cb && Math.hypot(cb[0] - ca[0], cb[1] - ca[1]) > 0.08) return true;
+  if (tiltShifted(a, b)) return true;
+  return false;
+}
+
+function freezeSurfaceGeometry(next: GateReading, frozen: GateReading): GateReading {
+  const frozenMove = frozen.move_cam;
+  const nextMove = next.move_cam;
+  return {
+    ...next,
+    outline_uv: frozen.outline_uv ?? next.outline_uv,
+    visible_outline_uv: frozen.visible_outline_uv ?? next.visible_outline_uv,
+    points_uv: frozen.points_uv ?? next.points_uv,
+    grid_uv: frozen.grid_uv ?? next.grid_uv,
+    grid_spacing_mm: frozen.grid_spacing_mm ?? next.grid_spacing_mm,
+    extent_mm: frozen.extent_mm ?? next.extent_mm,
+    rectangle_size_mm: frozen.rectangle_size_mm ?? next.rectangle_size_mm,
+    crop_size_mm: frozen.crop_size_mm ?? next.crop_size_mm,
+    // Hold the tilt/level readouts too. While the surface is static the fitted
+    // plane normal only wiggles from RealSense noise; freezing the rectangle/dots
+    // but not these left the TILT readout + LEVEL (B/C/A) numbers jittering.
+    // surfaceShifted() releases the whole freeze on a real leveling rotation, so
+    // this guidance still updates the moment the operator actually tilts the tool.
+    tilt_deg: frozen.tilt_deg ?? next.tilt_deg,
+    tilt_b_deg: frozen.tilt_b_deg ?? next.tilt_b_deg,
+    tilt_c_deg: frozen.tilt_c_deg ?? next.tilt_c_deg,
+    yaw_a_deg: frozen.yaw_a_deg ?? next.yaw_a_deg,
+    move_cam: frozenMove && nextMove
+      ? [frozenMove[0], frozenMove[1], nextMove[2]]
+      : next.move_cam,
+    center_latched: true,
+  };
+}
+
 export default function Scan() {
   const { subscribe } = useEvents();
   const [config, setConfig] = useState<ScanConfig | null>(null);
@@ -113,12 +175,15 @@ export default function Scan() {
   const coverageRef = useRef<Array<Array<[number, number]>>>([]);
   const coverageCenterRef = useRef<[number, number] | null>(null);
   const [coverageDots, setCoverageDots] = useState<Array<[number, number]> | null>(null);
+  const frozenGateRef = useRef<GateReading | null>(null);
+  const stableLiveFramesRef = useRef(0);
   const gateReceivedAtRef = useRef(0);
   const stableSinceRef = useRef<number | null>(null);
   const lastValidRef = useRef<number | null>(null);
   const [surfaceStable, setSurfaceStable] = useState(false);
   const [stableProgress, setStableProgress] = useState(0);
   const [surfaceLocked, setSurfaceLocked] = useState(false);
+  const [surfaceMode, setSurfaceMode] = useState<"auto" | "crop">("auto");
   const [locking, setLocking] = useState(false);
   const { mark: markFrame, reset: resetStream, stat: streamStat } = useStreamStats();
   const [targets, setTargets] = useState<number | null>(null);
@@ -244,14 +309,28 @@ export default function Scan() {
         const p = ev.payload as GateReading;
         if (p?.gates && !p.error) {
           gateReceivedAtRef.current = performance.now();
-          setGate((prev) => lockDisplayGate(p, prev));
-          // Accumulate the live aiming stream. On the authoritative (non-live) lock
-          // snapshot we deliberately do NOT reset: a single frame's depth lands only
-          // where the surface has texture (edges/low-texture drop out), so its dots
-          // collapse toward the centre. Keeping the accumulated multi-frame union
-          // frozen shows the real coverage the operator just saw. It is reset on the
-          // next Start camera / Reposition / Create-targets (beginLive/stopLive).
-          if (p.live && Array.isArray(p.points_uv) && p.points_uv.length) {
+          const frozenBefore = p.live ? frozenGateRef.current : null;
+          if (frozenBefore && surfaceShifted(frozenBefore, p)) {
+            resetCoverage();
+          }
+          setGate((prev) => {
+            let next = lockDisplayGate(p, prev);
+            if (p.live) {
+              const frozen = frozenGateRef.current;
+              if (frozen && !surfaceShifted(frozen, p)) {
+                next = freezeSurfaceGeometry(next, frozen);
+              } else {
+                if (prev && p.ok && !surfaceShifted(prev, p)) stableLiveFramesRef.current += 1;
+                else stableLiveFramesRef.current = p.ok ? 1 : 0;
+                if (stableLiveFramesRef.current >= 5) {
+                  frozenGateRef.current = next;
+                }
+              }
+            }
+            return next;
+          });
+          if (p.live && !frozenGateRef.current
+              && Array.isArray(p.points_uv) && p.points_uv.length) {
             accumulateCoverage(p.points_uv as Array<[number, number]>);
           }
         }
@@ -301,6 +380,8 @@ export default function Scan() {
   const resetCoverage = () => {
     coverageRef.current = [];
     coverageCenterRef.current = null;
+    frozenGateRef.current = null;
+    stableLiveFramesRef.current = 0;
     setCoverageDots(null);
   };
 
@@ -432,7 +513,7 @@ export default function Scan() {
       addLog("create targets: " + e.message, true);
       setRunError("Create targets: " + e.message);
       setSurfaceLocked(false);
-      beginLive(false).catch(() => setLive(false));
+      beginLive(true).catch(() => setLive(false));
     } finally { setGenerating(false); }
   };
   const lockAndCreateTargets = async () => {
@@ -443,7 +524,7 @@ export default function Scan() {
         surface_mode: "full" | "crop";
         extent_mm?: [number, number] | null;
         crop_size_mm?: [number, number] | null;
-      }>("/surface/lock");
+      }>("/surface/lock", { mode: surfaceMode });
       setLive(false); resetStream();
       setGate((prev) => lockDisplayGate(r.gate, prev));
       setSurfaceLocked(true);
@@ -455,7 +536,7 @@ export default function Scan() {
     } catch (e: any) {
       addLog("lock surface: " + e.message, true);
       setRunError("Lock surface: " + e.message);
-      beginLive(false).catch(() => setLive(false));
+      beginLive(true).catch(() => setLive(false));
       setLocking(false);
       return;
     }
@@ -508,6 +589,9 @@ export default function Scan() {
 
   const g = config?.gate;
   const crop = gate?.crop_size_mm;
+  const manualCropReady = surfaceMode === "crop"
+    && !!gate?.gates?.detected && !!gate?.gates?.distance && !!gate?.gates?.angle;
+  const canLockSurface = surfaceStable || manualCropReady;
   const surfaceDescription = gate?.surface_mode === "crop"
     ? crop
       ? `Surface overruns view — generic ${Math.round(crop[0])} × ${Math.round(crop[1])} mm work area on the reticle`
@@ -573,6 +657,9 @@ export default function Scan() {
           {!live && !gate && <div className="aim-off">camera off — press “Start camera”</div>}
         </div>
 
+        <SurfaceModeNotice gate={gate} mode={surfaceMode}
+                           onModeChange={setSurfaceMode}
+                           disabled={running || locking || generating || surfaceLocked} />
         <SurfaceGuide gate={gate} stable={surfaceStable} />
 
         <div className="lamps">
@@ -613,7 +700,7 @@ export default function Scan() {
               : null}
           {!surfaceLocked
             ? <button onClick={lockAndCreateTargets}
-                      disabled={!ready || running || locking || generating || !live || !surfaceStable}>
+                      disabled={!ready || running || locking || generating || !live || !canLockSurface}>
                 {locking ? "Locking…" : generating ? "Creating…" : "Lock & create targets"}
               </button>
             : <>
@@ -811,32 +898,80 @@ export default function Scan() {
   );
 }
 
+
+function SurfaceModeNotice({ gate, mode, onModeChange, disabled }:
+  { gate: GateReading | null; mode: "auto" | "crop";
+    onModeChange: (mode: "auto" | "crop") => void; disabled: boolean }) {
+  const manualCrop = mode === "crop";
+  const crop = manualCrop || gate?.surface_mode === "crop";
+  const full = gate?.surface_mode === "full" && gate?.fully_framed === true;
+  const cropSize = gate?.crop_size_mm;
+  const extent = gate?.extent_mm;
+  const modeText = manualCrop
+    ? "Manual large platform mode"
+    : crop
+    ? "Large platform mode"
+    : full
+      ? "Rectangle tracking"
+      : "Surface mode";
+  const detail = manualCrop
+    ? "ON - ignoring unstable rectangle/dot coverage; lock will use the center depth plane and fixed reticle work area."
+    : crop
+      ? cropSize
+        ? `ON - surface exceeds the camera frame; using a fixed ${Math.round(cropSize[0])} x ${Math.round(cropSize[1])} mm reticle work area.`
+        : "ON - surface exceeds the camera frame; using the reticle work area."
+    : full && extent
+      ? `ON - full rectangle tracked (${Math.round(extent[0])} x ${Math.round(extent[1])} mm). X/Y is advisory; targets use the measured rectangle center.`
+      : "Auto will use a finite rectangle when the measured surface fits. Turn on Large crop if dot coverage is incomplete or jittery.";
+  return (
+    <div className={"surface-mode " + (crop ? "crop" : full ? "full" : "")}>
+      <button type="button"
+              className={"surface-mode-toggle " + (manualCrop ? "on" : "")}
+              disabled={disabled}
+              onClick={() => onModeChange(manualCrop ? "auto" : "crop")}>
+        <span className="surface-mode-knob" />
+        {manualCrop ? "Large crop ON" : "Auto"}
+      </button>
+      <div>
+        <b>{modeText}</b>
+        <span>{detail}</span>
+      </div>
+    </div>
+  );
+}
+
 function SurfaceGuide({ gate, stable }: { gate: GateReading | null; stable: boolean }) {
   const move = gate?.move_cam ?? null;
   const cropSurface = gate?.surface_mode === "crop";
+  const trackedRectangle = gate?.surface_mode === "full" && gate?.fully_framed === true;
   const distanceTol = gate?.distance_tol_mm ?? 50;
   const centerTol = gate?.center_tol_mm ?? 30;
-  const range = move ? axisInstruction("Z", move[2], distanceTol, "mm") : "waiting for depth";
-  const centerX = move ? axisInstruction("X", move[0], centerTol, "mm") : "waiting";
-  const centerY = move ? axisInstruction("Y", move[1], centerTol, "mm") : "waiting";
+  const range = move ? axisInstruction("Z", move[2], distanceTol, "mm") : "not measured";
+  const centerX = trackedRectangle && !gate?.gates?.center
+    ? "rectangle tracked"
+    : move ? axisInstruction("X", move[0], centerTol, "mm") : "not measured";
+  const centerY = trackedRectangle && !gate?.gates?.center
+    ? "rectangle tracked"
+    : move ? axisInstruction("Y", move[1], centerTol, "mm") : "not measured";
   const tiltB = rotationInstruction("B", gate?.tilt_b_deg ?? null);
   const tiltC = rotationInstruction("C", gate?.tilt_c_deg ?? null);
   const yawA = rotationInstruction("A", gate?.yaw_a_deg ?? null);
   const chips = [
     ["Range", range, !!gate?.gates?.distance],
-    ["Center X", centerX, !!gate && (gate.gates?.center ?? cropSurface)],
-    ["Center Y", centerY, !!gate && (gate.gates?.center ?? cropSurface)],
+    ["Center X", centerX, !!gate && (gate.gates?.center || cropSurface || trackedRectangle)],
+    ["Center Y", centerY, !!gate && (gate.gates?.center || cropSurface || trackedRectangle)],
     ["Level B", tiltB, !!gate?.gates?.angle],
     ["Level C", tiltC, !!gate?.gates?.angle],
-    ["Edge A", yawA, !!gate && (gate.gates?.edge ?? cropSurface)],
+    ["Edge A", trackedRectangle && gate?.yaw_a_deg == null ? "rectangle tracked" : yawA,
+      !!gate && (gate.gates?.edge || cropSurface || trackedRectangle)],
   ] as const;
   return (
     <div className={"surface-guide " + (stable ? "ready" : gate?.ok ? "holding" : "")}>
       <div className="surface-guide-head">
-        <b>{stable ? "Ready to lock" : gate?.detected ? "Position with TOOL jog" : "Move near the platform"}</b>
+        <b>{stable ? "Surface ready" : gate?.detected ? "Review measured surface" : "Move near the platform"}</b>
         <span>{gate?.distance_mm != null
           ? `${Math.round(gate.distance_mm)} mm from surface, target ${Math.round(gate.ideal_distance_mm ?? 0)} mm`
-          : "Depth feed will appear when the surface is visible"}</span>
+          : "Waiting for live surface telemetry"}</span>
       </div>
       <div className="surface-guide-grid">
         {chips.map(([label, text, ok]) => (

@@ -212,6 +212,23 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
   background: rgba(210,153,34,.08); }
 .scan-ready.ready { color: var(--ok); border-color: rgba(63,185,80,.5);
   background: rgba(63,185,80,.10); }
+.surface-mode { max-width: 760px; margin-top: 10px; display: flex; align-items: flex-start;
+  gap: 10px; border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px;
+  background: var(--panel-2); font-size: 12px; line-height: 1.4; }
+.surface-mode.full { border-left: 3px solid var(--ok); background: rgba(63,185,80,.07); }
+.surface-mode.crop { border-left: 3px solid var(--warn); background: rgba(210,153,34,.08); }
+.surface-mode b { display: block; font-size: 13px; }
+.surface-mode span { color: var(--muted); }
+.surface-mode-toggle { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 7px;
+  font-family: var(--mono); font-weight: 800; color: var(--muted); background: transparent;
+  border: 1px solid var(--border); border-radius: 999px; padding: 4px 9px; }
+.surface-mode-toggle.on { color: var(--warn); }
+.surface-mode-toggle:disabled { opacity: .65; cursor: not-allowed; }
+.surface-mode-knob { width: 30px; height: 16px; border-radius: 999px; border: 1px solid var(--border);
+  background: rgba(255,255,255,.08); position: relative; }
+.surface-mode-knob::after { content: ""; position: absolute; top: 2px; left: 2px; width: 10px; height: 10px;
+  border-radius: 50%; background: var(--muted); transition: transform .15s; }
+.surface-mode-toggle.on .surface-mode-knob::after { transform: translateX(14px); background: var(--warn); }
 .surface-guide { max-width: 760px; margin-top: 10px; border: 1px solid var(--border);
   border-radius: 8px; padding: 10px 12px; background: var(--panel-2); }
 .surface-guide.ready { border-left: 3px solid var(--ok); background: rgba(63,185,80,.08); }
