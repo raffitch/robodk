@@ -38,6 +38,8 @@ class SurveyThresholds:
     ransac_distance_mm: float = 6.0       # RANSAC plane inlier band (mm)
     max_samples: int = 8000               # max points passed to RANSAC (stride-subsample)
     grid_target_px: int = 64              # desired on-screen grid cell size (px)
+    frame_margin_uv: float = 0.02         # fitted-rect corners this far inside the frame
+    #                                       => object bounded in view (keep the rectangle)
     work_crop_mm: tuple[float, float] = (1000.0, 1000.0)  # generic work square when the
     #                                       surface overruns the view (edges untrustworthy)
 
@@ -216,12 +218,27 @@ def survey_surface(
     corners3d, ax1, ax2, len1, len2 = _oriented_rectangle(inlier_pts, normal, centroid)
     extent_mm = (float(len1), float(len2))
 
-    # 6. Border test (fully_framed) — do any inlier pixels touch the image border?
+    # 6. Framed test. The old test asked "do any raw inlier PIXELS touch the image
+    # border?" — too strict: a few stray coplanar fringe points near an edge made a
+    # well-margined object read as an overrun and fall back to the generic square.
+    # Instead TRUST THE FITTED RECTANGLE: if its projected corners sit inside the
+    # frame with a margin, the object is bounded in view and we keep its rectangle.
     margin = th.border_margin_px
-    fully_framed = not (
+    depth_within_border = not (
         bool(np.any(inlier_xs < margin)) or bool(np.any(inlier_xs > W - 1 - margin)) or
         bool(np.any(inlier_ys < margin)) or bool(np.any(inlier_ys > H - 1 - margin))
     )
+
+    def _corners_in_frame(corners, frac=float(th.frame_margin_uv)) -> bool:
+        cc = np.asarray(corners, float).reshape(-1, 3)
+        if cc.shape[0] < 4 or bool(np.any(cc[:, 2] <= 0)):
+            return False
+        cu = (cc[:, 0] * fx / cc[:, 2] + cx) / W
+        cv = (cc[:, 1] * fy / cc[:, 2] + cy) / H
+        return bool(np.all((cu >= frac) & (cu <= 1.0 - frac)
+                           & (cv >= frac) & (cv <= 1.0 - frac)))
+
+    fully_framed = _corners_in_frame(corners3d)
 
     # When the surface overruns the view, its real edges are not in frame, so the
     # board rectangle above would over-run the table. Replace the operator overlay +

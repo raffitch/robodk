@@ -289,6 +289,7 @@ def _survey_thresholds(scfg) -> SurveyThresholds:
         accurate_max_mm=scfg.accurate_max_mm,
         survey_max_tilt_deg=scfg.survey_max_tilt_deg,
         grid_target_px=scfg.grid_target_px,
+        frame_margin_uv=float(getattr(scfg, "live_frame_margin_uv", 0.02)),
         work_crop_mm=tuple(scfg.work_crop_mm),
     )
 
@@ -497,14 +498,27 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
         W, H = camera_cfg.size
         calibrated_uv = projected.reshape(-1, 2) / np.array([W, H], dtype=float)
         if np.all(np.isfinite(calibrated_uv)):
-            outline_uv = calibrated_uv.tolist()
             edge_angle = _outline_edge_angle_deg(calibrated_uv)
-            color_margin = 0.015
-            fully_framed = bool(raw.get("depth_fully_framed")) and bool(np.all(
-                (calibrated_uv[:, 0] >= color_margin)
-                & (calibrated_uv[:, 0] <= 1.0 - color_margin)
-                & (calibrated_uv[:, 1] >= color_margin)
-                & (calibrated_uv[:, 1] <= 1.0 - color_margin)))
+            # TRUST THE FITTED RECTANGLE: if its calibrated corners sit inside the
+            # colour frame with a margin, the object is bounded in view — draw that
+            # rectangle and mark it framed. The server's depth_fully_framed test keys
+            # off RAW depth-inlier pixels touching the border, so a few stray fringe
+            # points made a well-margined block read as an overrun and fall back to
+            # the generic work square. The projected rectangle corners (built from the
+            # trimmed fit) are the reliable "does the object fit the view" signal, so
+            # the host overrides the server's over-eager crop here.
+            frame_margin = float(getattr(scfg, "live_frame_margin_uv", 0.02))
+            rectangle_in_frame = bool(np.all(
+                (calibrated_uv[:, 0] >= frame_margin)
+                & (calibrated_uv[:, 0] <= 1.0 - frame_margin)
+                & (calibrated_uv[:, 1] >= frame_margin)
+                & (calibrated_uv[:, 1] <= 1.0 - frame_margin)))
+            fully_framed = rectangle_in_frame
+            surface_mode = "full" if rectangle_in_frame else "crop"
+            if rectangle_in_frame:
+                # Hug the object with the fitted rectangle. When it overruns, keep the
+                # server's generic reticle square (raw outline_uv) instead.
+                outline_uv = calibrated_uv.tolist()
             max_center_span = float(np.max(np.abs(calibrated_uv - 0.5)))
             raw = {
                 **raw,

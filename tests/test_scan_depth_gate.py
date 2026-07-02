@@ -153,6 +153,64 @@ def test_live_outline_uses_saved_color_calibration():
     print("[telemetry calibration] saved RGB K+distortion drives blue outline")
 
 
+def _cam_320():
+    return type("Camera", (), {
+        "K": np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]]),
+        "dist": np.zeros((5, 1)),
+        "size": (320, 240),
+    })()
+
+
+def test_live_trusts_fitted_rectangle_over_strict_depth_border():
+    # A well-margined block: the server's raw-pixel depth test tripped (a few stray
+    # fringe points) -> it sent surface_mode="crop"/not framed, but the fitted
+    # rectangle projects comfortably inside the frame. The host must TRUST the
+    # rectangle: framed + full + draw the rectangle, not the generic square.
+    cfg = ScanConfig()
+    camera = _cam_320()
+    corners = np.array([[-120.0, -90.0, 500.0], [120.0, -90.0, 500.0],
+                        [120.0, 90.0, 500.0], [-120.0, 90.0, 500.0]])
+    raw = {
+        "detected": True, "distance_mm": 500.0, "tilt_deg": 1.0, "valid_frac": 1.0,
+        "depth_fully_framed": False, "fully_framed": False, "surface_mode": "crop",
+        "extent_mm": [240.0, 180.0], "rectangle_size_mm": [1000.0, 1000.0],
+        "rectangle_corners_color_mm": corners.tolist(),
+        "surface_center_cam_mm": [0.0, 0.0, 500.0],
+        "outline_uv": [[-0.1, -0.1], [1.1, -0.1], [1.1, 1.1], [-0.1, 1.1]],
+    }
+    p = live_scan_telemetry_payload(raw, cfg, camera_cfg=camera)
+    assert p["fully_framed"] is True, p
+    assert p["surface_mode"] == "full", p
+    assert p["gates"].get("framed") is True, p["gates"]
+    expected = cv2.projectPoints(corners, np.zeros(3), np.zeros(3),
+                                 camera.K, camera.dist)[0].reshape(-1, 2) / np.array(camera.size)
+    assert np.allclose(np.asarray(p["outline_uv"]), expected), p["outline_uv"]
+    print("[framing] fitted rectangle inside frame -> framed+full, hugging the object")
+
+
+def test_live_overrun_rectangle_still_crops():
+    # A surface that overruns the colour view: even if the server was optimistic
+    # (full), the projected corners fall on/over the frame edge -> host corrects to
+    # crop and keeps the generic square, not a frame-spanning rectangle.
+    cfg = ScanConfig()
+    camera = _cam_320()
+    corners = np.array([[-280.0, -210.0, 500.0], [280.0, -210.0, 500.0],
+                        [280.0, 210.0, 500.0], [-280.0, 210.0, 500.0]])
+    raw = {
+        "detected": True, "distance_mm": 500.0, "tilt_deg": 1.0, "valid_frac": 1.0,
+        "depth_fully_framed": True, "fully_framed": True, "surface_mode": "full",
+        "extent_mm": [560.0, 420.0], "rectangle_size_mm": [560.0, 420.0],
+        "rectangle_corners_color_mm": corners.tolist(),
+        "surface_center_cam_mm": [0.0, 0.0, 500.0],
+        "outline_uv": [[-0.2, -0.2], [1.2, -0.2], [1.2, 1.2], [-0.2, 1.2]],
+    }
+    p = live_scan_telemetry_payload(raw, cfg, camera_cfg=camera)
+    assert p["fully_framed"] is False, p
+    assert p["surface_mode"] == "crop", p
+    assert p["crop_size_mm"] is not None, p
+    print("[framing] overrunning rectangle -> crop + generic square (no regression)")
+
+
 def test_live_scan_payload_stabilizes_static_jitter():
     cfg = ScanConfig()
     base = {
@@ -467,6 +525,8 @@ if __name__ == "__main__":
     test_live_telemetry_uses_surface_appropriate_standoff()
     test_live_target_is_continuous_across_color_frame_boundary()
     test_live_outline_uses_saved_color_calibration()
+    test_live_trusts_fitted_rectangle_over_strict_depth_border()
+    test_live_overrun_rectangle_still_crops()
     test_live_scan_payload_stabilizes_static_jitter()
     test_live_scan_payload_holds_mode_on_border_flicker()
     test_live_scan_payload_aligns_rectangle_corner_order()

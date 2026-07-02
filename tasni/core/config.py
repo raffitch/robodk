@@ -450,6 +450,9 @@ class ScanConfig(_Model):
     live_hold_settle_frames: int = 5       # projected frames to average into the rectangle
     #                                        before the hold locks (avoids freezing a
     #                                        half-settled fit right after a move)
+    live_frame_margin_uv: float = 0.02     # fitted-rectangle corners this far inside the
+    #                                        frame => the object is bounded in view (draw
+    #                                        the rectangle), not an overrun (generic square)
     # Vision safety net for the hold: the live rectangle is depth-derived, so it must
     # still track a physical camera move even if RoboDK is not mirroring the arm. A
     # standoff/tilt shift past these (well above the ~1 mm / ~0.5° noise floor)
