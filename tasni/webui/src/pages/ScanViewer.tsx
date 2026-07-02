@@ -50,7 +50,9 @@ export default function ScanViewer({ nonce, src, frameT, corners }: Props) {
     (async () => {
       let n = 0, pts: Float32Array, cols: Float32Array;
       try {
-        const buf = await fetch(src).then((r) => {
+        const url = new URL(src, window.location.origin);
+        url.searchParams.set("_", String(nonce));
+        const buf = await fetch(url, { cache: "no-store" }).then((r) => {
           if (!r.ok) throw new Error(String(r.status));
           return r.arrayBuffer();
         });
