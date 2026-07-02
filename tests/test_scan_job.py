@@ -167,6 +167,8 @@ def test_generate_run_insert():
     # The full-frame survey now drives the actual scan geometry: this 300 mm square
     # scans near the closest standoff that still frames its measured boundary.
     assert 380 < gen["look_distance_mm"] < 405
+    target_z = [float(state["targets"][name][2, 3]) for name in gen["targets"]]
+    assert min(target_z) >= gen["look_distance_mm"] - 1.0, target_z
     assert gen["planned_cone_deg"] == services.config.scan.flat_cone_deg
     assert gen["planned_views"] == services.config.scan.flat_views
 
@@ -448,6 +450,25 @@ def test_run_without_targets_errors():
     print("[run needs targets] refused")
 
 
+def test_sparse_measured_support_is_rejected():
+    cfg = AppConfig().scan
+    coverage = {
+        "point_count": 19,
+        "fill": 0.00018,
+        "weakest_edge": 0.0,
+    }
+    mesh_stats = {
+        "support_fallback": True,
+        "combined_vertices": 0,
+    }
+    reasons = scan_service._surface_quality_reasons(coverage, mesh_stats, cfg)
+    assert any("only 19 supported" in r for r in reasons), reasons
+    assert any("fill 0%" in r for r in reasons), reasons
+    assert any("weakest edge support 0%" in r for r in reasons), reasons
+    assert any("repeated multi-view" in r for r in reasons), reasons
+    print("[surface quality] sparse measured support rejected:", len(reasons), "reasons")
+
+
 if __name__ == "__main__":
     test_generate_run_insert()
     test_lock_then_create_targets_reuses_frozen_surface()
@@ -461,4 +482,5 @@ if __name__ == "__main__":
     test_generate_accepts_dynamic_near_quality_distance()
     test_warns_but_proceeds_without_calibration()
     test_run_without_targets_errors()
+    test_sparse_measured_support_is_rejected()
     print("\nScan job (gate -> generate -> run -> insert) tests passed.")

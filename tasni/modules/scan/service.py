@@ -590,6 +590,8 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
     target_center = None
     target_count = scfg.pose_count
     target_cone_deg = scfg.cone_half_angle_deg
+    target_normal = None
+    min_perpendicular_mm = None
     plan = None
     planned_voxel_m = scfg.voxel_size_m
     extent_mm = (list(survey.extent_mm)
@@ -602,6 +604,8 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
             if plan.mode == "quality" and plan.aims:
                 look = float(plan.standoff_mm)
                 target_center = np.asarray(plan.aims[0].point_base_mm, float)
+                target_normal = -np.asarray(plan.aims[0].view_dir_base, float)
+                min_perpendicular_mm = float(plan.aims[0].min_perpendicular_mm)
                 # Preserve an operator-configured denser tour (12 by default), while
                 # still allowing a raised-surface plan to request more viewpoints.
                 target_count = max(int(scfg.pose_count), int(plan.aims[0].n_views))
@@ -644,7 +648,8 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
         seed_T, count=target_count, look_distance_mm=look,
         cone_half_angle_deg=target_cone_deg,
         roll_max_deg=scfg.roll_max_deg, distance_jitter=scfg.distance_jitter,
-        target_center=target_center)
+        target_center=target_center, target_normal=target_normal,
+        min_perpendicular_mm=min_perpendicular_mm)
     reachable = [(i, T) for i, T in enumerate(candidates) if rdk.is_reachable(T)]
     n_reach = len(reachable)
     reachable_before_collision = list(reachable)
@@ -732,6 +737,28 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
         sel = select_diverse(reach_T, min(target_count, n_usable), seed_fwd=seed_T[:3, 2])
     chosen = [(reachable[k][0], reachable[k][1], reach_joints[k]) for k in sel]
 
+    _, eff_max, eff_mean = viewing_angle_span([T for _, T, _ in chosen], seed_T[:3, 2])
+    # Predicted surface coverage: fraction of the footprint grid the kept views tile.
+    # A low value is exactly the "one part of the board never captured" failure, so
+    # surface it BEFORE the run rather than discovering the hole in the fused mesh.
+    surface_coverage = None
+    if footprint_base is not None:
+        surface_coverage, _ = projected_corner_coverage(
+            [T for _, T, _ in chosen], footprint_base, K, (W, H))
+    if (surface_coverage is not None
+            and surface_coverage < float(scfg.min_surface_coverage)):
+        message = (
+            f"the chosen views tile only {surface_coverage:.0%} of the surface "
+            f"(< {scfg.min_surface_coverage:.0%}) — part of the surface would not "
+            "be captured. Re-seed at a more central/open view or move farther back "
+            "until the surface stays framed, then Create targets again.")
+        hard_fail_coverage = (
+            getattr(scfg, "surface_coverage_hard_fail", False)
+            and crop_size_mm is None)
+        if hard_fail_coverage:
+            raise RuntimeError(message)
+        services.bus.publish(JobEvent("log", {"message": f"WARNING: {message}"}))
+
     n_backfilled = 0
     created: list[str] = []
     for _, T, joints in chosen:
@@ -742,15 +769,6 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
         name = f"{prefix}{len(created) + 1:02d}"
         rdk.add_target(name, T, joints=joints)
         created.append(name)
-
-    _, eff_max, eff_mean = viewing_angle_span([T for _, T, _ in chosen], seed_T[:3, 2])
-    # Predicted surface coverage: fraction of the footprint grid the kept views tile.
-    # A low value is exactly the "one part of the board never captured" failure, so
-    # surface it BEFORE the run rather than discovering the hole in the fused mesh.
-    surface_coverage = None
-    if footprint_base is not None:
-        surface_coverage, _ = projected_corner_coverage(
-            [T for _, T, _ in chosen], footprint_base, K, (W, H))
     extent_txt = (f"; extent {round(extent_mm[0])}×{round(extent_mm[1])} mm"
                   if extent_mm else "")
     collide_note = (f"; collision filter bypassed after {n_collide} reported collision(s)"
@@ -765,14 +783,6 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
         f"{n_reach}/{len(candidates)} candidates reachable; effective cone "
         f"~{eff_max:.0f}° of {target_cone_deg:.0f}°{collide_note}{cover_note}) — "
         f"inspect them in RoboDK"}))
-    if surface_coverage is not None and surface_coverage < scfg.min_surface_coverage:
-        services.bus.publish(JobEvent("log", {"message":
-            f"WARNING: the chosen views tile only {surface_coverage:.0%} of the surface "
-            f"(< {scfg.min_surface_coverage:.0%}) — part of the board may not be captured. "
-            f"Re-seed at a more central/open view, lower scan.cone_half_angle_deg, or "
-            f"raise scan.frame_margin so each view frames the whole surface, then "
-            f"Create targets again."}))
-
     return {"mode": "quality", "created": len(created), "targets": created,
             "look_distance_mm": look,
             "gate": gate_payload, "candidates_reachable": n_reach,
@@ -890,6 +900,29 @@ def _surface_coverage(points_m: np.ndarray, wp, *, bin_m: float,
         "edges": edges,
         "weakest_edge": float(min(edges.values())),
     }
+
+
+def _surface_quality_reasons(coverage: dict, mesh_stats: dict, scfg) -> list[str]:
+    """Reasons a fitted flat surface is not backed by enough measured depth."""
+    reasons: list[str] = []
+    point_count = int(coverage.get("point_count") or 0)
+    fill = float(coverage.get("fill") or 0.0)
+    weakest_edge = float(coverage.get("weakest_edge") or 0.0)
+    if point_count < int(scfg.min_actual_surface_points):
+        reasons.append(
+            f"only {point_count} supported measured mesh vertices "
+            f"(< {int(scfg.min_actual_surface_points)})")
+    if fill < float(scfg.min_actual_fill_coverage):
+        reasons.append(
+            f"measured surface fill {fill:.0%} "
+            f"(< {float(scfg.min_actual_fill_coverage):.0%})")
+    if weakest_edge < float(scfg.min_actual_edge_coverage):
+        reasons.append(
+            f"weakest edge support {weakest_edge:.0%} "
+            f"(< {float(scfg.min_actual_edge_coverage):.0%})")
+    if bool(mesh_stats.get("support_fallback")) and int(mesh_stats.get("combined_vertices") or 0) == 0:
+        reasons.append("no measured vertices had repeated multi-view depth support")
+    return reasons
 
 
 def _combine_depth_frames(frames) -> tuple[np.ndarray, np.ndarray]:
@@ -1064,12 +1097,19 @@ class ScanCaptureJob:
                 np.asarray(measured_mesh.vertices, dtype=float), wp,
                 bin_m=scfg.actual_coverage_bin_m,
                 edge_band_m=scfg.actual_coverage_edge_band_m)
+            quality_reasons = _surface_quality_reasons(coverage, mesh_stats, scfg)
             if coverage["weakest_edge"] < float(scfg.min_actual_edge_coverage):
                 ctx.log(
                     f"WARNING: measured mesh edge support is weak "
                     f"(weakest edge {coverage['weakest_edge']:.0%}, "
                     f"interior {coverage['interior']:.0%}); expect visible gaps "
                     f"or re-scan with better edge coverage")
+            if quality_reasons and getattr(scfg, "actual_coverage_hard_fail", False):
+                raise RuntimeError(
+                    "scan rejected: the fitted work surface is not backed by enough "
+                    "measured depth (" + "; ".join(quality_reasons) + "). "
+                    "Move farther back so the whole surface stays framed in every "
+                    "target, then lock and create targets again.")
 
             report = _result_report(wp, frame_T_mm, corners_mm, n_views=len(views),
                                      n_points=len(pts), mesh=mesh, run_dir=run_dir,

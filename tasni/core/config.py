@@ -423,6 +423,7 @@ class ScanConfig(_Model):
     raised_views: int = 13               # view count for raised objects
     min_surface_coverage: float = 0.85   # warn if the chosen views tile < this fraction
                                          # of the surface footprint grid (a missed region)
+    surface_coverage_hard_fail: bool = True  # refuse target sets that cannot tile the surface
     grid_target_px: int = 64             # desired on-screen grid cell (px) for live overlay
     # When the surface overruns the view (edges not fully framed) its real edges are
     # untrustworthy, so we stop fitting the board and project a GENERIC fixed work
@@ -474,7 +475,10 @@ class ScanConfig(_Model):
     measured_mesh_neutral_color: bool = True  # do not show printed ChArUco/color texture
     actual_coverage_bin_m: float = 0.004  # post-run occupancy cell for measured surface
     actual_coverage_edge_band_m: float = 0.024  # edge band width for coverage warnings
-    min_actual_edge_coverage: float = 0.60  # warn below this weakest-edge fill
+    min_actual_surface_points: int = 500  # reject fitted rectangles backed by too little real mesh
+    min_actual_fill_coverage: float = 0.20  # reject when measured support is too sparse overall
+    min_actual_edge_coverage: float = 0.60  # warn/reject below this weakest-edge fill
+    actual_coverage_hard_fail: bool = True  # do not offer Insert for unsupported fitted planes
 
     # -- region of interest: isolate the work surface (the "top layer") ----
     # Without this, fusing every view captures the whole room and RANSAC locks

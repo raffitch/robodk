@@ -33,6 +33,7 @@ class AimPoint:
     point_base_mm: np.ndarray      # look-at target (centroid) in base frame (or camera frame if cam_to_base_T=None)
     view_dir_base: np.ndarray      # desired camera forward direction (toward surface)
     standoff_mm: float
+    min_perpendicular_mm: float
     cone_half_angle_deg: float
     roll_max_deg: float
     n_views: int
@@ -42,6 +43,7 @@ class AimPoint:
             "point_base_mm": np.asarray(self.point_base_mm, float).tolist(),
             "view_dir_base": np.asarray(self.view_dir_base, float).tolist(),
             "standoff_mm": float(self.standoff_mm),
+            "min_perpendicular_mm": float(self.min_perpendicular_mm),
             "cone_half_angle_deg": float(self.cone_half_angle_deg),
             "roll_max_deg": float(self.roll_max_deg),
             "n_views": int(self.n_views),
@@ -163,6 +165,7 @@ def plan_scan(
         point_base_mm=point_mm,
         view_dir_base=view_dir,
         standoff_mm=standoff_mm,
+        min_perpendicular_mm=float(d_fit),
         cone_half_angle_deg=cone,
         roll_max_deg=scan_cfg.roll_max_deg,
         n_views=n_views,
