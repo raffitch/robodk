@@ -734,13 +734,13 @@ export default function Scan() {
                 <>
                   <div className="k">Fused</div>
                   <div className="v">{result.n_views} views · {result.n_points.toLocaleString()} points ·
-                    {result.mesh_vertices.toLocaleString()} measured mesh verts ·
+                    {result.mesh_vertices.toLocaleString()} fitted mesh verts ·
                     {result.mesh_triangles.toLocaleString()} tris</div>
                   {result.quality && (
                     <>
                       <div className="k">Quality</div>
                       <div className="v">{result.quality.voxel_size_mm.toFixed(1)} mm TSDF ·
-                        measured mesh insert ·
+                        fitted flat mesh insert ·
                         {result.quality.frames_per_pose} frame{result.quality.frames_per_pose === 1 ? "" : "s"}/target</div>
                     </>
                   )}

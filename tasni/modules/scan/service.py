@@ -815,14 +815,16 @@ class ScanResult:
 def _result_report(wp, frame_T_mm, corners_mm, *, n_views, n_points, mesh,
                    run_dir, stamp, voxel_size_m: float, mesh_spacing_m: float,
                    frames_per_pose: int, mesh_stats: dict | None = None,
-                   coverage: dict | None = None) -> dict:
+                   coverage: dict | None = None,
+                   mesh_kind: str = "fitted_flat_surface") -> dict:
     return {
         "module": "scan", "stamp": stamp, "run_dir": str(run_dir),
         "n_views": int(n_views), "n_points": int(n_points),
         "mesh_vertices": int(len(mesh.vertices)),
         "mesh_triangles": int(len(mesh.triangles)),
         "mesh_file": "mesh.obj",
-        "mesh_kind": "measured_tsdf_surface",
+        "mesh_kind": mesh_kind,
+        "measured_mesh_file": "measured_tsdf_mesh.ply",
         "reference_mesh_file": "work_surface_rect.obj",
         "raw_mesh_file": "raw_tsdf_mesh.ply",
         "mesh_cleaning": mesh_stats or {},
@@ -1027,12 +1029,13 @@ class ScanCaptureJob:
                     f"{self.params.surface_size_mm[0]:.0f}×"
                     f"{self.params.surface_size_mm[1]:.0f} mm from the surface lock")
 
-            # Keep the work rectangle as a reference, but insert the measured TSDF
-            # surface after clipping it to the rectangle and removing weakly
-            # supported/disconnected fragments.
+            # Keep the measured TSDF surface as diagnostic evidence, but insert a
+            # dense fitted plane for the operator-facing flat-surface workflow. The
+            # raw TSDF topology preserves RealSense validity holes from printed
+            # ChArUco texture; projecting that topology flat still looks patterned.
             reference_mesh = planar_rectangle_mesh(
                 wp.corners, spacing_m=scfg.surface_mesh_spacing_m)
-            mesh, mesh_stats = clean_measured_surface_mesh(
+            measured_mesh, mesh_stats = clean_measured_surface_mesh(
                 raw_mesh, views, wp, K, width, height,
                 plane_band_m=scfg.measured_mesh_plane_band_m,
                 rect_margin_m=scfg.measured_mesh_rect_margin_m,
@@ -1046,11 +1049,11 @@ class ScanCaptureJob:
                 keep_largest_component=scfg.measured_mesh_keep_largest_component,
                 project_to_plane=scfg.measured_mesh_project_to_plane,
                 neutral_color=scfg.measured_mesh_neutral_color)
-            if len(mesh.triangles) == 0:
+            if len(measured_mesh.triangles) == 0:
                 ctx.log("WARNING: measured mesh cleaning produced no triangles; "
-                        "falling back to the reference rectangle mesh")
-                mesh = reference_mesh
-                mesh_stats["fallback_mesh"] = "reference_rectangle"
+                        "using only the fitted flat surface mesh")
+                mesh_stats["fallback_mesh"] = "fitted_flat_surface"
+            mesh = reference_mesh
             # metres -> mm for RoboDK (rotation is unitless; translation + corners scale)
             frame_T_mm = wp.frame_T.copy()
             frame_T_mm[:3, 3] *= 1000.0
@@ -1058,7 +1061,7 @@ class ScanCaptureJob:
             pp_m, cc = mesh_preview_points(mesh, max_points=scfg.preview_max_points)
             preview_mm = (pp_m * 1000.0).astype(np.float32)
             coverage = _surface_coverage(
-                np.asarray(mesh.vertices, dtype=float), wp,
+                np.asarray(measured_mesh.vertices, dtype=float), wp,
                 bin_m=scfg.actual_coverage_bin_m,
                 edge_band_m=scfg.actual_coverage_edge_band_m)
             if coverage["weakest_edge"] < float(scfg.min_actual_edge_coverage):
@@ -1073,11 +1076,14 @@ class ScanCaptureJob:
                                      stamp=stamp, voxel_size_m=voxel_m,
                                      mesh_spacing_m=scfg.surface_mesh_spacing_m,
                                      frames_per_pose=scfg.frames_per_pose,
-                                     mesh_stats=mesh_stats, coverage=coverage)
+                                     mesh_stats=mesh_stats, coverage=coverage,
+                                     mesh_kind="fitted_flat_surface")
             mesh_obj = None
             if self.params.save_artifacts:
                 save_mesh(mesh, str(run_dir / "mesh.obj"))
                 save_mesh(mesh, str(run_dir / "mesh.ply"))
+                save_mesh(measured_mesh, str(run_dir / "measured_tsdf_mesh.obj"))
+                save_mesh(measured_mesh, str(run_dir / "measured_tsdf_mesh.ply"))
                 save_mesh(reference_mesh, str(run_dir / "work_surface_rect.obj"))
                 save_mesh(raw_mesh, str(run_dir / "raw_tsdf_mesh.ply"))
                 mesh_obj = str(run_dir / "mesh.obj")
@@ -1095,7 +1101,7 @@ class ScanCaptureJob:
 
             sz = report["plane"]["size_mm"]
             ctx.log(f"fused {len(views)} views -> {len(pts)} pts, "
-                    f"{len(mesh.vertices)} measured mesh verts "
+                    f"{len(mesh.vertices)} fitted flat mesh verts "
                     f"({len(mesh.triangles)} tris); work surface "
                     f"{sz[0]:.0f} x {sz[1]:.0f} mm (plane inliers "
                     f"{report['plane']['inlier_frac']:.0%}). Review, then Insert.")
