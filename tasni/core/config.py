@@ -425,6 +425,10 @@ class ScanConfig(_Model):
                                          # of the surface footprint grid (a missed region)
     surface_coverage_hard_fail: bool = True  # refuse target sets that cannot tile the surface
     grid_target_px: int = 64             # desired on-screen grid cell (px) for live overlay
+    live_aim_smoothing_alpha: float = 0.35  # EMA for live HUD numbers/rectangle; lock remains raw
+    live_aim_reset_distance_mm: float = 120.0  # reset smoothing when the camera truly moved
+    live_aim_reset_center_mm: float = 80.0
+    live_aim_reset_outline_uv: float = 0.08
     # When the surface overruns the view (edges not fully framed) its real edges are
     # untrustworthy, so we stop fitting the board and project a GENERIC fixed work
     # square on the plane, centred on the camera reticle (the aim point). This is its

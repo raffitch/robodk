@@ -533,6 +533,139 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
     }
 
 
+def _as_float_array(value, shape_last: int | None = None) -> np.ndarray | None:
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=float)
+    except Exception:
+        return None
+    if not np.all(np.isfinite(arr)):
+        return None
+    if shape_last is not None and (arr.ndim == 0 or arr.shape[-1] != shape_last):
+        return None
+    return arr
+
+
+def _lerp(a, b, alpha: float):
+    return (1.0 - alpha) * np.asarray(a, dtype=float) + alpha * np.asarray(b, dtype=float)
+
+
+def _smooth_scalar(prev: dict, cur: dict, key: str, alpha: float) -> None:
+    if prev.get(key) is None or cur.get(key) is None:
+        return
+    try:
+        cur[key] = float(_lerp(float(prev[key]), float(cur[key]), alpha))
+    except Exception:
+        pass
+
+
+def _smooth_vector(prev: dict, cur: dict, key: str, alpha: float,
+                   *, shape_last: int | None = None) -> None:
+    a = _as_float_array(prev.get(key), shape_last)
+    b = _as_float_array(cur.get(key), shape_last)
+    if a is None or b is None or a.shape != b.shape:
+        return
+    out = _lerp(a, b, alpha)
+    if key == "normal_cam":
+        n = float(np.linalg.norm(out))
+        if n > 1e-9:
+            out = out / n
+    cur[key] = out.tolist()
+
+
+def _payload_center_mm(payload: dict) -> np.ndarray | None:
+    move = _as_float_array(payload.get("move_cam"), 3)
+    if move is None:
+        return None
+    return move[:2]
+
+
+def _payload_outline_uv(payload: dict) -> np.ndarray | None:
+    outline = _as_float_array(payload.get("outline_uv"), 2)
+    if outline is None or outline.ndim != 2 or len(outline) < 3:
+        return None
+    return outline
+
+
+def _should_reset_live_smoothing(prev: dict, cur: dict, scfg) -> bool:
+    if not prev or not prev.get("detected") or not cur.get("detected"):
+        return True
+    if prev.get("surface_mode") != cur.get("surface_mode"):
+        return True
+    if prev.get("fully_framed") != cur.get("fully_framed"):
+        return True
+    if prev.get("distance_mm") is not None and cur.get("distance_mm") is not None:
+        if abs(float(cur["distance_mm"]) - float(prev["distance_mm"])) > float(scfg.live_aim_reset_distance_mm):
+            return True
+    pc, cc = _payload_center_mm(prev), _payload_center_mm(cur)
+    if pc is not None and cc is not None:
+        if float(np.linalg.norm(cc - pc)) > float(scfg.live_aim_reset_center_mm):
+            return True
+    po, co = _payload_outline_uv(prev), _payload_outline_uv(cur)
+    if po is not None and co is not None and po.shape == co.shape:
+        if float(np.median(np.linalg.norm(co - po, axis=1))) > float(scfg.live_aim_reset_outline_uv):
+            return True
+    return False
+
+
+def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg) -> dict:
+    """Temporal smoothing for live scan HUD telemetry only.
+
+    The lock/create-target path still grabs an authoritative raw RGBD frame. This
+    filter prevents per-frame RealSense plane/edge noise from making a static robot
+    look like it is moving in the live aiming UI.
+    """
+    if not current or current.get("live") is not True:
+        return current
+    if previous is None or _should_reset_live_smoothing(previous, current, scfg):
+        return current
+
+    out = dict(current)
+    alpha = float(np.clip(getattr(scfg, "live_aim_smoothing_alpha", 0.35), 0.05, 1.0))
+    for key in (
+        "distance_mm", "tilt_deg", "tilt_b_deg", "tilt_c_deg",
+        "yaw_a_deg", "ideal_distance_mm",
+    ):
+        _smooth_scalar(previous, out, key, alpha)
+    for key, shape_last in (
+        ("move_cam", 3),
+        ("normal_cam", 3),
+        ("centroid_cam_mm", 3),
+        ("extent_mm", None),
+        ("rectangle_size_mm", None),
+        ("outline_uv", 2),
+        ("visible_outline_uv", 2),
+    ):
+        _smooth_vector(previous, out, key, alpha, shape_last=shape_last)
+
+    gates = dict(out.get("gates") or {})
+    distance = out.get("distance_mm")
+    ideal = out.get("ideal_distance_mm")
+    tilt = out.get("tilt_deg")
+    if distance is not None and ideal is not None:
+        gates["distance"] = abs(float(distance) - float(ideal)) <= float(out.get("distance_tol_mm", scfg.distance_tol_mm))
+    if tilt is not None:
+        gates["angle"] = float(tilt) <= float(out.get("max_tilt_deg", scfg.max_tilt_deg))
+    if "center" in gates and out.get("move_cam") is not None:
+        mv = _as_float_array(out.get("move_cam"), 3)
+        if mv is not None:
+            gates["center"] = (
+                abs(float(mv[0])) <= float(out.get("center_tol_mm", scfg.center_tol_mm))
+                and abs(float(mv[1])) <= float(out.get("center_tol_mm", scfg.center_tol_mm)))
+    if "edge" in gates and out.get("yaw_a_deg") is not None:
+        gates["edge"] = abs(float(out["yaw_a_deg"])) <= float(out.get("edge_align_tol_deg", scfg.edge_align_tol_deg))
+    if out.get("fully_framed") is not None:
+        gates["framed"] = bool(out.get("fully_framed"))
+    ok_gates = dict(gates)
+    if out.get("surface_mode") == "crop":
+        ok_gates.pop("framed", None)
+    out["gates"] = gates
+    out["ok"] = all(bool(v) for v in ok_gates.values())
+    out["stabilized"] = True
+    return out
+
+
 def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> dict:
     """Gate-gated scan-target creation (synchronous, no robot motion).
 

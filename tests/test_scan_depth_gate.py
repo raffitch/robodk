@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tasni.modules.scan.depth_gate import (  # noqa: E402
     ScanGateThresholds, evaluate_depth_gate)
 from tasni.core.config import ScanConfig  # noqa: E402
-from tasni.modules.scan.service import live_scan_telemetry_payload  # noqa: E402
+from tasni.modules.scan.service import (  # noqa: E402
+    live_scan_telemetry_payload, stabilize_live_scan_payload)
 
 W, H = 320, 240
 K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
@@ -90,7 +91,8 @@ def test_live_telemetry_uses_surface_appropriate_standoff():
         "color_fit_standoff_per_margin_mm": 300.0,
     }
     p = live_scan_telemetry_payload(raw, cfg)
-    assert abs(p["ideal_distance_mm"] - 390.0) < 1e-6, p
+    expected = round((300.0 * cfg.frame_margin) / 10.0) * 10.0
+    assert abs(p["ideal_distance_mm"] - expected) < 1e-6, p
     assert p["gates"]["angle"] is True
     assert p["gates"]["framed"] is True
     assert p["rectangle_size_mm"] == [200.0, 300.0]
@@ -107,17 +109,18 @@ def test_live_target_is_continuous_across_color_frame_boundary():
     }
     framed = live_scan_telemetry_payload({**base, "fully_framed": True}, cfg)
     clipped = live_scan_telemetry_payload({**base, "fully_framed": False}, cfg)
-    assert framed["ideal_distance_mm"] == clipped["ideal_distance_mm"] == 420.0
+    expected = round((326.0 * cfg.frame_margin) / 10.0) * 10.0
+    assert framed["ideal_distance_mm"] == clipped["ideal_distance_mm"] == expected
     chatter = live_scan_telemetry_payload(
         {**base, "color_fit_standoff_per_margin_mm": 318.0,
-         "fully_framed": True}, cfg, previous_ideal_mm=420.0)
-    assert chatter["ideal_distance_mm"] == 420.0
+         "fully_framed": True}, cfg, previous_ideal_mm=expected)
+    assert chatter["ideal_distance_mm"] == expected
 
     crop = live_scan_telemetry_payload({
         **base, "fully_framed": False, "surface_mode": "crop"}, cfg)
     assert crop["ideal_distance_mm"] == cfg.accurate_min_mm
     assert crop["crop_size_mm"] is not None
-    print("[telemetry hysteresis] color clipping keeps target 420 mm; true crop stays 300 mm")
+    print("[telemetry hysteresis] color clipping keeps target stable; true crop stays 300 mm")
 
 
 def test_live_outline_uses_saved_color_calibration():
@@ -150,6 +153,38 @@ def test_live_outline_uses_saved_color_calibration():
     print("[telemetry calibration] saved RGB K+distortion drives blue outline")
 
 
+def test_live_scan_payload_stabilizes_static_jitter():
+    cfg = ScanConfig()
+    base = {
+        "detected": True, "distance_mm": 500.0, "tilt_deg": 2.0,
+        "tilt_b_deg": 1.0, "tilt_c_deg": -1.0, "valid_frac": 0.9,
+        "fully_framed": True, "depth_fully_framed": True,
+        "extent_mm": [300.0, 200.0], "rectangle_size_mm": [300.0, 200.0],
+        "surface_mode": "full", "color_fit_standoff_per_margin_mm": 300.0,
+        "surface_center_cam_mm": [4.0, -3.0, 500.0],
+        "edge_angle_deg": 1.0,
+        "outline_uv": [[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]],
+    }
+    prev = live_scan_telemetry_payload(base, cfg)
+    noisy = live_scan_telemetry_payload({
+        **base,
+        "distance_mm": 530.0,
+        "tilt_deg": 5.0,
+        "tilt_b_deg": 5.0,
+        "surface_center_cam_mm": [34.0, -23.0, 530.0],
+        "edge_angle_deg": 4.0,
+        "outline_uv": [[0.27, 0.24], [0.77, 0.26], [0.73, 0.76], [0.23, 0.74]],
+    }, cfg, previous_ideal_mm=prev["ideal_distance_mm"])
+    stable = stabilize_live_scan_payload(noisy, prev, cfg)
+    assert stable["stabilized"] is True
+    assert 500.0 < stable["distance_mm"] < 530.0, stable["distance_mm"]
+    assert stable["distance_mm"] < 515.0, stable["distance_mm"]
+    assert 2.0 < stable["tilt_deg"] < 5.0, stable["tilt_deg"]
+    assert stable["move_cam"][0] < noisy["move_cam"][0], (stable["move_cam"], noisy["move_cam"])
+    assert np.asarray(stable["outline_uv"])[0, 0] < np.asarray(noisy["outline_uv"])[0, 0]
+    print("[telemetry smoothing] static frame jitter damped for live HUD")
+
+
 if __name__ == "__main__":
     test_frontal_plane_all_green()
     test_tilt_measured_and_gated()
@@ -158,4 +193,5 @@ if __name__ == "__main__":
     test_live_telemetry_uses_surface_appropriate_standoff()
     test_live_target_is_continuous_across_color_frame_boundary()
     test_live_outline_uses_saved_color_calibration()
+    test_live_scan_payload_stabilizes_static_jitter()
     print("\ndepth_gate.py tests passed.")

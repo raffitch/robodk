@@ -16,7 +16,7 @@ from ..base import ServiceContainer, WorkflowModule
 from ..calibration.service import SimTourJob
 from .service import (ScanCaptureJob, ScanParams, ScanResult, generate_scan_targets,
                       insert_scan, live_scan_telemetry_payload, LockedScanSurface,
-                      lock_scan_surface)
+                      lock_scan_surface, stabilize_live_scan_payload)
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
@@ -164,9 +164,10 @@ class ScanModule(WorkflowModule):
             PREVIEW_W = 960
             enc = [cv2.IMWRITE_JPEG_QUALITY, sc.preview_jpeg_quality]
             last_ideal_mm = None
+            last_metrics = None
 
             def analyze(frame):
-                nonlocal last_ideal_mm
+                nonlocal last_ideal_mm, last_metrics
                 # Color-only video: draw ONLY a thin reticle marking where the gate
                 # samples standoff/tilt. The HUD overlays all numbers, so we bake no
                 # text here (that was the overlapping-text bug).
@@ -184,6 +185,8 @@ class ScanModule(WorkflowModule):
                     previous_ideal_mm=last_ideal_mm,
                     camera_cfg=c.camera)
                 if metrics:
+                    metrics = stabilize_live_scan_payload(metrics, last_metrics, sc)
+                    last_metrics = metrics
                     last_ideal_mm = metrics.get("ideal_distance_mm", last_ideal_mm)
                 return (jpeg.tobytes() if ok else b""), metrics
 
