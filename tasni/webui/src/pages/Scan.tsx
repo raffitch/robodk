@@ -714,7 +714,10 @@ export default function Scan() {
         {result ? (
           <>
             {result.mode !== "reference" && (
-              <ScanViewer nonce={viewerNonce} src={PREVIEW_URL}
+              <ScanViewer nonce={viewerNonce}
+                          src={result.stamp
+                            ? `${PREVIEW_URL}?run_id=${encodeURIComponent(result.stamp)}`
+                            : PREVIEW_URL}
                           frameT={pl?.frame_T_mm} corners={pl?.corners_mm} />
             )}
             <div className="kv" style={{ marginTop: 12 }}>
