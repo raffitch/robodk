@@ -185,6 +185,104 @@ def test_live_scan_payload_stabilizes_static_jitter():
     print("[telemetry smoothing] static frame jitter damped for live HUD")
 
 
+def test_live_scan_payload_holds_mode_on_border_flicker():
+    cfg = ScanConfig()
+    prev = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 500.0, "tilt_deg": 1.0,
+        "valid_frac": 0.9, "fully_framed": True, "depth_fully_framed": True,
+        "surface_mode": "full", "extent_mm": [500.0, 350.0],
+        "rectangle_size_mm": [500.0, 350.0],
+        "color_fit_standoff_per_margin_mm": 500.0,
+        "surface_center_cam_mm": [0.0, 0.0, 500.0],
+        "outline_uv": [[0.15, 0.15], [0.85, 0.15], [0.85, 0.85], [0.15, 0.85]],
+    }, cfg)
+    noisy_crop = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 505.0, "tilt_deg": 1.2,
+        "valid_frac": 0.9, "fully_framed": False, "depth_fully_framed": False,
+        "surface_mode": "crop", "extent_mm": [510.0, 360.0],
+        "rectangle_size_mm": [1000.0, 1000.0],
+        "color_fit_standoff_per_margin_mm": 505.0,
+        "surface_center_cam_mm": [5.0, -4.0, 505.0],
+        "outline_uv": [[-0.1, -0.1], [1.1, -0.1], [1.1, 1.1], [-0.1, 1.1]],
+    }, cfg, previous_ideal_mm=prev["ideal_distance_mm"])
+    stable = stabilize_live_scan_payload(noisy_crop, prev, cfg)
+    assert stable["surface_mode"] == "full", stable
+    assert stable["fully_framed"] is True, stable
+    assert stable["outline_uv"] == prev["outline_uv"], stable["outline_uv"]
+    assert stable["stabilized"] is True
+    print("[telemetry smoothing] border full/crop flicker held stable")
+
+
+def test_live_scan_payload_aligns_rectangle_corner_order():
+    cfg = ScanConfig()
+    prev = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 500.0, "tilt_deg": 1.0,
+        "valid_frac": 0.9, "fully_framed": True, "depth_fully_framed": True,
+        "surface_mode": "full", "extent_mm": [500.0, 350.0],
+        "rectangle_size_mm": [500.0, 350.0],
+        "color_fit_standoff_per_margin_mm": 500.0,
+        "surface_center_cam_mm": [0.0, 0.0, 500.0],
+        "outline_uv": [[0.2, 0.2], [0.8, 0.2], [0.8, 0.7], [0.2, 0.7]],
+    }, cfg)
+    shifted = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 501.0, "tilt_deg": 1.1,
+        "valid_frac": 0.9, "fully_framed": True, "depth_fully_framed": True,
+        "surface_mode": "full", "extent_mm": [501.0, 351.0],
+        "rectangle_size_mm": [501.0, 351.0],
+        "color_fit_standoff_per_margin_mm": 501.0,
+        "surface_center_cam_mm": [1.0, -1.0, 501.0],
+        "outline_uv": [[0.8, 0.2], [0.8, 0.7], [0.2, 0.7], [0.2, 0.2]],
+    }, cfg, previous_ideal_mm=prev["ideal_distance_mm"])
+    stable = stabilize_live_scan_payload(shifted, prev, cfg)
+    assert stable["stabilized"] is True
+    assert np.allclose(np.asarray(stable["outline_uv"])[0], [0.2, 0.2], atol=0.01)
+    print("[telemetry smoothing] rectangle corner-order flip aligned")
+
+
+def test_live_scan_payload_hysteresis_holds_green_gate():
+    cfg = ScanConfig()
+    prev = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 500.0, "tilt_deg": 1.0,
+        "valid_frac": 0.9, "fully_framed": True, "depth_fully_framed": True,
+        "surface_mode": "full", "extent_mm": [300.0, 200.0],
+        "rectangle_size_mm": [300.0, 200.0],
+        "color_fit_standoff_per_margin_mm": 476.0,
+        "surface_center_cam_mm": [25.0, 0.0, 500.0],
+        "outline_uv": [[0.3, 0.3], [0.7, 0.3], [0.7, 0.7], [0.3, 0.7]],
+    }, cfg)
+    assert prev["gates"]["center"] is True, prev
+    noisy = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 501.0, "tilt_deg": 1.1,
+        "valid_frac": 0.9, "fully_framed": True, "depth_fully_framed": True,
+        "surface_mode": "full", "extent_mm": [300.0, 200.0],
+        "rectangle_size_mm": [300.0, 200.0],
+        "color_fit_standoff_per_margin_mm": 476.0,
+        "surface_center_cam_mm": [42.0, 0.0, 501.0],
+        "outline_uv": [[0.3, 0.3], [0.7, 0.3], [0.7, 0.7], [0.3, 0.7]],
+    }, cfg, previous_ideal_mm=prev["ideal_distance_mm"])
+    stable = stabilize_live_scan_payload(noisy, prev, cfg)
+    assert stable["gates"]["center"] is True, stable
+    print("[telemetry smoothing] live gate hysteresis holds near-threshold center")
+
+
+def test_live_scan_near_square_skips_edge_gate():
+    cfg = ScanConfig()
+    raw = {
+        "detected": True, "distance_mm": 800.0, "tilt_deg": 1.0,
+        "valid_frac": 0.9, "fully_framed": True, "depth_fully_framed": True,
+        "surface_mode": "full", "extent_mm": [800.0, 790.0],
+        "rectangle_size_mm": [800.0, 790.0],
+        "color_fit_standoff_per_margin_mm": 760.0,
+        "surface_center_cam_mm": [0.0, 0.0, 800.0],
+        "edge_angle_deg": 20.0,
+    }
+    p = live_scan_telemetry_payload(raw, cfg)
+    assert "edge" not in p["gates"], p
+    assert p["yaw_a_deg"] is None, p
+    assert p["ok"] is True, p
+    print("[telemetry square] near-square surface skips ambiguous EDGE A gate")
+
+
 if __name__ == "__main__":
     test_frontal_plane_all_green()
     test_tilt_measured_and_gated()
@@ -194,4 +292,8 @@ if __name__ == "__main__":
     test_live_target_is_continuous_across_color_frame_boundary()
     test_live_outline_uses_saved_color_calibration()
     test_live_scan_payload_stabilizes_static_jitter()
+    test_live_scan_payload_holds_mode_on_border_flicker()
+    test_live_scan_payload_aligns_rectangle_corner_order()
+    test_live_scan_payload_hysteresis_holds_green_gate()
+    test_live_scan_near_square_skips_edge_gate()
     print("\ndepth_gate.py tests passed.")

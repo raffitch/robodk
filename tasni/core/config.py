@@ -428,7 +428,12 @@ class ScanConfig(_Model):
     live_aim_smoothing_alpha: float = 0.35  # EMA for live HUD numbers/rectangle; lock remains raw
     live_aim_reset_distance_mm: float = 120.0  # reset smoothing when the camera truly moved
     live_aim_reset_center_mm: float = 80.0
-    live_aim_reset_outline_uv: float = 0.08
+    live_aim_reset_outline_uv: float = 0.20
+    live_aim_distance_hysteresis_mm: float = 20.0
+    live_aim_center_hysteresis_mm: float = 80.0
+    live_aim_angle_hysteresis_deg: float = 1.0
+    live_aim_edge_hysteresis_deg: float = 10.0
+    edge_gate_min_aspect: float = 1.15  # below this a rectangle is near-square; yaw edge is ambiguous
     # When the surface overruns the view (edges not fully framed) its real edges are
     # untrustworthy, so we stop fitting the board and project a GENERIC fixed work
     # square on the plane, centred on the camera reticle (the aim point). This is its

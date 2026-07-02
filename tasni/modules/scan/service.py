@@ -92,6 +92,15 @@ def _outline_edge_angle_deg(outline_uv) -> float | None:
     return ((angle + 45.0) % 90.0) - 45.0
 
 
+def _aspect_ratio(values) -> float | None:
+    try:
+        a, b = [abs(float(v)) for v in values[:2]]
+    except Exception:
+        return None
+    lo = max(min(a, b), 1e-9)
+    return max(a, b) / lo
+
+
 def _planned_surface_standoff_mm(
     scfg, K, image_size, reading, survey, full_frame_valid_frac: float | None = None
 ) -> float:
@@ -159,7 +168,9 @@ def lock_scan_surface(services) -> LockedScanSurface:
                 float((reading.distance_mm or ideal_distance) - ideal_distance),
             ]
             gate_payload["center_tol_mm"] = float(scfg.center_tol_mm)
-        if survey.outline_uv and len(survey.outline_uv) >= 2:
+        aspect = _aspect_ratio(survey.extent_mm) if survey.extent_mm is not None else None
+        if (survey.outline_uv and len(survey.outline_uv) >= 2
+                and (aspect is None or aspect >= float(scfg.edge_gate_min_aspect))):
             uv = np.asarray(survey.outline_uv, float)
             edges = np.roll(uv, -1, axis=0) - uv
             edge = edges[int(np.argmax(np.linalg.norm(edges, axis=1)))]
@@ -484,11 +495,14 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
     center_cam = raw.get("surface_center_cam_mm")
     edge_angle = raw.get("edge_angle_deg")
     finite_surface = surface_mode == "full"
+    edge_aspect = _aspect_ratio(raw.get("rectangle_size_mm") or extent or [])
+    edge_gate_reliable = (
+        edge_aspect is None or edge_aspect >= float(scfg.edge_gate_min_aspect))
     if finite_surface and center_cam is not None:
         gates["center"] = bool(
             abs(float(center_cam[0])) <= float(scfg.center_tol_mm)
             and abs(float(center_cam[1])) <= float(scfg.center_tol_mm))
-    if finite_surface and edge_angle is not None:
+    if finite_surface and edge_angle is not None and edge_gate_reliable:
         gates["edge"] = abs(float(edge_angle)) <= float(scfg.edge_align_tol_deg)
     if fully_framed is not None:
         gates["framed"] = bool(fully_framed)
@@ -514,7 +528,7 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
         ],
         "center_tol_mm": float(scfg.center_tol_mm),
         "yaw_a_deg": (-float(edge_angle)
-                      if finite_surface and edge_angle is not None else None),
+                      if finite_surface and edge_angle is not None and edge_gate_reliable else None),
         "edge_align_tol_deg": float(scfg.edge_align_tol_deg),
         "tilt_b_deg": raw.get("tilt_b_deg"),
         "tilt_c_deg": raw.get("tilt_c_deg"),
@@ -588,23 +602,24 @@ def _payload_outline_uv(payload: dict) -> np.ndarray | None:
     return outline
 
 
+def _align_polygon_like(reference: np.ndarray, candidate: np.ndarray) -> np.ndarray:
+    """Return candidate with cyclic/reversed corner order closest to reference."""
+    ref = np.asarray(reference, dtype=float)
+    cand = np.asarray(candidate, dtype=float)
+    if ref.shape != cand.shape or cand.ndim != 2 or len(cand) < 3:
+        return cand
+    variants = []
+    for arr in (cand, cand[::-1]):
+        for shift in range(len(arr)):
+            variants.append(np.roll(arr, shift, axis=0))
+    return min(variants, key=lambda v: float(np.mean(np.linalg.norm(v - ref, axis=1))))
+
+
 def _should_reset_live_smoothing(prev: dict, cur: dict, scfg) -> bool:
     if not prev or not prev.get("detected") or not cur.get("detected"):
         return True
-    if prev.get("surface_mode") != cur.get("surface_mode"):
-        return True
-    if prev.get("fully_framed") != cur.get("fully_framed"):
-        return True
     if prev.get("distance_mm") is not None and cur.get("distance_mm") is not None:
         if abs(float(cur["distance_mm"]) - float(prev["distance_mm"])) > float(scfg.live_aim_reset_distance_mm):
-            return True
-    pc, cc = _payload_center_mm(prev), _payload_center_mm(cur)
-    if pc is not None and cc is not None:
-        if float(np.linalg.norm(cc - pc)) > float(scfg.live_aim_reset_center_mm):
-            return True
-    po, co = _payload_outline_uv(prev), _payload_outline_uv(cur)
-    if po is not None and co is not None and po.shape == co.shape:
-        if float(np.median(np.linalg.norm(co - po, axis=1))) > float(scfg.live_aim_reset_outline_uv):
             return True
     return False
 
@@ -622,6 +637,19 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg) -> d
         return current
 
     out = dict(current)
+    if previous.get("surface_mode") != current.get("surface_mode"):
+        out["surface_mode"] = previous.get("surface_mode")
+        out["crop_size_mm"] = previous.get("crop_size_mm", out.get("crop_size_mm"))
+        for key in ("outline_uv", "visible_outline_uv", "grid_uv", "points_uv"):
+            if previous.get(key) is not None:
+                out[key] = previous.get(key)
+    if previous.get("fully_framed") != current.get("fully_framed"):
+        out["fully_framed"] = previous.get("fully_framed")
+    for key in ("outline_uv", "visible_outline_uv"):
+        prev_poly = _as_float_array(previous.get(key), 2)
+        cur_poly = _as_float_array(out.get(key), 2)
+        if prev_poly is not None and cur_poly is not None and prev_poly.shape == cur_poly.shape:
+            out[key] = _align_polygon_like(prev_poly, cur_poly).tolist()
     alpha = float(np.clip(getattr(scfg, "live_aim_smoothing_alpha", 0.35), 0.05, 1.0))
     for key in (
         "distance_mm", "tilt_deg", "tilt_b_deg", "tilt_c_deg",
@@ -640,21 +668,34 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg) -> d
         _smooth_vector(previous, out, key, alpha, shape_last=shape_last)
 
     gates = dict(out.get("gates") or {})
+    prev_gates = dict(previous.get("gates") or {})
     distance = out.get("distance_mm")
     ideal = out.get("ideal_distance_mm")
     tilt = out.get("tilt_deg")
     if distance is not None and ideal is not None:
-        gates["distance"] = abs(float(distance) - float(ideal)) <= float(out.get("distance_tol_mm", scfg.distance_tol_mm))
+        tol = float(out.get("distance_tol_mm", scfg.distance_tol_mm))
+        if prev_gates.get("distance"):
+            tol += float(getattr(scfg, "live_aim_distance_hysteresis_mm", 20.0))
+        gates["distance"] = abs(float(distance) - float(ideal)) <= tol
     if tilt is not None:
-        gates["angle"] = float(tilt) <= float(out.get("max_tilt_deg", scfg.max_tilt_deg))
+        tol = float(out.get("max_tilt_deg", scfg.max_tilt_deg))
+        if prev_gates.get("angle"):
+            tol += float(getattr(scfg, "live_aim_angle_hysteresis_deg", 1.0))
+        gates["angle"] = float(tilt) <= tol
     if "center" in gates and out.get("move_cam") is not None:
         mv = _as_float_array(out.get("move_cam"), 3)
         if mv is not None:
+            tol = float(out.get("center_tol_mm", scfg.center_tol_mm))
+            if prev_gates.get("center"):
+                tol += float(getattr(scfg, "live_aim_center_hysteresis_mm", 15.0))
             gates["center"] = (
-                abs(float(mv[0])) <= float(out.get("center_tol_mm", scfg.center_tol_mm))
-                and abs(float(mv[1])) <= float(out.get("center_tol_mm", scfg.center_tol_mm)))
+                abs(float(mv[0])) <= tol
+                and abs(float(mv[1])) <= tol)
     if "edge" in gates and out.get("yaw_a_deg") is not None:
-        gates["edge"] = abs(float(out["yaw_a_deg"])) <= float(out.get("edge_align_tol_deg", scfg.edge_align_tol_deg))
+        tol = float(out.get("edge_align_tol_deg", scfg.edge_align_tol_deg))
+        if prev_gates.get("edge"):
+            tol += float(getattr(scfg, "live_aim_edge_hysteresis_deg", 2.0))
+        gates["edge"] = abs(float(out["yaw_a_deg"])) <= tol
     if out.get("fully_framed") is not None:
         gates["framed"] = bool(out.get("fully_framed"))
     ok_gates = dict(gates)
