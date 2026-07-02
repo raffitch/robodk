@@ -433,7 +433,7 @@ class ScanConfig(_Model):
     live_aim_center_hysteresis_mm: float = 80.0
     live_aim_angle_hysteresis_deg: float = 1.0
     live_aim_edge_hysteresis_deg: float = 10.0
-    edge_gate_min_aspect: float = 1.15  # below this a rectangle is near-square; yaw edge is ambiguous
+    edge_gate_min_aspect: float = 1.80  # below this yaw edge is advisory; it is too ambiguous for lock
     # When the surface overruns the view (edges not fully framed) its real edges are
     # untrustworthy, so we stop fitting the board and project a GENERIC fixed work
     # square on the plane, centred on the camera reticle (the aim point). This is its

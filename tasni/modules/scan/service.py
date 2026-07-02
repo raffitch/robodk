@@ -168,15 +168,12 @@ def lock_scan_surface(services) -> LockedScanSurface:
                 float((reading.distance_mm or ideal_distance) - ideal_distance),
             ]
             gate_payload["center_tol_mm"] = float(scfg.center_tol_mm)
-        aspect = _aspect_ratio(survey.extent_mm) if survey.extent_mm is not None else None
-        if (survey.outline_uv and len(survey.outline_uv) >= 2
-                and (aspect is None or aspect >= float(scfg.edge_gate_min_aspect))):
+        if survey.outline_uv and len(survey.outline_uv) >= 2:
             uv = np.asarray(survey.outline_uv, float)
             edges = np.roll(uv, -1, axis=0) - uv
             edge = edges[int(np.argmax(np.linalg.norm(edges, axis=1)))]
             angle = float(np.degrees(np.arctan2(edge[1], edge[0])))
             angle = ((angle + 45.0) % 90.0) - 45.0
-            final_gates["edge"] = abs(angle) <= float(scfg.edge_align_tol_deg)
             gate_payload["yaw_a_deg"] = -angle
             gate_payload["edge_align_tol_deg"] = float(scfg.edge_align_tol_deg)
     elif survey.detected and not surface_overruns_view:
@@ -495,15 +492,10 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
     center_cam = raw.get("surface_center_cam_mm")
     edge_angle = raw.get("edge_angle_deg")
     finite_surface = surface_mode == "full"
-    edge_aspect = _aspect_ratio(raw.get("rectangle_size_mm") or extent or [])
-    edge_gate_reliable = (
-        edge_aspect is None or edge_aspect >= float(scfg.edge_gate_min_aspect))
     if finite_surface and center_cam is not None:
         gates["center"] = bool(
             abs(float(center_cam[0])) <= float(scfg.center_tol_mm)
             and abs(float(center_cam[1])) <= float(scfg.center_tol_mm))
-    if finite_surface and edge_angle is not None and edge_gate_reliable:
-        gates["edge"] = abs(float(edge_angle)) <= float(scfg.edge_align_tol_deg)
     if fully_framed is not None:
         gates["framed"] = bool(fully_framed)
     ok_gates = dict(gates)
@@ -528,7 +520,7 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
         ],
         "center_tol_mm": float(scfg.center_tol_mm),
         "yaw_a_deg": (-float(edge_angle)
-                      if finite_surface and edge_angle is not None and edge_gate_reliable else None),
+                      if finite_surface and edge_angle is not None else None),
         "edge_align_tol_deg": float(scfg.edge_align_tol_deg),
         "tilt_b_deg": raw.get("tilt_b_deg"),
         "tilt_c_deg": raw.get("tilt_c_deg"),
@@ -615,6 +607,16 @@ def _align_polygon_like(reference: np.ndarray, candidate: np.ndarray) -> np.ndar
     return min(variants, key=lambda v: float(np.mean(np.linalg.norm(v - ref, axis=1))))
 
 
+def _polygon_area(poly: np.ndarray | None) -> float:
+    if poly is None:
+        return 0.0
+    pts = np.asarray(poly, dtype=float)
+    if pts.ndim != 2 or len(pts) < 3 or pts.shape[1] < 2:
+        return 0.0
+    x, y = pts[:, 0], pts[:, 1]
+    return abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))) * 0.5
+
+
 def _should_reset_live_smoothing(prev: dict, cur: dict, scfg) -> bool:
     if not prev or not prev.get("detected") or not cur.get("detected"):
         return True
@@ -649,7 +651,21 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg) -> d
         prev_poly = _as_float_array(previous.get(key), 2)
         cur_poly = _as_float_array(out.get(key), 2)
         if prev_poly is not None and cur_poly is not None and prev_poly.shape == cur_poly.shape:
-            out[key] = _align_polygon_like(prev_poly, cur_poly).tolist()
+            aligned = _align_polygon_like(prev_poly, cur_poly)
+            if key == "outline_uv":
+                prev_area = _polygon_area(prev_poly)
+                cur_area = _polygon_area(aligned)
+                # Live RealSense validity can drop an edge or low-texture band for
+                # one telemetry frame. Do not let the blue work rectangle shrink to
+                # that partial footprint; only grow/refine it, or reset on a real
+                # distance change handled above.
+                if prev_area > 0.0 and cur_area < 0.98 * prev_area:
+                    out[key] = prev_poly.tolist()
+                    for size_key in ("extent_mm", "rectangle_size_mm"):
+                        if previous.get(size_key) is not None:
+                            out[size_key] = previous.get(size_key)
+                    continue
+            out[key] = aligned.tolist()
     alpha = float(np.clip(getattr(scfg, "live_aim_smoothing_alpha", 0.35), 0.05, 1.0))
     for key in (
         "distance_mm", "tilt_deg", "tilt_b_deg", "tilt_c_deg",
@@ -691,11 +707,7 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg) -> d
             gates["center"] = (
                 abs(float(mv[0])) <= tol
                 and abs(float(mv[1])) <= tol)
-    if "edge" in gates and out.get("yaw_a_deg") is not None:
-        tol = float(out.get("edge_align_tol_deg", scfg.edge_align_tol_deg))
-        if prev_gates.get("edge"):
-            tol += float(getattr(scfg, "live_aim_edge_hysteresis_deg", 2.0))
-        gates["edge"] = abs(float(out["yaw_a_deg"])) <= tol
+    gates.pop("edge", None)
     if out.get("fully_framed") is not None:
         gates["framed"] = bool(out.get("fully_framed"))
     ok_gates = dict(gates)

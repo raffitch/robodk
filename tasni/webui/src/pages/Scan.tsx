@@ -313,7 +313,7 @@ export default function Scan() {
     const last = coverageCenterRef.current;
     // A clear camera/surface move invalidates the accumulated dots (they were
     // anchored to the old view) — start fresh so coverage never smears.
-    if (last && Math.hypot(center[0] - last[0], center[1] - last[1]) > 0.035) {
+    if (last && Math.hypot(center[0] - last[0], center[1] - last[1]) > 0.20) {
       coverageRef.current = [];
     }
     coverageCenterRef.current = center;

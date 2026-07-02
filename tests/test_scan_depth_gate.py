@@ -239,6 +239,33 @@ def test_live_scan_payload_aligns_rectangle_corner_order():
     print("[telemetry smoothing] rectangle corner-order flip aligned")
 
 
+def test_live_scan_payload_does_not_shrink_to_partial_depth():
+    cfg = ScanConfig()
+    prev = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 800.0, "tilt_deg": 1.0,
+        "valid_frac": 0.9, "fully_framed": True, "depth_fully_framed": True,
+        "surface_mode": "full", "extent_mm": [800.0, 790.0],
+        "rectangle_size_mm": [800.0, 790.0],
+        "color_fit_standoff_per_margin_mm": 760.0,
+        "surface_center_cam_mm": [0.0, 0.0, 800.0],
+        "outline_uv": [[0.15, 0.15], [0.85, 0.15], [0.85, 0.85], [0.15, 0.85]],
+    }, cfg)
+    partial = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 801.0, "tilt_deg": 1.1,
+        "valid_frac": 0.9, "fully_framed": True, "depth_fully_framed": True,
+        "surface_mode": "full", "extent_mm": [430.0, 400.0],
+        "rectangle_size_mm": [430.0, 400.0],
+        "color_fit_standoff_per_margin_mm": 430.0,
+        "surface_center_cam_mm": [4.0, -3.0, 801.0],
+        "outline_uv": [[0.32, 0.32], [0.68, 0.32], [0.68, 0.68], [0.32, 0.68]],
+    }, cfg, previous_ideal_mm=prev["ideal_distance_mm"])
+    stable = stabilize_live_scan_payload(partial, prev, cfg)
+    assert stable["outline_uv"] == prev["outline_uv"], stable["outline_uv"]
+    assert stable["extent_mm"] == prev["extent_mm"], stable["extent_mm"]
+    assert stable["rectangle_size_mm"] == prev["rectangle_size_mm"], stable["rectangle_size_mm"]
+    print("[telemetry smoothing] partial-depth rectangle shrink ignored")
+
+
 def test_live_scan_payload_hysteresis_holds_green_gate():
     cfg = ScanConfig()
     prev = live_scan_telemetry_payload({
@@ -278,9 +305,8 @@ def test_live_scan_near_square_skips_edge_gate():
     }
     p = live_scan_telemetry_payload(raw, cfg)
     assert "edge" not in p["gates"], p
-    assert p["yaw_a_deg"] is None, p
     assert p["ok"] is True, p
-    print("[telemetry square] near-square surface skips ambiguous EDGE A gate")
+    print("[telemetry square] EDGE A is advisory, not a lock gate")
 
 
 if __name__ == "__main__":
@@ -294,6 +320,7 @@ if __name__ == "__main__":
     test_live_scan_payload_stabilizes_static_jitter()
     test_live_scan_payload_holds_mode_on_border_flicker()
     test_live_scan_payload_aligns_rectangle_corner_order()
+    test_live_scan_payload_does_not_shrink_to_partial_depth()
     test_live_scan_payload_hysteresis_holds_green_gate()
     test_live_scan_near_square_skips_edge_gate()
     print("\ndepth_gate.py tests passed.")
