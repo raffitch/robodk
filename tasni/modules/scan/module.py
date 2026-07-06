@@ -7,6 +7,7 @@ the pure ``reconstruct``/``plane``/``depth_gate`` libraries.
 """
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -51,6 +52,9 @@ class ScanModule(WorkflowModule):
         self._planned_crop_mm: tuple[float, float] | None = None
         self._planned_surface_size_mm: tuple[float, float] | None = None
         self._locked_surface: LockedScanSurface | None = None
+        # Set by POST /live/refresh; consumed by the live analyze loop to drop the
+        # anti-jitter hold + pose anchor and re-read fresh at the current robot pose.
+        self._live_refresh = threading.Event()
 
     def router(self) -> "APIRouter":
         from fastapi import APIRouter, HTTPException, Response
@@ -173,6 +177,16 @@ class ScanModule(WorkflowModule):
 
             def analyze(frame):
                 nonlocal last_ideal_mm, last_metrics, anchor_pose_T
+                if self._live_refresh.is_set():
+                    # Operator pressed Refresh: re-read at the current pose. Drop the
+                    # hold (last_metrics) and the pose anchor (anchor_pose_T) so the next
+                    # few frames re-settle a fresh reading HERE — clears a stale overlay
+                    # when RoboDK is not mirroring the arm and a lateral jog slipped past
+                    # the hold. KEEP last_ideal_mm so the distance target stays continuous
+                    # (no flash to accurate_min while it re-frames).
+                    self._live_refresh.clear()
+                    last_metrics = None
+                    anchor_pose_T = None
                 # Color-only video: draw ONLY a thin reticle marking where the gate
                 # samples standoff/tilt. The HUD overlays all numbers, so we bake no
                 # text here (that was the overlapping-text bug).
@@ -247,6 +261,21 @@ class ScanModule(WorkflowModule):
         def live_stop() -> dict:
             services.live.stop()
             return {"status": "stopped"}
+
+        @router.post("/live/refresh")
+        def live_refresh() -> dict:
+            """Re-read the live surface at the current robot pose.
+
+            Drops the anti-jitter hold + pose anchor so the overlay/readouts re-settle
+            fresh where the arm is NOW — the escape hatch for a stale projection when
+            RoboDK is not mirroring the arm (driver monitoring off) and a lateral jog
+            slipped past the hold + vision escape. Keeps the video streaming (no
+            teardown) and the distance target continuous.
+            """
+            if not services.live.running:
+                raise HTTPException(409, "live preview is not running")
+            self._live_refresh.set()
+            return {"status": "refreshing"}
 
         @router.post("/surface/lock")
         def surface_lock(body: SurfaceLockBody) -> dict:

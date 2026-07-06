@@ -449,6 +449,19 @@ export default function Scan() {
     try { await api.post("/live/stop"); } catch { /* ignore */ }
     setLive(false); resetStream(); resetCoverage();
   };
+  // Re-read the surface at the current robot pose: drops the anti-jitter hold so the
+  // overlay/readouts re-settle where the arm is NOW (fixes a stale projection when
+  // RoboDK is not mirroring the arm). Keeps the video streaming.
+  const refreshLive = async () => {
+    try {
+      await api.post("/live/refresh");
+      resetCoverage();
+      stableSinceRef.current = null;
+      setSurfaceStable(false);
+      setStableProgress(0);
+      addLog("re-reading the surface at the current pose…");
+    } catch (e: any) { addLog("refresh: " + e.message, true); }
+  };
   const repositionSurface = async () => {
     try { await api.post("/surface/unlock"); } catch { /* best effort */ }
     setSurfaceLocked(false);
@@ -698,6 +711,12 @@ export default function Scan() {
             : live
               ? <button className="secondary" onClick={stopLive}>Stop camera</button>
               : null}
+          {live
+            ? <button className="secondary" onClick={refreshLive} disabled={running}
+                      title="Re-read the surface at the current robot pose (clears a stale overlay if the arm moved but the readout didn't)">
+                Refresh view
+              </button>
+            : null}
           {!surfaceLocked
             ? <button onClick={lockAndCreateTargets}
                       disabled={!ready || running || locking || generating || !live || !canLockSurface}>
