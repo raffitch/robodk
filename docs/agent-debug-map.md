@@ -3,7 +3,24 @@
 Current purpose: give future agents a low-token entry point into the Tasni app,
 scan/calibration logic, RoboDK connection, and Jetson camera server.
 
-Last updated: 2026-06-29. Active branch: `calibration-improvements`.
+Last updated: 2026-07-06. Active branch: `calibration-improvements`.
+
+## Recent scan fixes (2026-07-06)
+
+- `55f3c27` — **parked-scan jitter fixed**: the live HUD hold now uses symmetric
+  hysteresis (`live_hold_release_frames`), so a parked arm shows zero jitter and only
+  sustained motion releases the freeze. Live-verified (parked 124/124 held, 0.00 p-p;
+  real-robot A6 move releases+tracks+refreezes).
+- `d4e56bd` — **three scan defects**: (1) live overlay draws the density-TRIMMED
+  rectangle to match lock/insert (server sends `trimmed_corners_color_mm`; host
+  projects it calibrated); (2) reference mode wired (`generate_scan_targets` →
+  `_reference_locate`, was dead code); (3) EDGE A lamp populated (advisory — real for
+  an elongated platform via `edge_gate_min_aspect`, never blocks lock). Jetson
+  auto-deployed the server change.
+- Live 6-DOF HUD test (no code change): RANGE + TILT feedback + the hold verified on
+  the real arm; X/Y-center/EDGE not testable (large white surface = crop mode);
+  jog sign/`jog_invert` mapping to the pendant still to confirm. See
+  `docs/live-robot-testing.md`.
 
 ## Start Here
 
@@ -64,11 +81,15 @@ If dots look horizontally compressed:
 3. Check whether H.264 preview is active via `tasni.config.json` / `calibration.preview_codec`.
 4. Inspect `server/server_unicast_syncronous.py::stream_h264` projection code before touching frontend scaling.
 
-If FPS/no-signal dips:
+If FPS/no-signal dips (or the scan gate goes silent — no `gate` events on `/ws`):
 
-1. Check Jetson logs: `py -3.10 tools/jetson_deploy.py logs`.
-2. Look for repeated broken pipes or reconnect loops.
-3. H.264 path requires PyAV on the workstation and Nano NVENC. JPEG fallback is possible,
+1. **First remedy: restart the preview** — POST `/api/modules/scan/live/stop` then
+   `/api/modules/scan/live/start`. The scan-telemetry channel stalls intermittently on
+   Wi-Fi (and after robot-state changes); a restart reliably kicks it. See
+   `docs/live-robot-testing.md` §5.
+2. Check Jetson logs: `py -3.10 tools/jetson_deploy.py logs`.
+3. Look for repeated broken pipes or reconnect loops.
+4. H.264 path requires PyAV on the workstation and Nano NVENC. JPEG fallback is possible,
    but the JPEG server path must publish scan telemetry if dots/guidance are needed.
 
 ## Jetson Deploy Reality
@@ -132,6 +153,9 @@ pytest tests\test_collision_guard.py tests\test_calibration_job.py tests\test_sc
 
 Read only when needed:
 
+- `docs/live-robot-testing.md`: **how to drive the real KUKA from a script safely**
+  and read the live HUD — SIMULATE-vs-RUN_ROBOT trap, telemetry stalls, stale-hold
+  reads, camera-tool IK, the continuous-monitor pattern. Read before any move script.
 - `docs/jetson-scanner.md`: Jetson hardware/software/server details.
 - `docs/scan-workbox-handoff.md`: scan dots and rectangle trim history.
 - `docs/flat-workframe-validation-handoff.md`: current recommendation for the next
