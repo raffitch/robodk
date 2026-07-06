@@ -214,7 +214,13 @@ class ScanModule(WorkflowModule):
                     if pose_T is not None and not metrics.get("held"):
                         anchor_pose_T = pose_T
                     last_metrics = metrics
-                    last_ideal_mm = metrics.get("ideal_distance_mm", last_ideal_mm)
+                    # Latch the target only while the surface is FRAMED (full). In crop
+                    # the telemetry HOLDS this latched value instead of collapsing to
+                    # accurate_min, so a brief over-nudge into overrun doesn't move the
+                    # goalpost. A genuinely oversized surface never frames, so the latch
+                    # stays None and crop correctly falls back to the work-close standoff.
+                    if metrics.get("surface_mode") == "full":
+                        last_ideal_mm = metrics.get("ideal_distance_mm", last_ideal_mm)
                 return (jpeg.tobytes() if ok else b""), metrics
 
             # Use the exact same proven color transport as Calibration. Scan depth is

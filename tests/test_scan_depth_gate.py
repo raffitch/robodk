@@ -123,6 +123,62 @@ def test_live_target_is_continuous_across_color_frame_boundary():
     print("[telemetry hysteresis] color clipping keeps target stable; true crop stays 300 mm")
 
 
+def test_live_target_holds_framed_standoff_when_over_nudged_into_crop():
+    # THE MOVING-GOALPOST BUG: framed -> target ~T; the operator moves a little too
+    # close so the object overruns (surface_mode flips to crop). The target must HOLD T
+    # (so they can back off to reframe), NOT collapse to accurate_min and drive them
+    # even closer -- the reported "target says 592, I move toward it, it jumps to 300
+    # and I can never reach it". Only a genuinely oversized surface (never framed ->
+    # no latch) should work close at accurate_min.
+    cfg = ScanConfig()
+    framed = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 658.0, "tilt_deg": 1.0, "valid_frac": 0.9,
+        "fully_framed": True, "surface_mode": "full", "extent_mm": [360.0, 240.0],
+        "rectangle_size_mm": [360.0, 240.0],
+        "color_fit_standoff_per_margin_mm": 560.0,
+    }, cfg)
+    target = framed["ideal_distance_mm"]
+    assert cfg.accurate_min_mm < target < cfg.accurate_max_mm, framed
+
+    # Nudged too close -> overrun (crop), WITH a latched framed target: HOLD it.
+    crop = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 610.0, "tilt_deg": 1.0, "valid_frac": 0.9,
+        "fully_framed": False, "surface_mode": "crop", "extent_mm": [360.0, 240.0],
+        "rectangle_size_mm": [1000.0, 1000.0],
+        "color_fit_standoff_per_margin_mm": 610.0,
+    }, cfg, previous_ideal_mm=target)
+    assert crop["ideal_distance_mm"] == target, crop            # held, not 300
+    assert crop["ideal_distance_mm"] != cfg.accurate_min_mm, crop
+
+    # Genuinely oversized surface: never framed -> no latch -> work close at 300.
+    cold = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 610.0, "tilt_deg": 1.0, "valid_frac": 0.9,
+        "fully_framed": False, "surface_mode": "crop", "extent_mm": [900.0, 900.0],
+        "rectangle_size_mm": [1000.0, 1000.0],
+        "color_fit_standoff_per_margin_mm": 900.0,
+    }, cfg)                                                     # no previous_ideal_mm
+    assert cold["ideal_distance_mm"] == cfg.accurate_min_mm, cold
+    print("[telemetry latch] over-nudge into crop holds framed target; cold crop = 300")
+
+
+def test_recommended_standoff_sits_inside_the_frame_not_on_the_crop_edge():
+    # The recommended aim standoff must leave enough border that the object stays framed
+    # AT the target (so DISTANCE and FRAMED can both be green at one pose). With a fit-to-
+    # frame standoff F, the recommendation is F*frame_margin > F, i.e. FURTHER than the
+    # exact-fill distance -> the corner sits inside the view, not on the crop boundary.
+    cfg = ScanConfig()
+    fit = 560.0
+    p = live_scan_telemetry_payload({
+        "detected": True, "distance_mm": 640.0, "tilt_deg": 1.0, "valid_frac": 0.9,
+        "fully_framed": True, "surface_mode": "full", "extent_mm": [360.0, 240.0],
+        "rectangle_size_mm": [360.0, 240.0],
+        "color_fit_standoff_per_margin_mm": fit,
+    }, cfg)
+    assert cfg.frame_margin >= 1.1, cfg.frame_margin           # comfortable border
+    assert p["ideal_distance_mm"] > fit, p                     # target is outside exact-fill
+    print("[telemetry margin] aim standoff sits inside the frame, off the crop edge")
+
+
 def test_live_outline_uses_saved_color_calibration():
     cfg = ScanConfig()
     camera = type("Camera", (), {

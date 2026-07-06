@@ -172,8 +172,9 @@ def test_generate_run_insert():
     assert gen["gate"]["ok"] is True
     assert gen["calibration_on_file"] is True
     # The full-frame survey now drives the actual scan geometry: this 300 mm square
-    # scans near the closest standoff that still frames its measured boundary.
-    assert 380 < gen["look_distance_mm"] < 405
+    # scans near the closest standoff that still frames its measured boundary with the
+    # configured comfortable border (frame_margin 1.12).
+    assert 405 < gen["look_distance_mm"] < 430
     target_z = [float(state["targets"][name][2, 3]) for name in gen["targets"]]
     assert min(target_z) >= gen["look_distance_mm"] - 1.0, target_z
     assert gen["planned_cone_deg"] == min(
@@ -508,7 +509,7 @@ def test_generate_accepts_dynamic_near_quality_distance():
     state["cam"] = _look_at((0, 0, 420), (0, 0, 0))
     gen = scan_service.generate_scan_targets(services)
     assert gen["created"] == _expected_framed_views(services), gen
-    assert 380 < gen["look_distance_mm"] < 405, gen["look_distance_mm"]
+    assert 405 < gen["look_distance_mm"] < 430, gen["look_distance_mm"]
     print("[dynamic distance] near quality-band surface accepted at",
           round(gen["look_distance_mm"]), "mm")
 

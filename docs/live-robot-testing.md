@@ -103,8 +103,18 @@ Gate `payload` fields that matter for aiming:
 
 Notes: `center`/`yaw_a`/`framed` are only meaningful for a **framed finite platform**
 (`surface_mode == "full"`, `fully_framed == true`). In `crop` mode (surface overruns
-the view — e.g. a big/close/white object) `move_cam` X/Y read 0 and `ideal_distance`
-drops to `accurate_min_mm`, so you **cannot** test centering there.
+the view — e.g. a big/close/white object) `move_cam` X/Y read 0, so you **cannot** test
+centering there.
+
+**`ideal_distance_mm` is a STABLE target, not a live recompute** (fixed 2026-07-06). It
+is the standoff that frames the *physical* surface with a border (`frame_margin`, 1.12),
+which depends on the object's size — **not** on where the camera is now — so a parked
+operator sees a steady number. In `crop` mode the target **HOLDS** the value latched
+while the surface was framed (so a small over-nudge into overrun doesn't move the goal);
+it only falls to `accurate_min_mm` for a **genuinely oversized surface that was never
+framed**. If you see the RANGE target jump around as you dolly in/out, that is a
+regression — it should barely move. (The old bug: target `~592` → move toward it →
+overrun flips to `crop` → target collapses to `300` → drives you even closer, unreachable.)
 
 **Fresh read after a move** (avoids the stale frozen value): wait to *see the hold
 release* (`held == False`, the move registered) then take the next `held == True`
@@ -166,7 +176,9 @@ finally:
 ## 6. Verified feedback semantics (2026-07-06, on the real arm)
 
 - **RANGE / distance:** exact. Camera −100 mm (away) → `distance_mm` +98 mm; return →
-  baseline. `move_cam[2] = distance - ideal`; jog toward the sign to correct.
+  baseline. `move_cam[2] = distance - ideal`; jog toward the sign to correct. The
+  `ideal` (target) is a stable framing standoff — it should hold steady as you dolly,
+  and it does NOT collapse to `accurate_min` when you nudge slightly too close (see §4).
 - **TILT / level:** correct magnitude/axis. Camera +10° about tool-Y → `tilt_deg`
   ~2→9.6°, `tilt_b_deg` ~0→9.2°; standoff unchanged during a pure rotation.
 - **HOLD:** freezes when parked, releases + tracks on real motion, re-settles — good.

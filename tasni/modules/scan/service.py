@@ -558,34 +558,48 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
     ideal_distance = float(th.ideal_distance_mm)
     fit_per_margin = raw.get("color_fit_standoff_per_margin_mm")
     extent = raw.get("extent_mm")
-    if surface_mode == "crop":
-        # The surface overruns the view: do not chase an impossible whole-table
-        # framing distance. Work close, then project the generic reticle work square.
-        ideal_distance = float(scfg.accurate_min_mm)
-    elif fit_per_margin is not None:
-        # Continuous on both sides of the color-frame boundary, so moving toward
-        # the recommendation cannot flip the policy from 300 to 500 and back.
-        ideal_distance = float(np.clip(
+    # Framing standoff = the standoff that frames the *physical* surface with a border.
+    # This is distance-invariant (it depends on the object's size, not where the camera
+    # is now), so a parked operator sees a steady target instead of a moving goalpost.
+    # It is only trustworthy while the object is BOUNDED in view — once it overruns, the
+    # rectangle/extent are clipped to the frame and the estimate is meaningless.
+    framing_standoff = None
+    if fit_per_margin is not None:
+        framing_standoff = float(np.clip(
             float(fit_per_margin) * float(scfg.frame_margin),
             float(scfg.accurate_min_mm), float(scfg.accurate_max_mm)))
-        candidate = round(ideal_distance / 10.0) * 10.0
+    elif extent is not None and camera_cfg is not None:
+        try:
+            sx, sy = [float(v) for v in extent]
+            W, H = camera_cfg.size
+            K = camera_cfg.K
+            framing_standoff = float(np.clip(
+                max(float(scfg.frame_margin) * sx * float(K[0, 0]) / float(W),
+                    float(scfg.frame_margin) * sy * float(K[1, 1]) / float(H)),
+                float(scfg.accurate_min_mm), float(scfg.accurate_max_mm)))
+        except Exception:
+            framing_standoff = None
+
+    if surface_mode == "crop":
+        # The surface overruns the view, so its live rectangle/extent are clipped to the
+        # frame — the framing standoff cannot be re-measured here. If a target was already
+        # latched while the surface WAS framed (``previous_ideal_mm``), HOLD it: a small
+        # over-nudge past the framing distance must NOT collapse the goal to accurate_min
+        # and then drive the operator even closer (which deepens the overrun). That was
+        # the "target says 590, I move toward it, it jumps to 300, I can never reach it"
+        # bug. Only fall back to the work-close accurate standoff when nothing was ever
+        # framed — a genuinely oversized surface (whole table), where working close and
+        # projecting the generic reticle square is the right policy.
+        ideal_distance = (float(previous_ideal_mm) if previous_ideal_mm is not None
+                          else float(scfg.accurate_min_mm))
+    elif framing_standoff is not None:
+        candidate = round(framing_standoff / 10.0) * 10.0
         # Recommendation deadband: 410/420 is sensor/fitting noise, not a useful
         # instruction. Hold the previous target until the estimate moves >=20 mm.
         if previous_ideal_mm is not None and abs(candidate - previous_ideal_mm) < 20.0:
             ideal_distance = float(previous_ideal_mm)
         else:
             ideal_distance = candidate
-    elif extent is not None and camera_cfg is not None:
-        try:
-            sx, sy = [float(v) for v in extent]
-            W, H = camera_cfg.size
-            K = camera_cfg.K
-            ideal_distance = float(np.clip(
-                max(float(scfg.frame_margin) * sx * float(K[0, 0]) / float(W),
-                    float(scfg.frame_margin) * sy * float(K[1, 1]) / float(H)),
-                float(scfg.accurate_min_mm), float(scfg.accurate_max_mm)))
-        except Exception:
-            pass
     crop_size = None
     if surface_mode == "crop":
         # Generic fixed work square (the surface overruns the view; its edges are not

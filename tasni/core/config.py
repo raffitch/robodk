@@ -410,7 +410,14 @@ class ScanConfig(_Model):
     # Old knobs (cone_half_angle_deg, pose_count, voxel_size_m) remain as fallbacks.
     accurate_min_mm: float = 300.0       # near edge of D435i accurate depth band
     accurate_max_mm: float = 800.0       # far edge; beyond -> reference mode (no tour/mesh)
-    frame_margin: float = 1.05           # keep just enough border; closer standoff = better depth resolution
+    frame_margin: float = 1.12           # frame the surface with a comfortable border.
+    # The recommended aiming standoff is frame_margin * the fit-to-frame standoff, so it
+    # must leave enough border that the object stays INSIDE the view at the target — at
+    # 1.05 the aim point sat right on the full/crop boundary, so moving to it tipped the
+    # object into overrun and the target collapsed to accurate_min. 1.12 keeps ~12%
+    # border (the object corner at ~0.446 of the half-frame vs the 0.48 crop line) so
+    # "distance-green" and "framed-green" hold at the same pose. Still closer = better
+    # depth resolution, so keep it modest.
     survey_max_tilt_deg: float = 6.0     # survey squareness gate (tighter than max_tilt_deg)
     center_tol_mm: float = 30.0          # finite-platform centroid offset allowed
     edge_align_tol_deg: float = 5.0      # finite-platform edge yaw allowed

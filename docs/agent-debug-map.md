@@ -7,6 +7,15 @@ Last updated: 2026-07-06. Active branch: `calibration-improvements`.
 
 ## Recent scan fixes (2026-07-06)
 
+- **RANGE target moving-goalpost fixed**: the distance target (`ideal_distance_mm`) is
+  now a STABLE framing standoff (physical-size based, `frame_margin` bumped 1.05→1.12 so
+  the aim point sits inside the frame, not on the crop edge). In `crop` mode the target
+  HOLDS the value latched while framed instead of collapsing to `accurate_min` — a small
+  over-nudge into overrun no longer snaps the goal to 300 mm and drives the operator even
+  closer (the "target 592 → jumps to 300 → unreachable" report). Only a genuinely
+  oversized/never-framed surface falls to `accurate_min`. Host-only
+  (`tasni/modules/scan/service.py::live_scan_telemetry_payload`, `module.py` latch on
+  `surface_mode=="full"`, `config.py` frame_margin). See `docs/live-robot-testing.md` §4.
 - `55f3c27` — **parked-scan jitter fixed**: the live HUD hold now uses symmetric
   hysteresis (`live_hold_release_frames`), so a parked arm shows zero jitter and only
   sustained motion releases the freeze. Live-verified (parked 124/124 held, 0.00 p-p;
