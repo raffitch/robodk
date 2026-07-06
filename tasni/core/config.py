@@ -407,6 +407,20 @@ class ScanConfig(_Model):
     color_boundary_min_color_dist: float = 14.0  # min Lab object<->table colour distance to trust
     color_boundary_seg_width: int = 480          # downscale width for the segmentation (speed)
 
+    # -- learned (SAM) work boundary for low-contrast scenes -------------------
+    # The classical colour layer abstains on genuinely low-contrast scenes (measured: a
+    # green mat on a gray table is ~5 Lab units apart, so no threshold isolates it). A
+    # point-prompted model (EdgeSAM/MobileSAM ONNX, host-side) segments by object-ness and
+    # nails those. Runs in a background thread so the ~450 ms/frame inference never hitches
+    # the video. Weights are NOT vendored — fetch with `tools/download_sam.py` (see
+    # models/README.md). LICENSE: EdgeSAM = S-Lab non-commercial; MobileSAM = Apache-2.0.
+    boundary_engine: str = "sam_then_color"   # "color" | "sam" | "sam_then_color" (SAM, colour fallback)
+    sam_model_dir: str = "models"             # dir holding the encoder/decoder ONNX
+    sam_encoder_file: str = "edge_sam_encoder.onnx"
+    sam_decoder_file: str = "edge_sam_decoder.onnx"
+    sam_min_score: float = 0.80               # abstain below this IoU/stability score
+    sam_max_fill_frac: float = 0.92           # a mask filling more than this is untrusted (overrun/fail)
+
     # -- pose generation (reuses the calibration cone+roll generator) -------
     # Orbit the gated standoff seed in a cone so the surface stays in view, with
     # roll + distance variation for viewing-angle diversity (better fusion).

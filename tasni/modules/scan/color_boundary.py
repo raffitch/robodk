@@ -19,6 +19,85 @@ import numpy as np
 import cv2
 
 
+def mask_to_boundary(
+    mask,
+    reticle_xy=None,
+    *,
+    min_fill_frac: float = 0.02,
+    max_fill_frac: float = 0.85,
+    border_touch_frac: float = 0.30,
+) -> dict | None:
+    """Turn a binary object ``mask`` into a normalized-uv boundary, or abstain.
+
+    Shared tail for every boundary producer (classical colour + SAM): pick the object
+    component, fit its min-area rectangle, and report whether it overruns the view. Kept
+    abstain-safe so a producer NEVER draws a whole-frame box: returns ``None`` when the
+    blob is implausibly small OR fills most of the frame (a near-full blob means either a
+    genuine overrun — depth's reticle square is the right answer — or a failed
+    segmentation; in both cases this rectangle is untrustworthy).
+
+    - ``mask``       – (H,W) uint8/bool, non-zero = object, in any resolution.
+    - ``reticle_xy`` – (x,y) pixel in the mask frame; the component under it is preferred
+      (the aim point). ``None`` -> use the largest component.
+
+    Returns ``{outline_uv, polygon_uv, fill_frac, border_touch, overruns}`` (all uv
+    normalized 0-1 over the mask) or ``None``. The caller adds a ``contrast`` confidence.
+    """
+    if mask is None:
+        return None
+    m = np.ascontiguousarray(np.asarray(mask))
+    if m.ndim != 2 or m.shape[0] < 4 or m.shape[1] < 4:
+        return None
+    m = (m != 0).astype(np.uint8)
+    H, W = m.shape
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if n <= 1:
+        return None
+    lbl = 0
+    if reticle_xy is not None:
+        rx = min(max(int(round(reticle_xy[0])), 0), W - 1)
+        ry = min(max(int(round(reticle_xy[1])), 0), H - 1)
+        lbl = int(labels[ry, rx])
+    if lbl == 0:
+        # Reticle sits on background (or no prompt): fall back to the largest component.
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        if areas.size == 0:
+            return None
+        lbl = 1 + int(np.argmax(areas))
+    comp = (labels == lbl).astype(np.uint8)
+    contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    cnt = max(contours, key=cv2.contourArea)
+    area = float(cv2.contourArea(cnt))
+    fill_frac = area / float(H * W)
+    if fill_frac < float(min_fill_frac) or fill_frac >= float(max_fill_frac):
+        return None
+
+    rect = cv2.minAreaRect(cnt)
+    box = cv2.boxPoints(rect).astype(float)  # 4 corners in the mask frame
+
+    pts = cnt.reshape(-1, 2).astype(float)
+    edge = 1.5
+    on_border = ((pts[:, 0] <= edge) | (pts[:, 0] >= W - 1 - edge)
+                 | (pts[:, 1] <= edge) | (pts[:, 1] >= H - 1 - edge))
+    border_touch = float(np.mean(on_border)) if len(pts) else 0.0
+    overruns = bool(border_touch >= float(border_touch_frac))
+
+    eps = 0.01 * cv2.arcLength(cnt, True)
+    poly = cv2.approxPolyDP(cnt, eps, True).reshape(-1, 2).astype(float)
+
+    norm = np.array([W, H], dtype=float)
+    return {
+        "outline_uv": (box / norm).tolist(),
+        "polygon_uv": (poly / norm).tolist(),
+        "fill_frac": fill_frac,
+        "border_touch": border_touch,
+        "overruns": overruns,
+    }
+
+
 def color_work_boundary(
     color_bgr,
     *,
@@ -90,52 +169,13 @@ def color_work_boundary(
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
 
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if n <= 1:
+    # Shared abstain-safe tail: component under the reticle -> min-area rectangle.
+    out = mask_to_boundary(
+        mask, (cx, cy),
+        min_fill_frac=min_fill_frac,
+        max_fill_frac=max_fill_frac,
+        border_touch_frac=border_touch_frac)
+    if out is None:
         return None
-    lbl = int(labels[cy, cx])
-    if lbl == 0:
-        # Reticle sits on background: fall back to the largest foreground component.
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        if areas.size == 0:
-            return None
-        lbl = 1 + int(np.argmax(areas))
-    comp = (labels == lbl).astype(np.uint8)
-    contours, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-    cnt = max(contours, key=cv2.contourArea)
-    area = float(cv2.contourArea(cnt))
-    fill_frac = area / float(H * W)
-    # Abstain (return None -> the HUD falls back to the depth outline) when the blob is
-    # implausibly small OR fills most of the frame. A near-full blob means either the
-    # object genuinely overruns the view (depth's reticle square is the right answer) or
-    # the segmentation failed to separate a low-contrast scene — in BOTH cases the color
-    # rectangle is untrustworthy, so it must never be drawn. This is what keeps the layer
-    # "never worse than depth": it shows a boundary only when it confidently isolated the
-    # object, and stays out of the way otherwise.
-    if fill_frac < float(min_fill_frac) or fill_frac >= float(max_fill_frac):
-        return None
-
-    rect = cv2.minAreaRect(cnt)
-    box = cv2.boxPoints(rect).astype(float)  # 4 corners in the downscaled frame
-
-    pts = cnt.reshape(-1, 2).astype(float)
-    edge = 1.5
-    on_border = ((pts[:, 0] <= edge) | (pts[:, 0] >= W - 1 - edge)
-                 | (pts[:, 1] <= edge) | (pts[:, 1] >= H - 1 - edge))
-    border_touch = float(np.mean(on_border)) if len(pts) else 0.0
-    overruns = bool(border_touch >= float(border_touch_frac))
-
-    eps = 0.01 * cv2.arcLength(cnt, True)
-    poly = cv2.approxPolyDP(cnt, eps, True).reshape(-1, 2).astype(float)
-
-    norm = np.array([W, H], dtype=float)
-    return {
-        "outline_uv": (box / norm).tolist(),
-        "polygon_uv": (poly / norm).tolist(),
-        "contrast": contrast,
-        "fill_frac": fill_frac,
-        "border_touch": border_touch,
-        "overruns": overruns,
-    }
+    out["contrast"] = contrast
+    return out

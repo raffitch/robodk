@@ -7,6 +7,23 @@ Last updated: 2026-07-06. Active branch: `calibration-improvements`.
 
 ## Recent scan fixes (2026-07-06)
 
+- **SAM (point-prompted) live work boundary**: for low-contrast scenes the colour layer
+  abstains on (the green-mat-on-gray-table), the blue rectangle is now segmented by a
+  learned point-prompted model (`tasni/modules/scan/sam_boundary.py`, ONNX on the HOST —
+  the Jetson never runs SAM). Verified on the real cell: EdgeSAM hugged the mat (score
+  0.98) where colour could only fall back to depth. Model-agnostic (reads the ONNX graph
+  signature → EdgeSAM's simplified decoder AND MobileSAM's standard SAM decoder both drop
+  in). Runs in a **background thread** (`SamBoundaryWorker`) so the ~450 ms/frame inference
+  never hitches the ~6 fps video; publishes the SAME `boundary` /ws event (no frontend
+  change). Config: `scan.boundary_engine` (`color` | `sam` | `sam_then_color`, default
+  `sam_then_color` = SAM primary, colour fallback) + `sam_*` knobs. Shared mask→rectangle
+  tail factored into `color_boundary.mask_to_boundary`. **Default weights = EdgeSAM
+  (S-Lab non-commercial license)**; MobileSAM (Apache-2.0) swaps in via config. Weights are
+  NOT committed — `py -3.10 -m pip install -e .[sam]` then `py -3.10 tools/download_sam.py`
+  (see `models/README.md`). **Windows gotcha:** onnxruntime must load BEFORE PySide2/Qt
+  (RoboDK `robolink` pulls Qt in; shiboken2's import hook otherwise breaks onnxruntime's
+  DLL init) → pre-loaded in `tasni/__init__.py` + `tests/conftest.py`. Full handoff +
+  status: `docs/scan-boundary-sam-handoff.md`.
 - **Live COLOR work boundary (`1dd8d21`)**: the blue work rectangle is now segmented from
   the color frame at video rate (`tasni/modules/scan/color_boundary.py`, reticle-seeded
   Lab distance) and published on a `boundary` /ws event — bypassing the noisy 1 Hz depth

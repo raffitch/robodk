@@ -1,5 +1,24 @@
 # Handoff: add SAM (point-prompted) for the live scan work boundary
 
+> **✅ IMPLEMENTED (2026-07-06).** SAM is wired end-to-end and verified on the real
+> green-mat cell (EdgeSAM hugged the mat, score 0.98, where colour abstained). Details:
+> - Engine: `tasni/modules/scan/sam_boundary.py` — model-agnostic ONNX (reads the graph
+>   signature, so EdgeSAM's simplified decoder AND MobileSAM's standard SAM decoder drop
+>   in). Runs in a **background worker** (`SamBoundaryWorker`) off the video thread, so
+>   ~450 ms/frame inference never hitches the ~6 fps preview; boundary updates at ~2 fps.
+> - Shared tail factored to `color_boundary.mask_to_boundary` (colour + SAM use identical
+>   abstain-safe geometry). Config: `scan.boundary_engine` (default `sam_then_color`) +
+>   `sam_*` knobs. Dispatch + worker lifecycle in `module.py` (`live_start`/`live_stop`).
+> - **Default model = EdgeSAM** (S-Lab **non-commercial** license — see below). MobileSAM
+>   (Apache-2.0) drops in via config for commercial use.
+> - **Windows gotcha (fixed):** onnxruntime's DLL init fails if PySide2/Qt (pulled by
+>   RoboDK `robolink`) loads first → onnxruntime is pre-loaded in `tasni/__init__.py`
+>   (and `tests/conftest.py`) before any robolink import.
+> - Weights are **not** committed (`.gitignore`); fetch with `tools/download_sam.py`
+>   (`pip install -e .[sam]` first). Frontend unchanged — same `boundary` event.
+>
+> The sections below are the original design notes (kept for reasoning history).
+
 **Goal:** make the live blue work-rectangle reliable on *any* scene — including
 low-contrast ones the classical color layer can't handle — by segmenting the object
 under the reticle with a learned, point-prompted model (SAM family) on the host.

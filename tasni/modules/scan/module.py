@@ -17,6 +17,7 @@ from ...core.rdk_io import link_real_robot
 from ..base import ServiceContainer, WorkflowModule
 from ..calibration.service import SimTourJob
 from .color_boundary import color_work_boundary
+from .sam_boundary import SamBoundaryWorker
 from .service import (camera_pose_moved, ScanCaptureJob, ScanParams, ScanResult,
                       generate_scan_targets, insert_scan, live_scan_telemetry_payload,
                       LockedScanSurface, lock_scan_surface, stabilize_live_scan_payload)
@@ -57,6 +58,9 @@ class ScanModule(WorkflowModule):
         # Set by POST /live/refresh; consumed by the live analyze loop to drop the
         # anti-jitter hold + pose anchor and re-read fresh at the current robot pose.
         self._live_refresh = threading.Event()
+        # Background SAM boundary worker (lives with the live preview; None for the
+        # classical colour engine). Runs the ~450 ms/frame model off the video thread.
+        self._sam_worker: "SamBoundaryWorker | None" = None
 
     def router(self) -> "APIRouter":
         from fastapi import APIRouter, HTTPException, Response
@@ -177,6 +181,22 @@ class ScanModule(WorkflowModule):
             last_metrics = None
             anchor_pose_T = None
 
+            def _publish_boundary(cb):
+                # The one boundary contract the HUD consumes (identical for every engine).
+                services.bus.publish(JobEvent("boundary", {
+                    "outline_uv": cb["outline_uv"],
+                    "polygon_uv": cb["polygon_uv"],
+                    "overruns": cb["overruns"],
+                    "contrast": cb["contrast"],
+                }))
+
+            def _color_boundary(color):
+                # Classical colour segmenter; also the SAM worker's abstain fallback.
+                return color_work_boundary(
+                    color, reticle_frac=sc.center_patch_frac,
+                    min_color_dist=sc.color_boundary_min_color_dist,
+                    seg_width=sc.color_boundary_seg_width)
+
             def analyze(frame):
                 nonlocal last_ideal_mm, last_metrics, anchor_pose_T
                 if self._live_refresh.is_set():
@@ -201,27 +221,23 @@ class ScanModule(WorkflowModule):
                     img = cv2.resize(img, (PREVIEW_W, int(h * PREVIEW_W / w)),
                                      interpolation=cv2.INTER_AREA)
                 ok, jpeg = cv2.imencode(".jpg", img, enc)
-                # Live COLOR work boundary, published every video frame (independent of
-                # the ~1 Hz depth telemetry + the anti-jitter freeze): segment the object
-                # under the reticle from the color image so the HUD's blue rectangle
-                # tracks it in real time. Runs on the raw color frame (before the reticle
-                # is drawn). A visual aid; depth still drives the gates + the lock.
+                # Live work boundary, published every video frame independent of the
+                # ~1 Hz depth telemetry + the anti-jitter freeze, so the HUD's blue
+                # rectangle tracks the object in real time. Segmented from the raw color
+                # frame (before the reticle is drawn). A visual aid; depth still drives the
+                # gates + the lock. SAM engines hand the frame to the background worker
+                # (inference runs off THIS video thread so ~450 ms/frame never hitches the
+                # preview); the classical colour engine segments inline (sub-frame cost).
                 if sc.color_boundary_enabled:
-                    try:
-                        cb = color_work_boundary(
-                            frame.color,
-                            reticle_frac=sc.center_patch_frac,
-                            min_color_dist=sc.color_boundary_min_color_dist,
-                            seg_width=sc.color_boundary_seg_width)
-                    except Exception:
-                        cb = None
-                    if cb is not None:
-                        services.bus.publish(JobEvent("boundary", {
-                            "outline_uv": cb["outline_uv"],
-                            "polygon_uv": cb["polygon_uv"],
-                            "overruns": cb["overruns"],
-                            "contrast": cb["contrast"],
-                        }))
+                    if self._sam_worker is not None:
+                        self._sam_worker.submit(frame.color.copy())
+                    elif sc.boundary_engine == "color":
+                        try:
+                            cb = _color_boundary(frame.color)
+                        except Exception:
+                            cb = None
+                        if cb is not None:
+                            _publish_boundary(cb)
                 metrics = live_scan_telemetry_payload(
                     getattr(frame, "telemetry", None), sc,
                     previous_ideal_mm=last_ideal_mm,
@@ -274,15 +290,38 @@ class ScanModule(WorkflowModule):
                 bitrate=c.calibration.preview_h264_bitrate_kbps,
                 scan_telemetry=True,
             )
+            # Boundary engine: spin up the SAM worker unless the classical colour engine
+            # is selected (or the boundary layer is off). A missing model / onnxruntime
+            # does NOT fail here — the worker detects it on its own thread and flips to the
+            # colour fallback (or idle), logging once, so the video always starts.
+            self._sam_worker = None
+            if sc.color_boundary_enabled and sc.boundary_engine in ("sam", "sam_then_color"):
+                fallback = _color_boundary if sc.boundary_engine == "sam_then_color" else None
+                self._sam_worker = SamBoundaryWorker(
+                    _publish_boundary,
+                    model_dir=sc.sam_model_dir,
+                    encoder_file=sc.sam_encoder_file,
+                    decoder_file=sc.sam_decoder_file,
+                    min_score=sc.sam_min_score,
+                    max_fill_frac=sc.sam_max_fill_frac,
+                    point_uv=(0.5, 0.5),
+                    fallback=fallback,
+                    log=print)
             try:
                 services.live.start(analyze, **kwargs)
             except CameraBusy as e:
+                if self._sam_worker is not None:
+                    self._sam_worker.stop()
+                    self._sam_worker = None
                 raise HTTPException(409, str(e))
             return {"status": "started"}
 
         @router.post("/live/stop")
         def live_stop() -> dict:
             services.live.stop()
+            if self._sam_worker is not None:
+                self._sam_worker.stop()
+                self._sam_worker = None
             return {"status": "stopped"}
 
         @router.post("/live/refresh")

@@ -14,4 +14,16 @@ proof-of-pattern: a thin leaf on top of the core, with nothing scan- or
 calibration-specific living in the core itself.
 """
 
+# Pre-load onnxruntime (optional; used by the scan SAM boundary) BEFORE anything imports
+# RoboDK's ``robolink`` — which pulls in PySide2/Qt. shiboken2 installs a global import
+# hook, and if Qt loads first it breaks onnxruntime's native DLL init on Windows ("DLL
+# initialization routine failed"), so SAM would silently fall back to colour forever. Every
+# app entry point (``python -m tasni``, uvicorn ``tasni.webapp``) runs this package init
+# before any ``tasni.core`` submodule imports robolink, so loading onnxruntime here fixes
+# the order. Guarded: a core install without the ``[sam]`` extra just skips it.
+try:  # noqa: SIM105
+    import onnxruntime as _onnxruntime  # noqa: F401
+except Exception:
+    pass
+
 __version__ = "0.1.0"
