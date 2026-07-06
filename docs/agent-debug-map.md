@@ -7,6 +7,12 @@ Last updated: 2026-07-06. Active branch: `calibration-improvements`.
 
 ## Recent scan fixes (2026-07-06)
 
+- **"Refresh view" button / `POST /live/refresh`**: manual escape hatch for a stale live
+  projection (driver not mirroring the arm + a lateral jog slips past the hold + vision
+  escape). Drops the anti-jitter hold + pose anchor so the reading re-settles at the
+  current pose; keeps video streaming + the distance target continuous. `module.py`
+  (`threading.Event` consumed by the analyze loop) + `Scan.tsx`. See
+  `docs/live-robot-testing.md` §4.
 - **RANGE target moving-goalpost fixed**: the distance target (`ideal_distance_mm`) is
   now a STABLE framing standoff (physical-size based, `frame_margin` bumped 1.05→1.12 so
   the aim point sits inside the frame, not on the crop edge). In `crop` mode the target

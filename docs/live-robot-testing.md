@@ -120,6 +120,16 @@ overrun flips to `crop` → target collapses to `300` → drives you even closer
 release* (`held == False`, the move registered) then take the next `held == True`
 (re-settled at the new pose).
 
+**Stale projection escape hatch (operator + scripts): `POST /api/modules/scan/live/refresh`.**
+The hold releases automatically when RoboDK mirrors the arm (pose gate) or on a
+dolly/tilt (vision escape). The one gap is **driver-not-monitoring + a pure lateral
+jog** — neither trips, so the frozen overlay keeps projecting the old pose. Refresh
+drops the hold + re-anchors so the reading re-settles at the current pose (video keeps
+streaming; distance target stays continuous — no flash to `accurate_min`). In the UI
+it's the **"Refresh view"** button next to Stop camera. Returns 409 if no preview is
+running. Watch it work: `static_frames` resets to 0 and `held` drops, then climbs back
+to a fresh `held == True` at the current pose.
+
 **Best pattern — continuous monitor + move in an executor** (this is the one that
 worked; `focused_hud_test.py`):
 
