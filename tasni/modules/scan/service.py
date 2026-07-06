@@ -806,27 +806,54 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg,
     """
     if not current or current.get("live") is not True:
         return current
+
+    # Robot-parked HOLD with symmetric hysteresis. The RealSense plane fit is noisy
+    # enough on a bare surface (measured ~6° tilt / ~50 mm centroid swing at 0.8 m with
+    # the arm PARKED) that the freeze must debounce BOTH edges: ENGAGE only after the
+    # reading has been still for ``live_hold_settle_frames`` (so the rectangle/tilt
+    # average first), and RELEASE only after motion PERSISTS for
+    # ``live_hold_release_frames``. Without a release debounce a single noisy frame drops
+    # the hold, re-latches a fresh noisy sample, and the operator sees the readout sit
+    # still and then suddenly jump. Motion is signalled by the RoboDK camera pose (it
+    # mirrors the arm) via ``robot_static``, with a large vision shift as the fallback
+    # when the driver is not monitoring.
+    have_context = bool(previous is not None and previous.get("detected")
+                        and current.get("detected") and previous.get("live") is True)
+    was_held = bool(previous and previous.get("held"))
+    moved_now = (not robot_static) or _vision_says_moved(current, previous or {}, scfg)
     static_frames = 0
-    if (robot_static and previous is not None
-            and previous.get("detected") and current.get("detected")
-            and previous.get("live") is True
-            and not _vision_says_moved(current, previous, scfg)):
-        # Robot parked with the surface in view. Do NOT freeze the FIRST static frame:
-        # right after a move the plane/rectangle fit is often half-settled, and hard-
-        # locking it gives the "never frames the object properly" snapshot. Instead let
-        # a few projected frames settle (the smoothing path below averages the rectangle
-        # corners/tilt across them), THEN hard-hold — enough frames to build a good
-        # rectangle, and rock-steady once locked.
+    moving_frames = 0
+    if have_context and was_held:
+        if not moved_now:
+            out = _hold_scan_payload(current, previous)
+            out["static_frames"] = int(previous.get("static_frames", 0)) + 1
+            out["moving_frames"] = 0
+            return out
+        # Moving while held: ride out brief noise blips — only release once the motion
+        # persists, so per-frame plane-fit noise can never break a parked hold.
+        moving_frames = int(previous.get("moving_frames", 0)) + 1
+        release = max(1, int(getattr(scfg, "live_hold_release_frames", 2)))
+        if moving_frames < release:
+            out = _hold_scan_payload(current, previous)
+            out["static_frames"] = int(previous.get("static_frames", 0))
+            out["moving_frames"] = moving_frames
+            return out
+        # else: motion confirmed → release, fall through to live smoothing below.
+    elif have_context and not moved_now:
+        # Settling toward a fresh hold: average a few frames before freezing so the
+        # latched rectangle/tilt is not a single half-settled sample.
         static_frames = int(previous.get("static_frames", 0)) + 1
         settle = max(1, int(getattr(scfg, "live_hold_settle_frames", 5)))
         if static_frames >= settle:
             out = _hold_scan_payload(current, previous)
             out["static_frames"] = static_frames
+            out["moving_frames"] = 0
             return out
         # else: fall through to smoothing to keep settling; counter carried below.
     if previous is None or _should_reset_live_smoothing(previous, current, scfg):
         res = dict(current)
         res["static_frames"] = static_frames
+        res["moving_frames"] = moving_frames
         return res
 
     out = dict(current)
@@ -924,8 +951,10 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg,
     out["gates"] = gates
     out["ok"] = all(bool(v) for v in ok_gates.values())
     out["stabilized"] = True
-    # Carry the settle counter so the hold engages after N consecutive static frames.
+    # Carry the debounce counters so the hold engages after N still frames and releases
+    # only after M moved frames (symmetric hysteresis).
     out["static_frames"] = static_frames
+    out["moving_frames"] = moving_frames
     return out
 
 

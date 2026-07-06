@@ -445,20 +445,29 @@ class ScanConfig(_Model):
     # plane-fit noise otherwise makes a still robot look like it is jittering. The
     # live gate holds the previous reading until the camera pose moves beyond these
     # tolerances (RoboDK mirrors the physical arm, so this is the true motion signal).
-    live_hold_pose_trans_mm: float = 0.8   # camera translation that releases the hold
-    live_hold_pose_rot_deg: float = 0.15   # camera rotation that releases the hold
-    live_hold_settle_frames: int = 5       # projected frames to average into the rectangle
-    #                                        before the hold locks (avoids freezing a
+    # These sit just above the live-driver's parked position-stream dither (the model
+    # pose mirrors the arm, so it never reads perfectly still) yet well below a real
+    # jog; combined with the release debounce below, a parked arm stays frozen.
+    live_hold_pose_trans_mm: float = 1.2   # camera translation that releases the hold
+    live_hold_pose_rot_deg: float = 0.3    # camera rotation that releases the hold
+    live_hold_settle_frames: int = 5       # still frames to average into the rectangle
+    #                                        before the hold ENGAGES (avoids freezing a
     #                                        half-settled fit right after a move)
+    live_hold_release_frames: int = 2      # consecutive "moved" frames before the hold
+    #                                        RELEASES — without this a single noisy frame
+    #                                        drops the freeze, re-latches a fresh noisy
+    #                                        sample, and the readout visibly jumps
     live_frame_margin_uv: float = 0.02     # fitted-rectangle corners this far inside the
     #                                        frame => the object is bounded in view (draw
     #                                        the rectangle), not an overrun (generic square)
     # Vision safety net for the hold: the live rectangle is depth-derived, so it must
     # still track a physical camera move even if RoboDK is not mirroring the arm. A
-    # standoff/tilt shift past these (well above the ~1 mm / ~0.5° noise floor)
-    # releases the hold regardless of the pose gate.
+    # standoff/tilt shift past these releases the hold regardless of the pose gate.
+    # Measured parked plane-fit noise at ~0.8 m is ~2 mm standoff / ~6° tilt peak-to-peak,
+    # so the tilt escape must sit ABOVE that floor or it trips on noise and (before the
+    # release debounce) caused the jitter; distance is clean so its escape stays tight.
     live_hold_vision_distance_mm: float = 12.0
-    live_hold_vision_tilt_deg: float = 4.0
+    live_hold_vision_tilt_deg: float = 10.0
     # When the surface overruns the view (edges not fully framed) its real edges are
     # untrustworthy, so we stop fitting the board and project a GENERIC fixed work
     # square on the plane, centred on the camera reticle (the aim point). This is its

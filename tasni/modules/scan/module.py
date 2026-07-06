@@ -203,11 +203,16 @@ class ScanModule(WorkflowModule):
                     moved = camera_pose_moved(
                         pose_T, anchor_pose_T,
                         sc.live_hold_pose_trans_mm, sc.live_hold_pose_rot_deg)
-                    if moved:
-                        anchor_pose_T = pose_T
                     metrics = stabilize_live_scan_payload(
                         metrics, last_metrics, sc,
                         robot_static=(not moved and pose_T is not None))
+                    # Re-anchor to the current pose only while the reading is LIVE (not
+                    # frozen). During a hold we keep comparing against the pose where it
+                    # engaged, so a transient model-pose blip can't drift the anchor and
+                    # cascade into a spurious release; while live/settling the anchor
+                    # tracks the arm frame-to-frame so a genuine jog is caught promptly.
+                    if pose_T is not None and not metrics.get("held"):
+                        anchor_pose_T = pose_T
                     last_metrics = metrics
                     last_ideal_mm = metrics.get("ideal_distance_mm", last_ideal_mm)
                 return (jpeg.tobytes() if ok else b""), metrics

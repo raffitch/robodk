@@ -477,6 +477,36 @@ def test_pose_hold_releases_and_tracks_when_robot_moves():
     print("[pose hold] real motion -> released, readouts track again")
 
 
+def test_pose_hold_release_is_debounced_against_single_noisy_frame():
+    # The parked-arm jitter bug: a frozen hold must NOT break on ONE frame flagged
+    # "moved" (a transient model-pose blip or a noisy plane fit). The release is
+    # debounced (live_hold_release_frames), so a single such frame keeps holding the
+    # frozen value and only SUSTAINED motion releases it. Directly reproduces "static,
+    # then a sudden jump": before the debounce, that single frame re-latched a fresh
+    # noisy sample.
+    cfg = ScanConfig()
+    prev, noisy = _jittery_pair(cfg)
+    cur, held = prev, None
+    for _ in range(int(cfg.live_hold_settle_frames) + 3):
+        cur = stabilize_live_scan_payload(noisy, cur, cfg, robot_static=True)
+        if cur.get("held"):
+            held = cur
+            break
+    assert held is not None and held.get("held") is True, held
+
+    # One "moved" frame -> STILL held (grace window), frozen value unchanged.
+    grace = stabilize_live_scan_payload(noisy, held, cfg, robot_static=False)
+    assert grace.get("held") is True, grace
+    assert grace["tilt_b_deg"] == held["tilt_b_deg"], "frozen value must not jump on a blip"
+
+    # Sustained motion (>= live_hold_release_frames) -> release, HUD tracks again.
+    released = grace
+    for _ in range(int(cfg.live_hold_release_frames)):
+        released = stabilize_live_scan_payload(noisy, released, cfg, robot_static=False)
+    assert released.get("held") is not True, released
+    print("[pose hold] single noisy frame ridden out; sustained motion releases")
+
+
 def test_pose_hold_vision_escape_releases_on_real_dolly():
     # Even if RoboDK is NOT mirroring the arm (pose gate wrongly says static), a real
     # dolly-in that drops the standoff far past the noise floor must release the hold
@@ -537,6 +567,7 @@ if __name__ == "__main__":
     test_live_scan_near_square_skips_edge_gate()
     test_pose_hold_settles_then_freezes_all_axes()
     test_pose_hold_releases_and_tracks_when_robot_moves()
+    test_pose_hold_release_is_debounced_against_single_noisy_frame()
     test_pose_hold_vision_escape_releases_on_real_dolly()
     test_camera_pose_moved_tolerances()
     print("\ndepth_gate.py tests passed.")
