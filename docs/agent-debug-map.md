@@ -7,6 +7,13 @@ Last updated: 2026-07-06. Active branch: `calibration-improvements`.
 
 ## Recent scan fixes (2026-07-06)
 
+- **Live COLOR work boundary (`1dd8d21`)**: the blue work rectangle is now segmented from
+  the color frame at video rate (`tasni/modules/scan/color_boundary.py`, reticle-seeded
+  Lab distance) and published on a `boundary` /ws event — bypassing the noisy 1 Hz depth
+  telemetry + the anti-jitter freeze (fixes "rectangle only updates on Refresh / laggy").
+  Abstain-safe: falls back to the depth outline on low-contrast scenes. **Next: add SAM
+  (point-prompted) for hard scenes — see `docs/scan-boundary-sam-handoff.md`** (the
+  `boundary` event is the ready drop-in seam; no frontend change needed).
 - **"Refresh view" button / `POST /live/refresh`**: manual escape hatch for a stale live
   projection (driver not mirroring the arm + a lateral jog slips past the hold + vision
   escape). Drops the anti-jitter hold + pose anchor so the reading re-settles at the
