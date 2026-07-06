@@ -396,6 +396,17 @@ class ScanConfig(_Model):
     jog_invert_y: bool = False
     jog_invert_z: bool = False
 
+    # -- live COLOR work boundary (host-side, every video frame) --------------
+    # RealSense depth is noisy on low-texture objects, so the depth-fitted rectangle
+    # flickers + lags (1 Hz telemetry + the anti-jitter freeze). The object's outline is
+    # crisp in the COLOR frame the host already decodes at video rate, so we segment it
+    # there (reticle-seeded, classical CV) and draw THAT as the live blue rectangle — it
+    # tracks the object in real time, independent of depth. A visual aid only; the
+    # authoritative 3D work rectangle is still measured from depth at Lock.
+    color_boundary_enabled: bool = True
+    color_boundary_min_color_dist: float = 14.0  # min Lab object<->table colour distance to trust
+    color_boundary_seg_width: int = 480          # downscale width for the segmentation (speed)
+
     # -- pose generation (reuses the calibration cone+roll generator) -------
     # Orbit the gated standoff seed in a cone so the surface stays in view, with
     # roll + distance variation for viewing-angle diversity (better fusion).

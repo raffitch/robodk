@@ -64,9 +64,10 @@ const spreadSample = <T,>(items: T[], max: number) => {
   return out;
 };
 
-function Hud({ gate, mode = "scan", coverageDots = null }:
+function Hud({ gate, mode = "scan", coverageDots = null, liveBoundary = null }:
   { gate: GateReading | null; mode?: "calibration" | "scan";
-    coverageDots?: Array<[number, number]> | null }) {
+    coverageDots?: Array<[number, number]> | null;
+    liveBoundary?: { outline: Array<[number, number]>; overruns: boolean } | null }) {
   const detected = !!gate?.detected;
   const locked = !!gate?.ok;
   const main = locked ? OK : detected ? WARN : BAD;
@@ -127,14 +128,26 @@ function Hud({ gate, mode = "scan", coverageDots = null }:
           centred square when the surface overruns the view, else the trimmed board
           rectangle. Drawn directly (no client-side cropping). visible_outline_uv is
           the raw depth silhouette, kept dashed as a diagnostic. */}
-      {mode === "scan" && gate?.outline_uv && gate.outline_uv.length >= 3 && (() => {
-        const region = gate.outline_uv!;
+      {mode === "scan" && (() => {
+        // The blue work rectangle. Prefer the LIVE COLOR boundary (segmented from the
+        // color frame at video rate — reliable + real-time); fall back to the depth-
+        // fitted outline (locked snapshot, or when color abstains on a low-contrast
+        // scene). The depth silhouette + metric grid are depth diagnostics, shown only
+        // with the depth box.
+        const usingColor = !!(liveBoundary && liveBoundary.outline.length >= 3);
+        const region = usingColor ? liveBoundary!.outline
+          : (gate?.outline_uv && gate.outline_uv.length >= 3 ? gate.outline_uv : null);
+        if (!region) return null;
         const regionPts = region.map(([u, v]) =>
           `${(u * W).toFixed(1)},${(v * H).toFixed(1)}`).join(" ");
-        const visiblePts = gate.visible_outline_uv?.map(([u, v]) =>
-          `${(u * W).toFixed(1)},${(v * H).toFixed(1)}`).join(" ");
-        const col = gate.fully_framed == null ? DIM
+        const visiblePts = (!usingColor && gate?.visible_outline_uv)
+          ? gate.visible_outline_uv.map(([u, v]) =>
+              `${(u * W).toFixed(1)},${(v * H).toFixed(1)}`).join(" ") : null;
+        const col = gate?.fully_framed == null ? DIM
           : gate.fully_framed ? OK : WARN;
+        // A color boundary that overruns the view -> dashed (its rectangle is the frame,
+        // not the true object extent) so the operator knows to back off / re-centre.
+        const dash = usingColor && liveBoundary!.overruns ? "10 8" : undefined;
         return (
           <>
             {visiblePts && (
@@ -142,8 +155,9 @@ function Hud({ gate, mode = "scan", coverageDots = null }:
                        strokeDasharray="4 7" opacity={0.45} />
             )}
             <polygon points={regionPts} fill="rgba(53,194,255,.16)"
-                     stroke="#35c2ff" strokeWidth={4} opacity={0.95} />
-            {gate.grid_uv && gate.grid_uv.map(([[u1, v1], [u2, v2]], i) => (
+                     stroke="#35c2ff" strokeWidth={4} strokeDasharray={dash}
+                     opacity={0.95} />
+            {!usingColor && gate?.grid_uv && gate.grid_uv.map(([[u1, v1], [u2, v2]], i) => (
               <line key={i} x1={u1 * W} y1={v1 * H} x2={u2 * W} y2={v2 * H}
                     stroke={col} strokeWidth={1} opacity={0.35} />
             ))}
@@ -337,7 +351,8 @@ function JogBar({ move, ctol, dtol }:
 // -- error boundary: never let a bad frame blank the page; self-heal next frame.
 export default class AimHud extends Component<
   { gate: GateReading | null; mode?: "calibration" | "scan";
-    coverageDots?: Array<[number, number]> | null },
+    coverageDots?: Array<[number, number]> | null;
+    liveBoundary?: { outline: Array<[number, number]>; overruns: boolean } | null },
   { err: boolean }
 > {
   state = { err: false };
@@ -348,6 +363,7 @@ export default class AimHud extends Component<
   render(): ReactNode {
     if (this.state.err) return null;
     return <Hud gate={this.props.gate} mode={this.props.mode}
-                coverageDots={this.props.coverageDots} />;
+                coverageDots={this.props.coverageDots}
+                liveBoundary={this.props.liveBoundary} />;
   }
 }

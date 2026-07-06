@@ -12,9 +12,11 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
+from ...core.events import JobEvent
 from ...core.rdk_io import link_real_robot
 from ..base import ServiceContainer, WorkflowModule
 from ..calibration.service import SimTourJob
+from .color_boundary import color_work_boundary
 from .service import (camera_pose_moved, ScanCaptureJob, ScanParams, ScanResult,
                       generate_scan_targets, insert_scan, live_scan_telemetry_payload,
                       LockedScanSurface, lock_scan_surface, stabilize_live_scan_payload)
@@ -199,6 +201,27 @@ class ScanModule(WorkflowModule):
                     img = cv2.resize(img, (PREVIEW_W, int(h * PREVIEW_W / w)),
                                      interpolation=cv2.INTER_AREA)
                 ok, jpeg = cv2.imencode(".jpg", img, enc)
+                # Live COLOR work boundary, published every video frame (independent of
+                # the ~1 Hz depth telemetry + the anti-jitter freeze): segment the object
+                # under the reticle from the color image so the HUD's blue rectangle
+                # tracks it in real time. Runs on the raw color frame (before the reticle
+                # is drawn). A visual aid; depth still drives the gates + the lock.
+                if sc.color_boundary_enabled:
+                    try:
+                        cb = color_work_boundary(
+                            frame.color,
+                            reticle_frac=sc.center_patch_frac,
+                            min_color_dist=sc.color_boundary_min_color_dist,
+                            seg_width=sc.color_boundary_seg_width)
+                    except Exception:
+                        cb = None
+                    if cb is not None:
+                        services.bus.publish(JobEvent("boundary", {
+                            "outline_uv": cb["outline_uv"],
+                            "polygon_uv": cb["polygon_uv"],
+                            "overruns": cb["overruns"],
+                            "contrast": cb["contrast"],
+                        }))
                 metrics = live_scan_telemetry_payload(
                     getattr(frame, "telemetry", None), sc,
                     previous_ideal_mm=last_ideal_mm,

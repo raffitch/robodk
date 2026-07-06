@@ -175,6 +175,12 @@ export default function Scan() {
   const coverageRef = useRef<Array<Array<[number, number]>>>([]);
   const coverageCenterRef = useRef<[number, number] | null>(null);
   const [coverageDots, setCoverageDots] = useState<Array<[number, number]> | null>(null);
+  // Live COLOR work boundary (server segments the object under the reticle from the color
+  // frame every ~6 fps — see color_boundary.py). It IS the blue rectangle while aiming:
+  // reliable + real-time, independent of the noisy 1 Hz depth telemetry + the freeze.
+  const [liveBoundary, setLiveBoundary] =
+    useState<{ outline: Array<[number, number]>; overruns: boolean } | null>(null);
+  const boundaryTimerRef = useRef<number | null>(null);
   const frozenGateRef = useRef<GateReading | null>(null);
   const stableLiveFramesRef = useRef(0);
   const gateReceivedAtRef = useRef(0);
@@ -333,6 +339,15 @@ export default function Scan() {
               && Array.isArray(p.points_uv) && p.points_uv.length) {
             accumulateCoverage(p.points_uv as Array<[number, number]>);
           }
+        }
+      } else if (ev.type === "boundary") {
+        // Video-rate color boundary. Store it (with a staleness timeout so it clears if
+        // the stream stalls); the render decides whether to show it (live + not locked).
+        const p = ev.payload as { outline_uv?: Array<[number, number]>; overruns?: boolean };
+        if (Array.isArray(p.outline_uv) && p.outline_uv.length >= 3) {
+          setLiveBoundary({ outline: p.outline_uv, overruns: !!p.overruns });
+          if (boundaryTimerRef.current) window.clearTimeout(boundaryTimerRef.current);
+          boundaryTimerRef.current = window.setTimeout(() => setLiveBoundary(null), 1500);
         }
       } else if (ev.type === "result") {
         if (ev.payload.name === "sim_tour") {
@@ -665,7 +680,9 @@ export default function Scan() {
               the real multi-frame coverage, not a sparse single-frame set. It is null
               once the camera is stopped / restarted (resetCoverage). */}
           {(live || gate) && <AimHud gate={gate} mode="scan"
-                                     coverageDots={coverageDots} />}
+                                     coverageDots={coverageDots}
+                                     liveBoundary={live && !surfaceLocked && !running
+                                       ? liveBoundary : null} />}
           {live && <StreamStats stat={streamStat} />}
           {!live && !gate && <div className="aim-off">camera off — press “Start camera”</div>}
         </div>
