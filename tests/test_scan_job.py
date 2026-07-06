@@ -455,6 +455,54 @@ def test_generate_refuses_when_too_far():
     print("[gate refusal] too-far standoff refused, nothing created")
 
 
+def test_generate_reference_mode_for_oversized_framed_surface():
+    """A fully framed surface whose framing standoff exceeds the accurate depth band
+    -> reference mode: a single-frame rectangle placed directly (no tour, no fusion),
+    returned as mode='reference' + _scan_result. Previously this fell through to a
+    quality tour and _reference_locate was dead code (never invoked).
+
+    The reachable window is narrow (framing needs a far standoff while the distance
+    gate caps it near accurate_max), so the test lowers accurate_max_mm to trigger it
+    with comfortable geometric margins.
+    """
+    global TABLE_HALF_MM
+    saved = TABLE_HALF_MM
+    # 4:3 frame (240 px tall) binds vertically: framing needs Z >= ~2.60*half, the
+    # distance gate caps Z <= accurate_max+50, and reference needs d_fit = ~2.625*half
+    # > accurate_max. half=205, accurate_max=500, Z=540 satisfies all three.
+    TABLE_HALF_MM = 205.0
+    try:
+        services, state = _build_fakes()
+        services.config.scan.accurate_max_mm = 500.0
+        state["cam"] = _look_at((0, 0, 540), (0, 0, 0))
+        with tempfile.TemporaryDirectory() as t:
+            runs.REPO_ROOT = Path(t)
+
+            def fake_new_run_dir(mid, stamp):
+                d = Path(t) / "runs" / mid / stamp
+                d.mkdir(parents=True, exist_ok=True)
+                return d
+            orig = scan_service.new_run_dir
+            scan_service.new_run_dir = fake_new_run_dir
+            try:
+                gen = scan_service.generate_scan_targets(services)
+                assert gen["mode"] == "reference", gen
+                assert gen["created"] == 0 and gen["targets"] == [], gen
+                assert "_scan_result" in gen, gen
+                r = gen["_scan_result"]
+                assert r.report["mode"] == "reference", r.report
+                assert r.mesh_obj_path is None, "reference mode places no fused mesh"
+                assert r.report["plane"]["size_mm"][0] > 300.0, r.report["plane"]
+                # No tour targets were created for reference mode.
+                assert services.rdk.list_targets("TasniScan_") == []
+            finally:
+                scan_service.new_run_dir = orig
+                runs.REPO_ROOT = _ORIG_ROOT
+    finally:
+        TABLE_HALF_MM = saved
+    print("[reference mode] oversized framed surface -> single-frame rectangle, no tour")
+
+
 def test_generate_accepts_dynamic_near_quality_distance():
     services, state = _build_fakes()
     state["cam"] = _look_at((0, 0, 420), (0, 0, 0))
@@ -515,6 +563,7 @@ if __name__ == "__main__":
     test_scan_collision_filter_bypasses_noisy_wall_map_by_default()
     test_scan_collision_filter_hard_fail_can_still_refuse()
     test_generate_refuses_when_too_far()
+    test_generate_reference_mode_for_oversized_framed_surface()
     test_generate_accepts_dynamic_near_quality_distance()
     test_warns_but_proceeds_without_calibration()
     test_run_without_targets_errors()

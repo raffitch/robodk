@@ -136,6 +136,20 @@ def _outline_edge_angle_deg(outline_uv) -> float | None:
     return ((angle + 45.0) % 90.0) - 45.0
 
 
+def _project_color_corners_uv(corners_color, camera_cfg):
+    """Project color-camera 3D corners (mm) to normalized uv through the workstation
+    RealSense calibration (K + distortion). Returns an ``(N, 2)`` array in 0-1 image
+    coords, or ``None`` if any projected point is non-finite."""
+    if corners_color is None:
+        return None
+    corners = np.asarray(corners_color, dtype=np.float64).reshape(-1, 3)
+    projected, _ = cv2.projectPoints(
+        corners, np.zeros(3), np.zeros(3), camera_cfg.K, camera_cfg.dist)
+    W, H = camera_cfg.size
+    uv = projected.reshape(-1, 2) / np.array([W, H], dtype=float)
+    return uv if np.all(np.isfinite(uv)) else None
+
+
 def _aspect_ratio(values) -> float | None:
     try:
         a, b = [abs(float(v)) for v in values[:2]]
@@ -232,10 +246,19 @@ def lock_scan_surface(services, *, force_crop: bool = False) -> LockedScanSurfac
             angle = ((angle + 45.0) % 90.0) - 45.0
             gate_payload["yaw_a_deg"] = -angle
             gate_payload["edge_align_tol_deg"] = float(scfg.edge_align_tol_deg)
+            # EDGE A: advisory alignment lamp (never part of ``ok`` — see
+            # live_scan_telemetry_payload). Meaningful only for an elongated platform;
+            # a near-square platform's edge yaw is ambiguous, so the lamp reads OK.
+            edge_aspect = _aspect_ratio(survey.extent_mm)
+            edge_meaningful = bool(edge_aspect is not None
+                                   and edge_aspect >= float(scfg.edge_gate_min_aspect))
+            final_gates["edge"] = (abs(angle) <= float(scfg.edge_align_tol_deg)
+                                   if edge_meaningful else True)
     elif survey.detected and not crop_mode:
         final_gates["framed"] = False
     gate_payload["gates"] = {**gate_payload.get("gates", {}), **final_gates}
     ok_gates = dict(final_gates)
+    ok_gates.pop("edge", None)          # advisory — never blocks readiness
     if survey.detected and survey.fully_framed:
         # Once a finite rectangle is fully framed, its measured centroid is the
         # target center used by the planner. Reticle-centering is useful guidance,
@@ -491,13 +514,10 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
     surface_mode = raw.get("surface_mode", "full")
     outline_uv = raw.get("outline_uv")
     corners_color = raw.get("rectangle_corners_color_mm")
+    trimmed_color = raw.get("trimmed_corners_color_mm")
     if camera_cfg is not None and corners_color is not None:
-        corners = np.asarray(corners_color, dtype=np.float64).reshape(-1, 3)
-        projected, _ = cv2.projectPoints(
-            corners, np.zeros(3), np.zeros(3), camera_cfg.K, camera_cfg.dist)
-        W, H = camera_cfg.size
-        calibrated_uv = projected.reshape(-1, 2) / np.array([W, H], dtype=float)
-        if np.all(np.isfinite(calibrated_uv)):
+        calibrated_uv = _project_color_corners_uv(corners_color, camera_cfg)
+        if calibrated_uv is not None:
             edge_angle = _outline_edge_angle_deg(calibrated_uv)
             # TRUST THE FITTED RECTANGLE: if its calibrated corners sit inside the
             # colour frame with a margin, the object is bounded in view — draw that
@@ -506,7 +526,8 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
             # points made a well-margined block read as an overrun and fall back to
             # the generic work square. The projected rectangle corners (built from the
             # trimmed fit) are the reliable "does the object fit the view" signal, so
-            # the host overrides the server's over-eager crop here.
+            # the host overrides the server's over-eager crop here. The framing test
+            # deliberately uses the RAW corners (the full object extent).
             frame_margin = float(getattr(scfg, "live_frame_margin_uv", 0.02))
             rectangle_in_frame = bool(np.all(
                 (calibrated_uv[:, 0] >= frame_margin)
@@ -516,9 +537,17 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
             fully_framed = rectangle_in_frame
             surface_mode = "full" if rectangle_in_frame else "crop"
             if rectangle_in_frame:
-                # Hug the object with the fitted rectangle. When it overruns, keep the
-                # server's generic reticle square (raw outline_uv) instead.
-                outline_uv = calibrated_uv.tolist()
+                # Draw the density/colour-TRIMMED rectangle so the LIVE overlay hugs
+                # the surface the same way the locked/inserted work rectangle does
+                # (the survey lock trims via plane._density_extent_1d). Both are now
+                # trimmed, so the box no longer visibly shrinks on lock. Fall back to
+                # the raw fitted rectangle if the server did not send trimmed corners
+                # (a pre-deploy server) — never worse than before. When the object
+                # overruns, keep the server's generic reticle square (raw outline_uv).
+                trimmed_uv = (_project_color_corners_uv(trimmed_color, camera_cfg)
+                              if trimmed_color is not None else None)
+                outline_uv = (trimmed_uv if trimmed_uv is not None
+                              else calibrated_uv).tolist()
             max_center_span = float(np.max(np.abs(calibrated_uv - 0.5)))
             raw = {
                 **raw,
@@ -576,7 +605,19 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
             and abs(float(center_cam[1])) <= float(scfg.center_tol_mm))
     if fully_framed is not None:
         gates["framed"] = bool(fully_framed)
+    # EDGE A: the platform edge's yaw alignment. It is a meaningful reading only for
+    # an elongated platform (the long edge defines the work-frame X); a near-square
+    # platform or the generic crop has an ambiguous edge, so the lamp is advisory.
+    # It is ADVISORY only (never part of ``ok``) so it informs without making lock
+    # harder — the lamp reflects reality instead of showing a permanent "·".
+    edge_aspect = _aspect_ratio(raw.get("rectangle_size_mm") or extent)
+    edge_meaningful = bool(finite_surface and edge_angle is not None
+                           and edge_aspect is not None
+                           and edge_aspect >= float(scfg.edge_gate_min_aspect))
+    gates["edge"] = (abs(float(edge_angle)) <= float(scfg.edge_align_tol_deg)
+                     if edge_meaningful else True)
     ok_gates = dict(gates)
+    ok_gates.pop("edge", None)          # advisory — never blocks readiness
     if surface_mode == "crop":
         ok_gates.pop("framed", None)
     elif fully_framed:
@@ -940,10 +981,25 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg,
                     out["move_cam"] = [float(prev_mv[0]), float(prev_mv[1]), float(mv[2])]
                     gates["center"] = True
                     out["center_latched"] = True
-    gates.pop("edge", None)
+    # EDGE A recomputed from the smoothed yaw with hysteresis (advisory; see
+    # live_scan_telemetry_payload). Preserved through smoothing rather than dropped so
+    # the EDGE A lamp keeps reflecting live alignment instead of going blank.
+    yaw = out.get("yaw_a_deg")
+    edge_aspect = _aspect_ratio(out.get("rectangle_size_mm") or out.get("extent_mm"))
+    edge_meaningful = bool(out.get("surface_mode") == "full" and yaw is not None
+                           and edge_aspect is not None
+                           and edge_aspect >= float(scfg.edge_gate_min_aspect))
+    if edge_meaningful:
+        tol = float(out.get("edge_align_tol_deg", scfg.edge_align_tol_deg))
+        if prev_gates.get("edge"):
+            tol += float(getattr(scfg, "live_aim_edge_hysteresis_deg", 10.0))
+        gates["edge"] = abs(float(yaw)) <= tol
+    else:
+        gates["edge"] = True
     if out.get("fully_framed") is not None:
         gates["framed"] = bool(out.get("fully_framed"))
     ok_gates = dict(gates)
+    ok_gates.pop("edge", None)          # advisory — never blocks readiness
     if out.get("surface_mode") == "crop":
         ok_gates.pop("framed", None)
     elif out.get("fully_framed") is True:
@@ -1038,6 +1094,27 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
         elif survey.fully_framed:
             plan = plan_scan(survey, K, (W, H), scfg, cam_to_base_T=seed_T)
             planned_voxel_m = plan.voxel_size_m
+            if plan.mode == "reference":
+                # The surface frames cleanly but is too large/far to capture within
+                # the camera's accurate depth band in a quality tour. Place a single-
+                # frame reference rectangle directly (no robot motion, no fusion) and
+                # return it for immediate review/insert — the frontend renders this
+                # mode without a tour. Previously this branch fell through and created
+                # a quality tour anyway (orbiting a surface it could not accurately
+                # fuse); _reference_locate was dead code.
+                for w in plan.warnings:
+                    pub(f"WARNING (survey): {w}")
+                prior_scan = rdk.list_targets(prefix)
+                if prior_scan:
+                    rdk.delete_items(prior_scan)
+                result = _reference_locate(services, frame, survey, seed_T, plan)
+                return {"mode": "reference", "created": 0, "targets": [],
+                        "look_distance_mm": float(plan.standoff_mm),
+                        "extent_mm": extent_mm, "voxel_size_m": plan.voxel_size_m,
+                        "crop_size_mm": None,
+                        "camera_tool_offset_mm": round(tool_offset_mm, 1),
+                        "calibration_on_file": tool_offset_mm >= 15.0,
+                        "gate": gate_payload, "_scan_result": result}
             if plan.mode == "quality" and plan.aims:
                 look = float(plan.standoff_mm)
                 target_center = np.asarray(plan.aims[0].point_base_mm, float)

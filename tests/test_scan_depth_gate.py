@@ -153,6 +153,43 @@ def test_live_outline_uses_saved_color_calibration():
     print("[telemetry calibration] saved RGB K+distortion drives blue outline")
 
 
+def test_live_overlay_draws_trimmed_rectangle_when_server_sends_it():
+    # Bug fix: the LIVE overlay must draw the density/colour-TRIMMED rectangle (the
+    # same box lock/insert uses) instead of the RAW fitted rectangle, so the box does
+    # not visibly shrink when the operator locks. The framing decision still uses the
+    # RAW corners (full object extent). Falls back to raw when the server (pre-deploy)
+    # sends no trimmed corners.
+    cfg = ScanConfig()
+    camera = type("Camera", (), {
+        "K": np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]]),
+        "dist": np.zeros((5, 1)), "size": (320, 240),
+    })()
+    raw_corners = np.array([[-180.0, -110.0, 500.0], [180.0, -110.0, 500.0],
+                            [180.0, 110.0, 500.0], [-180.0, 110.0, 500.0]])
+    trimmed_corners = np.array([[-150.0, -95.0, 500.0], [150.0, -95.0, 500.0],
+                                [150.0, 95.0, 500.0], [-150.0, 95.0, 500.0]])
+    base = {
+        "detected": True, "distance_mm": 500.0, "tilt_deg": 0.0, "valid_frac": 1.0,
+        "fully_framed": True, "depth_fully_framed": True, "surface_mode": "full",
+        "extent_mm": [360.0, 220.0], "rectangle_size_mm": [300.0, 190.0],
+        "rectangle_corners_color_mm": raw_corners.tolist(),
+        "outline_uv": [[0.0, 0.0]] * 4,
+    }
+    proj = lambda c: (cv2.projectPoints(c, np.zeros(3), np.zeros(3),
+                      camera.K, camera.dist)[0].reshape(-1, 2) / np.array(camera.size))
+    # With trimmed corners present -> overlay is the TRIMMED projection.
+    p = live_scan_telemetry_payload(
+        {**base, "trimmed_corners_color_mm": trimmed_corners.tolist()},
+        cfg, camera_cfg=camera)
+    assert p["fully_framed"] is True, p          # framing from RAW corners
+    assert np.allclose(np.asarray(p["outline_uv"]), proj(trimmed_corners)), p["outline_uv"]
+    assert not np.allclose(np.asarray(p["outline_uv"]), proj(raw_corners))
+    # Without trimmed corners (pre-deploy server) -> falls back to the RAW rectangle.
+    p2 = live_scan_telemetry_payload(base, cfg, camera_cfg=camera)
+    assert np.allclose(np.asarray(p2["outline_uv"]), proj(raw_corners)), p2["outline_uv"]
+    print("[telemetry trim] live overlay draws the trimmed box; falls back to raw")
+
+
 def _cam_320():
     return type("Camera", (), {
         "K": np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]]),
@@ -412,9 +449,33 @@ def test_live_scan_near_square_skips_edge_gate():
         "edge_angle_deg": 20.0,
     }
     p = live_scan_telemetry_payload(raw, cfg)
-    assert "edge" not in p["gates"], p
+    # Near-square platform: the edge yaw is ambiguous, so EDGE A reads OK (advisory
+    # lamp is populated, not blank) and never blocks readiness even at 20deg off.
+    assert p["gates"]["edge"] is True, p
     assert p["ok"] is True, p
-    print("[telemetry square] EDGE A is advisory, not a lock gate")
+    print("[telemetry square] EDGE A is advisory (lamp OK), not a lock gate")
+
+
+def test_live_scan_elongated_edge_gate_is_advisory_lamp():
+    # An elongated platform (aspect >= edge_gate_min_aspect) whose long edge is
+    # misaligned lights EDGE A amber (gates.edge False) but must NOT block readiness
+    # (ok stays True) — the lamp informs without making lock harder.
+    cfg = ScanConfig()
+    raw = {
+        "detected": True, "distance_mm": 500.0, "tilt_deg": 1.0,
+        "valid_frac": 0.9, "fully_framed": True, "depth_fully_framed": True,
+        "surface_mode": "full", "extent_mm": [600.0, 200.0],
+        "rectangle_size_mm": [600.0, 200.0],
+        "color_fit_standoff_per_margin_mm": 480.0,
+        "surface_center_cam_mm": [0.0, 0.0, 500.0],
+        "edge_angle_deg": 20.0,     # long edge 20deg off axis -> misaligned
+    }
+    p = live_scan_telemetry_payload(raw, cfg)
+    assert p["gates"]["edge"] is False, p     # meaningful + misaligned -> amber lamp
+    assert p["ok"] is True, p                 # but advisory: does not block lock
+    aligned = live_scan_telemetry_payload({**raw, "edge_angle_deg": 1.0}, cfg)
+    assert aligned["gates"]["edge"] is True, aligned
+    print("[telemetry elongated] EDGE A reflects real alignment but stays advisory")
 
 
 def _jittery_pair(cfg):
@@ -555,6 +616,7 @@ if __name__ == "__main__":
     test_live_telemetry_uses_surface_appropriate_standoff()
     test_live_target_is_continuous_across_color_frame_boundary()
     test_live_outline_uses_saved_color_calibration()
+    test_live_overlay_draws_trimmed_rectangle_when_server_sends_it()
     test_live_trusts_fitted_rectangle_over_strict_depth_border()
     test_live_overrun_rectangle_still_crops()
     test_live_scan_payload_stabilizes_static_jitter()
@@ -565,6 +627,7 @@ if __name__ == "__main__":
     test_framed_rectangle_center_is_advisory_for_readiness()
     test_stable_rectangle_latches_center_jitter()
     test_live_scan_near_square_skips_edge_gate()
+    test_live_scan_elongated_edge_gate_is_advisory_lamp()
     test_pose_hold_settles_then_freezes_all_axes()
     test_pose_hold_releases_and_tracks_when_robot_moves()
     test_pose_hold_release_is_debounced_against_single_noisy_frame()

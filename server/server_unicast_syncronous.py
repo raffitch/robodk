@@ -454,6 +454,14 @@ def scan_plane_telemetry(depth, intrinsics, depth_unit_mm=1.0,
                 pc + thi1 * ax1 + thi2 * ax2,
                 pc + tlo1 * ax1 + thi2 * ax2,
             ]
+            # The trimmed corners in the COLOR-camera frame (mm), so the workstation
+            # can re-project them through its RealSense calibration and draw the LIVE
+            # overlay as the same density/colour-trimmed box the lock/insert uses.
+            # (rectangle_corners_color_mm carries the RAW corners for the framing test.)
+            trimmed_corners_color = (
+                np.asarray(overlay_transform_points(np.asarray(trimmed_corners, float)),
+                           dtype=float)
+                if overlay_transform_points is not None else None)
             if overlay_project is not None:
                 tpc = np.asarray([overlay_project(p) for p in trimmed_corners], float)
             elif overlay_project_points is not None:
@@ -531,6 +539,9 @@ def scan_plane_telemetry(depth, intrinsics, depth_unit_mm=1.0,
                                       else [float(tlen1), float(tlen2)]),
                 "rectangle_corners_color_mm": (
                     corners_color.tolist() if corners_color is not None else None),
+                "trimmed_corners_color_mm": (
+                    trimmed_corners_color.tolist()
+                    if trimmed_corners_color is not None else None),
                 # Operator overlay: the generic reticle-centred work square when the
                 # surface overruns the view (edges off-frame), else the density/colour-
                 # trimmed board box (hugs the surface). Falls back to the raw outline
