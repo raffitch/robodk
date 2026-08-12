@@ -6,6 +6,7 @@ import { robotLinkNote } from "./Calibration";
 import CollisionPanel, { type CollisionStatus } from "../components/CollisionPanel";
 import ScanViewer from "./ScanViewer";
 import StreamStats, { useStreamStats } from "./StreamStats";
+import SurveyPanel, { type SurveyState } from "./SurveyPanel";
 
 const api = moduleApi("scan");
 const TARGET_PREFIX = "TasniScan_";          // must match service.py scan.target_prefix
@@ -175,6 +176,15 @@ export default function Scan() {
   const [surfaceLocked, setSurfaceLocked] = useState(false);
   const [surfaceMode, setSurfaceMode] = useState<"auto" | "crop">("auto");
   const [locking, setLocking] = useState(false);
+  // Guided five-position workframe survey (spec §7): an alternative to Lock & create
+  // targets for a platform too large for one camera view. surveyEvent forwards the
+  // "survey" websocket event into SurveyPanel; it is reset to null at every survey
+  // lifecycle transition (begin/finish/cancel) so a stale payload from a PRIOR survey
+  // can never be misread as live state for a freshly-begun one (SurveyPanel's own
+  // mount-time GET /survey/state is the real source of truth either way).
+  const [surveyActive, setSurveyActive] = useState(false);
+  const [surveyEvent, setSurveyEvent] = useState<SurveyState | null>(null);
+  const [surveyStarting, setSurveyStarting] = useState(false);
   const { mark: markFrame, reset: resetStream, stat: streamStat } = useStreamStats();
   const [targets, setTargets] = useState<number | null>(null);
   const [scanMode, setScanMode] = useState<"quality" | "reference" | null>(null);
@@ -326,6 +336,11 @@ export default function Scan() {
             accumulateCoverage(p.points_uv as Array<[number, number]>);
           }
         }
+      } else if (ev.type === "survey") {
+        // Fired by the backend after every successful five-position capture
+        // (module.py -> five_position_capture); SurveyPanel merges this as a
+        // fallback/resync channel alongside its own ~1s poll (ambiguity #3).
+        setSurveyEvent(ev.payload as SurveyState);
       } else if (ev.type === "boundary") {
         // Video-rate color boundary. Store it (with a staleness timeout so it clears if
         // the stream stalls); the render decides whether to show it (live + not locked).
@@ -568,6 +583,41 @@ export default function Scan() {
     setLocking(false);
     await generateTargets();
   };
+  // Guided five-position survey: an alternative to lockAndCreateTargets for a
+  // platform too large for one camera view (surface_mode === "crop"). Starts the
+  // backend's FivePositionSurvey state machine and swaps SurveyPanel in for the
+  // normal lock controls; SurveyPanel drives its own capture/recapture/finish loop.
+  const beginSurvey = async () => {
+    setSurveyStarting(true); setRunError(null);
+    try {
+      await api.post<SurveyState>("/survey/begin");
+      setSurveyEvent(null);
+      setSurveyActive(true);
+      addLog("guided five-position survey started — jog to the surface CENTER, stop, then Measure.");
+    } catch (e: any) {
+      addLog("survey: " + e.message, true);
+      setRunError("Survey: " + e.message);
+    } finally { setSurveyStarting(false); }
+  };
+  // Ambiguity resolution #2: /survey/finish already locks the surface server-side
+  // (module.py's survey_finish sets self._locked_surface directly), so this mirrors
+  // ONLY lockAndCreateTargets's post-lock bookkeeping (no second /surface/lock call)
+  // before handing off to the SAME generateTargets() the compact/crop lock path uses.
+  const handleSurveyFinished = async () => {
+    setSurveyActive(false);
+    setSurveyEvent(null);
+    setLive(false); resetStream();
+    setSurfaceLocked(true);
+    setSurfaceStable(false);
+    resetCoverage();
+    addLog("five-position survey complete — surface locked; creating targets");
+    await generateTargets();
+  };
+  const handleSurveyCancelled = () => {
+    setSurveyActive(false);
+    setSurveyEvent(null);
+    addLog("guided survey cancelled.");
+  };
   const dryRun = async () => {
     setTour(null); setPct(0); setStatus("starting dry run…"); setRunError(null);
     setRunning(true); setRunKind("tour"); setLive(false);
@@ -689,8 +739,17 @@ export default function Scan() {
 
         <SurfaceModeNotice gate={gate} mode={surfaceMode}
                            onModeChange={setSurfaceMode}
-                           disabled={running || locking || generating || surfaceLocked}
+                           disabled={running || locking || generating || surfaceLocked || surveyActive}
                            onRegionApplied={refreshLive} />
+        {gate?.surface_mode === "crop" && !surveyActive && !surfaceLocked && (
+          <div className="btn-row" style={{ marginTop: 8 }}>
+            <button className="secondary" onClick={beginSurvey}
+                    disabled={!ready || running || locking || generating || surveyStarting}
+                    title="Guided center + four-corner survey for a platform too large to fit in one camera view">
+              {surveyStarting ? "Starting survey…" : "Large surface — guided survey"}
+            </button>
+          </div>
+        )}
         <SurfaceGuide gate={gate} stable={surfaceStable} />
 
         <div className="lamps">
@@ -743,49 +802,57 @@ export default function Scan() {
                         onIgnore={ignoreCollisionPair}
                         recentPairs={recentCollisionPairs} />
 
-        <div className="btn-row">
-          {!live && !surfaceLocked
-            ? <button onClick={startLive} disabled={running}>Start camera</button>
-            : live
-              ? <button className="secondary" onClick={stopLive}>Stop camera</button>
-              : null}
-          {live
-            ? <button className="secondary" onClick={refreshLive} disabled={running}
-                      title="Re-read the surface at the current robot pose (clears a stale overlay if the arm moved but the readout didn't)">
-                Refresh view
-              </button>
-            : null}
-          {!surfaceLocked
-            ? <button onClick={lockAndCreateTargets}
-                      disabled={!ready || running || locking || generating || !live || !canLockSurface}>
-                {locking ? "Locking…" : generating ? "Creating…" : "Lock & create targets"}
-              </button>
-            : <>
-                <button className="secondary" onClick={repositionSurface}
-                        disabled={running || generating}>Reposition</button>
-                <button onClick={generateTargets}
-                        disabled={!ready || running || generating}>
-                  {generating ? "Creating…" : "Accept region & create targets"}
-                </button>
-              </>}
-          {targets != null &&
-            <button className="secondary" onClick={clearPoses} disabled={running}>Clear targets</button>}
-        </div>
-        {targets != null
-          ? <div className="ok-text" style={{ marginTop: 8, fontSize: 13 }}>
-              ✓ {targets} scan targets created (TasniScan_*). Inspect in RoboDK, then Run below.
+        {surveyActive ? (
+          <SurveyPanel event={surveyEvent}
+                       onFinished={handleSurveyFinished}
+                       onCancelled={handleSurveyCancelled} />
+        ) : (
+          <>
+            <div className="btn-row">
+              {!live && !surfaceLocked
+                ? <button onClick={startLive} disabled={running}>Start camera</button>
+                : live
+                  ? <button className="secondary" onClick={stopLive}>Stop camera</button>
+                  : null}
+              {live
+                ? <button className="secondary" onClick={refreshLive} disabled={running}
+                          title="Re-read the surface at the current robot pose (clears a stale overlay if the arm moved but the readout didn't)">
+                    Refresh view
+                  </button>
+                : null}
+              {!surfaceLocked
+                ? <button onClick={lockAndCreateTargets}
+                          disabled={!ready || running || locking || generating || !live || !canLockSurface}>
+                    {locking ? "Locking…" : generating ? "Creating…" : "Lock & create targets"}
+                  </button>
+                : <>
+                    <button className="secondary" onClick={repositionSurface}
+                            disabled={running || generating}>Reposition</button>
+                    <button onClick={generateTargets}
+                            disabled={!ready || running || generating}>
+                      {generating ? "Creating…" : "Accept region & create targets"}
+                    </button>
+                  </>}
+              {targets != null &&
+                <button className="secondary" onClick={clearPoses} disabled={running}>Clear targets</button>}
             </div>
-          : scanMode === "reference"
-          ? <div className="ok-text" style={{ marginTop: 8, fontSize: 13 }}>
-              ✓ Reference surface detected — rectangle placed directly. Review &amp; Insert below.
-              Re-aim closer (300–800 mm) for a quality mesh tour.
-            </div>
-          : surfaceLocked
-          ? <div className="hint">Surface is locked. Reposition if the wrong plane or crop
-              is highlighted; otherwise create the targets.</div>
-          : <div className="hint">Jog until RANGE, TILT, CENTER and EDGE are valid and
-              remain stable for one second. FRAMED may be red when the surface overruns
-              the view; in that case the scan uses the displayed generic 1 m work square.</div>}
+            {targets != null
+              ? <div className="ok-text" style={{ marginTop: 8, fontSize: 13 }}>
+                  ✓ {targets} scan targets created (TasniScan_*). Inspect in RoboDK, then Run below.
+                </div>
+              : scanMode === "reference"
+              ? <div className="ok-text" style={{ marginTop: 8, fontSize: 13 }}>
+                  ✓ Reference surface detected — rectangle placed directly. Review &amp; Insert below.
+                  Re-aim closer (300–800 mm) for a quality mesh tour.
+                </div>
+              : surfaceLocked
+              ? <div className="hint">Surface is locked. Reposition if the wrong plane or crop
+                  is highlighted; otherwise create the targets.</div>
+              : <div className="hint">Jog until RANGE, TILT, CENTER and EDGE are valid and
+                  remain stable for one second. FRAMED may be red when the surface overruns
+                  the view; in that case the scan uses the displayed generic 1 m work square.</div>}
+          </>
+        )}
       </div>
 
       {/* ---- Run -------------------------------------------------------- */}
