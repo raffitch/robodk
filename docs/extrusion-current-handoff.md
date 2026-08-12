@@ -1,7 +1,8 @@
 # Cylinder Test: Current Implementation and Live-Test Handoff
 
 Last updated: 2026-08-12. Active branch: `calibration-improvements`.
-Current implementation commits: `e36b4d5` and `a0670f1`.
+Current implementation commits: `e36b4d5`, `a0670f1`, and the scan-surface placement
+change below.
 
 This is the authoritative current-state handoff for Tasni's extrusion/cylinder
 module. `docs/HANDOFF_EXTRUSION_CYLINDER.md` is the original requirements document;
@@ -31,6 +32,7 @@ Primary code:
 - `tasni/modules/extrusion/module.py`: API, plan/preflight/dry/live interlocks.
 - `tasni/modules/extrusion/service.py`: dry/live jobs and cleanup behavior.
 - `tasni/modules/extrusion/toolpath.py`: deterministic layered circle coordinates.
+- `tasni/modules/extrusion/surface.py`: scan → extrusion placement handoff and checks.
 - `tasni/modules/extrusion/processing.py`: single-frame measurement pipeline.
 - `tasni/core/rdk_io.py`: native curves, machining projects, IK, generated programs.
 - `tasni/webui/src/pages/Extrusion.tsx`: controls, oblique bird's-eye preview, workflow.
@@ -70,20 +72,59 @@ area. Commit `a0670f1` fixed the placement workflow:
 - Selecting `World` shows a warning that all values are station-world coordinates.
 - A negative Curve Follow setup error now reports tool, frame, XYZ bounds, and RPW.
 
+## Placement on the scanned work surface (preferred workflow)
+
+The intended flow is: **scan the surface → insert it → build on that frame**. The Scan
+module's insert creates `Tasni Work Frame`, the `Tasni Work Surface` rectangle, and the
+fused mesh, and records the applied run in `runs/scan/active.json`. The Cylinder Test
+now reads that pointer.
+
+- `GET /api/modules/extrusion/scan-surface` reports the applied surface (frame, size,
+  run id, applied time) or that none is applied.
+- **Center on scanned surface** sets the work frame to the scan frame, centers the
+  cylinder on the measured rectangle, and sets build-plane Z = 0 (the scan frame's
+  origin lies on the surface). It records the originating run in `setup.scan_run_id`.
+- That run id is part of the plan fingerprint, so **re-scanning the table invalidates a
+  surface-placed plan** exactly like editing the recipe does.
+- Preflight then enforces the placement: same run, same frame, and the wall
+  (`radius + bead/2`) must fit inside the measured rectangle, reporting signed per-edge
+  margins.
+- Manual placement is still legal. **Seed path start from current TCP** clears
+  `scan_run_id`, and preflight reports `placement: "manual"` with an advisory when a
+  scanned surface exists on another frame.
+
+Why the centre cannot be derived from the recorded extents: the scan puts its frame
+origin on the rectangle **corner** nearest the robot base, and frame +Y is `Z × X`,
+which on this cell points *off* the rectangle (Y spans about −295..0 mm). So (0, 0) is a
+corner and (size/2, size/2) has the wrong Y sign. The insert therefore publishes
+`rectangle_corners_frame_mm` and `rectangle_center_frame_mm` in **frame** coordinates,
+and extrusion centres on the corner mean. A surface applied before those fields existed
+is recovered from its `report.json`; if neither source is available the module refuses
+to centre rather than guess (`available: false`).
+
+Primary code: `tasni/modules/extrusion/surface.py`,
+`tasni/modules/scan/plane.py:rectangle_in_frame`, and the payload written by
+`tasni/modules/scan/service.py:insert_scan`.
+
 ## Exact operator retry sequence
 
 1. Refresh the Cylinder Test page and connect/refresh the RoboDK station.
-2. Select the actual print tool, work frame, inspection tool, and inspection target.
-3. Jog the selected print TCP to the intended first point on the circle.
-4. Click **Seed path start from current TCP**.
-5. Review center X/Y, build-plane Z, and RPW. If using `World`, confirm these are
+2. Select the actual print tool, inspection tool, and inspection target.
+3. Place the path, preferring the scanned surface:
+   - **Preferred:** if the Scan surface row is not green, run the Scan module and insert
+     its result, then click **Center on scanned surface**.
+   - **Manual alternative:** jog the selected print TCP to the intended first point on
+     the circle and click **Seed path start from current TCP**.
+4. Review center X/Y, build-plane Z, and RPW. If using `World`, confirm these are
    deliberately world coordinates.
-6. Generate coordinates and fingerprint.
-7. Run geometry/station preflight. It must show all sampled IK poses reachable.
-8. Run the complete RoboDK dry run. Do not proceed live until collision validation,
+5. Generate coordinates and fingerprint.
+6. Run geometry/station preflight. It must show all sampled IK poses reachable, and the
+   placement section must not report an overhang or a stale scan.
+7. Run the complete RoboDK dry run. Do not proceed live until collision validation,
    simulation, inspection motion, and return-to-start all pass.
 
-Changing any recipe/setup value invalidates the fingerprint and prior checks.
+Changing any recipe/setup value invalidates the fingerprint and prior checks, as does
+re-scanning the surface a plan was centred on.
 
 ## Most recent live verification
 
@@ -191,6 +232,12 @@ Official references used during implementation:
 
 ## Verification and runtime state
 
+After the scan-surface placement change:
+
+- Full Python suite: 244 passed.
+- Extrusion-focused suite: 19 passed.
+- Frontend TypeScript check and production build: passed (existing chunk warning only).
+
 At commit `a0670f1`:
 
 - Full Python suite: 234 passed.
@@ -214,8 +261,10 @@ npm run build
 
 ## Safe next-agent priorities
 
-1. Ask the operator to retry using **Seed path start from current TCP** with the actual
-   extrusion tool and intended build location.
+1. Ask the operator to retry with the path placed on a freshly scanned surface
+   (**Center on scanned surface**) rather than the `spindle`/`World` seed that produced
+   the collision below. A circle centred on the measured table sits in the reachable
+   work area by construction; world zero did not.
 2. If preflight rejects a sampled coordinate, use the returned frame/XYZ and inspect
    the exact setup; do not start dry run.
 3. If Curve Follow generation or collision validation fails, inspect the retained

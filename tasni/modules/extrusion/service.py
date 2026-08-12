@@ -19,11 +19,17 @@ from ..calibration.service import _camera_hold, ensure_real_robot_link
 from .archive import ExtrusionArchive
 from .models import CylinderPlan, CylinderRecipe, CylinderSetup, LayerManifest
 from .processing import process_observation
+from .surface import surface_check
 from .toolpath import generate_cylinder_plan, points_array
 
 
-def geometry_preflight(plan: CylinderPlan) -> dict:
-    """Validate the generated geometry without claiming a RoboDK dry-run pass."""
+def geometry_preflight(plan: CylinderPlan, *, surface: dict | None = None) -> dict:
+    """Validate the generated geometry without claiming a RoboDK dry-run pass.
+
+    ``surface`` is the currently applied scan surface (``None`` = none applied). A
+    surface-placed plan fails here if that surface changed or if the wall overhangs
+    it, before any robot motion is offered.
+    """
     layers: list[dict] = []
     all_ok = True
     for layer in plan.layers:
@@ -41,9 +47,11 @@ def geometry_preflight(plan: CylinderPlan) -> dict:
             "closed": closed, "finite": finite, "length_mm": actual,
             "maximum_segment_mm": float(gaps.max()), "ok": ok,
         })
+    placement = surface_check(plan.setup, plan.recipe, surface)
+    all_ok &= bool(placement["ok"])
     return {
         "kind": "geometry_preflight", "fingerprint": plan.fingerprint,
-        "all_ok": all_ok, "layers": layers,
+        "all_ok": all_ok, "layers": layers, "surface": placement,
         "dry_run_passed": False,
         "note": "Geometry is valid; RoboDK reachability/collision/program execution is still required.",
         "simulated_valve_events": [

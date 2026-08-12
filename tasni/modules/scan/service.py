@@ -43,7 +43,8 @@ from ..calibration.service import (
     TARGET_PREFIX as CALIB_TARGET_PREFIX,
     _camera_hold, dry_tour_required, ensure_camera_tool, ensure_real_robot_link)
 from .depth_gate import ScanGateThresholds, evaluate_depth_gate
-from .plane import bounded_work_plane, reticle_plane_square, work_plane_from_points
+from .plane import (bounded_work_plane, rectangle_in_frame, reticle_plane_square,
+                    work_plane_from_points)
 from .planner import ScanPlan, plan_scan
 from .survey import SurveyThresholds, survey_surface
 from .reconstruct import (ScanView, clean_measured_surface_mesh, cloud_points_m,
@@ -1853,12 +1854,20 @@ def insert_scan(services, *, job: "ScanCaptureJob | None" = None,
         item = rdk.add_mesh_file(MESH_NAME, mesh_path)
         mesh_inserted = bool(getattr(item, "Valid", lambda: False)())
 
+    # Downstream modules place work *in* this frame, so publish the rectangle in
+    # frame coordinates too. The frame origin is a corner, so its centre has to be
+    # derived from the corners; the (X, Y) extents alone cannot give the sign.
+    corners_frame_mm = rectangle_in_frame(frame_T_mm, corners_mm)
+    center_frame_mm = corners_frame_mm.mean(axis=0)
     payload = {
         "module": "scan", "run_id": stamp_id, "source": source,
         "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "frame": FRAME_NAME, "rectangle": RECT_NAME,
         "mesh": MESH_NAME if mesh_inserted else None,
         "size_mm": report.get("plane", {}).get("size_mm"),
+        "rectangle_corners_frame_mm": corners_frame_mm.tolist(),
+        "rectangle_center_frame_mm": [float(center_frame_mm[0]),
+                                      float(center_frame_mm[1])],
     }
     runs.write_active("scan", payload)
     return {"status": "inserted", "frame": FRAME_NAME, "rectangle": RECT_NAME,

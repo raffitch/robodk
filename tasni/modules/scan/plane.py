@@ -32,7 +32,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ...core.geometry import Rt_to_T
+from ...core.geometry import Rt_to_T, invert_T, transform_points
 
 
 @dataclass
@@ -278,6 +278,20 @@ def _oriented_rectangle(points: np.ndarray, normal: np.ndarray, centroid: np.nda
     if w >= h:
         return corners, ax_a, ax_b, w, h
     return corners, ax_b, ax_a, h, w
+
+
+def rectangle_in_frame(frame_T: np.ndarray, corners: np.ndarray) -> np.ndarray:
+    """The rectangle corners re-expressed in the work frame (4x3, same units in/out).
+
+    ``frame_T`` is base->frame, so this applies its inverse. Consumers that place
+    work *on* the surface (the extrusion module centres its cylinder here) need the
+    rectangle in the frame they program in, not in the base frame. By construction
+    the result is axis-aligned with ~0 Z — frame X/Y run along the rectangle edges —
+    so the surface centre is a plain midpoint of the bounds. The frame origin is a
+    *corner*, so that centre is emphatically not (0, 0).
+    """
+    return transform_points(invert_T(np.asarray(frame_T, float)),
+                            np.asarray(corners, float).reshape(4, 3))
 
 
 def work_plane_from_points(points: np.ndarray, *, distance: float = 0.006,

@@ -215,6 +215,21 @@ def test_generate_run_insert():
             assert rdk.inserted["rect"].shape == (4, 3)
             active = runs.read_active("scan")
             assert active["frame"] == scan_service.FRAME_NAME
+            # The rectangle is published in FRAME coordinates too, so downstream
+            # modules (extrusion) can centre on the surface. The frame origin is a
+            # corner, so the recorded centre must be ~half the extent, never (0, 0).
+            corners_frame = np.asarray(active["rectangle_corners_frame_mm"], float)
+            assert corners_frame.shape == (4, 3)
+            np.testing.assert_allclose(corners_frame[:, 2], 0, atol=1e-6)
+            centre = np.asarray(active["rectangle_center_frame_mm"], float)
+            size = active["size_mm"]
+            # Half the extent on each axis in MAGNITUDE, but not necessarily positive:
+            # frame +Y is Z x X, which can point away from the rectangle (it does here,
+            # Y spans -295..0). So (size/2, size/2) is NOT the centre — it has to come
+            # from the corners, which is why insert publishes them.
+            np.testing.assert_allclose(np.abs(centre), [size[0] / 2, size[1] / 2], atol=1e-6)
+            assert np.linalg.norm(centre) > 1.0, centre
+            np.testing.assert_allclose(centre, corners_frame[:, :2].mean(axis=0), atol=1e-6)
 
             # Insert by run_id (from disk) also works.
             rdk.inserted.clear()

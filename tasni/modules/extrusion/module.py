@@ -6,7 +6,7 @@ import time
 from typing import TYPE_CHECKING
 
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ...core.jobrunner import JobBusy
 from ...core.logging import REPO_ROOT
@@ -14,6 +14,7 @@ from ..base import ServiceContainer, WorkflowModule
 from .models import CylinderPlan, CylinderRecipe, CylinderSetup
 from .service import (CylinderDryRunJob, CylinderPrintJob, geometry_preflight,
                       reprocess_saved_layer, station_requirements)
+from .surface import active_scan_surface, surface_fit
 from .toolpath import corrected_cylinder_plan, generate_cylinder_plan
 
 if TYPE_CHECKING:
@@ -36,6 +37,13 @@ class PrintBody(FingerprintBody):
 class TcpSeedBody(BaseModel):
     print_tool: str
     work_frame: str
+
+
+class SurfaceCenterBody(BaseModel):
+    """The wall footprint to fit while centring, so the answer carries its own check."""
+
+    radius_mm: float = Field(gt=0)
+    bead_diameter_mm: float = Field(gt=0)
 
 
 class ExtrusionModule(WorkflowModule):
@@ -74,7 +82,7 @@ class ExtrusionModule(WorkflowModule):
             "inspection_tool": c.default_inspection_tool,
             "inspection_target": c.default_inspection_target,
             "center_x_mm": c.center_x_mm, "center_y_mm": c.center_y_mm,
-            "build_plane_z_mm": c.build_plane_z_mm,
+            "build_plane_z_mm": c.build_plane_z_mm, "scan_run_id": None,
             "orientation_rpy_deg": list(c.orientation_rpy_deg),
             "approach_clearance_mm": c.approach_clearance_mm,
             "retreat_clearance_mm": c.retreat_clearance_mm,
@@ -150,6 +158,43 @@ class ExtrusionModule(WorkflowModule):
             except Exception as exc:
                 raise HTTPException(503, f"could not read selected TCP pose: {exc}")
 
+        @router.get("/scan-surface")
+        def scan_surface() -> dict:
+            """The work surface the Scan module currently has applied to the station."""
+            surface = active_scan_surface()
+            if surface is None:
+                return {"applied": False, "available": False,
+                        "note": "No scanned surface is applied. Run the Scan module and "
+                                "insert its result to build on the measured table."}
+            return {"applied": True, **surface}
+
+        @router.post("/center-on-surface")
+        def center_on_surface(body: SurfaceCenterBody) -> dict:
+            """Read only: the placement that centres this wall on the scanned surface."""
+            surface = active_scan_surface()
+            if surface is None:
+                raise HTTPException(
+                    409, "no scanned surface is applied — run the Scan module and insert "
+                         "its result first")
+            if not surface["available"]:
+                raise HTTPException(409, surface["note"])
+            if services.session.is_open and not services.rdk.item_exists_as(
+                    surface["frame"], "frame"):
+                raise HTTPException(
+                    409, f"the applied scan frame {surface['frame']!r} is not in the open "
+                         "station — re-insert the scan")
+            center_x, center_y = surface["center_mm"]
+            fit = surface_fit(
+                surface, center_x_mm=center_x, center_y_mm=center_y,
+                outer_radius_mm=body.radius_mm + body.bead_diameter_mm / 2.0)
+            return {
+                # Build plane Z is 0: the scan frame's origin sits ON the surface.
+                "setup": {"work_frame": surface["frame"], "center_x_mm": center_x,
+                          "center_y_mm": center_y, "build_plane_z_mm": 0.0,
+                          "scan_run_id": surface["run_id"]},
+                "surface": surface, "fit": fit,
+            }
+
         @router.post("/generate")
         def generate(body: GenerateBody) -> dict:
             if services.jobs.running:
@@ -165,7 +210,7 @@ class ExtrusionModule(WorkflowModule):
         def preflight(body: FingerprintBody) -> dict:
             if self._plan is None or body.fingerprint != self._plan.fingerprint:
                 raise HTTPException(409, "toolpath changed; generate the current recipe again")
-            result = geometry_preflight(self._plan)
+            result = geometry_preflight(self._plan, surface=active_scan_surface())
             if not services.session.is_open:
                 result["station"] = {"ready": False,
                                      "error": "connect RoboDK to validate selected station items"}

@@ -14,9 +14,20 @@ interface Recipe {
 interface Setup {
   print_tool: string; work_frame: string; inspection_tool: string;
   inspection_target: string; center_x_mm: number; center_y_mm: number;
-  build_plane_z_mm: number;
+  build_plane_z_mm: number; scan_run_id: string | null;
   orientation_rpy_deg: [number, number, number];
   approach_clearance_mm: number; retreat_clearance_mm: number;
+}
+interface SurfaceFit {
+  checked: boolean; inside: boolean; reason?: string;
+  minimum_margin_mm?: number; outer_radius_mm?: number;
+  margins_mm?: Record<string, number>;
+}
+interface ScanSurface {
+  applied: boolean; available: boolean; note?: string;
+  frame?: string; rectangle?: string | null; run_id?: string | null;
+  applied_at?: string | null; size_mm?: [number, number] | null;
+  center_mm?: [number, number] | null;
 }
 interface Point { x_mm: number; y_mm: number; z_mm: number; }
 interface Layer { layer_index: number; nominal_z_mm: number; points: Point[]; }
@@ -171,6 +182,7 @@ export default function Extrusion() {
   const [progress, setProgress] = useState({ step: 0, total: 1, message: "" });
   const [busy, setBusy] = useState(false);
   const [confirmLive, setConfirmLive] = useState(false);
+  const [surface, setSurface] = useState<ScanSurface | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
 
   const refreshStatus = useCallback(() => {
@@ -179,13 +191,16 @@ export default function Extrusion() {
       if (value.result?.kind?.startsWith("cylinder_")) setResult(value.result);
     }).catch(() => {});
   }, []);
+  const refreshSurface = useCallback(() => {
+    api.get<ScanSurface>("/scan-surface").then(setSurface).catch(() => setSurface(null));
+  }, []);
 
   useEffect(() => {
     api.get<Config>("/config").then((value) => {
       setConfig(value); setRecipe(value.defaults); setSetup(value.setup_defaults);
     }).catch((e) => setMessage(e.message));
-    refreshStatus();
-  }, [refreshStatus]);
+    refreshStatus(); refreshSurface();
+  }, [refreshStatus, refreshSurface]);
 
   useEffect(() => subscribe((event: JobEvent) => {
     const name = event.payload?.name as string | undefined;
@@ -237,8 +252,26 @@ export default function Extrusion() {
         center_y_mm: pose.xyz_mm[1],
         build_plane_z_mm: pose.xyz_mm[2] - recipe.bead_diameter_mm / 2,
         orientation_rpy_deg: pose.rpy_deg as [number, number, number],
+        // Jogged placement is manual by definition — it must not keep claiming the
+        // scanned surface, or preflight would check a fit this centre never had.
+        scan_run_id: null,
       };
       setSetup(next); invalidate("Path start and orientation captured from the current TCP — generate coordinates next.");
+    } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
+  };
+
+  const centerOnScannedSurface = async () => {
+    if (!setup || !recipe) return;
+    setBusy(true); setMessage("Reading the applied scan surface…");
+    try {
+      const response = await api.post<{ setup: Partial<Setup>; surface: ScanSurface; fit: SurfaceFit }>(
+        "/center-on-surface", { radius_mm: recipe.radius_mm, bead_diameter_mm: recipe.bead_diameter_mm });
+      setSurface({ ...response.surface, applied: true });
+      setSetup({ ...setup, ...response.setup });
+      const size = response.surface.size_mm;
+      invalidate(response.fit.inside
+        ? `Centred on the scanned surface${size ? ` (${size[0].toFixed(0)} × ${size[1].toFixed(0)} mm)` : ""} in ${response.setup.work_frame} — generate coordinates next.`
+        : `Centred, but the wall overhangs the measured surface by ${Math.abs(response.fit.minimum_margin_mm ?? 0).toFixed(1)} mm. Reduce the radius or re-scan a larger surface; preflight will reject it.`);
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
 
@@ -247,7 +280,7 @@ export default function Extrusion() {
     try {
       await api.post("/connect");
       const discovered = await api.get<StationOptions>("/station-options");
-      setOptions(discovered); setConnected(true);
+      setOptions(discovered); setConnected(true); refreshSurface();
       setMessage("Station loaded. Select print/inspection tools, work frame, and inspection target.");
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
@@ -267,7 +300,8 @@ export default function Extrusion() {
       const value = await api.post<any>("/preflight", { fingerprint: plan.fingerprint });
       setPreflight(value);
       const unreachable = value.station?.reachability?.first_unreachable;
-      setMessage(value.station?.ready ? value.note
+      setMessage(value.surface?.ok === false ? value.surface.problem
+        : value.station?.ready ? value.note
         : unreachable
           ? `No IK solution at sampled ${value.station.reachability.frame} coordinate (${unreachable.xyz_mm.map((v: number) => v.toFixed(1)).join(", ")}) mm. Re-seed from the current TCP.`
           : value.station?.error || "Geometry passed, but station placement or selected items are not ready.");
@@ -374,9 +408,25 @@ export default function Extrusion() {
             <label>Approach (mm)<input type="number" min="1" value={setup.approach_clearance_mm} onChange={(e) => updateSetup("approach_clearance_mm", Number(e.target.value))} /></label>
             <label>Retreat (mm)<input type="number" min="1" value={setup.retreat_clearance_mm} onChange={(e) => updateSetup("retreat_clearance_mm", Number(e.target.value))} /></label>
           </div>
-          <div className="btn-row"><button className="secondary" disabled={!connected || busy || !setup.print_tool || !setup.work_frame}
-            onClick={seedFromCurrentTcp}>Seed path start from current TCP</button></div>
-          <div className="hint">Jog the selected print TCP to the intended circle start, then seed it. Center, build-plane Z, and RoboDK XYZRPW are expressed in the selected work frame. Approach/retract follow the curve normal. These exact values are fingerprinted and dry-run.</div>
+          <div className="btn-row">
+            <button className="secondary" disabled={!surface?.available || busy || status?.running}
+              onClick={centerOnScannedSurface}>Center on scanned surface</button>
+            <button className="secondary" disabled={!connected || busy || !setup.print_tool || !setup.work_frame}
+              onClick={seedFromCurrentTcp}>Seed path start from current TCP</button>
+          </div>
+          <div className={`surface-row ${surface?.available ? "ready" : "warn-text"}`}>
+            <span className="conn-label">Scan surface</span>
+            <span className="status-line">{surface?.applied
+              ? `${surface.frame} · ${surface.size_mm ? `${surface.size_mm[0].toFixed(0)} × ${surface.size_mm[1].toFixed(0)} mm · ` : ""}run ${surface.run_id ?? "unknown"}${surface.applied_at ? ` · applied ${surface.applied_at.replace("T", " ")}` : ""}`
+              : surface?.note || "No scanned surface applied — run the Scan module first."}</span>
+            <button className="secondary" disabled={busy} onClick={refreshSurface}>Re-check</button>
+          </div>
+          {surface?.applied && !surface.available && <div className="hint warn-text">{surface.note}</div>}
+          <div className="hint">Preferred flow: scan the surface, insert it, then <b>Center on scanned surface</b> — the cylinder lands in the middle of the measured rectangle (the scan frame's own origin is a corner, so 0,0 is not the middle). Jogging and seeding from the TCP is the manual alternative. Center, build-plane Z, and RoboDK XYZRPW are expressed in the selected work frame. Approach/retract follow the curve normal. These exact values are fingerprinted and dry-run.</div>
+          {setup.scan_run_id
+            ? <div className="hint">Placed on scan run <code>{setup.scan_run_id}</code>. Re-scanning the surface invalidates this placement, and preflight rejects a wall that overhangs the measured rectangle.</div>
+            : surface?.available && surface.frame !== setup.work_frame &&
+              <div className="hint warn-text">A scanned surface is applied on <code>{surface.frame}</code> but this path is placed manually in <code>{setup.work_frame || "no frame"}</code>.</div>}
           {setup.work_frame === "World" && <div className="hint warn-text">World is allowed, but every X/Y/Z value is then a station-world coordinate. Use the current-TCP seed button unless world zero is deliberately your build plane.</div>}
         </>}
       </div>
@@ -431,6 +481,12 @@ export default function Extrusion() {
       <p className="status-line">{message}</p>
       {(busy || status?.running) && <><div className="progress"><div style={{ width: `${pct}%` }} /></div><div className="status-line">{progress.message}</div></>}
       {config && <div className="io-note">Valve: <code>{config.integration.valve_outputs.join(" + ")}</code> via {config.integration.air_on_program}/{config.integration.air_off_program}. Hardware approval: <b>{config.integration.hardware_io_test_approved ? "APPROVED" : "NOT APPROVED"}</b>.</div>}
+      {preflight?.surface && <div className={`io-note ${preflight.surface.ok ? "" : "warn-text"}`}>
+        Placement: <b>{preflight.surface.placement === "scan_surface" ? "scanned surface" : "manual"}</b>
+        {preflight.surface.fit?.checked && ` · clearance to surface edge ${preflight.surface.fit.minimum_margin_mm.toFixed(1)} mm`}
+        {preflight.surface.problem && ` — ${preflight.surface.problem}`}
+        {preflight.surface.advisory && ` — ${preflight.surface.advisory}`}
+      </div>}
       {preflight?.station?.reachability && <div className="io-note">Path IK sample: <b>{preflight.station.reachability.reachable_count}/{preflight.station.reachability.sample_count}</b> reachable in <code>{preflight.station.reachability.frame}</code>. Full curve generation and collision validation still run in the dry run.</div>}
       <div className="btn-row"><button disabled={!plan || !preflight?.all_ok || !stationReady || busy || status?.running} onClick={() => startJob("dry-run")}>Run complete RoboDK dry run</button>
         {(busy || status?.running) && <button className="secondary" onClick={cancel}>Cancel safely</button>}</div>

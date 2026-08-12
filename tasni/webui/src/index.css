@@ -327,6 +327,12 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .station-select-grid select, .motion-number-grid input { width: 100%; box-sizing: border-box; background: var(--panel-2);
   color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 7px 8px; }
 .motion-number-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; margin-top: 12px; }
+/* scan-surface provenance for the placement (which measured surface we build on) */
+.surface-row { display: flex; align-items: center; gap: 10px; margin-top: 12px; padding: 8px 10px;
+  background: var(--panel-2); border: 1px solid var(--border); border-left: 3px solid var(--warn);
+  border-radius: 8px; font-size: 12px; }
+.surface-row.ready { border-left-color: var(--ok); }
+.surface-row .status-line { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .birdseye-card { margin-top: 18px; }
 .birdseye-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .birdseye-head p { color: var(--muted); font-size: 12px; margin: -4px 0 10px; }

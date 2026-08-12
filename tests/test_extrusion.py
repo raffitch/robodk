@@ -8,11 +8,14 @@ from pathlib import Path
 import numpy as np
 from fastapi.testclient import TestClient
 
+from tasni.core import runs
 from tasni.core.config import AppConfig, ExtrusionConfig
 from tasni.modules.extrusion.archive import ExtrusionArchive
 from tasni.modules.extrusion.comparison import compare_circle, corrected_circle
 from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup, LayerManifest
 from tasni.modules.extrusion.service import geometry_preflight
+from tasni.modules.extrusion.surface import (active_scan_surface, surface_check,
+                                             surface_fit)
 from tasni.modules.extrusion.toolpath import generate_cylinder_plan, points_array
 from tasni.webapp.server import create_app
 from tools.setup_extrusion_station import LICENSED_ISOLATED_ARGS, expected_instructions
@@ -119,6 +122,166 @@ def test_archive_writes_reprocessable_layer(tmp_path: Path):
     assert np.array_equal(np.load(layer / "depth.npy"), depth)
     path_data = json.loads((layer / "nominal_path.json").read_text(encoding="utf-8"))
     assert path_data["frame"] == "work" and path_data["units"] == "mm"
+
+
+def scan_surface(**updates) -> dict:
+    """A 400 x 300 mm measured rectangle whose frame origin is its corner."""
+    corners = [[0, 0, 0], [400, 0, 0], [400, 300, 0], [0, 300, 0]]
+    values = dict(frame="Tasni Work Frame", run_id="20260812-101500",
+                  applied_at="2026-08-12T10:16:00", size_mm=[400.0, 300.0],
+                  available=True, center_mm=[200.0, 150.0], corners_frame_mm=corners,
+                  bounds_mm={"x_min": 0.0, "x_max": 400.0, "y_min": 0.0, "y_max": 300.0},
+                  note="")
+    values.update(updates)
+    return values
+
+
+def write_active_scan(root: Path, *, corners=None, run_id="20260812-101500") -> None:
+    (root / "runs" / "scan").mkdir(parents=True, exist_ok=True)
+    payload = {"module": "scan", "run_id": run_id, "frame": "Tasni Work Frame",
+               "rectangle": "Tasni Work Surface", "applied_at": "2026-08-12T10:16:00",
+               "size_mm": [400.0, 300.0],
+               "rectangle_center_frame_mm": [200.0, 150.0],
+               "rectangle_corners_frame_mm": corners if corners is not None else
+               [[0, 0, 0], [400, 0, 0], [400, 300, 0], [0, 300, 0]]}
+    (root / "runs" / "scan" / "active.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_scan_frame_origin_is_a_corner_so_centring_needs_the_rectangle(tmp_path):
+    """The whole point of the handoff: frame zero is NOT the middle of the surface."""
+    write_active_scan(tmp_path)
+    surface = active_scan_surface(root=tmp_path)
+    assert surface["available"] is True
+    assert surface["center_mm"] == [200.0, 150.0]      # not [0, 0]
+    assert surface["frame"] == "Tasni Work Frame"
+    assert surface["run_id"] == "20260812-101500"
+
+
+def test_active_scan_surface_recovers_geometry_from_the_run_report(tmp_path):
+    """A payload written before the frame-local fields existed still centres."""
+    run = tmp_path / "runs" / "scan" / "20260812-101500"
+    run.mkdir(parents=True)
+    # Frame sits at base (1000, 500, 300) rotated 90 deg about Z; corners follow.
+    frame_T = [[0, -1, 0, 1000], [1, 0, 0, 500], [0, 0, 1, 300], [0, 0, 0, 1]]
+    corners = [[1000, 500, 300], [1000, 900, 300], [700, 900, 300], [700, 500, 300]]
+    (run / "report.json").write_text(json.dumps(
+        {"plane": {"frame_T_mm": frame_T, "corners_mm": corners,
+                   "size_mm": [400.0, 300.0]}}), encoding="utf-8")
+    (tmp_path / "runs" / "scan" / "active.json").write_text(json.dumps(
+        {"module": "scan", "run_id": "20260812-101500", "frame": "Tasni Work Frame",
+         "size_mm": [400.0, 300.0]}), encoding="utf-8")
+    surface = active_scan_surface(root=tmp_path)
+    assert surface["available"] is True
+    np.testing.assert_allclose(surface["center_mm"], [200.0, 150.0], atol=1e-9)
+
+
+def test_unrecoverable_surface_refuses_to_guess_a_centre(tmp_path):
+    (tmp_path / "runs" / "scan").mkdir(parents=True)
+    (tmp_path / "runs" / "scan" / "active.json").write_text(json.dumps(
+        {"module": "scan", "run_id": "missing-run", "frame": "Tasni Work Frame",
+         "size_mm": [400.0, 300.0]}), encoding="utf-8")
+    surface = active_scan_surface(root=tmp_path)
+    assert surface["available"] is False and surface["center_mm"] is None
+    assert "Re-insert the scan" in surface["note"]
+    assert active_scan_surface(root=tmp_path / "empty") is None
+
+
+def test_surface_fit_names_the_overhanging_edge():
+    fits = surface_fit(scan_surface(), center_x_mm=200, center_y_mm=150,
+                       outer_radius_mm=43)
+    assert fits["inside"] is True and fits["minimum_margin_mm"] == 107.0
+    # A wall wider than the short axis overhangs both Y edges, not the X ones.
+    over = surface_fit(scan_surface(), center_x_mm=200, center_y_mm=150,
+                       outer_radius_mm=170)
+    assert over["inside"] is False
+    assert over["margins_mm"]["y_min"] == -20.0 and over["margins_mm"]["y_max"] == -20.0
+    assert over["margins_mm"]["x_min"] == 30.0
+
+
+def test_centring_handles_a_frame_whose_y_points_off_the_rectangle(tmp_path):
+    """Real cells hit this: frame +Y is Z x X, which can point away from the surface.
+
+    The rectangle then spans negative Y, so half the recorded extent is the wrong
+    centre and only the corners give the sign.
+    """
+    write_active_scan(tmp_path, corners=[[0, 0, 0], [400, 0, 0],
+                                         [400, -300, 0], [0, -300, 0]])
+    surface = active_scan_surface(root=tmp_path)
+    assert surface["center_mm"] == [200.0, -150.0]
+    fit = surface_fit(surface, center_x_mm=200, center_y_mm=-150, outer_radius_mm=43)
+    assert fit["inside"] is True and fit["minimum_margin_mm"] == 107.0
+
+
+def test_manual_placement_passes_with_an_advisory_when_a_surface_is_applied():
+    check = surface_check(setup(), recipe(), scan_surface())
+    assert check["ok"] is True and check["placement"] == "manual"
+    assert "placed manually" in check["advisory"]
+    assert surface_check(setup(), recipe(), None)["advisory"] == ""
+
+
+def test_surface_placed_plan_is_invalidated_by_a_rescan():
+    placed = setup(work_frame="Tasni Work Frame", center_x_mm=200, center_y_mm=150,
+                   scan_run_id="20260812-101500")
+    assert surface_check(placed, recipe(), scan_surface())["ok"] is True
+    rescanned = surface_check(placed, recipe(), scan_surface(run_id="20260812-180000"))
+    assert rescanned["ok"] is False and "re-scanned" in rescanned["problem"]
+    removed = surface_check(placed, recipe(), None)
+    assert removed["ok"] is False and "no scan is applied" in removed["problem"]
+    moved = surface_check(setup(work_frame="World", scan_run_id="20260812-101500"),
+                          recipe(), scan_surface())
+    assert moved["ok"] is False and "is not the scanned surface frame" in moved["problem"]
+
+
+def test_preflight_rejects_a_wall_that_overhangs_the_measured_surface():
+    placed = setup(work_frame="Tasni Work Frame", center_x_mm=200, center_y_mm=150,
+                   scan_run_id="20260812-101500")
+    plan = generate_cylinder_plan(recipe(radius_mm=170, bead_diameter_mm=6), placed)
+    result = geometry_preflight(plan, surface=scan_surface())
+    assert result["all_ok"] is False
+    assert all(layer["ok"] for layer in result["layers"])   # geometry itself is fine
+    assert "overhangs the measured surface" in result["surface"]["problem"]
+    assert "y_min by 23.0 mm" in result["surface"]["problem"]
+
+
+def test_surface_placement_is_fingerprinted():
+    placed = setup(work_frame="Tasni Work Frame", scan_run_id="20260812-101500")
+    rescanned = setup(work_frame="Tasni Work Frame", scan_run_id="20260812-180000")
+    assert (generate_cylinder_plan(recipe(), placed).fingerprint
+            != generate_cylinder_plan(recipe(), rescanned).fingerprint)
+
+
+def test_api_centres_on_the_scanned_surface_and_gates_when_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(runs, "REPO_ROOT", tmp_path)
+    client = TestClient(create_app(AppConfig()))
+    empty = client.get("/api/modules/extrusion/scan-surface").json()
+    assert empty["applied"] is False and empty["available"] is False
+    assert client.post("/api/modules/extrusion/center-on-surface",
+                       json={"radius_mm": 40, "bead_diameter_mm": 6}).status_code == 409
+
+    write_active_scan(tmp_path)
+    applied = client.get("/api/modules/extrusion/scan-surface").json()
+    assert applied["applied"] is True and applied["available"] is True
+    centred = client.post("/api/modules/extrusion/center-on-surface",
+                          json={"radius_mm": 40, "bead_diameter_mm": 6}).json()
+    assert centred["setup"] == {"work_frame": "Tasni Work Frame", "center_x_mm": 200.0,
+                                "center_y_mm": 150.0, "build_plane_z_mm": 0.0,
+                                "scan_run_id": "20260812-101500"}
+    assert centred["fit"]["inside"] is True
+
+    # That placement flows through generate -> preflight as surface-placed.
+    payload = generate_payload()
+    payload["setup"].update(centred["setup"])
+    plan = client.post("/api/modules/extrusion/generate", json=payload).json()
+    preflight = client.post("/api/modules/extrusion/preflight",
+                            json={"fingerprint": plan["fingerprint"]}).json()
+    assert preflight["surface"]["placement"] == "scan_surface"
+    assert preflight["surface"]["ok"] is True
+
+    # Re-scanning the table invalidates the placement, not just the recipe.
+    write_active_scan(tmp_path, run_id="20260812-180000")
+    stale = client.post("/api/modules/extrusion/preflight",
+                        json={"fingerprint": plan["fingerprint"]}).json()
+    assert stale["all_ok"] is False and stale["surface"]["ok"] is False
 
 
 def test_api_registers_module_and_invalidates_preflight_on_regeneration():
