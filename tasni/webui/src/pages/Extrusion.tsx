@@ -268,7 +268,34 @@ export default function Extrusion() {
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
 
-  const layer = plan?.layers[Math.min(plan.layers.length - 1, Math.max(0, selectedLayer - 1))];
+  // Analytic browser-only draft for immediate visual feedback. This never enters
+  // the robot workflow: only /generate can return the executable coordinates and
+  // fingerprint that preflight/dry-run accept.
+  const previewPlan = useMemo<Plan | null>(() => {
+    if (!recipe || !setup) return null;
+    const theta = Array.from({ length: recipe.points_per_circle + 1 }, (_, index) =>
+      index * 2 * Math.PI / recipe.points_per_circle);
+    const layers = Array.from({ length: recipe.layer_count }, (_, index): Layer => {
+      const z = recipe.bead_diameter_mm / 2 + index * recipe.layer_height_mm;
+      return {
+        layer_index: index + 1,
+        nominal_z_mm: z,
+        points: theta.map((angle) => ({
+          x_mm: setup.center_x_mm + recipe.radius_mm * Math.cos(angle),
+          y_mm: setup.center_y_mm + recipe.radius_mm * Math.sin(angle),
+          z_mm: z,
+        })),
+      };
+    });
+    return {
+      fingerprint: "DRAFT-NOT-GENERATED", recipe, setup, layers,
+      total_path_length_mm: recipe.layer_count * 2 * Math.PI * recipe.radius_mm,
+    };
+  }, [recipe, setup]);
+  const visualPlan = plan ?? previewPlan;
+  const visualSelectedLayer = visualPlan
+    ? Math.min(visualPlan.layers.length, Math.max(1, selectedLayer)) : 1;
+  const layer = visualPlan?.layers[visualSelectedLayer - 1];
   const selectionsReady = Boolean(setup?.print_tool && setup?.work_frame && setup?.inspection_tool && setup?.inspection_target);
   const stationReady = Boolean(preflight?.station?.ready);
   const pct = progress.total ? Math.round(progress.step / progress.total * 100) : 0;
@@ -321,26 +348,32 @@ export default function Extrusion() {
         {recipe && <label className="correction-toggle"><input type="checkbox" checked={recipe.correction_enabled}
           onChange={(e) => updateRecipe("correction_enabled", e.target.checked)} />Calculate bounded compensation after valid measurements</label>}
         <div className="hint warn-text">Extrusion rate is recorded only; it is not mapped to the valve outputs or an unverified analog controller command.</div>
-        <div className="btn-row"><button disabled={!recipe || !selectionsReady || busy || status?.running} onClick={generate}>Generate complete plan</button>
-          <button className="secondary" disabled={!plan || busy || status?.running} onClick={runPreflight}>Geometry & station preflight</button></div>
       </div>
     </div>
 
     <div className="card birdseye-card">
-      <div className="birdseye-head"><div><h2>Bird’s-eye layer stack</h2><p>Oblique XYZ view of the complete cylinder. Select a ring to inspect that layer and its true Z height.</p></div>
+      <div className="birdseye-head"><div><h2>Live bird’s-eye draft</h2><p>Sliders update this analytic preview immediately. It is not an executable robot plan until coordinates are generated below.</p></div>
         {layer && <div className="layer-readout">LAYER {layer.layer_index}<b>Z {layer.nominal_z_mm.toFixed(2)} mm</b></div>}</div>
-      {plan && layer ? <div className="birdseye-layout">
-        <BirdseyeStack plan={plan} selectedLayer={selectedLayer} onSelect={setSelectedLayer} />
-        <div className="layer-rail">{plan.layers.map((item) => <button key={item.layer_index}
-          className={`layer-tile ${item.layer_index === selectedLayer ? "selected" : ""}`}
+      {visualPlan && layer ? <div className="birdseye-layout">
+        <BirdseyeStack plan={visualPlan} selectedLayer={visualSelectedLayer} onSelect={setSelectedLayer} />
+        <div className="layer-rail">{visualPlan.layers.map((item) => <button key={item.layer_index}
+          className={`layer-tile ${item.layer_index === visualSelectedLayer ? "selected" : ""}`}
           onClick={() => setSelectedLayer(item.layer_index)}>
-          <i className="layer-swatch" style={{ opacity: .42 + item.layer_index / plan.layers.length * .58 }} />
+          <i className="layer-swatch" style={{ opacity: .42 + item.layer_index / visualPlan.layers.length * .58 }} />
           <span>Layer {item.layer_index}</span><small>Z {item.nominal_z_mm.toFixed(2)} mm</small>
         </button>)}</div>
-      </div> : <div className="empty cylinder-empty">Connect, select station items, and generate a plan.</div>}
-      {plan && <div className="kv preview-kv"><span className="k">Plan fingerprint</span><span className="v">{plan.fingerprint.slice(0, 16)}</span>
-        <span className="k">Total commanded path</span><span className="v">{plan.total_path_length_mm.toFixed(1)} mm</span>
-        <span className="k">Points / layer</span><span className="v">{plan.layers[0].points.length}</span></div>}
+      </div> : <div className="empty cylinder-empty">Loading recipe preview…</div>}
+      {visualPlan && <div className="kv preview-kv">
+        <span className="k">Visualization state</span><span className={`v preview-state ${plan ? "generated" : "draft"}`}>{plan ? "GENERATED · FINGERPRINTED" : "LIVE DRAFT · NOT ROBOT-READY"}</span>
+        <span className="k">Estimated circular path</span><span className="v">{visualPlan.total_path_length_mm.toFixed(1)} mm</span>
+        <span className="k">Preview samples / layer</span><span className="v">{visualPlan.layers[0].points.length}</span>
+        {plan && <><span className="k">Plan fingerprint</span><span className="v">{plan.fingerprint.slice(0, 16)}</span></>}
+      </div>}
+      <div className="preview-generation">
+        <div><b>Generate robot coordinates</b><span>This freezes the current recipe and station selections into an exact fingerprint. Any later input change invalidates it.</span></div>
+        <div className="btn-row"><button disabled={!recipe || !selectionsReady || busy || status?.running} onClick={generate}>Generate coordinates & fingerprint</button>
+          <button className="secondary" disabled={!plan || busy || status?.running} onClick={runPreflight}>Geometry & station preflight</button></div>
+      </div>
     </div>
 
     <div className={`card extrusion-safety ${status?.live_print_enabled ? "ready" : "locked"}`}>

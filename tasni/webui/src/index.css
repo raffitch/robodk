@@ -350,6 +350,15 @@ button.layer-tile.selected { border-color: var(--accent); box-shadow: 0 0 0 1px 
 button.layer-tile.selected .layer-swatch { background: #66a6ff; opacity: 1 !important; }
 .layer-tile small { color: var(--muted); font-family: var(--mono); }
 .preview-kv { margin-top: 14px; }
+.preview-state { font-size: 11px; letter-spacing: .4px; }
+.preview-state.draft { color: var(--warn); }
+.preview-state.generated { color: var(--ok); }
+.preview-generation { display: flex; justify-content: space-between; align-items: center; gap: 18px;
+  margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+.preview-generation > div:first-child { display: grid; gap: 4px; }
+.preview-generation b { font-size: 13px; }
+.preview-generation span { color: var(--muted); font-size: 11px; line-height: 1.45; }
+.preview-generation .btn-row { flex: 0 0 auto; margin: 0; }
 .extrusion-safety { margin-top: 18px; border-left: 3px solid var(--warn); }
 .extrusion-safety.ready { border-left-color: var(--ok); }
 .workflow-steps { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
@@ -369,6 +378,7 @@ button.layer-tile.selected .layer-swatch { background: #66a6ff; opacity: 1 !impo
   .birdseye-layout { grid-template-columns: 1fr; }
   .layer-rail { max-height: 240px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .motion-number-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .preview-generation { align-items: flex-start; flex-direction: column; }
 }
 @media (max-width: 600px) {
   .station-select-grid, .motion-number-grid { grid-template-columns: 1fr; }
