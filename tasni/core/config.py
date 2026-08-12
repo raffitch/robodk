@@ -587,6 +587,52 @@ class ScanConfig(_Model):
     collision_skip_wrist_links: int = 2
 
 
+class ExtrusionConfig(_Model):
+    """Cylinder-test defaults and verified extrusion-cell integration data.
+
+    Valve switching and extrusion rate are deliberately separate.  The two
+    digital outputs below were read from the legacy ``231006_RoboArchPaper.rdk``
+    AirOn/AirOff programs on 2026-08-12; hardware approval remains a distinct
+    interlock and defaults off.
+    """
+
+    radius_mm: float = Field(default=40.0, gt=0, le=500)
+    layer_count: int = Field(default=3, ge=1, le=100)
+    layer_height_mm: float = Field(default=5.0, gt=0, le=50)
+    bead_diameter_mm: float = Field(default=15.0, gt=0, le=50)
+    robot_speed_mm_s: float = Field(default=75.0, gt=0, le=1000)
+    extrusion_rate_pct: float = Field(default=0.0, ge=0, le=100)
+    points_per_circle: int = Field(default=180, ge=24, le=4000)
+    correction_enabled: bool = False
+    correction_gain: float = Field(default=1.0, ge=0, le=2)
+    correction_smoothing_points: int = Field(default=9, ge=1, le=101)
+    correction_max_mm: float = Field(default=10.0, gt=0, le=100)
+
+    extruder_tool: str = "Extruder"
+    work_frame: str = "woodFrame"
+    inspection_target: str = "camTarg"
+    air_on_program: str = "AirOn"
+    air_off_program: str = "AirOff"
+    valve_outputs: list[str] = Field(default_factory=lambda: ["IO_508", "IO_601"])
+    valve_active_value: int = 1
+    valve_inactive_value: int = 0
+    valve_mapping_source: str = "231006_RoboArchPaper.rdk"
+    valve_mapping_verified: bool = True
+    hardware_io_test_approved: bool = False
+
+    # Legacy single-frame processing defaults (metres where suffixed ``_m``).
+    plane_distance_threshold_m: float = Field(default=0.0025, gt=0)
+    voxel_size_m: float = Field(default=0.002, gt=0)
+    statistical_neighbors: int = Field(default=20, ge=3)
+    statistical_std_ratio: float = Field(default=2.0, gt=0)
+    radius_neighbors: int = Field(default=16, ge=2)
+    radius_m: float = Field(default=0.1, gt=0)
+    cluster_eps_m: float = Field(default=0.005, gt=0)
+    cluster_min_points: int = Field(default=10, ge=2)
+    upwards_normal_z: float = Field(default=0.92, ge=-1, le=1)
+    branch_guard_max_attempts: int = Field(default=3, ge=1, le=20)
+
+
 class WebConfig(_Model):
     host: str = "127.0.0.1"
     port: int = 8000
@@ -598,6 +644,7 @@ class AppConfig(_Model):
     robodk: RoboDKConfig = Field(default_factory=RoboDKConfig)
     calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
     scan: ScanConfig = Field(default_factory=ScanConfig)
+    extrusion: ExtrusionConfig = Field(default_factory=ExtrusionConfig)
     web: WebConfig = Field(default_factory=WebConfig)
 
 

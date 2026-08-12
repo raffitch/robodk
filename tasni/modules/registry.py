@@ -28,9 +28,11 @@ class ModuleRegistry:
 def build_registry(services: ServiceContainer) -> ModuleRegistry:
     """Instantiate and register every built-in module against ``services``."""
     from .calibration.module import CalibrationModule
+    from .extrusion.module import ExtrusionModule
     from .scan.module import ScanModule
 
     registry = ModuleRegistry()
     registry.register(CalibrationModule(services))
     registry.register(ScanModule(services))
+    registry.register(ExtrusionModule(services))
     return registry

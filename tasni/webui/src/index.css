@@ -310,3 +310,31 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .run-error-x { background: transparent; border: 0; color: var(--muted); font-size: 13px;
   padding: 2px 6px; cursor: pointer; }
 .run-error-x:hover { color: var(--text); }
+
+/* cylinder-test recipe, preview, and explicit safety gates */
+.extrusion-layout { display: grid; grid-template-columns: minmax(420px, 1fr) minmax(340px, .8fr); gap: 18px; }
+.recipe-field { display: grid; grid-template-columns: 120px minmax(120px, 1fr) 82px 40px;
+  gap: 10px; align-items: center; margin: 10px 0; font-size: 13px; }
+.recipe-field > span { color: var(--muted); }
+.recipe-field input[type="range"] { accent-color: var(--accent); width: 100%; }
+.recipe-number { width: 82px; box-sizing: border-box; background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 5px; padding: 5px 7px; font-family: var(--mono); }
+.recipe-field small { color: var(--muted); font-family: var(--mono); }
+.correction-toggle { display: flex; gap: 9px; margin-top: 14px; align-items: center; font-size: 13px; }
+.cylinder-preview-card { min-height: 420px; }
+.cylinder-preview { display: block; width: min(100%, 380px); margin: 0 auto 14px; background: #090d14;
+  border: 1px solid var(--border); border-radius: 9px; }
+.cylinder-empty { min-height: 300px; display: grid; place-items: center; }
+.extrusion-safety { margin-top: 18px; border-left: 3px solid var(--warn); }
+.extrusion-safety.ready { border-left-color: var(--ok); }
+.workflow-steps { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.workflow-steps span { padding: 5px 9px; border: 1px solid var(--border); border-radius: 999px;
+  color: var(--muted); font-family: var(--mono); font-size: 11px; }
+.workflow-steps span.done { color: var(--ok); border-color: rgba(63,185,80,.5); background: rgba(63,185,80,.08); }
+.io-note { margin-top: 10px; padding: 9px 11px; background: rgba(210,153,34,.08); border-radius: 7px;
+  color: var(--muted); font-size: 12px; line-height: 1.5; }
+.io-note b { color: var(--warn); }
+@media (max-width: 900px) {
+  .extrusion-layout { grid-template-columns: 1fr; }
+  .recipe-field { grid-template-columns: 105px 1fr 76px 34px; }
+}

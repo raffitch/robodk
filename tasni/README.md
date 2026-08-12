@@ -147,3 +147,19 @@ old `macros/3DScan.py` (OpenCV/Open3D popups, concatenation-not-fusion, WSL/NKSR
 - **Tests** (no hardware): `tests/test_scan_{config,plane,reconstruct,depth_gate,job}.py`.
 - Later modes of this module: object scan (same engine), a camera-feedback loop (the
   live depth gate is the seam), and optional marker-anchored framing.
+
+## Cylinder Test module (#3, implementation in progress)
+
+The first safe slice of the post-extrusion workflow is registered at
+`/m/extrusion`: typed recipe inputs, deterministic closed circular layers, an SVG
+preview, toolpath fingerprinting/invalidation, geometry preflight, measured-circle
+metrics, bounded opt-in compensation, and versioned trial/layer archive writers.
+The verified legacy valve mapping is `IO_508 + IO_601` (`1` on, `0` off), kept
+separate from extrusion rate and reproduced by `tools/setup_extrusion_station.py`.
+
+Live execution is intentionally locked: the current RoboDK license refused to
+persist `AirOn`/`AirOff` into `Tasni.rdk`, a current-path RoboDK dry tour is not yet
+implemented, and the physical I/O approval interlock defaults false. Geometry
+preflight explicitly does not claim a RoboDK dry-run pass. See
+`docs/extrusion-legacy-trace.md` for the traced legacy sequence and deliberate
+correction change.
