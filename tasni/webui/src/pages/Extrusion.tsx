@@ -7,6 +7,7 @@ const api = moduleApi("extrusion");
 interface Recipe {
   radius_mm: number; layer_count: number; layer_height_mm: number;
   bead_diameter_mm: number; robot_speed_mm_s: number;
+  travel_speed_mm_s: number; path_rounding_mm: number;
   extrusion_rate_pct: number; points_per_circle: number;
   correction_enabled: boolean; material: unknown[];
 }
@@ -44,8 +45,11 @@ const recipeFields: Array<{ key: keyof Recipe; label: string; min: number; max: 
   { key: "layer_count", label: "Layers", min: 1, max: 30, step: 1, unit: "" },
   { key: "layer_height_mm", label: "Layer height", min: .5, max: 20, step: .5, unit: "mm" },
   { key: "bead_diameter_mm", label: "Bead diameter", min: .5, max: 30, step: .5, unit: "mm" },
-  { key: "robot_speed_mm_s", label: "Robot speed", min: 5, max: 500, step: 5, unit: "mm/s" },
+  { key: "robot_speed_mm_s", label: "Process speed", min: 5, max: 500, step: 5, unit: "mm/s" },
+  { key: "travel_speed_mm_s", label: "Travel speed", min: 5, max: 1000, step: 5, unit: "mm/s" },
+  { key: "path_rounding_mm", label: "Path blending", min: 0, max: 25, step: .5, unit: "mm" },
   { key: "extrusion_rate_pct", label: "Extrusion rate", min: 0, max: 100, step: 1, unit: "%" },
+  { key: "points_per_circle", label: "Curve samples", min: 24, max: 720, step: 12, unit: "pts" },
 ];
 
 function BirdseyeStack({ plan, selectedLayer, onSelect }: {
@@ -257,6 +261,17 @@ export default function Extrusion() {
     } catch (e: any) { setBusy(false); setMessage(e.message); }
   };
   const cancel = async () => { await api.post("/cancel"); setMessage("Cancellation requested; forcing the safe exit sequence."); };
+  const resetGenerated = async () => {
+    setBusy(true);
+    try {
+      const response = await api.post<{ removed: string[] }>("/reset");
+      setPlan(null); setPreflight(null); setResult(null); setConfirmLive(false);
+      setStatus((old) => old ? { ...old, fingerprint: null,
+        geometry_preflight_passed: false, dry_run_passed: false,
+        live_print_enabled: false } : old);
+      setMessage(`Generated plan reset; removed ${response.removed.length} temporary RoboDK artifact(s).`);
+    } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
+  };
   const applyCorrection = async () => {
     if (!plan) return;
     setBusy(true);
@@ -333,7 +348,7 @@ export default function Extrusion() {
             <label>Approach (mm)<input type="number" min="1" value={setup.approach_clearance_mm} onChange={(e) => updateSetup("approach_clearance_mm", Number(e.target.value))} /></label>
             <label>Retreat (mm)<input type="number" min="1" value={setup.retreat_clearance_mm} onChange={(e) => updateSetup("retreat_clearance_mm", Number(e.target.value))} /></label>
           </div>
-          <div className="hint">Orientation uses RoboDK XYZRPW in the selected work frame. These exact values are fingerprinted and dry-run.</div>
+          <div className="hint">Orientation uses RoboDK XYZRPW in the selected work frame. Approach/retract follow the curve normal. These exact values are fingerprinted and dry-run.</div>
         </>}
       </div>
 
@@ -348,6 +363,7 @@ export default function Extrusion() {
         {recipe && <label className="correction-toggle"><input type="checkbox" checked={recipe.correction_enabled}
           onChange={(e) => updateRecipe("correction_enabled", e.target.checked)} />Calculate bounded compensation after valid measurements</label>}
         <div className="hint warn-text">Extrusion rate is recorded only; it is not mapped to the valve outputs or an unverified analog controller command.</div>
+        <div className="hint">RoboDK receives one disposable XYZ+IJK curve per layer. Curve samples control geometric resolution; process/travel speeds and blending are native Curve Follow settings.</div>
       </div>
     </div>
 
@@ -372,7 +388,8 @@ export default function Extrusion() {
       <div className="preview-generation">
         <div><b>Generate robot coordinates</b><span>This freezes the current recipe and station selections into an exact fingerprint. Any later input change invalidates it.</span></div>
         <div className="btn-row"><button disabled={!recipe || !selectionsReady || busy || status?.running} onClick={generate}>Generate coordinates & fingerprint</button>
-          <button className="secondary" disabled={!plan || busy || status?.running} onClick={runPreflight}>Geometry & station preflight</button></div>
+          <button className="secondary" disabled={!plan || busy || status?.running} onClick={runPreflight}>Geometry & station preflight</button>
+          <button className="secondary" disabled={!connected || busy || status?.running} onClick={resetGenerated}>Reset / clean RoboDK path</button></div>
       </div>
     </div>
 

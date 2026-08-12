@@ -1094,15 +1094,14 @@ class RdkIO:
     def create_extrusion_layer_program(
             self, *, name: str, points_xyz: np.ndarray, orientation_rpy_deg,
             print_tool: str, work_frame: str, speed_mm_s: float,
+            travel_speed_mm_s: float, rounding_mm: float,
             approach_clearance_mm: float, retreat_clearance_mm: float,
             air_on_program: str, air_off_program: str) -> dict:
-        """Create one complete layer program and its temporary targets.
+        """Build a disposable native RoboDK Curve Follow Project for one layer.
 
-        Motion order is identical for dry and live modes: approach (valve off),
-        descend to the first path point, path-start event, closed linear path,
-        path-finish event, and retreat. Inspection is a separate program so live
-        execution can command/verify OFF *before* any inspection motion. The caller
-        chooses real or comment-only valve program names.
+        Dense samples live inside one curve object (XYZ+IJK), not as station
+        targets. RoboDK owns interpolation, approach/retract, preferred orientation,
+        process/rapid speeds, blending, and path-boundary program events.
         """
         import robolink
 
@@ -1121,41 +1120,119 @@ class RdkIO:
         robot = self.robot()
         frame = self.rdk.Item(work_frame, robolink.ITEM_TYPE_FRAME)
         print_tcp = self.rdk.Item(print_tool, robolink.ITEM_TYPE_TOOL)
-        old = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
-        if old.Valid():
-            old.Delete()
-        program = self.rdk.AddProgram(name, robot)
-        program.setPoseFrame(frame)
-        program.setPoseTool(print_tcp)
-        program.setSpeed(float(speed_mm_s))
+        curve_name = name + "_Curve"
+        project_name = name + "_Settings"
+        for item_name, item_type in ((name, robolink.ITEM_TYPE_PROGRAM),
+                                     (project_name, robolink.ITEM_TYPE_MACHINING),
+                                     (curve_name, robolink.ITEM_TYPE_OBJECT)):
+            old = self.rdk.Item(item_name, item_type)
+            if old.Valid():
+                old.Delete()
 
-        target_names: list[str] = []
+        orientation = self.xyzrpy_pose_T([0.0, 0.0, 0.0], orientation_rpy_deg)
+        normal = orientation[:3, 2]
+        curve_vertices = np.column_stack(
+            (pts, np.repeat(normal.reshape(1, 3), len(pts), axis=0)))
+        curve = self.rdk.AddCurve(
+            curve_vertices.tolist(), projection_type=robolink.PROJECTION_NONE)
+        if not curve.Valid():
+            raise RuntimeError("RoboDK could not create the extrusion curve")
+        curve.setName(curve_name)
+        # setParent keeps the object's identity pose, so XYZ/IJK remain local to
+        # the selected work frame instead of station/world coordinates.
+        curve.setParent(frame)
+        curve.setValue("Display", "LINEW=4 COLOR=#FF39D0BD")
 
-        def add_target(suffix: str, xyz) -> object:
-            target_name = f"{name}_{suffix}"
-            existing = self.rdk.Item(target_name, robolink.ITEM_TYPE_TARGET)
-            if existing.Valid():
-                existing.Delete()
-            target = self.rdk.AddTarget(target_name, frame, robot)
-            target.setAsCartesianTarget()
-            target.setPose(T_to_pose(self.xyzrpy_pose_T(xyz, orientation_rpy_deg)))
-            target_names.append(target_name)
-            return target
+        project = self.rdk.AddMachiningProject(project_name, robot)
+        if not project.Valid():
+            curve.Delete()
+            raise RuntimeError("RoboDK could not create the Curve Follow Project")
+        project.setPoseFrame(frame)
+        project.setPoseTool(print_tcp)
+        project.setPose(T_to_pose(orientation))
+        project.setJoints(robot.Joints())
+        program, setup_status = project.setMachiningParameters(part=curve)
+        if not program.Valid() or setup_status < 0:
+            project.Delete()
+            curve.Delete()
+            raise RuntimeError(
+                f"RoboDK could not generate the curve-follow program (status {setup_status})")
+        program.setName(name)
+        project.setParam("Machining", {
+            "Algorithm": 0,
+            "ApproachRetractAll": 1,
+            "AutoUpdate": 0,
+            "AvoidCollisions": 0,
+            "FollowAngleOn": 0,
+            "FollowRealignOn": 0,
+            "FollowStepOn": 0,
+            "JoinCurvesTol": 0.1,
+            "PointApproach": float(approach_clearance_mm),
+            "RapidApproachRetract": 1,
+            "RotZ_Range": 0,
+            "SpeedOperation": float(speed_mm_s),
+            "SpeedRapid": float(travel_speed_mm_s),
+            "VisibleNormals": 1,
+        })
+        project.setParam("ProgEvents", {
+            "CallPathStart": air_on_program,
+            "CallPathStartOn": 1,
+            "CallPathFinish": air_off_program,
+            "CallPathFinishOn": 1,
+            "RapidSpeed": float(travel_speed_mm_s),
+            "Rounding": float(rounding_mm),
+            "RoundingOn": 1 if rounding_mm > 0 else 0,
+        })
+        project.setParam("Approach", f"NTS {float(approach_clearance_mm):.6f} 0 0")
+        project.setParam("Retract", f"NTS {float(retreat_clearance_mm):.6f} 0 0")
+        project.setParam("UpdatePath")
+        generation = project.Update(robolink.COLLISION_OFF)
+        if float(generation[3]) < 0:
+            project.Delete()
+            curve.Delete()
+            raise RuntimeError(
+                "RoboDK Curve Follow Project generation failed: " + str(generation[4] or ""))
+        program = project.getLink(robolink.ITEM_TYPE_PROGRAM)
+        if not program.Valid():
+            project.Delete()
+            curve.Delete()
+            raise RuntimeError("Curve Follow Project has no linked generated program")
+        program.setName(name)
+        # Curve normals constrain tool Z and the project optimizes the redundant
+        # rotation about it. This workflow exposes an exact fixed XYZRPW instead,
+        # so pin every generated motion pose to that requested rotation. Positions,
+        # interpolation, approach/retract, speeds, and events remain project-owned.
+        for index in range(program.InstructionCount()):
+            (instruction_name, instruction_type, move_type, _is_joint_target,
+             target_pose, joints) = program.Instruction(index)
+            if instruction_type != robolink.INS_TYPE_MOVE:
+                continue
+            target_T = pose_to_T(target_pose)
+            target_T[:3, :3] = orientation[:3, :3]
+            program.setInstruction(
+                index, instruction_name, instruction_type, move_type,
+                False, T_to_pose(target_T), joints)
+        artifacts = [curve_name, project_name, name]
+        return {
+            "program": name, "curve": curve_name, "project": project_name,
+            "artifacts": artifacts, "targets": [], "point_count": len(pts),
+            "setup_status": float(setup_status),
+            "project_generation_percent": float(generation[3]) * 100.0,
+        }
 
-        approach_xyz = pts[0].copy()
-        approach_xyz[2] += float(approach_clearance_mm)
-        retreat_xyz = pts[-1].copy()
-        retreat_xyz[2] += float(retreat_clearance_mm)
-        approach = add_target("Approach", approach_xyz)
-        start = add_target("Path0000", pts[0])
-        program.MoveJ(approach)
-        program.MoveL(start)
-        program.RunInstruction(air_on_program, robolink.INSTRUCTION_CALL_PROGRAM)
-        for index, xyz in enumerate(pts[1:], start=1):
-            program.MoveL(add_target(f"Path{index:04d}", xyz))
-        program.RunInstruction(air_off_program, robolink.INSTRUCTION_CALL_PROGRAM)
-        program.MoveL(add_target("Retreat", retreat_xyz))
-        return {"program": name, "targets": target_names, "point_count": len(pts)}
+    def cleanup_extrusion_artifacts(self, prefix: str = "TasniCylinder_") -> list[str]:
+        """Delete stale generated programs/projects/curves owned by this module."""
+        import robolink
+
+        removed: list[str] = []
+        for item_type in (robolink.ITEM_TYPE_PROGRAM, robolink.ITEM_TYPE_MACHINING,
+                          robolink.ITEM_TYPE_TARGET, robolink.ITEM_TYPE_OBJECT):
+            for item in list(self.rdk.ItemList(item_type)):
+                item_name = item.Name()
+                if item_name.startswith(prefix) and item.Valid():
+                    item.Delete()
+                    removed.append(item_name)
+        return removed
 
     def create_inspection_program(self, *, name: str, inspection_tool: str,
                                   inspection_target: str, speed_mm_s: float) -> dict:

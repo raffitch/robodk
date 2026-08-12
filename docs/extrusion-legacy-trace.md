@@ -86,3 +86,19 @@ was calculated.
 - Paths, crop limits, thresholds, IP addresses, and station item names were hard-coded.
 - The browser could request printing directly without a current-path dry run.
 - Raw RGB-D evidence and per-stage provenance were not archived per layer.
+
+## RoboDK curve-follow implementation
+
+Tasni uses RoboDK's manufacturing abstraction rather than expanding sampled path
+coordinates into station targets. For every active layer it creates one temporary
+curve object with XYZ positions and IJK normals, attaches it to the selected work
+frame, and links it to a Curve Follow/Robot Machining Project. The project owns
+approach/retract, process and rapid speeds, path blending, and `CallPathStart` /
+`CallPathFinish`. Its linked target-free robot program is then pinned to the exact
+selected XYZRPW and collision-validated before simulation or live execution.
+
+The curve, settings project, and linked generated program use the
+`TasniCylinder_` prefix. They are deleted on normal completion, cancellation, or
+fault, and the Cylinder Test reset action removes stale prefixed artifacts left by
+an interrupted application process. Existing user curves, programs, and targets are
+outside that namespace and are not touched.

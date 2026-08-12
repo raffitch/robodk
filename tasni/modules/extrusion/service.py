@@ -159,10 +159,12 @@ class CylinderDryRunJob:
                     print_tool=self.plan.setup.print_tool,
                     work_frame=self.plan.setup.work_frame,
                     speed_mm_s=self.plan.recipe.robot_speed_mm_s,
+                    travel_speed_mm_s=self.plan.recipe.travel_speed_mm_s,
+                    rounding_mm=self.plan.recipe.path_rounding_mm,
                     approach_clearance_mm=self.plan.setup.approach_clearance_mm,
                     retreat_clearance_mm=self.plan.setup.retreat_clearance_mm,
                     air_on_program=mock_on, air_off_program=mock_off)
-                artifacts.extend([built["program"], *built["targets"]])
+                artifacts.extend(built["artifacts"])
                 current_program = name
                 validation = rdk.update_program(name, collisions=True)
                 _require_program_valid(validation, layer.layer_index)
@@ -182,7 +184,7 @@ class CylinderDryRunJob:
                     name=inspection_name,
                     inspection_tool=self.plan.setup.inspection_tool,
                     inspection_target=self.plan.setup.inspection_target,
-                    speed_mm_s=self.plan.recipe.robot_speed_mm_s)
+                    speed_mm_s=self.plan.recipe.travel_speed_mm_s)
                 artifacts.append(inspect["program"])
                 inspection_validation = rdk.update_program(inspection_name, collisions=True)
                 _require_program_valid(inspection_validation, layer.layer_index)
@@ -310,11 +312,13 @@ class CylinderPrintJob:
                         print_tool=self.plan.setup.print_tool,
                         work_frame=self.plan.setup.work_frame,
                         speed_mm_s=self.plan.recipe.robot_speed_mm_s,
+                        travel_speed_mm_s=self.plan.recipe.travel_speed_mm_s,
+                        rounding_mm=self.plan.recipe.path_rounding_mm,
                         approach_clearance_mm=self.plan.setup.approach_clearance_mm,
                         retreat_clearance_mm=self.plan.setup.retreat_clearance_mm,
                         air_on_program=ecfg.air_on_program,
                         air_off_program=ecfg.air_off_program)
-                    artifacts.extend([built["program"], *built["targets"]])
+                    artifacts.extend(built["artifacts"])
                     validation = rdk.update_program(name, collisions=True)
                     _require_program_valid(validation, layer.layer_index)
                     current_program = name
@@ -339,7 +343,7 @@ class CylinderPrintJob:
                         name=inspection_name,
                         inspection_tool=self.plan.setup.inspection_tool,
                         inspection_target=self.plan.setup.inspection_target,
-                        speed_mm_s=self.plan.recipe.robot_speed_mm_s)
+                        speed_mm_s=self.plan.recipe.travel_speed_mm_s)
                     artifacts.append(inspect["program"])
                     inspection_validation = rdk.update_program(inspection_name, collisions=True)
                     _require_program_valid(inspection_validation, layer.layer_index)

@@ -23,6 +23,8 @@ class CylinderRecipe(_Record):
     layer_height_mm: float = Field(gt=0, le=50)
     bead_diameter_mm: float = Field(gt=0, le=50)
     robot_speed_mm_s: float = Field(gt=0, le=1000)
+    travel_speed_mm_s: float = Field(default=200.0, gt=0, le=2000)
+    path_rounding_mm: float = Field(default=1.0, ge=0, le=100)
     extrusion_rate_pct: float = Field(ge=0, le=100)
     points_per_circle: int = Field(default=180, ge=24, le=4000)
     correction_enabled: bool = False

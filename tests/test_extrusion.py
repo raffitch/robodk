@@ -67,6 +67,9 @@ def test_plan_is_closed_layered_and_fingerprinted():
     assert changed.fingerprint != plan.fingerprint
     changed_setup = generate_cylinder_plan(recipe(), setup(print_tool="OtherNozzle"))
     assert changed_setup.fingerprint != plan.fingerprint
+    changed_motion = generate_cylinder_plan(
+        recipe(travel_speed_mm_s=300, path_rounding_mm=2), setup())
+    assert changed_motion.fingerprint != plan.fingerprint
 
 
 def test_geometry_preflight_does_not_claim_robodk_dry_run():
@@ -134,3 +137,13 @@ def test_api_live_print_is_fail_closed():
                            json={"fingerprint": plan["fingerprint"]})
     assert response.status_code == 409
     assert "dry run" in response.json()["detail"]
+
+
+def test_api_reset_invalidates_generated_coordinates_without_a_station():
+    client = TestClient(create_app(AppConfig()))
+    plan = client.post("/api/modules/extrusion/generate", json=generate_payload()).json()
+    reset = client.post("/api/modules/extrusion/reset")
+    assert reset.status_code == 200 and reset.json()["removed"] == []
+    stale = client.post("/api/modules/extrusion/preflight",
+                        json={"fingerprint": plan["fingerprint"]})
+    assert stale.status_code == 409

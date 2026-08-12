@@ -53,6 +53,8 @@ class ExtrusionModule(WorkflowModule):
             radius_mm=c.radius_mm, layer_count=c.layer_count,
             layer_height_mm=c.layer_height_mm, bead_diameter_mm=c.bead_diameter_mm,
             robot_speed_mm_s=c.robot_speed_mm_s,
+            travel_speed_mm_s=c.travel_speed_mm_s,
+            path_rounding_mm=c.path_rounding_mm,
             extrusion_rate_pct=c.extrusion_rate_pct,
             points_per_circle=c.points_per_circle,
             correction_enabled=c.correction_enabled,
@@ -214,6 +216,25 @@ class ExtrusionModule(WorkflowModule):
         def cancel() -> dict:
             services.jobs.cancel()
             return {"status": "cancelling"}
+
+        @router.post("/reset")
+        def reset() -> dict:
+            """Invalidate the generated plan and remove only Tasni-owned artifacts."""
+            if services.jobs.running:
+                raise HTTPException(409, "cannot reset while a robot job is running")
+            removed: list[str] = []
+            if services.session.is_open:
+                try:
+                    removed = services.rdk.cleanup_extrusion_artifacts()
+                except Exception as exc:
+                    raise HTTPException(
+                        503, f"could not clean RoboDK extrusion artifacts: {exc}") from exc
+            self._plan = None
+            self._geometry_preflight_fingerprint = None
+            self._dry_run_fingerprint = None
+            self._active_dry_job = None
+            self._active_print_job = None
+            return {"status": "reset", "removed": removed}
 
         @router.get("/status")
         def status() -> dict:

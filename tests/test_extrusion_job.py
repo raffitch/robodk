@@ -48,7 +48,9 @@ class FakeRdk:
         names = (prefix + "AirOn", prefix + "AirOff"); self.events.append(("mock", names)); return names
     def create_extrusion_layer_program(self, **kwargs):
         self.created.append(kwargs); self.events.append(("create", kwargs["name"]))
-        return {"program": kwargs["name"], "targets": [kwargs["name"] + "_T"]}
+        return {"program": kwargs["name"], "project": kwargs["name"] + "_Settings",
+                "artifacts": [kwargs["name"], kwargs["name"] + "_Settings",
+                              kwargs["name"] + "_Curve"], "targets": []}
     def create_inspection_program(self, **kwargs):
         self.events.append(("create-inspection", kwargs["name"],
                             kwargs["inspection_tool"], kwargs["inspection_target"]))
@@ -126,6 +128,8 @@ def test_dry_run_uses_mock_outputs_and_restores_mode(tmp_path, monkeypatch):
     assert passed == [output["fingerprint"]]
     assert camera.grabs == 0
     assert all(call["air_on_program"].startswith("TasniDry_") for call in rdk.created)
+    assert all(call["travel_speed_mm_s"] == 200 and
+               call["rounding_mm"] == 1 for call in rdk.created)
     assert not any(event[0] == "station-program" for event in rdk.events)
     assert rdk.mode == 6
 

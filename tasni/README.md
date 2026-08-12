@@ -154,6 +154,12 @@ The post-extrusion workflow is registered at `/m/extrusion`: typed recipe inputs
 dynamic RoboDK tool/frame/inspection-target selection, deterministic closed layers,
 a bird's-eye all-layer preview, immutable toolpath fingerprints, geometry preflight,
 and a complete collision-checked RoboDK simulation using comment-only valve mocks.
+Each dense layer is represented in RoboDK as one disposable XYZ+IJK curve linked to
+a native Curve Follow/Robot Machining Project. The project generates a target-free
+program with independently configured process speed, travel speed, blending,
+approach/retract, fixed XYZRPW, selected TCP/frame, and path-start/path-finish valve
+events. Generated programs, projects, and curves are removed after a job and by the
+UI's reset/cleanup action; sampled station targets are not created.
 Live mode revalidates the exact station selections and valve program bodies, forces
 `AirOff` before approach/inspection and on every exit, prints one layer at a time,
 captures exactly one synchronized RGB-D observation per layer, reconstructs the
