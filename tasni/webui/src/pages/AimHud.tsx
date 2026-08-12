@@ -48,6 +48,14 @@ export interface GateReading {
   measurement_ts?: number | null;
   rect_stable_frames?: number;
   center_latched?: boolean;
+  // Locked-gate provenance (workframe survey, scan module only): how the locked
+  // outline_uv boundary was established. Absent when the surface auto-overran the
+  // camera view without an explicit operator region declaration — in that case the
+  // backend instead appends to `warnings` and the UI must not show a provenance
+  // chip (there is nothing honest to claim).
+  boundary_provenance?: string;
+  survey?: Record<string, unknown>;
+  warnings?: string[];
 }
 
 const W = 1280, H = 720, CX = W / 2, CY = H / 2;

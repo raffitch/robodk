@@ -69,22 +69,6 @@ interface RdkStatus {
   robot_link?: { connected: boolean; message: string; ip: string; configured: boolean } | null;
 }
 
-function lockDisplayGate(next: GateReading, prev: GateReading | null): GateReading {
-  if (next.live === true || !prev) return next;
-  // The lock snapshot is the authoritative measurement, but the live telemetry
-  // overlay is already projected into the color-preview coordinate system. Keep
-  // that display geometry so the HUD does not visibly rescale when lock publishes
-  // depth-derived snapshot UVs.
-  return {
-    ...next,
-    outline_uv: prev.outline_uv ?? next.outline_uv,
-    points_uv: prev.points_uv ?? next.points_uv,
-    visible_outline_uv: prev.visible_outline_uv ?? next.visible_outline_uv,
-    grid_uv: prev.grid_uv ?? next.grid_uv,
-    grid_spacing_mm: prev.grid_spacing_mm ?? next.grid_spacing_mm,
-  };
-}
-
 function meanUv(points: Array<[number, number]> | null | undefined): [number, number] | null {
   if (!points?.length) return null;
   let sx = 0, sy = 0;
@@ -320,7 +304,9 @@ export default function Scan() {
             resetCoverage();
           }
           setGate((prev) => {
-            let next = lockDisplayGate(p, prev);
+            // Spec §11: no frontend display latch may replace the locked polygon —
+            // a non-live (locked) gate is shown exactly as the backend sent it.
+            let next: GateReading = p;
             if (p.live) {
               const frozen = frozenGateRef.current;
               if (frozen && !surfaceShifted(frozen, p)) {
@@ -554,7 +540,9 @@ export default function Scan() {
         crop_size_mm?: [number, number] | null;
       }>("/surface/lock", { mode: surfaceMode });
       setLive(false); resetStream();
-      setGate((prev) => lockDisplayGate(r.gate, prev));
+      // The lock snapshot (r.gate) is the sole authoritative geometry — display it
+      // as sent, with no client-side latch/repair (spec §11).
+      setGate(r.gate);
       setSurfaceLocked(true);
       setSurfaceStable(false);
       addLog(r.surface_mode === "crop" && r.crop_size_mm
@@ -629,12 +617,15 @@ export default function Scan() {
     : gate?.fully_framed === true && gate.extent_mm
       ? `Full surface ${Math.round(gate.extent_mm[0])} × ${Math.round(gate.extent_mm[1])} mm`
       : "Aim the center reticle at the intended work surface";
-  const lamps: [string, boolean | undefined][] = [
+  // Spec §12: CENTER and EDGE A are advisory — they inform aim but never block
+  // locking (canLockSurface does not gate on them) — so they must not be presented
+  // identically to the mandatory lamps.
+  const lamps: [string, boolean | undefined, boolean?][] = [
     ["DETECT", gate?.gates?.detected],
     ["DISTANCE", gate?.gates?.distance],
     ["ANGLE", gate?.gates?.angle],
-    ["CENTER", gate?.gates?.center],
-    ["EDGE A", gate?.gates?.edge],
+    ["CENTER", gate?.gates?.center, true],
+    ["EDGE A", gate?.gates?.edge, true],
     ["FRAMED", gate?.gates?.framed],
   ];
   const pl = result?.plane;
@@ -689,16 +680,18 @@ export default function Scan() {
 
         <SurfaceModeNotice gate={gate} mode={surfaceMode}
                            onModeChange={setSurfaceMode}
-                           disabled={running || locking || generating || surfaceLocked} />
+                           disabled={running || locking || generating || surfaceLocked}
+                           onRegionApplied={refreshLive} />
         <SurfaceGuide gate={gate} stable={surfaceStable} />
 
         <div className="lamps">
-          {lamps.map(([name, on]) => {
+          {lamps.map(([name, on, advisory]) => {
             const state = on === undefined ? "unknown" : on ? "on" : "off";
             const glyph = on === undefined ? "·" : on ? "✓" : "✗";
             const word = on === undefined ? "—" : on ? "OK" : "NO";
             return (
-              <span key={name} className={"lamp " + state}>
+              <span key={name} className={"lamp " + state + (advisory ? " advisory" : "")}
+                    title={advisory ? "advisory — does not block lock" : undefined}>
                 <span className="glyph">{glyph}</span> {name}
                 <span className="lamp-state">{word}</span>
               </span>
@@ -716,6 +709,25 @@ export default function Scan() {
             : surfaceStable ? "Surface ready" : gate?.ok ? "Hold position…" : "Position surface"}</span>
           <span>{surfaceDescription}</span>
         </div>
+
+        {/* Locked-gate boundary provenance (spec §2/§11): the only geometry the
+            review UI may show is the locked polygon, so the operator must also see
+            how that boundary was established. Absent when the backend deliberately
+            declined to claim provenance (auto-overrun with no operator region
+            declared) — that case surfaces its `warnings` instead, honestly. */}
+        {gate?.live === false && gate?.boundary_provenance && (
+          <div className={"provenance-chip "
+              + (gate.boundary_provenance.startsWith("user specified") ? "declared" : "")}
+               title="boundary provenance — how the locked work-region boundary was established">
+            {gate.boundary_provenance}
+          </div>
+        )}
+        {gate?.live === false && !gate?.boundary_provenance
+          && gate?.warnings && gate.warnings.length > 0 && (
+          <div className="warn-text" style={{ marginTop: 6, fontSize: 12 }}>
+            {gate.warnings.map((w, i) => <div key={i}>⚠ {w}</div>)}
+          </div>
+        )}
 
         <CollisionPanel ready={ready} busy={collisionBusy} status={collision}
                         onRecheck={checkCollision}
@@ -935,9 +947,10 @@ export default function Scan() {
 }
 
 
-function SurfaceModeNotice({ gate, mode, onModeChange, disabled }:
+function SurfaceModeNotice({ gate, mode, onModeChange, disabled, onRegionApplied }:
   { gate: GateReading | null; mode: "auto" | "crop";
-    onModeChange: (mode: "auto" | "crop") => void; disabled: boolean }) {
+    onModeChange: (mode: "auto" | "crop") => void; disabled: boolean;
+    onRegionApplied: () => void }) {
   const manualCrop = mode === "crop";
   const crop = manualCrop || gate?.surface_mode === "crop";
   const full = gate?.surface_mode === "full" && gate?.fully_framed === true;
@@ -958,7 +971,40 @@ function SurfaceModeNotice({ gate, mode, onModeChange, disabled }:
         : "ON - surface exceeds the camera frame; using the reticle work area."
     : full && extent
       ? `ON - full rectangle tracked (${Math.round(extent[0])} x ${Math.round(extent[1])} mm). X/Y is advisory; targets use the measured rectangle center.`
-      : "Auto will use a finite rectangle when the measured surface fits. Turn on Large crop if dot coverage is incomplete or jittery.";
+      : "Auto will use a finite rectangle when the measured surface fits. Turn on User-specified region if dot coverage is incomplete or jittery.";
+
+  // Operator-typed region size (mm). Defaults from the gate's current crop_size_mm
+  // and keeps tracking it until the operator edits a field, so the inputs start
+  // pre-filled with the live/measured value but never fight the operator's typing.
+  const touchedRef = useRef(false);
+  const [width, setWidth] = useState(() =>
+    gate?.crop_size_mm ? String(Math.round(gate.crop_size_mm[0])) : "");
+  const [height, setHeight] = useState(() =>
+    gate?.crop_size_mm ? String(Math.round(gate.crop_size_mm[1])) : "");
+  const [regionBusy, setRegionBusy] = useState(false);
+  const [regionError, setRegionError] = useState<string | null>(null);
+  const cropW = cropSize?.[0], cropH = cropSize?.[1];
+  useEffect(() => {
+    if (touchedRef.current || cropW == null || cropH == null) return;
+    setWidth(String(Math.round(cropW)));
+    setHeight(String(Math.round(cropH)));
+  }, [cropW, cropH]);
+
+  const applyRegion = async () => {
+    const w = parseFloat(width), h = parseFloat(height);
+    if (!Number.isFinite(w) || !Number.isFinite(h)) {
+      setRegionError("enter numeric width and height (mm)."); return;
+    }
+    setRegionBusy(true); setRegionError(null);
+    try {
+      await api.post<{ user_region_mm: [number, number] }>(
+        "/surface/region", { width_mm: w, height_mm: h });
+      onRegionApplied();
+    } catch (e: any) {
+      setRegionError(e.message);
+    } finally { setRegionBusy(false); }
+  };
+
   return (
     <div className={"surface-mode " + (crop ? "crop" : full ? "full" : "")}>
       <button type="button"
@@ -966,11 +1012,32 @@ function SurfaceModeNotice({ gate, mode, onModeChange, disabled }:
               disabled={disabled}
               onClick={() => onModeChange(manualCrop ? "auto" : "crop")}>
         <span className="surface-mode-knob" />
-        {manualCrop ? "Large crop ON" : "Auto"}
+        {manualCrop ? "User-specified region" : "Auto"}
       </button>
       <div>
         <b>{modeText}</b>
         <span>{detail}</span>
+        {crop && (
+          <div className="row" style={{ gap: 10, alignItems: "flex-end", marginTop: 8 }}>
+            <div className="field">
+              <label>Region W (mm)</label>
+              <input type="number" min={100} max={4000} style={{ width: 90 }}
+                     value={width} disabled={disabled || regionBusy}
+                     onChange={(e) => { touchedRef.current = true; setWidth(e.target.value); }} />
+            </div>
+            <div className="field">
+              <label>Region H (mm)</label>
+              <input type="number" min={100} max={4000} style={{ width: 90 }}
+                     value={height} disabled={disabled || regionBusy}
+                     onChange={(e) => { touchedRef.current = true; setHeight(e.target.value); }} />
+            </div>
+            <button type="button" className="secondary mini" disabled={disabled || regionBusy}
+                    onClick={applyRegion}>
+              {regionBusy ? "Applying…" : "Apply region"}
+            </button>
+            {regionError && <span className="warn-text" style={{ fontSize: 12 }}>{regionError}</span>}
+          </div>
+        )}
       </div>
     </div>
   );
