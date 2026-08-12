@@ -28,6 +28,8 @@ from tasni.core.config import AppConfig  # noqa: E402
 from tasni.core.geometry import Rt_to_T  # noqa: E402
 from tasni.core.jobrunner import JobContext  # noqa: E402
 from tasni.modules.scan import service as scan_service  # noqa: E402
+from tasni.modules.scan.survey_contract import (  # noqa: E402
+    MODE_COMPACT, MODE_USER_SPECIFIED, PROVENANCE_COMPACT, PROVENANCE_USER_SPECIFIED)
 
 W, H = 320, 240
 K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
@@ -84,7 +86,11 @@ def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
         def robot_connection_params(self): return {"ip": "10.0.0.5", "port": 7000}
         def use_camera_tool(self, tool): return mount
         def camera_pose_T(self): return state["cam"]
-        def current_joints(self): return "HOME"
+        # A constant 6-element list (not the old opaque "HOME" sentinel): the new
+        # explicit robot-state refresh (survey_contract.refresh_robot_state) reads
+        # this numerically twice to decide stationary-vs-moving, so it must be a
+        # real joint vector. Fixed across calls -> always reads as stationary here.
+        def current_joints(self): return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         def move_j_joints(self, j): state["cam"] = seed_T
         def is_reachable(self, T): return True
         def screen_collisions(self, poses, *, guard_skip=None, **kw):
@@ -264,6 +270,55 @@ def test_lock_then_create_targets_reuses_frozen_surface():
     except RuntimeError as e:
         assert "moved after surface lock" in str(e), e
     print("[surface lock] frozen RGBD reused; 10 mm post-lock motion refused")
+
+
+def test_lock_builds_locked_workframe_survey_compact():
+    """A normal (fully-framed, non-crop) lock now also freezes the immutable §11
+    LockedWorkframeSurvey contract alongside the legacy gate/survey/frame fields."""
+    services, _state = _build_fakes()
+    locked = scan_service.lock_scan_surface(services)
+    rec = locked.survey_record
+    assert rec is not None and rec.mode == MODE_COMPACT
+    assert rec.boundary_provenance == PROVENANCE_COMPACT
+    assert rec.corners_np().shape == (4, 3)
+    assert rec.frame_np()[2, 2] > 0.99            # +Z up
+    assert rec.calibration_id.startswith("cam-")
+    assert rec.locked_robot.stationary is True
+    assert locked.lock_token != ""
+    print("[survey record] compact lock ->", rec.mode, rec.boundary_provenance)
+
+
+def test_lock_crop_is_user_specified_with_declared_size():
+    """force_crop + an explicit user_region_mm declares the boundary instead of
+    measuring it: the record is USER_SPECIFIED and its size is the declared region,
+    reusing the same camera->base transform path as the compact/measured case."""
+    services, _state = _build_fakes()
+    locked = scan_service.lock_scan_surface(
+        services, force_crop=True, user_region_mm=(1200.0, 900.0))
+    rec = locked.survey_record
+    assert rec is not None
+    assert rec.mode == MODE_USER_SPECIFIED
+    assert rec.boundary_provenance == PROVENANCE_USER_SPECIFIED
+    assert sorted(rec.size_mm, reverse=True) == [1200.0, 900.0]
+    print("[survey record] crop lock -> user-specified", rec.size_mm)
+
+
+def test_lock_gate_event_carries_survey_and_provenance():
+    """The gate JobEvent published at lock time now carries the record's to_dict()
+    and boundary_provenance, so the live HUD can show the locked polygon as-is."""
+    services, _state = _build_fakes()
+    events = []
+    services.bus = SimpleNamespace(publish=lambda e: events.append(e))
+    scan_service.lock_scan_surface(services)
+    gate_events = [e for e in events if e.type == "gate"]
+    assert gate_events, "expected at least one gate JobEvent"
+    payload = gate_events[-1].payload
+    assert payload["live"] is False
+    assert "outline_uv" in payload            # locked polygon is displayable as-is
+    assert payload["boundary_provenance"]
+    assert payload["survey"]["mode"] == MODE_COMPACT
+    print("[gate event] carries survey + boundary_provenance:",
+          payload["boundary_provenance"])
 
 
 def test_targets_report_surface_coverage_from_footprint():
@@ -571,6 +626,9 @@ def test_sparse_measured_support_is_rejected():
 if __name__ == "__main__":
     test_generate_run_insert()
     test_lock_then_create_targets_reuses_frozen_surface()
+    test_lock_builds_locked_workframe_survey_compact()
+    test_lock_crop_is_user_specified_with_declared_size()
+    test_lock_gate_event_carries_survey_and_provenance()
     test_targets_report_surface_coverage_from_footprint()
     test_save_views_persists_per_pose_frames()
     test_burst_capture_path()

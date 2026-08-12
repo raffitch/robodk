@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -43,10 +44,14 @@ from ..calibration.service import (
     TARGET_PREFIX as CALIB_TARGET_PREFIX,
     _camera_hold, dry_tour_required, ensure_camera_tool, ensure_real_robot_link)
 from .depth_gate import ScanGateThresholds, evaluate_depth_gate
-from .plane import (bounded_work_plane, rectangle_in_frame, reticle_plane_square,
-                    work_plane_from_points)
+from .plane import (bounded_work_plane, fit_plane, rectangle_in_frame,
+                    reticle_plane_square, work_plane_from_points)
 from .planner import ScanPlan, plan_scan
 from .survey import SurveyThresholds, survey_surface
+from .survey_contract import (
+    MODE_COMPACT, MODE_USER_SPECIFIED, PROVENANCE_BY_MODE,
+    CaptureRecord, LockedWorkframeSurvey, camera_calibration_id,
+    frame_from_rectangle, order_corners_clockwise, refresh_robot_state)
 from .reconstruct import (ScanView, clean_measured_surface_mesh, cloud_points_m,
                           crop_box, fuse_views, look_point_from_views,
                           mesh_preview_points, planar_rectangle_mesh, save_mesh)
@@ -72,14 +77,19 @@ class LockedScanSurface:
     seed_T: np.ndarray
     seed_joints: object
     locked_at: float
+    survey_record: "LockedWorkframeSurvey | None" = None
+    lock_token: str = ""
 
 
 def _crop_gate_payload(gate_payload: dict, scfg, K, image_size, look_mm: float,
-                       survey=None) -> dict:
+                       survey=None, user_region_mm: tuple[float, float] | None = None) -> dict:
     """Force the locked surface into reticle-crop mode.
 
     This is the operator escape hatch for cases where a finite rectangle/dot overlay
     jitters or is partially missing even though the center depth plane is usable.
+    ``user_region_mm``, when given, declares the crop rectangle's size explicitly
+    (the operator-specified work region) instead of the generic ``scfg.work_crop_mm``
+    square.
     """
     out = dict(gate_payload)
     gates = dict(out.get("gates") or {})
@@ -90,7 +100,7 @@ def _crop_gate_payload(gate_payload: dict, scfg, K, image_size, look_mm: float,
     out["ok"] = all(bool(gates.get(k)) for k in ("detected", "distance", "angle"))
     out["surface_mode"] = "crop"
     out["fully_framed"] = False
-    out["crop_size_mm"] = _large_surface_crop_mm(scfg, K, image_size, look_mm)
+    out["crop_size_mm"] = _large_surface_crop_mm(scfg, K, image_size, look_mm, user_region_mm)
     out["rectangle_size_mm"] = list(out["crop_size_mm"])
     if survey is not None and getattr(survey, "detected", False):
         try:
@@ -98,6 +108,12 @@ def _crop_gate_payload(gate_payload: dict, scfg, K, image_size, look_mm: float,
                 np.asarray(survey.normal_cam, float),
                 np.asarray(survey.centroid_cam_mm, float),
                 tuple(out["crop_size_mm"]))
+            # Overwrite the survey's rectangle corners with this declared crop square
+            # (camera frame, mm) — a fully-framed survey would otherwise still hold the
+            # MEASURED board rectangle, not the crop the operator/gate actually wants.
+            # Downstream (the locked-survey record) reuses this same field, so it picks
+            # up the declared size without a second geometry path.
+            survey.corners_cam_mm = np.asarray(corners, float)
             W, H = image_size
             fx, fy = float(K[0, 0]), float(K[1, 1])
             cx, cy = float(K[0, 2]), float(K[1, 2])
@@ -117,14 +133,73 @@ def _crop_gate_payload(gate_payload: dict, scfg, K, image_size, look_mm: float,
     return out
 
 
-def _large_surface_crop_mm(scfg, K, image_size, look_mm: float) -> list[float]:
-    """The generic work-square size used when the surface overruns the view.
+def _large_surface_crop_mm(scfg, K, image_size, look_mm: float,
+                           user_region_mm: tuple[float, float] | None = None) -> list[float]:
+    """The work-square size used when the surface overruns the view (or is forced).
 
     Fixed (``scfg.work_crop_mm``, default 1.0×1.0 m) rather than a fraction of the FOV:
     the operator aims the reticle at the work area and we project a standard square on
-    the plane around it. ``K``/``image_size``/``look_mm`` are unused now (kept so the
-    call sites — which have them handy — need not change)."""
+    the plane around it. ``user_region_mm``, when given, overrides this with an
+    explicit operator-declared (length, width) in mm. ``K``/``image_size``/``look_mm``
+    are unused now (kept so the call sites — which have them handy — need not change)."""
+    if user_region_mm is not None:
+        return [float(user_region_mm[0]), float(user_region_mm[1])]
     return [float(scfg.work_crop_mm[0]), float(scfg.work_crop_mm[1])]
+
+
+def _plane_rms_mm(depth, K, *, stride: int = 8) -> float:
+    """Quick plane-fit RMS (mm) of the fused lock depth, for the quality report."""
+    d = np.asarray(depth, dtype=float)[::stride, ::stride]
+    v, u = np.nonzero(d > 0)
+    if len(v) < 50:
+        return float("nan")
+    z = d[v, u]
+    fx, fy, cx, cy = K[0][0], K[1][1], K[0][2], K[1][2]
+    pts = np.stack([(u * stride - cx) / fx * z, (v * stride - cy) / fy * z, z], axis=1)
+    try:
+        normal, centroid, _ = fit_plane(pts, distance=6.0)
+    except Exception:
+        return float("nan")
+    res = (pts - centroid) @ np.asarray(normal, dtype=float)
+    return float(np.sqrt(np.mean(res ** 2)))
+
+
+def _survey_record_from_lock(survey, seed_T, snapshot, camera_cfg, *, mode, n_frames,
+                             measurement_ts, valid_frac, plane_rms_mm) -> "LockedWorkframeSurvey | None":
+    """Build the immutable §11 contract from the authoritative lock acquisition."""
+    if survey.corners_cam_mm is None:
+        return None
+    T = np.asarray(seed_T, dtype=float)
+    R, t = T[:3, :3], T[:3, 3]
+    corners_base = np.asarray(survey.corners_cam_mm, dtype=float) @ R.T + t
+    normal_base = R @ np.asarray(survey.normal_cam, dtype=float)
+    if normal_base[2] < 0:
+        normal_base = -normal_base
+    centroid_base = R @ np.asarray(survey.centroid_cam_mm, dtype=float) + t
+    corners_base = order_corners_clockwise(corners_base, normal_base)
+    frame_T = frame_from_rectangle(corners_base, normal_base)
+    e1 = float(np.linalg.norm(corners_base[1] - corners_base[0]))
+    e2 = float(np.linalg.norm(corners_base[2] - corners_base[1]))
+    record = CaptureRecord(
+        kind="compact" if mode == MODE_COMPACT else "center", robot=snapshot,
+        measurement_ts=float(measurement_ts), captured_at=snapshot.fetched_at,
+        n_frames=int(n_frames), standoff_mm=float(survey.standoff_mm),
+        tilt_deg=float(survey.tilt_deg), valid_frac=float(valid_frac),
+        plane_rms_mm=float(plane_rms_mm),
+        plane_normal_base=tuple(normal_base), plane_point_base=tuple(centroid_base))
+    quality = {
+        "plane_rms_mm": float(plane_rms_mm), "standoff_mm": float(survey.standoff_mm),
+        "tilt_deg": float(survey.tilt_deg), "valid_frac": float(valid_frac),
+        "measure_frames": int(n_frames),
+    }
+    return LockedWorkframeSurvey(
+        mode=mode, boundary_provenance=PROVENANCE_BY_MODE[mode], captures=(record,),
+        plane_normal_base=tuple(normal_base), plane_point_base=tuple(centroid_base),
+        corners_base=tuple(map(tuple, corners_base)),
+        center_base=tuple(corners_base.mean(axis=0)),
+        frame_T_base=tuple(map(tuple, frame_T)), size_mm=(max(e1, e2), min(e1, e2)),
+        quality=quality, calibration_id=camera_calibration_id(camera_cfg),
+        locked_robot=snapshot, locked_at=snapshot.fetched_at)
 
 
 def _outline_edge_angle_deg(outline_uv) -> float | None:
@@ -181,7 +256,8 @@ def _planned_surface_standoff_mm(
     return float(scfg.ideal_distance_mm)
 
 
-def lock_scan_surface(services, *, force_crop: bool = False) -> LockedScanSurface:
+def lock_scan_surface(services, *, force_crop: bool = False,
+                      user_region_mm: tuple[float, float] | None = None) -> LockedScanSurface:
     """Freeze one authoritative RGBD measurement and the matching robot pose."""
     cfg = services.config
     scfg = cfg.scan
@@ -269,7 +345,26 @@ def lock_scan_surface(services, *, force_crop: bool = False) -> LockedScanSurfac
     if crop_mode and reading.distance_mm is not None:
         gate_payload = _crop_gate_payload(
             gate_payload, scfg, K, cfg.camera.size, float(reading.distance_mm),
-            survey=survey)
+            survey=survey, user_region_mm=user_region_mm)
+
+    # Explicit robot-state refresh (§9): a real double-read of joints + the derived
+    # camera pose, tagged stationary/moving, rather than a bare current_joints() call.
+    # This is the authoritative state for THIS measurement, so it is captured before
+    # the survey record / gate event are built — even on a failing gate the operator's
+    # HUD should reflect the robot state the failed reading was taken at.
+    snapshot = refresh_robot_state(rdk)
+    seed_T = snapshot.camera_T_np()
+    seed_joints = list(snapshot.joints)
+
+    mode = MODE_USER_SPECIFIED if crop_mode else MODE_COMPACT
+    plane_rms = _plane_rms_mm(depth, K)
+    record = _survey_record_from_lock(
+        survey, seed_T, snapshot, services.config.camera,
+        mode=mode, n_frames=len(frames), measurement_ts=gate_payload.get("measurement_ts", 0.0),
+        valid_frac=gate_payload.get("valid_frac", 0.0), plane_rms_mm=plane_rms)
+    if record is not None:
+        gate_payload["survey"] = record.to_dict()
+        gate_payload["boundary_provenance"] = record.boundary_provenance
 
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:
@@ -285,15 +380,10 @@ def lock_scan_surface(services, *, force_crop: bool = False) -> LockedScanSurfac
             + f" (distance {reading.distance_mm and round(reading.distance_mm)} mm, "
             + f"target {round(ideal_distance)} mm, "
             + f"tilt {reading.tilt_deg and round(reading.tilt_deg, 1)}°).")
-    seed_T = rdk.camera_pose_T()
-    try:
-        seed_joints = rdk.current_joints()
-    except Exception:
-        seed_joints = None
     return LockedScanSurface(
         frame=frame, reading=reading, survey=survey, gate_payload=gate_payload,
         seed_T=np.asarray(seed_T, float), seed_joints=seed_joints,
-        locked_at=time.monotonic())
+        locked_at=time.monotonic(), survey_record=record, lock_token=uuid.uuid4().hex)
 
 
 def scan_gate_thresholds(scfg) -> ScanGateThresholds:
