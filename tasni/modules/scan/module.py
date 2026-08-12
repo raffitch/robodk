@@ -60,6 +60,13 @@ class ScanModule(WorkflowModule):
         self._planned_voxel_m: float | None = None         # set by /poses/generate for /run
         self._planned_crop_mm: tuple[float, float] | None = None
         self._planned_surface_size_mm: tuple[float, float] | None = None
+        # §11 provenance (Task 5): the locked survey's boundary_provenance/to_dict(),
+        # threaded from /poses/generate into the /run ScanParams so the run report
+        # (and eventually insert's active.json) carry the same provenance as the
+        # targets actually created. None/"" whenever the lock built no survey record.
+        self._planned_provenance: str | None = None
+        self._planned_survey: dict | None = None
+        self._targets_token: str = ""
         self._locked_surface: LockedScanSurface | None = None
         # Set by POST /live/refresh; consumed by the live analyze loop to drop the
         # anti-jitter hold + pose anchor and re-read fresh at the current robot pose.
@@ -422,6 +429,9 @@ class ScanModule(WorkflowModule):
                     self._planned_voxel_m = None
                     self._planned_crop_mm = None
                     self._planned_surface_size_mm = None
+                    self._planned_provenance = None
+                    self._planned_survey = None
+                    self._targets_token = ""
                 else:
                     self._reference_result = None
                     self._planned_voxel_m = result_dict.get("voxel_size_m")
@@ -430,6 +440,9 @@ class ScanModule(WorkflowModule):
                     extent = result_dict.get("extent_mm")
                     self._planned_surface_size_mm = (
                         tuple(extent) if crop is None and extent is not None else None)
+                    self._planned_provenance = result_dict.get("boundary_provenance")
+                    self._planned_survey = result_dict.get("survey")
+                    self._targets_token = result_dict.get("lock_token") or ""
                 self._locked_surface = None
                 return result_dict
             except RuntimeError as e:
@@ -475,7 +488,9 @@ class ScanModule(WorkflowModule):
             self._active_job = ScanCaptureJob(services, ScanParams(
                 voxel_size_m=self._planned_voxel_m,
                 crop_size_mm=self._planned_crop_mm,
-                surface_size_mm=self._planned_surface_size_mm))
+                surface_size_mm=self._planned_surface_size_mm,
+                boundary_provenance=self._planned_provenance,
+                survey=self._planned_survey))
             services.jobs.start(self._active_job, name="scan")
             return {"status": "started"}
 

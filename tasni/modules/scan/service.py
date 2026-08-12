@@ -1465,7 +1465,14 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
             "extent_mm": extent_mm,
             "crop_size_mm": crop_size_mm,
             "voxel_size_m": planned_voxel_m,
-            "plan": plan.to_dict() if plan is not None else None}
+            "plan": plan.to_dict() if plan is not None else None,
+            # §11 provenance (Task 5): absent (None) whenever the lock built no
+            # survey_record (e.g. a silent auto-crop overrun) — never fabricated.
+            "boundary_provenance": (locked.survey_record.boundary_provenance
+                                    if locked and locked.survey_record else None),
+            "survey": (locked.survey_record.to_dict()
+                       if locked and locked.survey_record else None),
+            "lock_token": locked.lock_token if locked else ""}
 
 
 # -- capture + reconstruct job ----------------------------------------------
@@ -1475,6 +1482,12 @@ class ScanParams:
     voxel_size_m: float | None = None   # None → use ScanConfig default
     crop_size_mm: tuple[float, float] | None = None
     surface_size_mm: tuple[float, float] | None = None
+    # §11 provenance threaded from the locked surface (Task 3/5): who/what decided
+    # the boundary, and the LockedWorkframeSurvey.to_dict() it came from. Both are
+    # None when the lock never built a survey record (e.g. an auto-crop overrun) —
+    # that is an honest absence, never a fabricated/defaulted string (spec §1/§12).
+    boundary_provenance: str | None = None
+    survey: dict | None = None
 
 
 @dataclass
@@ -1492,7 +1505,9 @@ def _result_report(wp, frame_T_mm, corners_mm, *, n_views, n_points, mesh,
                    run_dir, stamp, voxel_size_m: float, mesh_spacing_m: float,
                    frames_per_pose: int, mesh_stats: dict | None = None,
                    coverage: dict | None = None,
-                   mesh_kind: str = "fitted_flat_surface") -> dict:
+                   mesh_kind: str = "fitted_flat_surface",
+                   provenance: str | None = None,
+                   survey: dict | None = None) -> dict:
     return {
         "module": "scan", "stamp": stamp, "run_dir": str(run_dir),
         "n_views": int(n_views), "n_points": int(n_points),
@@ -1505,6 +1520,11 @@ def _result_report(wp, frame_T_mm, corners_mm, *, n_views, n_points, mesh,
         "raw_mesh_file": "raw_tsdf_mesh.ply",
         "mesh_cleaning": mesh_stats or {},
         "coverage": coverage or {},
+        # §11 provenance (Task 5): carried through from ScanParams, which came from
+        # generate_scan_targets's locked-surface survey record. None when the lock
+        # built no record — an honest absence, never a fabricated string.
+        "boundary_provenance": provenance,
+        "survey": survey,
         "quality": {
             "voxel_size_mm": float(voxel_size_m * 1000.0),
             "surface_mesh_spacing_mm": float(mesh_spacing_m * 1000.0),
@@ -1783,7 +1803,9 @@ class ScanCaptureJob:
                                      mesh_spacing_m=scfg.surface_mesh_spacing_m,
                                      frames_per_pose=scfg.frames_per_pose,
                                      mesh_stats=mesh_stats, coverage=coverage,
-                                     mesh_kind="fitted_flat_surface")
+                                     mesh_kind="fitted_flat_surface",
+                                     provenance=self.params.boundary_provenance,
+                                     survey=self.params.survey)
             mesh_obj = None
             if self.params.save_artifacts:
                 save_mesh(mesh, str(run_dir / "mesh.obj"))
@@ -1977,6 +1999,12 @@ def insert_scan(services, *, job: "ScanCaptureJob | None" = None,
     # derived from the corners; the (X, Y) extents alone cannot give the sign.
     corners_frame_mm = rectangle_in_frame(frame_T_mm, corners_mm)
     center_frame_mm = corners_frame_mm.mean(axis=0)
+    # §11 provenance (Task 5): read from the SAME resolved report as the geometry
+    # above — never a different source — so provenance can never disagree with what
+    # was actually inserted. Absent (None) whenever the run carried no survey
+    # record; never fabricated or defaulted to a measured-sounding string.
+    boundary_provenance = report.get("boundary_provenance")
+    survey_quality = (report.get("survey") or {}).get("quality")
     payload = {
         "module": "scan", "run_id": stamp_id, "source": source,
         "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1986,6 +2014,8 @@ def insert_scan(services, *, job: "ScanCaptureJob | None" = None,
         "rectangle_corners_frame_mm": corners_frame_mm.tolist(),
         "rectangle_center_frame_mm": [float(center_frame_mm[0]),
                                       float(center_frame_mm[1])],
+        "boundary_provenance": boundary_provenance,
+        "survey_quality": survey_quality,
     }
     runs.write_active("scan", payload)
     return {"status": "inserted", "frame": FRAME_NAME, "rectangle": RECT_NAME,

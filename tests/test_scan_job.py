@@ -253,6 +253,119 @@ def test_generate_run_insert():
           tuple(round(s) for s in res["plane"]["size_mm"]), "mm; inserted")
 
 
+def test_provenance_flows_lock_to_insert():
+    """The §11 boundary provenance + survey record must thread end to end: a
+    normal (fully framed, non-crop) lock builds a real LockedWorkframeSurvey,
+    generate_scan_targets carries its provenance/survey/lock_token in its
+    return dict, ScanParams/ScanCaptureJob carry them into the run report, and
+    insert_scan carries them into the runs/scan/active.json payload -- reading
+    provenance and geometry from the SAME resolved source (job.result)."""
+    try:
+        import open3d  # noqa: F401
+    except Exception:
+        print("[skip] open3d not installed — `pip install -e .[scan]`")
+        return
+    services, state = _build_fakes()
+
+    locked = scan_service.lock_scan_surface(services)
+    assert locked.survey_record is not None
+    gen = scan_service.generate_scan_targets(services, locked)
+    assert gen["boundary_provenance"] == locked.survey_record.boundary_provenance
+    assert gen["survey"] == locked.survey_record.to_dict()
+    assert gen["lock_token"] == locked.lock_token
+    assert gen["lock_token"] != ""
+
+    with tempfile.TemporaryDirectory() as t:
+        runs.REPO_ROOT = Path(t)
+
+        def fake_new_run_dir(mid, stamp):
+            d = Path(t) / "runs" / mid / stamp
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        orig = scan_service.new_run_dir
+        scan_service.new_run_dir = fake_new_run_dir
+        try:
+            params = scan_service.ScanParams(
+                boundary_provenance=gen["boundary_provenance"], survey=gen["survey"])
+            job = scan_service.ScanCaptureJob(services, params)
+            result = job(_Ctx())
+            assert result["boundary_provenance"] == gen["boundary_provenance"]
+            assert result["survey"] == gen["survey"]
+
+            out = scan_service.insert_scan(services, result=job.result)
+            assert out["status"] == "inserted"
+            active = runs.read_active("scan")
+            assert active["boundary_provenance"] == gen["boundary_provenance"]
+            assert active["survey_quality"] == gen["survey"]["quality"]
+        finally:
+            scan_service.new_run_dir = orig
+            runs.REPO_ROOT = _ORIG_ROOT
+    print("[provenance] lock ->", gen["boundary_provenance"],
+          "-> report -> insert payload survey_quality", active["survey_quality"])
+
+
+def test_provenance_absent_when_survey_record_is_none():
+    """An auto-detected crop overrun (the surface overruns the view, no
+    force_crop) builds NO survey_record -- a silent SYSTEM fallback, not an
+    operator declaration (Task 3's honest-provenance rule). The pipeline must
+    still complete end to end: provenance is simply ABSENT throughout (None),
+    never fabricated, never defaulted to a measured-sounding string."""
+    try:
+        import open3d  # noqa: F401
+    except Exception:
+        print("[skip] open3d not installed — `pip install -e .[scan]`")
+        return
+    global TABLE_HALF_MM
+    saved = TABLE_HALF_MM
+    TABLE_HALF_MM = 1000.0
+    try:
+        services, state = _build_fakes()
+        state["cam"] = _look_at((0, 0, 310), (0, 0, 0))
+        # The crop's fixed 1000x1000 mm work region reaches farther than the 8
+        # cone-limited tour views actually capture on this synthetic table, which
+        # would otherwise trip the (unrelated) measured-edge-coverage hard-fail
+        # gate -- this test is about provenance flow, not synthetic mesh coverage.
+        services.config.scan.actual_coverage_hard_fail = False
+        locked = scan_service.lock_scan_surface(services)
+        assert locked.survey_record is None
+        assert locked.lock_token != ""
+
+        gen = scan_service.generate_scan_targets(services, locked)
+        assert gen["boundary_provenance"] is None
+        assert gen["survey"] is None
+        assert gen["lock_token"] == locked.lock_token
+
+        with tempfile.TemporaryDirectory() as t:
+            runs.REPO_ROOT = Path(t)
+
+            def fake_new_run_dir(mid, stamp):
+                d = Path(t) / "runs" / mid / stamp
+                d.mkdir(parents=True, exist_ok=True)
+                return d
+            orig = scan_service.new_run_dir
+            scan_service.new_run_dir = fake_new_run_dir
+            try:
+                params = scan_service.ScanParams(
+                    boundary_provenance=gen["boundary_provenance"], survey=gen["survey"])
+                job = scan_service.ScanCaptureJob(services, params)
+                result = job(_Ctx())
+                assert result["boundary_provenance"] is None
+                assert result["survey"] is None
+
+                out = scan_service.insert_scan(services, result=job.result)
+                assert out["status"] == "inserted"
+                active = runs.read_active("scan")
+                assert active["boundary_provenance"] is None
+                assert active["survey_quality"] is None
+            finally:
+                scan_service.new_run_dir = orig
+                runs.REPO_ROOT = _ORIG_ROOT
+    finally:
+        TABLE_HALF_MM = saved
+    print("[provenance absent] auto-crop overrun -> no survey_record -> "
+          "report/insert carry None throughout, no crash, no fabricated string")
+
+
 def test_lock_then_create_targets_reuses_frozen_surface():
     services, state = _build_fakes()
     locked = scan_service.lock_scan_surface(services)
@@ -698,6 +811,8 @@ def test_sparse_measured_support_is_rejected():
 
 if __name__ == "__main__":
     test_generate_run_insert()
+    test_provenance_flows_lock_to_insert()
+    test_provenance_absent_when_survey_record_is_none()
     test_lock_then_create_targets_reuses_frozen_surface()
     test_lock_builds_locked_workframe_survey_compact()
     test_lock_crop_is_user_specified_with_declared_size()
