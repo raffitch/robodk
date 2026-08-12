@@ -197,6 +197,17 @@ class FivePositionSurvey:
                     "corner capture has no usable edge evidence - reposition and recapture")
             if evidence.corner_base_mm is None:
                 raise RuntimeError("corner depth missing - reposition and recapture")
+            # Same hazard as the plane-points check below, through a different
+            # intake field: corner_agreement_mm downstream is computed from
+            # this value (via order_corners_clockwise -> project_points_2d ->
+            # local_corners2d), and nothing else on that path checks
+            # finiteness -- solve_constrained_rectangle only validates its
+            # edge-point sets, not local_corners2d. Reject here, at the gate
+            # layer, rather than trust the extractor's own invariant.
+            if not np.all(np.isfinite(np.asarray(evidence.corner_base_mm, dtype=float))):
+                raise RuntimeError(
+                    f"{expected} capture has a non-finite corner depth (NaN/Inf) - "
+                    "reposition and recapture")
         pts = np.asarray(plane_points_base, dtype=float).reshape(-1, 3)
         # A single non-finite plane point silently defeats the coplanarity
         # gates downstream (fit_global_plane's per-position RMS becomes NaN,
@@ -302,7 +313,20 @@ class FivePositionSurvey:
                 "internal error: corner agreement was not checked - refusing to "
                 "trust an unverified rectangle (this indicates a bug, not an "
                 "operator error)")
-        if rect.corner_agreement_mm > float(self._scfg.survey_corner_agreement_mm):
+        # NaN-safe (same class as the add_capture rewrite above): `value >
+        # threshold` silently PASSES a NaN, so these are written as
+        # `not (value satisfies the bound)`. Not reachable through the sole
+        # production path today (add_capture now blocks a non-finite
+        # corner_base_mm at intake, and solve_constrained_rectangle itself
+        # rejects non-finite edge points before computing discrepancy_mm) --
+        # but this is the gate layer, and a gate must be safe on its own
+        # terms, not merely because its current caller happens to be.
+        if not (rect.corner_agreement_mm <= float(self._scfg.survey_corner_agreement_mm)):
+            if not np.isfinite(rect.corner_agreement_mm):
+                raise RuntimeError(
+                    "internal error: corner agreement is non-finite (NaN/Inf) - "
+                    "refusing to trust this rectangle; reposition and recapture "
+                    "the survey")
             corner_deltas = np.linalg.norm(ordered2d - np.asarray(rect.corners2d), axis=1)
             worst_corner = f"C{int(np.argmax(corner_deltas)) + 1}"
             raise RuntimeError(
@@ -311,7 +335,12 @@ class FivePositionSurvey:
                 f"{float(self._scfg.survey_corner_agreement_mm):.1f} mm, worst at "
                 f"{worst_corner}) - {worst_corner} is likely mis-registered; reposition "
                 f"and recapture it")
-        if rect.discrepancy_mm > float(self._scfg.survey_rect_discrepancy_mm):
+        if not (rect.discrepancy_mm <= float(self._scfg.survey_rect_discrepancy_mm)):
+            if not np.isfinite(rect.discrepancy_mm):
+                raise RuntimeError(
+                    "internal error: rectangle discrepancy is non-finite (NaN/Inf) - "
+                    "refusing to trust this rectangle; reposition and recapture "
+                    "the survey")
             i = int(np.argmax(np.asarray(rect.edge_rms_mm)))
             worst_edge = f"C{i + 1}-C{(i + 1) % 4 + 1}"
             raise RuntimeError(

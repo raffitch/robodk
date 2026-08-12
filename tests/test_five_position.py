@@ -310,6 +310,49 @@ def test_noncoplanar_rejected_even_with_a_nan_present():
         s.finish(calibration_id="c", locked_robot=_snap())
 
 
+def test_nan_corner_depth_rejected_at_capture():
+    """Re-review finding: the NaN closure was incomplete -- corner_base_mm
+    feeds corner_agreement_mm (via order_corners_clockwise ->
+    project_points_2d -> local_corners2d) exactly the way plane_points_base
+    feeds the coplanarity tiers, and nothing on that path checked finiteness.
+    Rejected here at intake, mirroring the plane-points rejection above.
+    """
+    s = _survey()
+    s.add_capture(_record("center"), _plane_points([1000, 800]), None)
+    ev = _corner_evidence(0)
+    bad = CornerEvidence(ev.corner_uv,
+                         (float("nan"), ev.corner_base_mm[1], ev.corner_base_mm[2]),
+                         ev.edge_points_base)
+    with pytest.raises(RuntimeError, match="non-finite"):
+        s.add_capture(_record("corner1"), _plane_points(_CORNERS[0][:2]), bad)
+
+
+def test_nan_corner_agreement_rejected_not_silently_accepted(monkeypatch):
+    """Re-review finding, part 2: the GATE itself (the ``> threshold``
+    comparison at corner_agreement_mm's use site) must be safe on its own
+    terms, not merely safe because add_capture happens to be the only caller
+    today. ``add_capture`` now blocks a non-finite corner_base_mm (see the
+    test above), so the only way to reach ``finish()`` with a NaN
+    corner_agreement_mm is to inject one downstream, exactly like
+    test_none_corner_agreement_is_treated_as_a_failed_check does for the
+    None case. Before this fix, ``rect.corner_agreement_mm > threshold`` was
+    a plain ``>`` comparison -- the identical hazard Finding 1 closed for
+    plane_points_base/valid_frac/tilt_deg, left open here.
+    """
+    import tasni.modules.scan.five_position as five_position
+
+    real_solve = five_position.solve_constrained_rectangle
+
+    def _nan_agreement(edge_points, *, local_corners2d=None):
+        sol = real_solve(edge_points, local_corners2d=local_corners2d)
+        return dataclasses.replace(sol, corner_agreement_mm=float("nan"))
+
+    monkeypatch.setattr(five_position, "solve_constrained_rectangle", _nan_agreement)
+    s = _run_all(_survey())
+    with pytest.raises(RuntimeError, match="non-finite"):
+        s.finish(calibration_id="c", locked_robot=_snap())
+
+
 def test_recapture_rejects_an_unknown_kind():
     """The UI must not be told a capture was dropped when it never existed as
     a survey step in the first place."""
