@@ -98,7 +98,10 @@ approach/retract, process and rapid speeds, path blending, and `CallPathStart` /
 selected XYZRPW and collision-validated before simulation or live execution.
 
 The curve, settings project, and linked generated program use the
-`TasniCylinder_` prefix. They are deleted on normal completion, cancellation, or
-fault, and the Cylinder Test reset action removes stale prefixed artifacts left by
-an interrupted application process. Existing user curves, programs, and targets are
-outside that namespace and are not touched.
+`TasniCylinder_` prefix. They are deleted after a successful dry run. A failed
+generation or dry-run validation deliberately keeps the native curve/project/program
+for diagnosis; dry-run mock I/O programs are still cleaned immediately. The Cylinder
+Test reset action removes stale prefixed path artifacts. Existing user curves,
+programs, and targets are outside that namespace and are not touched. See
+`docs/extrusion-current-handoff.md` for the current live-test status and exact retry
+workflow.

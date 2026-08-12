@@ -1,5 +1,9 @@
 # Handoff: Post-Extrusion Cylinder Test in Tasni
 
+> **Historical requirements document.** The module is now implemented. Read
+> `docs/extrusion-current-handoff.md` first for current architecture, live-test
+> status, the RoboDK status -5 diagnosis, and next steps.
+
 ## Purpose
 
 Implement the existing PostExtrusionToolPath workflow as a Tasni module for a fast, repeatable cylinder experiment needed for the RoboArch / Prototypes for Humanity paper.
@@ -176,6 +180,9 @@ These exclusions constrain the paper-test UI, not the preserved PostExtrusionToo
 7. Add deviation metrics, overlays, timings, and the archive table.
 8. Validate one complete few-layer cylinder trial, then validate correction if included in the paper claim.
 
-## Current repository state at handoff
+## Original repository state at handoff (historical)
 
-Before this document was added, the full Tasni test suite completed successfully: **217 passed, 0 failed**, with two RoboDK import deprecation warnings. No implementation work for this extrusion module has been performed yet.
+Before this original requirements document was added, the full Tasni test suite
+completed successfully: **217 passed, 0 failed**, with two RoboDK import deprecation
+warnings. No implementation work had been performed at that time. For the current
+implemented state, read `docs/extrusion-current-handoff.md`.

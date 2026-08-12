@@ -3,7 +3,7 @@
 Current purpose: give future agents a low-token entry point into the Tasni app,
 scan/calibration logic, RoboDK connection, and Jetson camera server.
 
-Last updated: 2026-07-06. Active branch: `calibration-improvements`.
+Last updated: 2026-08-12. Active branch: `calibration-improvements`.
 
 ## Recent scan fixes (2026-07-06)
 
@@ -69,6 +69,9 @@ Use this file before reading the long handoff docs.
 |---|---|
 | Global agent rules and app overview | `CLAUDE.md` |
 | Tasni app architecture | `tasni/README.md` |
+| Cylinder/extrusion current state and status -5 diagnosis | `docs/extrusion-current-handoff.md` |
+| Cylinder original requirements (historical) | `docs/HANDOFF_EXTRUSION_CYLINDER.md` |
+| Cylinder legacy behavior and valve mapping | `docs/extrusion-legacy-trace.md` |
 | Scan workflow backend | `tasni/modules/scan/module.py`, `tasni/modules/scan/service.py` |
 | Scan frontend | `tasni/webui/src/pages/Scan.tsx`, `tasni/webui/src/pages/AimHud.tsx` |
 | Scan planner / surface survey | `tasni/modules/scan/planner.py`, `tasni/modules/scan/survey.py` |
@@ -203,6 +206,11 @@ Read only when needed:
 - `docs/scan-survey-planner-handoff.md`: original surface-aware planner design; some status is stale.
 - `docs/calibration-aiming-guidance-handoff.md`: calibration aiming UX.
 - `docs/best-practices-review.md`: broader calibration/scan review.
+- `docs/extrusion-current-handoff.md`: authoritative Cylinder Test implementation,
+  live-test result, status -5 placement fix, retained artifacts, and next steps.
+- `docs/HANDOFF_EXTRUSION_CYLINDER.md`: original cylinder requirements; its final
+  pre-implementation status is historical.
+- `docs/extrusion-legacy-trace.md`: legacy pipeline, valve mapping, and deliberate changes.
 
 Many handoff docs contain old commit hashes and status lines. Prefer this map for
 current navigation, then use the long docs for reasoning history.
