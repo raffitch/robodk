@@ -72,6 +72,14 @@ FRAME_NAME = "Tasni Work Frame"
 RECT_NAME = "Tasni Work Surface"
 MESH_NAME = "Tasni Scan Mesh"
 
+# five_position_capture's corner-detection retry (Task 13 review, remedy ii): a
+# small, fixed sanity floor -- just enough real depth for survey_surface's RANSAC
+# to even attempt a plane fit -- deliberately NOT the same value as
+# ScanConfig.survey_corner_min_plane_coverage_frac, the MEANINGFUL corner-adequacy
+# gate applied afterward; see the call site for why reusing one value for both
+# would make the coverage gate unreachable dead code.
+_CORNER_DETECT_SANITY_FRAC = 0.02
+
 
 @dataclass
 class LockedScanSurface:
@@ -496,9 +504,28 @@ def _backproject_depth(depth: np.ndarray, K: np.ndarray, *,
 
 def _deproject_plane_points_mm(depth, K, T_base_cam, *, plane_normal_cam,
                                plane_point_cam, band_mm: float,
-                               stride: int = 6) -> np.ndarray:
+                               stride: int = 6) -> "tuple[np.ndarray, float, float]":
     """Deproject a strided grid of depth pixels that lie within ``band_mm`` of the
     ALREADY-FITTED local plane to BASE-frame millimetres.
+
+    Returns ``(points_base_mm, purity_frac, coverage_frac)``:
+
+    - ``purity_frac`` = (points kept by the band) / (points with ANY valid depth in
+      the stride grid). "Of the depth we actually got, how much of it is trustworthy
+      (on the work plane)?" Robust to whether the missing/background portion of the
+      frame returns real-but-off-plane depth (a nearby floor/fixture) OR no depth at
+      all (open space beyond the D435i's range): a genuinely good capture reads near
+      1.0 in BOTH cases (a real floor drags it down; open space simply isn't counted
+      in either the numerator or denominator, so it does not drag the ratio down the
+      way a naive whole-frame fraction would). See ``five_position_capture`` for why
+      this -- not the compact lock's centre-patch fraction -- is what a CORNER step's
+      ``CaptureRecord.valid_frac`` needs to be (Task 13 review Finding, remedy ii).
+    - ``coverage_frac`` = (points kept by the band) / (all stride-grid positions,
+      valid or not). "How much of the FULL FRAME is actually table?" This is what
+      catches "genuinely too little table in view" (e.g. a corner capture whose
+      table sliver is tiny) -- a case ``purity_frac`` alone cannot: a tiny-but-clean
+      sliver against an empty (0-depth) background also reads ``purity_frac`` near
+      1.0, since there is nothing else to dilute it.
 
     Explicit millimetres throughout -- deliberately the SAME pattern as
     ``corner_evidence._deproject_base`` (depth is the raw uint16 RealSense frame,
@@ -523,29 +550,43 @@ def _deproject_plane_points_mm(depth, K, T_base_cam, *, plane_normal_cam,
     inliers" the brief's own spec asked for. A five-position CORNER capture aims the
     camera at a table corner (``corner_hint_uv=(0.5, 0.5)``), so a large fraction of
     the frame legitimately looks PAST the table's two edges at background (floor,
-    fixtures) tens of centimetres away on a real D435i. Those off-plane points, fed
-    unfiltered into ``fit_global_plane``'s per-set RMS (a plain, non-robust RMS, not
-    a further RANSAC pass), inflate it by roughly ``d * sqrt(f)`` for an off-plane
-    fraction ``f`` at distance ``d`` -- MEASURED on a synthetic 300x300 mm table with
-    a floor 750 mm below and a corner capture whose reticle sits exactly on the
-    corner (~75% of the frame is floor at this geometry): per-set RMS **384 mm**,
-    against the ``survey_coplanar_reject_mm`` gate of 8 mm -- i.e. every real corner
-    capture would fail as "not coplanar" (see the Task 13 review fix report for the
-    full before/after measurement). Filtering to a band around the plane
-    ``survey_surface`` already fit for THIS exact frame turns this into a genuine
-    plane-inlier cloud, matching what ``fit_global_plane`` needs -- verified: the
-    same fixture now measures **0.00 mm** per-set RMS (only exact-zero floating-point
-    residual from the synthetic ray-plane intersection remains).
+    fixtures) tens of centimetres away on a real D435i.
+
+    MEASURED failure (corrected mechanism -- Task 13 re-review follow-up): on a
+    synthetic 300x300 mm table with a floor 750 mm below and a corner capture whose
+    reticle sits exactly on the corner (73.75% of the frame is floor, 26.25% table),
+    the unfiltered points fed into ``fit_global_plane`` produced per-set RMS
+    **384.26 mm** against the ``survey_coplanar_reject_mm`` gate of 8 mm. This is
+    NOT "off-plane points measured against the correct plane" (the docstring's
+    original, wrong explanation) -- ``fit_global_plane`` always re-derives its OWN
+    plane via an internal RANSAC pass over whatever points it is given; it never
+    receives or uses this function's ``plane_normal_cam``/``plane_point_cam`` at
+    all. With the floor as the 73.75% MAJORITY of the unfiltered points, THAT
+    internal RANSAC locks onto the floor (verified: its recovered plane's centroid
+    sits at z=-750, not z=0), and the reported 384.26 mm is the residual of the
+    MINORITY 567 table points against that WRONG (floor) plane:
+    ``750 mm (table-to-floor distance) * sqrt(567/2160) = 384.2 mm`` -- matching the
+    measurement (the 1593 floor points fit their own RANSAC-recovered plane almost
+    exactly, residual ~0). Filtering to a band around the plane ``survey_surface``
+    already fit for THIS exact frame (a real, independent detector -- not
+    ``fit_global_plane``'s own internal RANSAC) removes the floor points before
+    ``fit_global_plane`` ever sees them, so its internal RANSAC has nothing left to
+    lock onto but the table -- verified: the same fixture now measures **0.00 mm**
+    per-set RMS (only exact-zero floating-point residual from the synthetic
+    ray-plane intersection remains). See the Task 13 review fix reports for the
+    full before/after measurement and this mechanism trace.
     """
     d = np.asarray(depth, dtype=float)
     if d.ndim != 2 or d.size == 0:
-        return np.zeros((0, 3), dtype=float)
+        return np.zeros((0, 3), dtype=float), 0.0, 0.0
     h, w = d.shape
     ys, xs = np.mgrid[0:h:stride, 0:w:stride]
+    n_grid_total = int(ys.size)
     z = d[ys, xs]
     valid = z > 0
-    if not np.any(valid):
-        return np.zeros((0, 3), dtype=float)
+    n_valid = int(np.count_nonzero(valid))
+    if n_valid == 0:
+        return np.zeros((0, 3), dtype=float), 0.0, 0.0
     xs_v = xs[valid].astype(float)
     ys_v = ys[valid].astype(float)
     z_v = z[valid].astype(float)
@@ -558,13 +599,19 @@ def _deproject_plane_points_mm(depth, K, T_base_cam, *, plane_normal_cam,
     n = n / max(float(np.linalg.norm(n)), 1e-9)
     p0 = np.asarray(plane_point_cam, dtype=float)
     dist = np.abs((pts_cam - p0) @ n)
-    pts_cam = pts_cam[dist <= float(band_mm)]
+    keep = dist <= float(band_mm)
+    n_inliers = int(np.count_nonzero(keep))
+    pts_cam = pts_cam[keep]
+
+    purity_frac = n_inliers / n_valid
+    coverage_frac = n_inliers / n_grid_total
+
     if len(pts_cam) == 0:
-        return np.zeros((0, 3), dtype=float)
+        return np.zeros((0, 3), dtype=float), purity_frac, coverage_frac
 
     pts_cam_h = np.column_stack([pts_cam, np.ones(len(pts_cam))])
     T = np.asarray(T_base_cam, dtype=float)
-    return (pts_cam_h @ T.T)[:, :3]
+    return (pts_cam_h @ T.T)[:, :3], purity_frac, coverage_frac
 
 
 def _boundary_polygon_uv(scfg, color) -> "np.ndarray | None":
@@ -679,15 +726,79 @@ def five_position_capture(services, survey: FivePositionSurvey) -> dict:
         raise RuntimeError(
             f"{kind} capture: the robot moved between the two robot-state reads "
             "taken for this capture - stop the robot and remeasure")
+
+    if kind != "center" and not measurement.detected:
+        # _authoritative_acquisition's own survey_surface() call uses
+        # _survey_thresholds(scfg)'s min_valid_depth_frac default (0.3 -- a
+        # centre-patch-style "is there a substantial surface in frame" sanity
+        # floor, appropriate for the compact lock and the CENTRE step, where a
+        # well-aimed capture fills most of the frame). A well-aimed CORNER
+        # capture legitimately cannot clear that: centring the reticle on a
+        # 90-degree corner caps real coverage at 25% of the frame (see
+        # survey_corner_min_plane_coverage_frac's own config comment) -- below
+        # the 0.3 floor -- so a capture at a corner's geometric BEST would be
+        # misreported as "no usable surface plane detected" before this
+        # function's own purity/coverage checks ever run (this is the "two
+        # thresholds uncoordinated" observation from the Task 13 review). Rather
+        # than touch _authoritative_acquisition (the review's protected
+        # refactor) or SurveyThresholds' own default (shared with the compact
+        # lock), re-run survey_surface here on the frame already fetched -- a
+        # second, cheap, pure-numpy RANSAC pass, not a second camera grab --
+        # scoped to corner steps only, at the small fixed sanity floor
+        # (_CORNER_DETECT_SANITY_FRAC, not survey_corner_min_plane_coverage_frac
+        # -- see that constant's own comment for why reusing one value for both
+        # would make the coverage gate below unreachable).
+        corner_th = replace(_survey_thresholds(scfg),
+                            min_valid_depth_frac=_CORNER_DETECT_SANITY_FRAC)
+        measurement = survey_surface(frame.depth, K, corner_th, depth_scale=scfg.depth_scale)
+
     if not measurement.detected:
         raise RuntimeError(
             f"{kind} capture: no usable surface plane detected - reposition and recapture")
 
     T_base_cam = snapshot.camera_T_np()
-    plane_points_base = _deproject_plane_points_mm(
+    plane_points_base, plane_purity_frac, plane_coverage_frac = _deproject_plane_points_mm(
         frame.depth, K, T_base_cam, plane_normal_cam=measurement.normal_cam,
         plane_point_cam=measurement.centroid_cam_mm,
         band_mm=float(scfg.survey_plane_inlier_band_mm))
+
+    # CaptureRecord.valid_frac: the CENTRE step keeps the coarse centre-patch metric
+    # (`reading.valid_frac`) -- the reticle really does sit ON the surface there, so
+    # "is the centre of frame valid?" is the right question, matching the compact
+    # lock's own convention (Task 13 review, remedy ii). A CORNER step's reticle
+    # straddles the table/background boundary BY DESIGN (it is aimed AT the corner),
+    # so that same question is the WRONG one: a corner shot aimed past the table into
+    # open space beyond the D435i's reliable range returns zeros there and would be
+    # spuriously rejected ("not enough valid depth") even though the visible table
+    # portion is perfectly good. `plane_purity_frac` (see _deproject_plane_points_mm)
+    # answers the question that actually matters for a corner -- of the depth we DID
+    # get, how much of it is trustworthy -- and is robust to whether the missing
+    # portion of the frame is silent (0 depth) or a real, off-plane surface.
+    #
+    # Coverage is gated SEPARATELY, before add_capture, using a corner-specific
+    # threshold: purity_frac alone cannot catch "genuinely too little table in view"
+    # (a tiny-but-clean sliver against silence also reads purity_frac ~1.0), and the
+    # SHARED add_capture gate (scfg.min_valid_depth_frac, default 0.5, tuned for the
+    # compact lock's typically near-full-frame centre-patch coverage) cannot use a
+    # looser number for corners without changing behaviour for every OTHER step and
+    # path that field feeds -- so it is checked here instead, against a threshold
+    # sized for what a corner can ever legitimately achieve: centring the reticle
+    # exactly on a 90-degree corner caps real table coverage at 25% of the frame (a
+    # geometric ceiling, not a fixture artefact -- confirmed by ray-tracing all four
+    # corners of the test table), so scan.survey_corner_min_plane_coverage_frac
+    # defaults well below that (0.10), admitting normal aiming imprecision while
+    # still refusing a genuinely-too-small sliver.
+    if kind != "center":
+        if plane_coverage_frac < float(scfg.survey_corner_min_plane_coverage_frac):
+            raise RuntimeError(
+                f"{kind} capture: only {plane_coverage_frac:.0%} of the frame is on "
+                "the work plane (< "
+                f"{float(scfg.survey_corner_min_plane_coverage_frac):.0%} minimum) - "
+                "too little of the table is in view; move closer to the corner or "
+                "reposition and recapture")
+        valid_frac = plane_purity_frac
+    else:
+        valid_frac = float(reading.valid_frac)
 
     R, t = T_base_cam[:3, :3], T_base_cam[:3, 3]
     normal_base = R @ np.asarray(measurement.normal_cam, dtype=float)
@@ -699,7 +810,7 @@ def five_position_capture(services, survey: FivePositionSurvey) -> dict:
         kind=kind, robot=snapshot, measurement_ts=float(frame.timestamp),
         captured_at=snapshot.fetched_at, n_frames=int(n_frames),
         standoff_mm=float(measurement.standoff_mm), tilt_deg=float(measurement.tilt_deg),
-        valid_frac=float(reading.valid_frac), plane_rms_mm=_plane_rms_mm(frame.depth, K),
+        valid_frac=valid_frac, plane_rms_mm=_plane_rms_mm(frame.depth, K),
         plane_normal_base=tuple(float(v) for v in normal_base),
         plane_point_base=tuple(float(v) for v in point_base))
 

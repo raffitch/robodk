@@ -517,15 +517,30 @@ class ScanConfig(_Model):
     # Per-capture PLANE-INLIER band (mm, camera frame) for the coplanarity check's raw
     # input (Task 13 review Finding 1): a corner capture aims at a table corner, so a
     # large fraction of the frame legitimately looks past the table's two edges at
-    # background (floor, fixtures) far off the work plane. Deprojecting every valid
-    # depth pixel unfiltered inflates fit_global_plane's per-set RMS by roughly
-    # d*sqrt(f) for an off-plane fraction f at distance d -- measured 384 mm on a
-    # synthetic table with a floor 750 mm below, against the 8 mm reject gate above,
-    # i.e. every real corner capture would fail as "not coplanar." This band re-selects
-    # inliers around the plane survey_surface already fit (via RANSAC) for that exact
-    # frame -- matches its own default RANSAC inlier distance (survey.SurveyThresholds.
-    # ransac_distance_mm) so "inlier" means the same thing in both places.
+    # background (floor, fixtures) far off the work plane. fit_global_plane re-derives
+    # its OWN plane via an internal RANSAC over whatever points it is given -- with a
+    # majority-background frame that RANSAC locks onto the BACKGROUND, and the reported
+    # per-set RMS is really the minority table points' residual against that WRONG
+    # plane: measured 384 mm on a synthetic table with a floor 750 mm below (73.75%
+    # floor), against the 8 mm reject gate above -- every real corner capture would
+    # fail as "not coplanar." This band re-selects inliers around the plane
+    # survey_surface already fit (an independent detector, via its own RANSAC) for
+    # that exact frame -- matches its own default RANSAC inlier distance
+    # (survey.SurveyThresholds.ransac_distance_mm) so "inlier" means the same thing in
+    # both places -- removing the background BEFORE fit_global_plane's internal RANSAC
+    # ever sees it, so it has nothing left to lock onto but the table.
     survey_plane_inlier_band_mm: float = 6.0
+    # Minimum fraction of the FULL FRAME that must be on the work plane for a CORNER
+    # step (Task 13 review, remedy ii): purity alone (see _deproject_plane_points_mm)
+    # cannot catch "genuinely too little table in view" -- a tiny-but-clean sliver
+    # against an empty background also reads ~100% pure. Centring the reticle exactly
+    # on a 90-degree corner caps real coverage at 25% of the frame (a geometric
+    # ceiling: the two near edges, each a straight line through image centre, always
+    # quarter a rectangular frame -- confirmed by ray-tracing all four corners of the
+    # test table; independent of table size or standoff). 0.10 admits normal aiming
+    # imprecision around that ceiling while still refusing a genuinely-too-small
+    # sliver (e.g. the reticle mostly missing the platform).
+    survey_corner_min_plane_coverage_frac: float = 0.10
     # -- tiled close-range tour over a five-position-surveyed rectangle -----
     # (Task 12) A platform too large for one camera view is measured by the
     # five-position survey above, then TILED with overlapping close-range

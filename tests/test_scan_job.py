@@ -1354,15 +1354,34 @@ def _true_table_plane_cam(cx, cy, *, table_z=0.0):
     return m.normal_cam, m.centroid_cam_mm, m.standoff_mm, m.tilt_deg
 
 
-def _build_fakes_five_position_background(table_z_by_kind=None):
-    """A five-position-survey fake harness whose camera renders a REAL
-    background (floor) beyond the table edges (Finding 1's fixture), and
-    whose pose depends on state["cur_kind"] (set by the caller before each
-    capture) -- "center" looks straight down at the table centre; "cornerN"
-    looks straight down at that physical corner, matching how the guided UI
-    instructs the operator to centre the reticle on each position in turn.
+def _render_zero_background(T_base_cam, *, table_z=0.0):
+    """Like _render_with_floor, but the background is SILENT (0 depth) rather
+    than a real off-plane surface -- the D435i pointed past the table's edge
+    into open space beyond its reliable range, not at a nearby floor. Same
+    SimpleNamespace(color, depth, timestamp) shape as every other render
+    helper in this file."""
+    depth = _render_table_only(T_base_cam, table_z=table_z)
+    color = np.full((H, W, 3), 128, np.uint8)
+    return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP)
+
+
+def _build_fakes_five_position_background(table_z_by_kind=None, *, background="floor"):
+    """A five-position-survey fake harness whose pose depends on
+    state["cur_kind"] (set by the caller before each capture) -- "center"
+    looks straight down at the table centre; "cornerN" looks straight down
+    at that physical corner, matching how the guided UI instructs the
+    operator to centre the reticle on each position in turn.
+
+    ``background`` selects which of Finding 1's two failure modes the camera
+    renders beyond the table edges: ``"floor"`` (default) is a REAL off-plane
+    surface (a floor 750 mm below); ``"zero"`` is silence (0 depth, open
+    space beyond the D435i's reliable range) -- the mode remedy (ii)
+    (corner-appropriate valid_frac) specifically targets, since that mode is
+    invisible to the coarse centre-patch metric's replacement unless the
+    fixture actually renders it.
     """
     table_z_by_kind = table_z_by_kind or {}
+    render = _render_with_floor if background == "floor" else _render_zero_background
     state = {"cam": _look_at((0.0, 0.0, 420.0), (0.0, 0.0, 0.0)), "cur_kind": "center"}
     mount = Rt_to_T(np.eye(3), np.array([40.0, -15.0, 55.0]))
 
@@ -1384,7 +1403,7 @@ def _build_fakes_five_position_background(table_z_by_kind=None):
             T, _cx, _cy = _pose_for(state["cur_kind"])
             state["cam"] = T
             tz = table_z_by_kind.get(state["cur_kind"], 0.0)
-            return _render_with_floor(T, table_z=tz)
+            return render(T, table_z=tz)
 
     cfg = AppConfig()
     cfg.camera.intrinsics = {"320x240": K.tolist()}
@@ -1472,10 +1491,10 @@ def test_deproject_plane_points_mm_filters_background_to_plane_inliers():
     bg_frac = float(np.mean(depth_bg > 1000))
     assert bg_frac > 0.7, bg_frac      # a genuinely majority-background frame
 
-    pts_before = scan_service._deproject_plane_points_mm(
+    pts_before, purity_before, coverage_before = scan_service._deproject_plane_points_mm(
         depth_bg, K, T, plane_normal_cam=normal_cam, plane_point_cam=centroid_cam_mm,
         band_mm=1.0e6)                 # effectively unfiltered -- reproduces the pre-fix behaviour
-    pts_after = scan_service._deproject_plane_points_mm(
+    pts_after, purity_after, coverage_after = scan_service._deproject_plane_points_mm(
         depth_bg, K, T, plane_normal_cam=normal_cam, plane_point_cam=centroid_cam_mm,
         band_mm=6.0)                   # the scan.survey_plane_inlier_band_mm default
 
@@ -1487,18 +1506,45 @@ def test_deproject_plane_points_mm_filters_background_to_plane_inliers():
     assert rms_after < 1.0, rms_after          # measured 0.00 mm
     assert len(pts_after) < len(pts_before)    # background points were actually dropped
     assert np.all(np.abs(pts_after[:, 2]) < 1.0), "filtered points must be on the table (z~0), not the floor"
+    # purity/coverage after the fix: with band_mm=1e6 every valid pixel survives, so
+    # purity_before is trivially 1.0 (not informative -- band=1e6 disables filtering
+    # entirely); the AFTER values are the real per-corner-step metrics five_position_
+    # capture now uses (remedy ii) -- with a REAL majority-background floor filling
+    # the frame, purity/coverage are both ~26%, correctly reflecting how much of this
+    # particular capture is genuinely trustworthy table.
+    assert purity_before == 1.0, purity_before
+    assert 0.2 < purity_after < 0.3, purity_after
+    assert 0.2 < coverage_after < 0.3, coverage_after
     print(f"[Finding 1] bg_frac={bg_frac:.3f} n_before={len(pts_before)} rms_before={rms_before:.2f} mm "
-          f"-> n_after={len(pts_after)} rms_after={rms_after:.4f} mm")
+          f"-> n_after={len(pts_after)} rms_after={rms_after:.4f} mm; "
+          f"purity_after={purity_after:.3f} coverage_after={coverage_after:.3f}")
 
 
-def test_five_position_survey_accepts_captures_with_real_background_depth():
-    """Finding 1's end-to-end positive proof: a full five-position survey
-    (center + 4 corners) driven through the REAL five_position_capture, with
-    a REAL floor visible beyond every corner's near edges, is ACCEPTED at
-    every step (plane_points_base land on the table, not the floor) and
-    finish() succeeds -- a genuinely flat, coplanar table is not refused just
-    because its corner captures see real background."""
-    services, state = _build_fakes_five_position_background()
+def test_five_position_survey_accepts_captures_with_zero_background_depth():
+    """Finding 1 remedy (ii)'s end-to-end positive proof: a full five-position
+    survey (center + 4 corners) driven through the REAL five_position_capture,
+    with SILENT (0 depth) background beyond every corner's near edges -- the
+    D435i pointed past the table into open space beyond its reliable range,
+    not at a nearby floor -- is ACCEPTED at every step and finish() succeeds.
+
+    This is exactly the scenario the coarse centre-patch metric got wrong
+    (mode (b) of the original Finding 1): the reticle straddles the table/
+    background boundary by design at a corner, so a patch centred there sees
+    a lot of 0-depth void even on a perfectly good capture, and would have
+    been spuriously rejected as "not enough valid depth." The plane-inlier
+    PURITY metric (survivors of the band filter / all pixels with ANY valid
+    depth) is robust to this: with nothing else providing depth, virtually
+    every valid pixel IS on the table, so purity reads near 1.0 regardless of
+    how little of the FRAME the table fills.
+
+    Verified against the code before this fix: with CaptureRecord.valid_frac
+    still fed the CENTRE-PATCH metric for corner steps, this exact fixture
+    fails at add_capture with "not enough valid depth in the capture" (the
+    centre 25% patch, centred on the corner, is itself mostly the 0-depth
+    void) -- reproduced by temporarily reverting five_position_capture's
+    valid_frac line back to `float(reading.valid_frac)` and re-running this
+    test, which then fails exactly that way."""
+    services, state = _build_fakes_five_position_background(background="zero")
     services.config.scan.boundary_engine = "color"
     survey = FivePositionSurvey(services.config.scan)
     patched, unpatch = _patch_boundary_and_plane_for_five_position_background({})
@@ -1509,6 +1555,9 @@ def test_five_position_survey_accepts_captures_with_real_background_depth():
             st = scan_service.five_position_capture(services, survey)
             pts = survey._accepted[kind].plane_points_base
             assert np.all(np.abs(pts[:, 2]) < 1.0), (kind, pts[:, 2].min(), pts[:, 2].max())
+            if kind != "center":
+                purity = survey._accepted[kind].record.valid_frac
+                assert purity > 0.9, (kind, purity)   # near-pure: nothing else provides depth
         assert survey.step == "review"
         record = survey.finish(calibration_id="cam-test",
                                locked_robot=scan_service.refresh_robot_state(services.rdk))
@@ -1516,18 +1565,144 @@ def test_five_position_survey_accepts_captures_with_real_background_depth():
         assert max(record.quality["per_position_rms_mm"]) < 1.0, record.quality
     finally:
         unpatch()
-    print("[Finding 1] full 5-position survey with real background depth -> accepted + finish() succeeded")
+    print("[Finding 1 remedy ii] full 5-position survey with SILENT background -> "
+          "accepted (purity ~1.0 at every corner) + finish() succeeded")
+
+
+def test_five_position_survey_rejects_too_little_table_in_view():
+    """Finding 1 remedy (ii)'s end-to-end negative proof (the other half of
+    "pin the metric in both directions"): a corner capture whose reticle sits
+    exactly on the table corner sees a REAL, coherent off-plane surface (a
+    floor 750 mm below) filling ~74% of the frame -- only ~26% is genuinely
+    trustworthy table. That is exactly "too little of the table in view" in
+    the sense that matters (most of what this capture measured is NOT the
+    work surface), and must still be REJECTED, not waved through just
+    because the plane-inlier COPLANARITY fix (Finding 1's Critical remedy)
+    can salvage the minority table points for the RMS calculation.
+
+    This reuses the SAME fixture the original Finding-1 "accepts real
+    background" test used before this round -- once corner steps compare a
+    genuine purity/coverage fraction (~26%) against
+    scan.min_valid_depth_frac (0.5) and scan.survey_corner_min_plane_coverage_frac
+    (0.10), the ~26% purity fails the FIRST (broader) gate. (The narrower
+    coverage gate, calibrated to the ~25% ceiling for a WELL-aimed corner, is
+    exercised separately by the tiny-sliver test below -- purity is what
+    actually fires here, since it is the stricter of the two for a frame this
+    contaminated.)"""
+    services, state = _build_fakes_five_position_background(background="floor")
+    services.config.scan.boundary_engine = "color"
+    survey = FivePositionSurvey(services.config.scan)
+    patched, unpatch = _patch_boundary_and_plane_for_five_position_background({})
+    try:
+        state["cur_kind"] = "center"
+        patched.cur = "center"
+        scan_service.five_position_capture(services, survey)   # center: unaffected, accepted
+        assert survey.step == "corner1"
+
+        state["cur_kind"] = "corner1"
+        patched.cur = "corner1"
+        try:
+            scan_service.five_position_capture(services, survey)
+            raise AssertionError("expected the majority-background corner capture to be rejected")
+        except RuntimeError as e:
+            assert "not enough valid depth" in str(e), e
+        assert survey.step == "corner1"   # rejected capture must not have been accepted
+    finally:
+        unpatch()
+    print("[Finding 1 remedy ii] majority-background corner capture (~26% purity) correctly rejected")
+
+
+def test_five_position_capture_rejects_tiny_table_sliver_via_coverage_gate():
+    """Finding 1 remedy (ii)'s coverage-specific gate (the NEW corner-specific
+    config key, scan.survey_corner_min_plane_coverage_frac): purity alone
+    cannot catch "genuinely too little table in view" when the background is
+    SILENT, since a tiny-but-clean sliver against a 0-depth void also reads
+    purity ~1.0 -- exactly the blind spot the review flagged. Shrinks the
+    table to a sliver far too small to be a usable corner capture (a fraction
+    of the ~25% ceiling a well-aimed corner shot achieves) while keeping the
+    background silent, and confirms coverage (not purity) is what catches it."""
+    # 80x80 mm sliver, vs the normal 300x300 mm table: ~4.3% coverage -- above
+    # five_position_capture's own small RANSAC-attempt sanity floor (2%, just
+    # enough real depth to try a plane fit at all) but comfortably below
+    # scan.survey_corner_min_plane_coverage_frac (0.10), so this pins the
+    # COVERAGE gate specifically, not the earlier detection retry.
+    tiny_half_mm = 40.0
+    cx, cy = _FIVE_POS_WORLD_CORNERS["corner1"]
+    T = _look_at((cx, cy, 420.0), (cx, cy, 0.0))
+
+    def render_tiny(T_base_cam):
+        fx, fy, ccx, ccy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        us, vs = np.meshgrid(np.arange(W), np.arange(H))
+        dirs_cam = np.stack([(us - ccx) / fx, (vs - ccy) / fy, np.ones_like(us, float)], -1)
+        R, t = T_base_cam[:3, :3], T_base_cam[:3, 3]
+        dirs_base = dirs_cam @ R.T
+        dz = dirs_base[..., 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s = (0.0 - t[2]) / dz
+        P = t + s[..., None] * dirs_base
+        valid = ((np.abs(P[..., 0] - cx) <= tiny_half_mm) & (np.abs(P[..., 1] - cy) <= tiny_half_mm)
+                 & (s > 0) & np.isfinite(s))
+        depth = np.where(valid, s, 0).astype(np.uint16)
+        color = np.full((H, W, 3), 128, np.uint8)
+        return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP)
+
+    # Unit-level sanity first: prove purity alone would be misled, coverage is not.
+    tiny_frame = render_tiny(T)
+    normal_cam, centroid_cam_mm, _standoff_mm, _tilt = _true_table_plane_cam(cx, cy)
+    _pts, purity, coverage = scan_service._deproject_plane_points_mm(
+        tiny_frame.depth, K, T, plane_normal_cam=normal_cam, plane_point_cam=centroid_cam_mm,
+        band_mm=6.0)
+    assert purity > 0.9, purity          # the blind spot: silent bg -> purity looks fine
+    assert coverage < 0.05, coverage     # but coverage correctly shows almost nothing is there
+
+    # Now end to end: a normal "center" capture, then a corner1 whose camera grab is
+    # swapped for the tiny-sliver render (everything else -- pose, driver, boundary
+    # stub -- stays the real fixture machinery every other pipeline test uses).
+    services, state = _build_fakes_five_position_background(background="zero")
+    real_grab = services.camera.grab
+
+    def grab_tiny_for_corner1(*a, **kw):
+        if state["cur_kind"] == "corner1":
+            state["cam"] = T
+            return render_tiny(T)
+        return real_grab(*a, **kw)
+
+    services.camera.grab = grab_tiny_for_corner1
+    services.config.scan.boundary_engine = "color"
+    survey = FivePositionSurvey(services.config.scan)
+    patched, unpatch = _patch_boundary_and_plane_for_five_position_background({})
+    try:
+        state["cur_kind"] = "center"
+        patched.cur = "center"
+        scan_service.five_position_capture(services, survey)
+        assert survey.step == "corner1"
+
+        state["cur_kind"] = "corner1"
+        patched.cur = "corner1"
+        try:
+            scan_service.five_position_capture(services, survey)
+            raise AssertionError("expected the tiny table sliver to be rejected by the coverage gate")
+        except RuntimeError as e:
+            assert "too little of the table is in view" in str(e), e
+        assert survey.step == "corner1"    # rejected capture must not have been accepted
+    finally:
+        unpatch()
+    print(f"[Finding 1 remedy ii] tiny table sliver: purity={purity:.3f} (looks fine) "
+          f"coverage={coverage:.3f} (correctly low) -> coverage gate rejected it")
 
 
 def test_five_position_survey_still_rejects_genuine_noncoplanarity_with_background():
-    """Finding 1's end-to-end negative proof: the SAME background-contaminated
-    pipeline must still REFUSE a genuinely non-coplanar surface -- proving the
-    per-capture plane-inlier filter (which only removes THIS capture's own
-    off-plane background) does not also defeat the SEPARATE cross-position
-    coplanarity check (fit_global_plane's per-set RMS against the pooled
-    global plane). corner4's table is rendered 50 mm above the other four
-    positions' -- each capture is still internally flat (passes add_capture
-    on its own), but finish() must catch the cross-position discrepancy."""
+    """Finding 1's end-to-end negative proof: the SAME pipeline must still
+    REFUSE a genuinely non-coplanar surface -- proving the per-capture
+    plane-inlier filter (which only removes THIS capture's own off-plane
+    background) does not also defeat the SEPARATE cross-position coplanarity
+    check (fit_global_plane's per-set RMS against the pooled global plane).
+    Uses the SILENT-background fixture (background="zero") so every
+    individual capture is accepted on its own merits (matching the
+    "accepts" test above) -- corner4's table is rendered 50 mm above the
+    other four positions', so each capture is still internally flat (passes
+    add_capture on its own), but finish() must catch the cross-position
+    discrepancy."""
     table_z_by_kind = {"corner4": 50.0}
     # BOTH the fake camera (the actual rendered depth) and the plane stub (what
     # survey_surface is told the true plane is) must agree on the shift, or the
@@ -1535,7 +1710,7 @@ def test_five_position_survey_still_rejects_genuine_noncoplanarity_with_backgrou
     # heights and every point gets filtered out as "off-plane" -- a fixture
     # bug, not a production one; caught by this test itself failing loudly
     # ("too few plane points") rather than silently mis-testing something else.
-    services, state = _build_fakes_five_position_background(table_z_by_kind)
+    services, state = _build_fakes_five_position_background(table_z_by_kind, background="zero")
     services.config.scan.boundary_engine = "color"
     survey = FivePositionSurvey(services.config.scan)
     patched, unpatch = _patch_boundary_and_plane_for_five_position_background(table_z_by_kind)
