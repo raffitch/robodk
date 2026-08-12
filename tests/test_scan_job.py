@@ -35,6 +35,9 @@ W, H = 320, 240
 K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
 TABLE_HALF_MM = 150.0
 _ORIG_ROOT = runs.REPO_ROOT
+# A fixed, deterministic, non-zero "camera frame timestamp (server clock)" so tests
+# can assert the locked survey record's measurement_ts is real (not the 0.0 default).
+FRAME_TIMESTAMP = 1_700_000_000.5
 
 
 class _Ctx(JobContext):
@@ -69,7 +72,7 @@ def _render(T_base_cam):
              & (s > 0) & np.isfinite(s))
     depth = np.where(valid, s, 0).astype(np.uint16)
     color = np.full((H, W, 3), 128, np.uint8)
-    return SimpleNamespace(color=color, depth=depth, timestamp=0.0)
+    return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP)
 
 
 def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
@@ -285,7 +288,13 @@ def test_lock_builds_locked_workframe_survey_compact():
     assert rec.calibration_id.startswith("cam-")
     assert rec.locked_robot.stationary is True
     assert locked.lock_token != ""
-    print("[survey record] compact lock ->", rec.mode, rec.boundary_provenance)
+    # measurement_ts must be the real camera-frame timestamp (server clock), not the
+    # 0.0 default that silently landed there when the record read a nonexistent
+    # gate_payload["measurement_ts"] key.
+    assert rec.captures[0].measurement_ts == FRAME_TIMESTAMP
+    assert rec.captures[0].measurement_ts != 0.0
+    print("[survey record] compact lock ->", rec.mode, rec.boundary_provenance,
+          "measurement_ts", rec.captures[0].measurement_ts)
 
 
 def test_lock_crop_is_user_specified_with_declared_size():
@@ -301,6 +310,33 @@ def test_lock_crop_is_user_specified_with_declared_size():
     assert rec.boundary_provenance == PROVENANCE_USER_SPECIFIED
     assert sorted(rec.size_mm, reverse=True) == [1200.0, 900.0]
     print("[survey record] crop lock -> user-specified", rec.size_mm)
+
+
+def test_lock_auto_crop_overrun_builds_no_survey_record_but_warns():
+    """An auto-detected crop (the surface overruns the view, no force_crop) is a
+    silent SYSTEM fallback, not an operator declaration — tagging it USER_SPECIFIED
+    would be a false provenance claim (spec §1/§12). No survey record is built; the
+    gate payload instead carries a human-readable warning. Everything else about the
+    lock (readiness, the crop overlay, the lock_token) still works as before.
+    """
+    global TABLE_HALF_MM
+    saved = TABLE_HALF_MM
+    TABLE_HALF_MM = 1000.0
+    try:
+        services, state = _build_fakes()
+        state["cam"] = _look_at((0, 0, 310), (0, 0, 0))
+        locked = scan_service.lock_scan_surface(services)
+        assert locked.gate_payload["ok"] is True, locked.gate_payload
+        assert locked.gate_payload["surface_mode"] == "crop", locked.gate_payload
+        assert locked.survey_record is None
+        assert "boundary_provenance" not in locked.gate_payload
+        assert "survey" not in locked.gate_payload
+        assert locked.gate_payload.get("warnings"), locked.gate_payload
+        assert locked.lock_token != ""
+    finally:
+        TABLE_HALF_MM = saved
+    print("[survey record] auto-overrun crop -> no record, warning:",
+          locked.gate_payload["warnings"][-1])
 
 
 def test_lock_gate_event_carries_survey_and_provenance():
@@ -628,6 +664,7 @@ if __name__ == "__main__":
     test_lock_then_create_targets_reuses_frozen_surface()
     test_lock_builds_locked_workframe_survey_compact()
     test_lock_crop_is_user_specified_with_declared_size()
+    test_lock_auto_crop_overrun_builds_no_survey_record_but_warns()
     test_lock_gate_event_carries_survey_and_provenance()
     test_targets_report_surface_coverage_from_footprint()
     test_save_views_persists_per_pose_frames()

@@ -23,7 +23,7 @@ import base64
 import json
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 
 import cv2
@@ -82,7 +82,8 @@ class LockedScanSurface:
 
 
 def _crop_gate_payload(gate_payload: dict, scfg, K, image_size, look_mm: float,
-                       survey=None, user_region_mm: tuple[float, float] | None = None) -> dict:
+                       survey=None, user_region_mm: tuple[float, float] | None = None
+                       ) -> tuple[dict, "np.ndarray | None"]:
     """Force the locked surface into reticle-crop mode.
 
     This is the operator escape hatch for cases where a finite rectangle/dot overlay
@@ -90,6 +91,14 @@ def _crop_gate_payload(gate_payload: dict, scfg, K, image_size, look_mm: float,
     ``user_region_mm``, when given, declares the crop rectangle's size explicitly
     (the operator-specified work region) instead of the generic ``scfg.work_crop_mm``
     square.
+
+    Pure: neither ``gate_payload`` nor ``survey`` is mutated. Returns
+    ``(payload, corners_cam_mm)`` — a new payload dict, and the crop rectangle's
+    corners (camera frame, mm) so the caller can fold them into its own survey
+    object (e.g. via ``dataclasses.replace``) instead of this function reaching into
+    someone else's object. ``corners_cam_mm`` is ``None`` when the crop rectangle
+    could not be computed (survey not detected / not enough info) — the payload is
+    still valid in that case, just without an updated overlay.
     """
     out = dict(gate_payload)
     gates = dict(out.get("gates") or {})
@@ -102,23 +111,19 @@ def _crop_gate_payload(gate_payload: dict, scfg, K, image_size, look_mm: float,
     out["fully_framed"] = False
     out["crop_size_mm"] = _large_surface_crop_mm(scfg, K, image_size, look_mm, user_region_mm)
     out["rectangle_size_mm"] = list(out["crop_size_mm"])
+    corners_cam_mm = None
     if survey is not None and getattr(survey, "detected", False):
         try:
             corners, _u, _v, _reticle = reticle_plane_square(
                 np.asarray(survey.normal_cam, float),
                 np.asarray(survey.centroid_cam_mm, float),
                 tuple(out["crop_size_mm"]))
-            # Overwrite the survey's rectangle corners with this declared crop square
-            # (camera frame, mm) — a fully-framed survey would otherwise still hold the
-            # MEASURED board rectangle, not the crop the operator/gate actually wants.
-            # Downstream (the locked-survey record) reuses this same field, so it picks
-            # up the declared size without a second geometry path.
-            survey.corners_cam_mm = np.asarray(corners, float)
+            corners_cam_mm = np.asarray(corners, float)
             W, H = image_size
             fx, fy = float(K[0, 0]), float(K[1, 1])
             cx, cy = float(K[0, 2]), float(K[1, 2])
             outline = []
-            for p in np.asarray(corners, float):
+            for p in corners_cam_mm:
                 if float(p[2]) <= 0:
                     continue
                 outline.append([
@@ -129,8 +134,8 @@ def _crop_gate_payload(gate_payload: dict, scfg, K, image_size, look_mm: float,
                 out["outline_uv"] = outline
                 out["grid_uv"] = None
         except Exception:
-            pass
-    return out
+            corners_cam_mm = None
+    return out, corners_cam_mm
 
 
 def _large_surface_crop_mm(scfg, K, image_size, look_mm: float,
@@ -343,9 +348,15 @@ def lock_scan_surface(services, *, force_crop: bool = False,
         ok_gates.pop("center", None)
     gate_payload["ok"] = all(ok_gates.values())
     if crop_mode and reading.distance_mm is not None:
-        gate_payload = _crop_gate_payload(
+        gate_payload, crop_corners_cam_mm = _crop_gate_payload(
             gate_payload, scfg, K, cfg.camera.size, float(reading.distance_mm),
             survey=survey, user_region_mm=user_region_mm)
+        if crop_corners_cam_mm is not None:
+            # Rebind to a corrected local copy rather than mutating the shared
+            # ``survey`` object in place (_crop_gate_payload is pure). This same
+            # local is used for the rest of the lock (record building below, and
+            # the LockedScanSurface.survey the caller/generate_scan_targets reads).
+            survey = replace(survey, corners_cam_mm=crop_corners_cam_mm)
 
     # Explicit robot-state refresh (§9): a real double-read of joints + the derived
     # camera pose, tagged stationary/moving, rather than a bare current_joints() call.
@@ -356,15 +367,32 @@ def lock_scan_surface(services, *, force_crop: bool = False,
     seed_T = snapshot.camera_T_np()
     seed_joints = list(snapshot.joints)
 
-    mode = MODE_USER_SPECIFIED if crop_mode else MODE_COMPACT
-    plane_rms = _plane_rms_mm(depth, K)
-    record = _survey_record_from_lock(
-        survey, seed_T, snapshot, services.config.camera,
-        mode=mode, n_frames=len(frames), measurement_ts=gate_payload.get("measurement_ts", 0.0),
-        valid_frac=gate_payload.get("valid_frac", 0.0), plane_rms_mm=plane_rms)
-    if record is not None:
-        gate_payload["survey"] = record.to_dict()
-        gate_payload["boundary_provenance"] = record.boundary_provenance
+    # Boundary provenance (spec §1 / §12): a survey record is built only when the
+    # boundary was either MEASURED (the normal compact path, crop_mode False) or
+    # EXPLICITLY DECLARED by the operator (force_crop — today's "region" mode).
+    # crop_mode alone is NOT that discriminator: it also goes true automatically
+    # when the surface overruns the camera view (surface_overruns_view), and that
+    # is the system silently falling back, not the operator specifying anything —
+    # tagging it "user specified" would be a false provenance claim. In that
+    # auto-overrun-without-force_crop case, leave survey_record/boundary_provenance
+    # unset and surface a warning instead; everything else about the lock (gate
+    # readiness, the crop overlay/outline_uv, etc.) is unaffected.
+    record = None
+    if force_crop or not crop_mode:
+        mode = MODE_USER_SPECIFIED if force_crop else MODE_COMPACT
+        plane_rms = _plane_rms_mm(depth, K)
+        record = _survey_record_from_lock(
+            survey, seed_T, snapshot, services.config.camera,
+            mode=mode, n_frames=len(frames), measurement_ts=frame.timestamp,
+            valid_frac=gate_payload.get("valid_frac", 0.0), plane_rms_mm=plane_rms)
+        if record is not None:
+            gate_payload["survey"] = record.to_dict()
+            gate_payload["boundary_provenance"] = record.boundary_provenance
+    else:
+        gate_payload.setdefault("warnings", []).append(
+            "the surface overruns the camera view, so its boundary is unverified — "
+            "declare a region (crop mode) or run a multi-position survey before "
+            "relying on this lock's geometry.")
 
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:
