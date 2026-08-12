@@ -93,6 +93,18 @@ export default function SurveyPanel({ event, onFinished, onCancelled }: Props) {
   // for, and could machine-gun GET /survey/state during live streaming).
   const onCancelledRef = useRef(onCancelled);
   useEffect(() => { onCancelledRef.current = onCancelled; }, [onCancelled]);
+  // POST /survey/finish is a slow, plain `def` route (RoboDK RPC + a geometry fit)
+  // sharing Starlette's threadpool with the trivial GET /survey/state, so a poll
+  // tick issued while finish is in flight can have its response race ahead of the
+  // finish response and land AFTER the server has already cleared its survey object
+  // (survey_finish's last step) but BEFORE this component has recorded the report —
+  // i.e. it would see {step: null} and misread "finished" as "cancelled". Set
+  // synchronously (no await before this line) the instant doFinish is invoked, so
+  // every poll/ws tick that resolves from then on — regardless of whether the finish
+  // call itself has resolved yet — is held off by the guard in refresh()/the event
+  // effect below until the outcome (report or finishError) is known. See the fix
+  // report for how the JS single-threaded ordering was verified.
+  const finishingRef = useRef(false);
 
   const noticeEnded = useCallback(() => {
     if (endedRef.current) return;
@@ -103,7 +115,7 @@ export default function SurveyPanel({ event, onFinished, onCancelled }: Props) {
   const refresh = useCallback(async () => {
     try {
       const s = await api.get<SurveyState>("/survey/state");
-      if (doneRef.current) return;
+      if (doneRef.current || finishingRef.current) return;
       if (s.step == null) { noticeEnded(); return; }
       setState(s);
     } catch { /* transient network hiccup — the next poll/ws tick catches up */ }
@@ -116,7 +128,7 @@ export default function SurveyPanel({ event, onFinished, onCancelled }: Props) {
     return () => window.clearInterval(id);
   }, [refresh, report]);
   useEffect(() => {
-    if (!event || doneRef.current) return;
+    if (!event || doneRef.current || finishingRef.current) return;
     if (event.step == null) { noticeEnded(); return; }
     setState(event);
   }, [event, noticeEnded]);
@@ -140,12 +152,22 @@ export default function SurveyPanel({ event, onFinished, onCancelled }: Props) {
   };
 
   const doFinish = async () => {
+    // Set BEFORE the request goes out (nothing awaited yet in this function), so
+    // every poll/ws tick that can possibly resolve during the request is guarded —
+    // see finishingRef's own comment for the race this closes.
+    finishingRef.current = true;
     setFinishing(true); setFinishError(null);
     try {
       const r = await api.post<SurveyReport>("/survey/finish");
       doneRef.current = true;
       setReport(r);
-    } catch (e: any) { setFinishError(e.message); }
+    } catch (e: any) {
+      setFinishError(e.message);
+      // A failed finish leaves the survey active server-side (still at "review"),
+      // so polling must resume normally — only a SUCCESSFUL finish (doneRef above)
+      // should keep it suppressed permanently.
+      finishingRef.current = false;
+    }
     finally { setFinishing(false); }
   };
 
@@ -283,6 +305,17 @@ function StepStrip({ currentStep, accepted, done }:
 // corners out of order, which a geometrically "corrected" re-sort would hide.
 function SurveyDiagram({ state }: { state: SurveyState | null }) {
   const W = 220, H = 180, PAD = 26;
+  // Positional zip: cornerKinds[i] is assumed to be the kind that produced
+  // corners_base[i]. This relies on two invariants of the BACKEND's state shape
+  // (FivePositionSurvey.state(), five_position.py) that are not encoded in the
+  // TypeScript types and would silently misalign if either changed: (1) "center"
+  // string-sorts before every "cornerN" key AND contributes no corners_base entry
+  // (its evidence is always None), so filtering it out here exactly matches what
+  // the backend already excluded server-side; (2) "corner1".."corner4" string-sort
+  // in the same order as their numeric suffixes (true only because they are all
+  // single digits) — corners_base is built from `sorted(self._accepted.items())`,
+  // so re-sorting cornerKinds the same way keeps the two arrays in lockstep even
+  // when an earlier corner is missing (recaptured) while later ones remain.
   const cornerKinds = (state?.accepted ?? []).filter((k) => k !== "center").sort();
   const points = state?.corners_base ?? [];
   const labeled = cornerKinds

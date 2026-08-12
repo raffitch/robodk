@@ -250,9 +250,26 @@ export default function Scan() {
     setCollision(r);
     addLog(`ignored collision pair: ${pair}`);
   }, []);
+  // Task 14 review Finding 2: a guided five-position survey can be left in progress
+  // on the backend (a page refresh, a second tab, navigating away and back) with
+  // nothing client-side to show for it — survey_begin's own docstring says it
+  // REPLACES any prior in-progress survey and DISCARDS its captures, and each
+  // capture cost a real jog-stop-measure cycle on the physical robot. On mount,
+  // resume straight into SurveyPanel instead of ever offering a fresh "begin" that
+  // would silently discard real work.
+  const hydrateSurvey = useCallback(async () => {
+    try {
+      const r = await api.get<SurveyState>("/survey/state");
+      if (r.step != null) {
+        setSurveyEvent(r);
+        setSurveyActive(true);
+        addLog(`resuming an in-progress guided survey (step: ${r.step}).`);
+      }
+    } catch { /* opportunistic, same as hydrateConnection */ }
+  }, []);
 
-  useEffect(() => { loadConfig(); refreshJob(); hydrateConnection(); },
-            [loadConfig, refreshJob, hydrateConnection]);
+  useEffect(() => { loadConfig(); refreshJob(); hydrateConnection(); hydrateSurvey(); },
+            [loadConfig, refreshJob, hydrateConnection, hydrateSurvey]);
   useEffect(() => { liveRef.current = live; }, [live]);
   useEffect(() => () => {
     if (liveRef.current) sessionStorage.setItem("tasni:autoStartCamera", "calibration");
@@ -590,6 +607,19 @@ export default function Scan() {
   const beginSurvey = async () => {
     setSurveyStarting(true); setRunError(null);
     try {
+      // Task 14 review Finding 2: hydrateSurvey() only runs once on mount, so it
+      // cannot see a survey another tab/operator started AFTER this page loaded.
+      // Re-check right before the action that would discard captures (survey_begin
+      // replaces any in-progress survey) — this closes that window instead of
+      // merely narrowing it, so there is no remaining path where clicking this
+      // button can discard real jog-stop-measure work.
+      const existing = await api.get<SurveyState>("/survey/state");
+      if (existing.step != null) {
+        setSurveyEvent(existing);
+        setSurveyActive(true);
+        addLog(`an in-progress guided survey was already active (step: ${existing.step}) — resuming it.`);
+        return;
+      }
       await api.post<SurveyState>("/survey/begin");
       setSurveyEvent(null);
       setSurveyActive(true);
@@ -607,6 +637,16 @@ export default function Scan() {
     setSurveyActive(false);
     setSurveyEvent(null);
     setLive(false); resetStream();
+    // Follow-up 3 (Task 14 review): lockAndCreateTargets seeds a fresh authoritative
+    // `gate` from /surface/lock's own response (see its comment on why a stale
+    // pre-lock reading must not linger in the HUD). /survey/finish has no gate/reading
+    // field to source an equivalent snapshot from, so the closest match is to clear
+    // it outright — the same "fresh start, no stale carryover" semantics beginLive's
+    // own clearGate=true path already uses — rather than let a reading from
+    // somewhere the operator jogged WHILE measuring corners (not the final locked
+    // surface) linger until the next live gate tick happens to overwrite it.
+    setGate(null);
+    gateReceivedAtRef.current = 0;
     setSurfaceLocked(true);
     setSurfaceStable(false);
     resetCoverage();
