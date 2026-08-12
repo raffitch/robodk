@@ -333,17 +333,21 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .layer-readout { flex: 0 0 auto; display: grid; text-align: right; color: var(--muted); font-family: var(--mono);
   font-size: 11px; letter-spacing: .8px; }
 .layer-readout b { color: var(--accent); font-size: 14px; margin-top: 3px; }
-.birdseye-layout { display: grid; grid-template-columns: minmax(320px, 1fr) 260px; gap: 15px; align-items: stretch; }
-.birdseye-map { display: block; width: min(100%, 560px); aspect-ratio: 1; margin: 0 auto; border: 1px solid var(--border);
+.birdseye-layout { display: grid; grid-template-columns: minmax(360px, 1fr) 230px; gap: 15px; align-items: stretch; }
+.birdseye-map { display: block; width: min(100%, 720px); aspect-ratio: 640 / 440; margin: 0 auto; border: 1px solid var(--border);
   border-radius: 9px; background: #090d14; }
 .preview-axis { fill: #7d899c; font-size: 11px; font-family: var(--mono); }
-.layer-rail { max-height: 560px; overflow-y: auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+.preview-note { fill: #68768b; font-size: 10px; font-family: var(--mono); letter-spacing: .5px; }
+.stack-layer { cursor: pointer; }
+.stack-layer:hover path { stroke-opacity: 1; }
+.layer-rail { max-height: 495px; overflow-y: auto; display: grid; grid-template-columns: 1fr;
   gap: 8px; align-content: start; padding-right: 3px; }
-button.layer-tile { display: grid; grid-template-columns: 54px 1fr; grid-template-rows: 1fr 1fr; column-gap: 7px;
-  align-items: center; text-align: left; padding: 6px; background: var(--panel-2); color: var(--text);
+button.layer-tile { display: grid; grid-template-columns: 18px 1fr auto; gap: 8px;
+  align-items: center; text-align: left; padding: 9px 10px; background: var(--panel-2); color: var(--text);
   border: 1px solid var(--border); font-size: 11px; font-weight: 600; }
 button.layer-tile.selected { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(76,154,255,.3) inset; }
-.layer-tile .layer-mini-map { grid-row: 1 / 3; width: 54px; height: 54px; border-radius: 5px; }
+.layer-swatch { display: block; width: 14px; height: 4px; border-radius: 4px; background: #39d0bd; }
+button.layer-tile.selected .layer-swatch { background: #66a6ff; opacity: 1 !important; }
 .layer-tile small { color: var(--muted); font-family: var(--mono); }
 .preview-kv { margin-top: 14px; }
 .extrusion-safety { margin-top: 18px; border-left: 3px solid var(--warn); }

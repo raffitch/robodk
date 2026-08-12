@@ -48,37 +48,104 @@ const recipeFields: Array<{ key: keyof Recipe; label: string; min: number; max: 
   { key: "extrusion_rate_pct", label: "Extrusion rate", min: 0, max: 100, step: 1, unit: "%" },
 ];
 
-function Birdseye({ layer, radius, centerX, centerY, compact = false }: {
-  layer: Layer; radius: number; centerX: number; centerY: number; compact?: boolean;
+function BirdseyeStack({ plan, selectedLayer, onSelect }: {
+  plan: Plan; selectedLayer: number; onSelect: (layer: number) => void;
 }) {
+  const width = 640, height = 440, pad = 38;
+  const { radius_mm: radius, layer_height_mm: layerHeight } = plan.recipe;
+  const { center_x_mm: centerX, center_y_mm: centerY } = plan.setup;
+  const baseZ = plan.layers[0].nominal_z_mm;
+  const topZ = plan.layers[plan.layers.length - 1].nominal_z_mm;
+  const actualHeight = Math.max(0, topZ - baseZ);
+  // Thin real layers need a modest vertical exaggeration to remain individually
+  // visible. XY stays exact; the displayed factor makes the visualization honest.
+  const desiredHeight = plan.layers.length > 1
+    ? Math.min(radius * 1.4, Math.max(actualHeight, (plan.layers.length - 1) * radius * .16))
+    : 0;
+  const zExaggeration = actualHeight > 0 ? desiredHeight / actualHeight : 1;
+  const raw = (x: number, y: number, z: number) => ({
+    x: (x - centerX - (y - centerY)) * .866,
+    y: (x - centerX + (y - centerY)) * .36 - (z - baseZ) * zExaggeration,
+  });
   const extent = Math.max(radius * 1.25, 1);
-  const size = compact ? 88 : 420;
-  const pad = compact ? 8 : 34;
-  const scale = (size / 2 - pad) / extent;
-  const center = size / 2;
-  const d = layer.points.map((p, index) => {
-    const x = center + (p.x_mm - centerX) * scale;
-    const y = center - (p.y_mm - centerY) * scale;
-    return `${index ? "L" : "M"}${x.toFixed(2)},${y.toFixed(2)}`;
+  const plane = [
+    raw(centerX - extent, centerY - extent, baseZ),
+    raw(centerX + extent, centerY - extent, baseZ),
+    raw(centerX + extent, centerY + extent, baseZ),
+    raw(centerX - extent, centerY + extent, baseZ),
+  ];
+  const projectedLayers = plan.layers.map((item) => ({
+    item,
+    rawPoints: item.points.map((p) => raw(p.x_mm, p.y_mm, p.z_mm)),
+  }));
+  const bounds = [...plane, ...projectedLayers.flatMap((entry) => entry.rawPoints)];
+  const minX = Math.min(...bounds.map((p) => p.x));
+  const maxX = Math.max(...bounds.map((p) => p.x));
+  const minY = Math.min(...bounds.map((p) => p.y));
+  const maxY = Math.max(...bounds.map((p) => p.y));
+  const scale = Math.min((width - 2 * pad) / Math.max(1, maxX - minX),
+                         (height - 2 * pad) / Math.max(1, maxY - minY));
+  const project = (p: { x: number; y: number }) => ({
+    x: pad + (p.x - minX) * scale,
+    y: pad + (p.y - minY) * scale,
+  });
+  const path = (points: Array<{ x: number; y: number }>) => points.map((p, index) => {
+    const q = project(p);
+    return `${index ? "L" : "M"}${q.x.toFixed(2)},${q.y.toFixed(2)}`;
   }).join(" ");
-  return <svg viewBox={`0 0 ${size} ${size}`} className={compact ? "layer-mini-map" : "birdseye-map"}
-              aria-label={`Bird's-eye path for layer ${layer.layer_index}`}>
-    <rect width={size} height={size} fill="#090d14" />
-    {!compact && <>
-      {[-1, -.5, 0, .5, 1].map((v) => <g key={v}>
-        <line x1={center + v * radius * scale} y1={pad} x2={center + v * radius * scale} y2={size - pad}
-              stroke={v === 0 ? "#344055" : "#1b2331"} strokeWidth={v === 0 ? 1.2 : 1} />
-        <line x1={pad} y1={center + v * radius * scale} x2={size - pad} y2={center + v * radius * scale}
-              stroke={v === 0 ? "#344055" : "#1b2331"} strokeWidth={v === 0 ? 1.2 : 1} />
-      </g>)}
-      <text x={size - pad} y={center - 7} textAnchor="end" className="preview-axis">+X</text>
-      <text x={center + 7} y={pad + 11} className="preview-axis">+Y</text>
-    </>}
-    <path d={d} fill="none" stroke="#39d0bd" strokeWidth={compact ? 2.2 : 4}
-          strokeLinecap="round" strokeLinejoin="round" />
-    <circle cx={center + (layer.points[0].x_mm - centerX) * scale}
-            cy={center - (layer.points[0].y_mm - centerY) * scale}
-            r={compact ? 2 : 5} fill="#f0a45d" />
+  const floor = plane.map(project);
+  const axisOrigin = project(raw(centerX, centerY, baseZ));
+  const axes = [
+    { label: "+X", end: project(raw(centerX + extent, centerY, baseZ)), color: "#f0a45d" },
+    { label: "+Y", end: project(raw(centerX, centerY + extent, baseZ)), color: "#39d0bd" },
+    { label: "+Z", end: project(raw(centerX, centerY, topZ || baseZ)), color: "#8ab4ff" },
+  ];
+  const guideIndices = [0, .25, .5, .75].map((fraction) =>
+    Math.min(plan.recipe.points_per_circle - 1,
+             Math.round(fraction * plan.recipe.points_per_circle)));
+
+  return <svg viewBox={`0 0 ${width} ${height}`} className="birdseye-map"
+              aria-label="Oblique bird's-eye view of the complete layer stack">
+    <rect width={width} height={height} fill="#090d14" />
+    <polygon points={floor.map((p) => `${p.x},${p.y}`).join(" ")}
+             fill="#0d1420" stroke="#263247" strokeWidth="1.2" />
+    {[-.5, 0, .5].map((offset) => {
+      const a = project(raw(centerX - extent, centerY + offset * extent, baseZ));
+      const b = project(raw(centerX + extent, centerY + offset * extent, baseZ));
+      const c = project(raw(centerX + offset * extent, centerY - extent, baseZ));
+      const d = project(raw(centerX + offset * extent, centerY + extent, baseZ));
+      return <g key={offset} stroke={offset === 0 ? "#344055" : "#1b2636"} strokeWidth="1">
+        <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} />
+        <line x1={c.x} y1={c.y} x2={d.x} y2={d.y} />
+      </g>;
+    })}
+    {plan.layers.length > 1 && guideIndices.map((pointIndex) => {
+      const bottom = project(projectedLayers[0].rawPoints[pointIndex]);
+      const top = project(projectedLayers[projectedLayers.length - 1].rawPoints[pointIndex]);
+      return <line key={pointIndex} x1={bottom.x} y1={bottom.y} x2={top.x} y2={top.y}
+                   stroke="#31425b" strokeWidth="1" strokeDasharray="4 5" />;
+    })}
+    {projectedLayers.map(({ item, rawPoints }) => {
+      const selected = item.layer_index === selectedLayer;
+      const start = project(rawPoints[0]);
+      return <g key={item.layer_index} className="stack-layer"
+                onClick={() => onSelect(item.layer_index)}>
+        <path d={path(rawPoints)} fill={selected ? "rgba(76,154,255,.10)" : "none"}
+              stroke={selected ? "#66a6ff" : "#39d0bd"}
+              strokeOpacity={selected ? 1 : .42 + item.layer_index / plan.layers.length * .34}
+              strokeWidth={selected ? 4 : 2} strokeLinecap="round" strokeLinejoin="round" />
+        {selected && <circle cx={start.x} cy={start.y} r="5" fill="#f0a45d" />}
+      </g>;
+    })}
+    {axes.map((axis) => <g key={axis.label}>
+      <line x1={axisOrigin.x} y1={axisOrigin.y} x2={axis.end.x} y2={axis.end.y}
+            stroke={axis.color} strokeWidth="1.6" />
+      <text x={axis.end.x + 6} y={axis.end.y - 5} className="preview-axis"
+            style={{ fill: axis.color }}>{axis.label}</text>
+    </g>)}
+    <text x="14" y={height - 14} className="preview-note">
+      OBLIQUE XYZ · Z ×{zExaggeration.toFixed(1)} · ΔZ {layerHeight.toFixed(2)} mm
+    </text>
   </svg>;
 }
 
@@ -260,17 +327,15 @@ export default function Extrusion() {
     </div>
 
     <div className="card birdseye-card">
-      <div className="birdseye-head"><div><h2>Bird’s-eye layer review</h2><p>Exact XY geometry in the selected work frame. Choose a layer to inspect its path and Z height.</p></div>
+      <div className="birdseye-head"><div><h2>Bird’s-eye layer stack</h2><p>Oblique XYZ view of the complete cylinder. Select a ring to inspect that layer and its true Z height.</p></div>
         {layer && <div className="layer-readout">LAYER {layer.layer_index}<b>Z {layer.nominal_z_mm.toFixed(2)} mm</b></div>}</div>
       {plan && layer ? <div className="birdseye-layout">
-        <Birdseye layer={layer} radius={plan.recipe.radius_mm}
-          centerX={plan.setup.center_x_mm} centerY={plan.setup.center_y_mm} />
+        <BirdseyeStack plan={plan} selectedLayer={selectedLayer} onSelect={setSelectedLayer} />
         <div className="layer-rail">{plan.layers.map((item) => <button key={item.layer_index}
           className={`layer-tile ${item.layer_index === selectedLayer ? "selected" : ""}`}
           onClick={() => setSelectedLayer(item.layer_index)}>
-          <Birdseye layer={item} radius={plan.recipe.radius_mm}
-            centerX={plan.setup.center_x_mm} centerY={plan.setup.center_y_mm} compact />
-          <span>Layer {item.layer_index}</span><small>Z {item.nominal_z_mm.toFixed(1)} mm</small>
+          <i className="layer-swatch" style={{ opacity: .42 + item.layer_index / plan.layers.length * .58 }} />
+          <span>Layer {item.layer_index}</span><small>Z {item.nominal_z_mm.toFixed(2)} mm</small>
         </button>)}</div>
       </div> : <div className="empty cylinder-empty">Connect, select station items, and generate a plan.</div>}
       {plan && <div className="kv preview-kv"><span className="k">Plan fingerprint</span><span className="v">{plan.fingerprint.slice(0, 16)}</span>
