@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -657,13 +658,17 @@ def test_manual_crop_ignores_unstable_framed_rectangle():
 
 
 def test_scan_collision_filter_bypasses_noisy_wall_map_by_default():
-    """Scan should match calibration's soft default for noisy collision maps.
+    """Scan's collision gate is STRICT by default (Task 8, §10) — a soft bypass
+    is not appropriate for a production target set. This test now exercises the
+    soft path deliberately, via an explicit opt-out, to prove the bypass still
+    works for an operator who consciously chooses it.
 
     If RoboDK reports every reachable candidate as colliding (for example an oversized
     wall collision mesh), target creation still leaves reachable targets for operator
-    inspection unless scan.collision_filter_hard_fail is enabled.
+    inspection when scan.collision_filter_hard_fail is explicitly disabled.
     """
     services, _state = _build_fakes()
+    services.config.scan.collision_filter_hard_fail = False  # explicit opt-in to the soft path
 
     def all_collide(poses, *, guard_skip=None, **kw):
         out = [False] * len(poses), True, [None] * len(poses)
@@ -790,6 +795,83 @@ def test_run_without_targets_errors():
     print("[run needs targets] refused")
 
 
+def _build_fakes_with_jobs(**kw):
+    """_build_fakes() plus a fake JobRunner-shaped services.jobs (Task 8's guard
+    tests drive ScanModule.run() directly, which touches services.jobs before
+    the real scan job ever needs to execute — a real ScanCaptureJob run belongs
+    to test_generate_run_insert, not to these route-guard tests)."""
+    services, state = _build_fakes(**kw)
+    started = {}
+    services.jobs = SimpleNamespace(
+        running=False,
+        start=lambda job, name="job": started.update(job=job, name=name))
+    return services, state, started
+
+
+def test_run_refuses_targets_from_a_previous_lock():
+    """§Task 8: the operator UNLOCKED the surface after generating targets — the
+    targets now predate the current lock (there is none) and must be refused,
+    not silently run against stale geometry."""
+    import tasni.modules.scan.module as scan_module
+
+    services, _state, _started = _build_fakes_with_jobs()
+    mod = scan_module.ScanModule(services)
+    mod.surface_lock(scan_module.SurfaceLockBody(mode="auto"))
+    mod.poses_generate()
+    mod.surface_unlock()                       # locked state changed after generation
+    with pytest.raises(Exception, match="regenerate"):
+        mod.run()
+    print("[lock guard] targets orphaned by unlock -> run refused")
+
+
+def test_run_refuses_targets_from_a_relocked_surface():
+    """§Task 8: the operator RE-LOCKED (not just unlocked) after generating
+    targets — a fresh lock_token means the targets were computed for the
+    PREVIOUS lock's geometry, which may since have moved."""
+    import tasni.modules.scan.module as scan_module
+
+    services, _state, _started = _build_fakes_with_jobs()
+    mod = scan_module.ScanModule(services)
+    mod.surface_lock(scan_module.SurfaceLockBody(mode="auto"))
+    mod.poses_generate()
+    mod.surface_lock(scan_module.SurfaceLockBody(mode="auto"))   # re-lock, no re-generate
+    with pytest.raises(Exception, match="regenerate"):
+        mod.run()
+    print("[lock guard] targets orphaned by re-lock -> run refused")
+
+
+def test_run_starts_normally_after_lock_and_generate():
+    """The guard must not block the ordinary lock -> generate -> run flow: this
+    is the happy path every real scan takes, so it has to keep working."""
+    import tasni.modules.scan.module as scan_module
+
+    services, _state, started = _build_fakes_with_jobs()
+    mod = scan_module.ScanModule(services)
+    mod.surface_lock(scan_module.SurfaceLockBody(mode="auto"))
+    mod.poses_generate()
+    result = mod.run()
+    assert result == {"status": "started"}
+    assert started.get("name") == "scan"
+    print("[lock guard] normal lock -> generate -> run not blocked")
+
+
+def test_run_not_blocked_when_targets_token_was_never_set():
+    """No-guard case: targets present in RoboDK but this ScanModule instance
+    never generated them (e.g. an older flow, or a fresh process after a
+    restart) -- _targets_token defaults to "" and must not be treated as a
+    stale-lock mismatch. /run only enforces the ordinary 'targets exist' gate."""
+    import tasni.modules.scan.module as scan_module
+
+    services, state, started = _build_fakes_with_jobs()
+    mod = scan_module.ScanModule(services)
+    assert mod._targets_token == ""
+    services.rdk.add_target("TasniScan_0", state["cam"])
+    result = mod.run()
+    assert result == {"status": "started"}
+    assert started.get("name") == "scan"
+    print("[lock guard] no-guard case (token never set) does not block run")
+
+
 def test_sparse_measured_support_is_rejected():
     cfg = AppConfig().scan
     coverage = {
@@ -831,5 +913,9 @@ if __name__ == "__main__":
     test_generate_accepts_dynamic_near_quality_distance()
     test_warns_but_proceeds_without_calibration()
     test_run_without_targets_errors()
+    test_run_refuses_targets_from_a_previous_lock()
+    test_run_refuses_targets_from_a_relocked_surface()
+    test_run_starts_normally_after_lock_and_generate()
+    test_run_not_blocked_when_targets_token_was_never_set()
     test_sparse_measured_support_is_rejected()
     print("\nScan job (gate -> generate -> run -> insert) tests passed.")

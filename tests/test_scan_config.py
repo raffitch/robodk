@@ -32,9 +32,20 @@ def test_defaults_present_and_sane():
     for k in ("pose_count", "cone_half_angle_deg", "roll_max_deg",
               "distance_jitter", "look_distance_mm"):
         assert hasattr(s, k)
-    assert s.collision_filter_hard_fail is False
+    # §10: a soft collision bypass is not appropriate for a production target
+    # set, so scan defaults to the STRICT collision gate (unlike calibration's
+    # collision_filter_hard_fail, which stays soft — this is scan-only).
+    assert s.collision_filter_hard_fail is True
     print("[defaults] scan present; prefix", s.target_prefix,
           "voxel", s.voxel_size_m, "ideal", s.ideal_distance_mm)
+
+
+def test_collision_hard_fail_is_default():
+    """Dedicated regression for the Task 8 default flip: a fresh ScanConfig()
+    must refuse (not silently bypass) a noisy collision map unless the operator
+    explicitly opts back into the soft path."""
+    assert ScanConfig().collision_filter_hard_fail is True
+    print("[defaults] scan collision_filter_hard_fail defaults to True (hard fail)")
 
 
 def test_json_override_merges_only_targeted_fields():
@@ -65,6 +76,7 @@ def test_unknown_scan_key_rejected():
 
 if __name__ == "__main__":
     test_defaults_present_and_sane()
+    test_collision_hard_fail_is_default()
     test_json_override_merges_only_targeted_fields()
     test_unknown_scan_key_rejected()
     print("\nScanConfig tests passed.")

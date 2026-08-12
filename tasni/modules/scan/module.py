@@ -70,6 +70,15 @@ class ScanModule(WorkflowModule):
         self._planned_survey: dict | None = None
         self._targets_token: str = ""
         self._locked_surface: LockedScanSurface | None = None
+        # Task 8: the identity of the CURRENT lock, independent of
+        # self._locked_surface (which poses_generate() clears once it has
+        # consumed the lock to build targets, forcing a fresh lock before the
+        # next generate). This field instead tracks "what is locked right now"
+        # across a generate — updated by surface_lock() (to the new lock's
+        # token) and cleared by surface_unlock() — so run() can tell whether
+        # self._targets_token still matches the surface that is currently
+        # locked, or whether the operator re-locked/unlocked since generating.
+        self._current_lock_token: str | None = None
         # Set by POST /live/refresh; consumed by the live analyze loop to drop the
         # anti-jitter hold + pose anchor and re-read fresh at the current robot pose.
         self._live_refresh = threading.Event()
@@ -102,6 +111,136 @@ class ScanModule(WorkflowModule):
         self._user_region_mm = (w, h)
         save_overrides({"scan": {"work_crop_mm": [w, h]}})
         return {"user_region_mm": [w, h]}
+
+    def surface_lock(self, body: SurfaceLockBody) -> dict:
+        """Freeze the current measured surface (auto or forced crop) so target
+        generation has a stable geometry to build from.
+
+        A real bound method (not a router() closure) — same pattern as
+        surface_region, so it is directly callable by tests. Records this
+        lock's identity in ``self._current_lock_token`` so run()'s Task 8
+        guard can tell whether generated targets still match the surface that
+        is currently locked, or whether the operator re-locked/unlocked since.
+        """
+        from fastapi import HTTPException
+
+        services = self.services
+        if services.jobs.running:
+            raise HTTPException(409, "a job is already running")
+        force_crop = body.mode == "crop"
+        if body.mode not in ("auto", "crop"):
+            raise HTTPException(400, "surface lock mode must be 'auto' or 'crop'")
+        try:
+            self._locked_surface = lock_scan_surface(
+                services, force_crop=force_crop, user_region_mm=self._user_region_mm)
+            self._current_lock_token = self._locked_surface.lock_token
+            gate = self._locked_surface.gate_payload
+            crop = gate.get("crop_size_mm")
+            extent = gate.get("extent_mm")
+            return {
+                "status": "locked",
+                "gate": gate,
+                "surface_mode": "crop" if crop else "full",
+                "extent_mm": extent,
+                "crop_size_mm": crop,
+            }
+        except RuntimeError as e:
+            self._locked_surface = None
+            self._current_lock_token = None
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            self._locked_surface = None
+            self._current_lock_token = None
+            raise HTTPException(503, f"camera/RoboDK unavailable: {e}")
+
+    def surface_unlock(self) -> dict:
+        """Drop the current lock.
+
+        Also invalidates any targets already generated from it, for run()'s
+        Task 8 guard: self._current_lock_token -> None, so a stale
+        self._targets_token no longer matches and run() refuses.
+        """
+        self._locked_surface = None
+        self._current_lock_token = None
+        return {"status": "unlocked"}
+
+    def poses_generate(self) -> dict:
+        """Generate TasniScan_* targets from the currently locked surface.
+
+        A real bound method (not a router() closure) — same pattern as
+        surface_region — so the Task 8 lock-token guard is directly testable.
+        """
+        from fastapi import HTTPException
+
+        services = self.services
+        if services.jobs.running:
+            raise HTTPException(409, "a job is already running")
+        if self._locked_surface is None:
+            raise HTTPException(400, "lock and review the surface first")
+        try:
+            result_dict = generate_scan_targets(services, self._locked_surface)
+            # Reference mode returns a ready ScanResult with no targets.
+            if result_dict.get("mode") == "reference" and "_scan_result" in result_dict:
+                self._reference_result = result_dict.pop("_scan_result")
+                self._active_job = None
+                self._planned_voxel_m = None
+                self._planned_crop_mm = None
+                self._planned_surface_size_mm = None
+                self._planned_provenance = None
+                self._planned_survey = None
+                self._targets_token = ""
+            else:
+                self._reference_result = None
+                self._planned_voxel_m = result_dict.get("voxel_size_m")
+                crop = result_dict.get("crop_size_mm")
+                self._planned_crop_mm = tuple(crop) if crop is not None else None
+                extent = result_dict.get("extent_mm")
+                self._planned_surface_size_mm = (
+                    tuple(extent) if crop is None and extent is not None else None)
+                self._planned_provenance = result_dict.get("boundary_provenance")
+                self._planned_survey = result_dict.get("survey")
+                self._targets_token = result_dict.get("lock_token") or ""
+            self._locked_surface = None
+            return result_dict
+        except RuntimeError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            raise HTTPException(503, f"RoboDK/camera unavailable: {e}")
+
+    def run(self) -> dict:
+        """Start the capture+fuse job for the currently generated TasniScan_*
+        targets.
+
+        A real bound method (not a router() closure) — same pattern as
+        surface_region — so the Task 8 lock-token guard is directly testable.
+
+        Task 8 guard: refuses before the job starts if the targets were
+        generated for a surface lock that is no longer the current one (the
+        operator re-locked or unlocked since generating) — running them could
+        drive the arm to poses computed for geometry that has since moved.
+        """
+        from fastapi import HTTPException
+
+        services = self.services
+        sc = services.config.scan
+        if services.jobs.running:
+            raise HTTPException(409, "a job is already running")
+        token = self._targets_token
+        if token and self._current_lock_token != token:
+            raise HTTPException(409, "targets predate the current surface lock "
+                                "— regenerate targets before running")
+        if len(services.rdk.list_targets(sc.target_prefix)) == 0:
+            raise HTTPException(400, "no scan targets — aim the camera until the "
+                                "gate is green and Create targets first")
+        services.live.stop()
+        self._active_job = ScanCaptureJob(services, ScanParams(
+            voxel_size_m=self._planned_voxel_m,
+            crop_size_mm=self._planned_crop_mm,
+            surface_size_mm=self._planned_surface_size_mm,
+            boundary_provenance=self._planned_provenance,
+            survey=self._planned_survey))
+        services.jobs.start(self._active_job, name="scan")
+        return {"status": "started"}
 
     def router(self) -> "APIRouter":
         from fastapi import APIRouter, HTTPException, Response
@@ -401,35 +540,11 @@ class ScanModule(WorkflowModule):
 
         @router.post("/surface/lock")
         def surface_lock(body: SurfaceLockBody) -> dict:
-            if services.jobs.running:
-                raise HTTPException(409, "a job is already running")
-            force_crop = body.mode == "crop"
-            if body.mode not in ("auto", "crop"):
-                raise HTTPException(400, "surface lock mode must be 'auto' or 'crop'")
-            try:
-                self._locked_surface = lock_scan_surface(
-                    services, force_crop=force_crop, user_region_mm=self._user_region_mm)
-                gate = self._locked_surface.gate_payload
-                crop = gate.get("crop_size_mm")
-                extent = gate.get("extent_mm")
-                return {
-                    "status": "locked",
-                    "gate": gate,
-                    "surface_mode": "crop" if crop else "full",
-                    "extent_mm": extent,
-                    "crop_size_mm": crop,
-                }
-            except RuntimeError as e:
-                self._locked_surface = None
-                raise HTTPException(400, str(e))
-            except Exception as e:
-                self._locked_surface = None
-                raise HTTPException(503, f"camera/RoboDK unavailable: {e}")
+            return self.surface_lock(body)
 
         @router.post("/surface/unlock")
         def surface_unlock() -> dict:
-            self._locked_surface = None
-            return {"status": "unlocked"}
+            return self.surface_unlock()
 
         @router.post("/surface/region")
         def surface_region(body: SurfaceRegionBody) -> dict:
@@ -437,39 +552,7 @@ class ScanModule(WorkflowModule):
 
         @router.post("/poses/generate")
         def poses_generate() -> dict:
-            if services.jobs.running:
-                raise HTTPException(409, "a job is already running")
-            if self._locked_surface is None:
-                raise HTTPException(400, "lock and review the surface first")
-            try:
-                result_dict = generate_scan_targets(services, self._locked_surface)
-                # Reference mode returns a ready ScanResult with no targets.
-                if result_dict.get("mode") == "reference" and "_scan_result" in result_dict:
-                    self._reference_result = result_dict.pop("_scan_result")
-                    self._active_job = None
-                    self._planned_voxel_m = None
-                    self._planned_crop_mm = None
-                    self._planned_surface_size_mm = None
-                    self._planned_provenance = None
-                    self._planned_survey = None
-                    self._targets_token = ""
-                else:
-                    self._reference_result = None
-                    self._planned_voxel_m = result_dict.get("voxel_size_m")
-                    crop = result_dict.get("crop_size_mm")
-                    self._planned_crop_mm = tuple(crop) if crop is not None else None
-                    extent = result_dict.get("extent_mm")
-                    self._planned_surface_size_mm = (
-                        tuple(extent) if crop is None and extent is not None else None)
-                    self._planned_provenance = result_dict.get("boundary_provenance")
-                    self._planned_survey = result_dict.get("survey")
-                    self._targets_token = result_dict.get("lock_token") or ""
-                self._locked_surface = None
-                return result_dict
-            except RuntimeError as e:
-                raise HTTPException(400, str(e))
-            except Exception as e:
-                raise HTTPException(503, f"RoboDK/camera unavailable: {e}")
+            return self.poses_generate()
 
         @router.post("/poses/simulate")
         def poses_simulate() -> dict:
@@ -499,21 +582,7 @@ class ScanModule(WorkflowModule):
 
         @router.post("/run")
         def run() -> dict:
-            sc = services.config.scan
-            if services.jobs.running:
-                raise HTTPException(409, "a job is already running")
-            if len(services.rdk.list_targets(sc.target_prefix)) == 0:
-                raise HTTPException(400, "no scan targets — aim the camera until the "
-                                    "gate is green and Create targets first")
-            services.live.stop()
-            self._active_job = ScanCaptureJob(services, ScanParams(
-                voxel_size_m=self._planned_voxel_m,
-                crop_size_mm=self._planned_crop_mm,
-                surface_size_mm=self._planned_surface_size_mm,
-                boundary_provenance=self._planned_provenance,
-                survey=self._planned_survey))
-            services.jobs.start(self._active_job, name="scan")
-            return {"status": "started"}
+            return self.run()
 
         @router.post("/cancel")
         def cancel() -> dict:

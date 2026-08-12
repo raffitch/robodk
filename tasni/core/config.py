@@ -583,11 +583,14 @@ class ScanConfig(_Model):
     # -- collision guard + dry tour (same semantics as calibration) --------
     collision_filter: bool = True
     collision_ignore_pairs: list[str] = []
-    # Same soft default as calibration: if RoboDK's collision map reports so many
-    # collisions that target creation would fail (common with stale/oversized wall
-    # or fixture geometry), keep the reachable targets and make the operator inspect
-    # them / dry-run before moving the real robot. Set True for strict refusal.
-    collision_filter_hard_fail: bool = False
+    # UNLIKE calibration's soft default: a production target set that the robot is
+    # about to run gets a STRICT collision gate by default. If RoboDK's collision
+    # map reports so many collisions that target creation would otherwise fail
+    # (common with stale/oversized wall or fixture geometry), refuse outright
+    # rather than silently shipping a target set for the operator to inspect —
+    # a soft bypass is not appropriate here (spec §10). Set False to opt back
+    # into the soft/advisory path (e.g. for a deliberately inspected dry run).
+    collision_filter_hard_fail: bool = True
     collision_self_pairs: bool = True
     collision_skip_wrist_links: int = 2
 
