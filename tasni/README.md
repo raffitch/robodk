@@ -157,9 +157,9 @@ metrics, bounded opt-in compensation, and versioned trial/layer archive writers.
 The verified legacy valve mapping is `IO_508 + IO_601` (`1` on, `0` off), kept
 separate from extrusion rate and reproduced by `tools/setup_extrusion_station.py`.
 
-Live execution is intentionally locked: the current RoboDK license refused to
-persist `AirOn`/`AirOff` into `Tasni.rdk`, a current-path RoboDK dry tour is not yet
-implemented, and the physical I/O approval interlock defaults false. Geometry
-preflight explicitly does not claim a RoboDK dry-run pass. See
+`AirOn`/`AirOff` are now saved and independently reopened/verified in `Tasni.rdk`.
+Live execution remains intentionally locked until a current-path RoboDK dry tour is
+implemented and the physical I/O approval interlock is set. Geometry preflight
+explicitly does not claim a RoboDK dry-run pass. See
 `docs/extrusion-legacy-trace.md` for the traced legacy sequence and deliberate
 correction change.

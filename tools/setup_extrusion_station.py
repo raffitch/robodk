@@ -16,8 +16,19 @@ if str(REPO_ROOT) not in sys.path:
 
 from robodk import robolink
 
-from rdk_session import connect
 from tasni.core.config import load_config
+
+LICENSED_ISOLATED_ARGS = ["-NEWINSTANCE", "-NOUI", "-EXIT_LAST_COM"]
+
+
+def connect_for_station_save():
+    """Private RoboDK instance that retains the user's license settings.
+
+    The normal extraction helper adds ``-SKIPINI`` for maximal reproducibility,
+    but that also made this writer start without the active RoboDK license.  We
+    still force a separate headless instance, so this never attaches to the GUI.
+    """
+    return robolink.Robolink(args=LICENSED_ISOLATED_ARGS, quit_on_close=True)
 
 
 def expected_instructions(outputs: list[str], value: int) -> list[str]:
@@ -49,7 +60,7 @@ def ensure_program(rdk, robot, name: str, outputs: list[str], value: int, *, rep
 
 def verify_saved_station(path: Path, cfg) -> None:
     """Reopen the on-disk artifact; RoboDK can reject Save due to licensing."""
-    rdk = connect()
+    rdk = connect_for_station_save()
     try:
         station = rdk.AddFile(str(path))
         if not station.Valid():
@@ -62,7 +73,7 @@ def verify_saved_station(path: Path, cfg) -> None:
             if actual != expected:
                 raise RuntimeError(
                     f"saved station verification failed for {name}: {actual!r}; "
-                    "RoboDK may have rejected Save because its license is expired")
+                    "RoboDK did not persist the requested program instructions")
     finally:
         try:
             rdk.CloseRoboDK()
@@ -87,7 +98,7 @@ def main() -> int:
 
     app_cfg = load_config()
     cfg = app_cfg.extrusion
-    rdk = connect()
+    rdk = connect_for_station_save()
     try:
         station = rdk.AddFile(str(source))
         if not station.Valid():

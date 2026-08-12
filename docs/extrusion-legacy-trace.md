@@ -33,16 +33,22 @@ approved physical I/O test. Tasni therefore keeps `hardware_io_test_approved=fal
 and live print remains locked. `tools/setup_extrusion_station.py` reproduces these
 programs without executing them.
 
-On 2026-08-12 the setup was attempted against `Tasni.rdk`, but RoboDK 6.0.5
-reported an expired/free license and refused to persist the edited station. A
-fresh isolated reopen confirmed both programs are still absent and Git confirmed
-the binary is unchanged. The setup utility now reopens its output and fails if the
-instructions did not persist, preventing this license failure from being reported
-as success. Run it again with a valid RoboDK license:
+On 2026-08-12 the first setup attempt used Tasni's generic isolated-session helper,
+which launches RoboDK with `-SKIPINI`. That private process did not load the user's
+active license settings, displayed a misleading free-license message, and did not
+persist the programs. This was **not evidence that the installed RoboDK license was
+inactive**. The setup utility now uses a separate headless instance without
+`-SKIPINI`, while retaining `-NEWINSTANCE` so it cannot attach to the open GUI. It
+also reopens its output and fails if the instructions did not persist. Run:
 
 ```powershell
 py -3.10 tools\setup_extrusion_station.py Tasni.rdk --inplace
 ```
+
+The corrected setup was then run successfully. A second fresh private RoboDK
+instance reopened `Tasni.rdk` and verified `AirOn` contains `Set IO_508=1` and
+`Set IO_601=1`, while `AirOff` contains the corresponding `=0` instructions.
+Neither program was executed; the approved physical I/O test remains outstanding.
 
 ## Effective processing defaults
 

@@ -15,7 +15,7 @@ from tasni.modules.extrusion.models import CylinderRecipe, LayerManifest
 from tasni.modules.extrusion.service import geometry_preflight
 from tasni.modules.extrusion.toolpath import generate_cylinder_plan, points_array
 from tasni.webapp.server import create_app
-from tools.setup_extrusion_station import expected_instructions
+from tools.setup_extrusion_station import LICENSED_ISOLATED_ARGS, expected_instructions
 
 
 def recipe(**updates) -> CylinderRecipe:
@@ -33,6 +33,9 @@ def test_config_keeps_verified_mapping_separate_from_hardware_approval():
     assert config.hardware_io_test_approved is False
     assert expected_instructions(config.valve_outputs, 1) == ["Set IO_508=1", "Set IO_601=1"]
     assert expected_instructions(config.valve_outputs, 0) == ["Set IO_508=0", "Set IO_601=0"]
+    assert "-NEWINSTANCE" in LICENSED_ISOLATED_ARGS
+    assert "-NOUI" in LICENSED_ISOLATED_ARGS
+    assert "-SKIPINI" not in LICENSED_ISOLATED_ARGS
 
 
 def test_plan_is_closed_layered_and_fingerprinted():
