@@ -1145,6 +1145,258 @@ def test_five_position_tiled_tour_small_rectangle_is_single_tile():
           gen["created"], "targets")
 
 
+# -- Task 13: survey capture orchestration + REST routes --------------------
+# five_position_capture() is the ORCHESTRATION that connects the pure Task 11
+# state machine + Task 10 corner extractor to real hardware: one authoritative
+# step-and-measure acquisition per operator position, reusing the exact same
+# camera-hold/grab/fuse/robot-refresh sequence lock_scan_surface() uses (now
+# factored out as _authoritative_acquisition, shared by both). The brief's own
+# Step-1 test snippet assumed an illustrative `scan_services` fixture and a
+# JobEvent shape (`.kind`/`.data`) that don't exist in this file/codebase --
+# adapted below to the real `_build_fakes()` fixture and JobEvent's actual
+# fields (`.type`/`.payload`), keeping the assertions semantically identical.
+
+def test_five_position_capture_uses_fresh_robot_state():
+    """One authoritative five-position capture (the initial "center" step)
+    against the real synthetic-table fake camera: must succeed, record a
+    genuine (fresh, double-read) robot-state snapshot, advance the survey
+    machine to "corner1", and publish a "survey" JobEvent carrying the same
+    state -- the exact contract the guided UI polls / listens for."""
+    services, _state = _build_fakes()
+    events = []
+    services.bus = SimpleNamespace(publish=lambda e: events.append(e))
+    survey = FivePositionSurvey(services.config.scan)
+
+    state = scan_service.five_position_capture(services, survey)
+
+    assert state["step"] == "corner1"          # center accepted, machine advanced
+    assert survey._accepted["center"].record.robot.stationary is True
+    assert survey._accepted["center"].evidence is None  # no corner evidence for "center"
+    survey_events = [e for e in events if e.type == "survey"]
+    assert survey_events and survey_events[-1].payload["step"] == "corner1"
+    print("[five-position capture] center accepted -> step corner1; JobEvent published")
+
+
+def test_five_position_capture_rejects_moving_robot():
+    """Core safety contract (Task 13): a robot that MOVED between the two
+    refresh_robot_state reads must be rejected immediately -- before the
+    capture is ever handed to the survey state machine -- not merely
+    recorded and silently accepted. This is stricter than the compact lock
+    (which still records robot.stationary=False without refusing) because a
+    five-position survey combines FIVE separately-registered positions, so a
+    stale/live pose blend at any one of them would corrupt the cross-position
+    plane/rectangle fit in a way no downstream check could distinguish from a
+    real geometry error."""
+    services, _state = _build_fakes()
+    survey = FivePositionSurvey(services.config.scan)
+
+    calls = {"n": 0}
+
+    def moving_joints():
+        calls["n"] += 1
+        return [0.0, 0.0, 0.0, 0.0, 0.0, float(calls["n"])]   # different every read
+
+    services.rdk.current_joints = moving_joints
+    try:
+        scan_service.five_position_capture(services, survey)
+        raise AssertionError("expected a moving robot to be rejected")
+    except RuntimeError as e:
+        assert "moving" in str(e), e
+    assert survey.step == "center"       # rejected capture must not have been accepted
+    print("[five-position capture] moving robot correctly rejected before acceptance")
+
+
+def test_five_position_capture_corner_step_passes_closed_true_to_corner_evidence():
+    """CRITICAL per the Task 10/13 interface note: extract_corner_evidence's
+    `closed` flag is NOT auto-detected, and every production boundary polygon
+    (color_work_boundary / sam_work_boundary, both via mask_to_boundary's
+    cv2.findContours) is a genuinely CLOSED contour. five_position_capture
+    must pass closed=True for every corner step -- verified here by spying on
+    the real call (not merely trusting the source reads correctly)."""
+    services, _state = _build_fakes()
+    services.config.scan.boundary_engine = "color"   # skip the SAM attempt entirely
+    survey = FivePositionSurvey(services.config.scan)
+    scan_service.five_position_capture(services, survey)   # center -> corner1
+    assert survey.step == "corner1"
+
+    # The fake's flat-grey colour frame has zero contrast, so the REAL
+    # color_work_boundary would abstain (return None) here -- stub it so the
+    # corner-evidence step actually runs, and spy on extract_corner_evidence
+    # to capture exactly what it was called with.
+    fake_polygon = [[0.5, 0.3], [0.7, 0.5], [0.5, 0.7], [0.3, 0.5]]
+    orig_color_boundary = scan_service.color_work_boundary
+    orig_extract = scan_service.extract_corner_evidence
+    captured_kwargs = {}
+
+    def fake_color_boundary(*_a, **_k):
+        return {"outline_uv": fake_polygon, "polygon_uv": fake_polygon,
+                "fill_frac": 0.1, "border_touch": 0.0, "overruns": False, "contrast": 50.0}
+
+    def spy_extract(depth, K, polygon_uv, T_base_cam, **kwargs):
+        captured_kwargs.update(kwargs)
+        return CornerEvidence(corner_uv=(0.5, 0.5), corner_base_mm=(1000.0, 500.0, 0.0),
+                              edge_points_base=np.zeros((25, 3)))
+
+    scan_service.color_work_boundary = fake_color_boundary
+    scan_service.extract_corner_evidence = spy_extract
+    try:
+        state = scan_service.five_position_capture(services, survey)
+        assert state["step"] == "corner2"
+    finally:
+        scan_service.color_work_boundary = orig_color_boundary
+        scan_service.extract_corner_evidence = orig_extract
+
+    assert captured_kwargs.get("closed") is True, captured_kwargs
+    assert captured_kwargs.get("corner_hint_uv") == (0.5, 0.5), captured_kwargs
+    print("[five-position capture] corner boundary -> extract_corner_evidence(closed=True) confirmed")
+
+
+def test_survey_begin_state_capture_cancel_routes():
+    """The five-position guided-survey routes (Task 13), driven through the
+    real bound methods -- same pattern as the surface_lock/poses_generate
+    route tests above."""
+    import tasni.modules.scan.module as scan_module
+
+    services, _state, _started = _build_fakes_with_jobs()
+    mod = scan_module.ScanModule(services)
+
+    assert mod.survey_state() == {"step": None}     # inactive
+
+    begun = mod.survey_begin()
+    assert begun["step"] == "center"
+    assert mod.survey_state()["step"] == "center"
+
+    captured = mod.survey_capture()
+    assert captured["step"] == "corner1"
+    assert mod.survey_state()["step"] == "corner1"
+
+    cancelled = mod.survey_cancel()
+    assert cancelled == {"status": "cancelled"}
+    assert mod.survey_state() == {"step": None}
+    print("[survey routes] begin -> capture -> state -> cancel wired correctly")
+
+
+def test_survey_routes_require_an_active_survey():
+    import tasni.modules.scan.module as scan_module
+    from fastapi import HTTPException
+
+    services, _state, _started = _build_fakes_with_jobs()
+    mod = scan_module.ScanModule(services)
+    checks = (
+        mod.survey_capture,
+        lambda: mod.survey_recapture(scan_module.SurveyRecaptureBody(kind="center")),
+        mod.survey_finish,
+    )
+    for call in checks:
+        try:
+            call()
+            raise AssertionError("expected a 400 without an active survey")
+        except HTTPException as e:
+            assert e.status_code == 400, e.status_code
+    print("[survey guards] capture/recapture/finish all refuse without an active survey")
+
+
+def test_survey_recapture_route_rejects_unknown_kind():
+    import tasni.modules.scan.module as scan_module
+    from fastapi import HTTPException
+
+    services, _state, _started = _build_fakes_with_jobs()
+    mod = scan_module.ScanModule(services)
+    mod.survey_begin()
+    try:
+        mod.survey_recapture(scan_module.SurveyRecaptureBody(kind="bogus"))
+        raise AssertionError("expected an unknown recapture kind to be rejected")
+    except HTTPException as e:
+        assert e.status_code == 400
+
+    # A known kind not yet captured is a harmless no-op (mirrors
+    # FivePositionSurvey.recapture's own dict.pop(kind, None) semantics).
+    out = mod.survey_recapture(scan_module.SurveyRecaptureBody(kind="corner1"))
+    assert out["step"] == "center"
+    print("[survey recapture] unknown kind -> 400; known-but-uncaptured kind -> no-op")
+
+
+def test_survey_finish_route_locks_and_sets_current_lock_token():
+    """POST /survey/finish (Task 13, ambiguity resolution #3): once a survey
+    is complete, finishing it must store a LockedScanSurface with a FRESH
+    lock_token AND set self._current_lock_token to that SAME token, mirroring
+    surface_lock()'s own bookkeeping exactly -- otherwise poses_generate()'s
+    Task 8 "targets predate the current lock" guard could not tell a
+    five-position lock from no lock at all."""
+    import tasni.modules.scan.module as scan_module
+
+    services, state, _started = _build_fakes_with_jobs()
+    mod = scan_module.ScanModule(services)
+    # A fixed clock matching _fp_record's captured_at (100.0), same as
+    # _five_position_locked_survey above -- survey_begin() (real time.monotonic)
+    # would make every synthetic _fp_record instantly "stale".
+    mod._five_survey = FivePositionSurvey(services.config.scan, clock=lambda: _FP_CLOCK[0])
+    mod._five_survey.add_capture(
+        _fp_record("center"), _fp_plane_points(_FP_LARGE_CORNERS.mean(axis=0)[:2]), None)
+    for i in range(4):
+        mod._five_survey.add_capture(
+            _fp_record(f"corner{i + 1}"), _fp_plane_points(_FP_LARGE_CORNERS[i][:2], seed=i + 1),
+            _fp_corner_evidence(_FP_LARGE_CORNERS, i, seed=i + 1))
+    assert mod._five_survey.step == "review"
+
+    out = mod.survey_finish()
+    assert out["status"] == "locked"
+    assert "discrepancy_mm" in out and "corner_agreement_mm" in out  # record.quality spread in
+
+    locked = mod._locked_surface
+    assert locked is not None and locked.survey_record is not None
+    assert locked.survey_record.mode == MODE_FIVE_POSITION
+    assert locked.lock_token != ""
+    assert mod._current_lock_token == locked.lock_token             # ambiguity resolution #3
+    assert locked.gate_payload["surface_mode"] == "five_position"
+    assert locked.gate_payload["ok"] is True
+    assert mod._five_survey is None                                 # consumed
+    assert mod.survey_state() == {"step": None}
+    print("[survey finish] locked with a fresh lock_token; self._current_lock_token mirrors it")
+
+
+def test_survey_finish_route_rejects_incomplete_survey():
+    import tasni.modules.scan.module as scan_module
+    from fastapi import HTTPException
+
+    services, _state, _started = _build_fakes_with_jobs()
+    mod = scan_module.ScanModule(services)
+    mod.survey_begin()
+    try:
+        mod.survey_finish()
+        raise AssertionError("expected an incomplete survey to be rejected")
+    except HTTPException as e:
+        assert e.status_code == 400
+        assert "incomplete" in str(e.detail), e.detail
+    assert mod._five_survey is not None    # not consumed by a failed finish
+    print("[survey finish] incomplete survey -> 400, survey left intact for the operator")
+
+
+def test_poses_generate_rejects_out_of_range_overlap_with_400():
+    """Bundled cleanup (ambiguity resolution #5, a review finding from the
+    previous task): poses_generate()'s except-chain used to map ONLY
+    RuntimeError to 400, letting a config-validation ValueError (e.g. an
+    out-of-range survey_tour_overlap, raised by planner._tile_grid_dims) fall
+    through to the generic 503 "RoboDK/camera unavailable" -- misleading,
+    since nothing was actually unavailable. Now mirrors insert()'s own
+    convention: except (RuntimeError, ValueError, KeyError) -> 400."""
+    import tasni.modules.scan.module as scan_module
+    from fastapi import HTTPException
+
+    services, state, _started = _build_fakes_with_jobs()
+    services.config.scan.survey_tour_overlap = 1.5   # out of [0.0, 1.0)
+    mod = scan_module.ScanModule(services)
+    mod._locked_surface = _locked_five_position_scan_surface(state, _FP_LARGE_CORNERS)
+
+    try:
+        mod.poses_generate()
+        raise AssertionError("expected the out-of-range overlap to be rejected")
+    except HTTPException as e:
+        assert e.status_code == 400, e.status_code
+        assert "survey_tour_overlap" in str(e.detail), e.detail
+    print("[poses_generate] out-of-range survey_tour_overlap -> 400, not 503")
+
+
 if __name__ == "__main__":
     test_generate_run_insert()
     test_provenance_flows_lock_to_insert()
@@ -1175,4 +1427,13 @@ if __name__ == "__main__":
     test_five_position_tiled_tour_spans_multiple_tiles()
     test_five_position_tiled_tour_coverage_gate_catches_missing_tiles()
     test_five_position_tiled_tour_small_rectangle_is_single_tile()
+    test_five_position_capture_uses_fresh_robot_state()
+    test_five_position_capture_rejects_moving_robot()
+    test_five_position_capture_corner_step_passes_closed_true_to_corner_evidence()
+    test_survey_begin_state_capture_cancel_routes()
+    test_survey_routes_require_an_active_survey()
+    test_survey_recapture_route_rejects_unknown_kind()
+    test_survey_finish_route_locks_and_sets_current_lock_token()
+    test_survey_finish_route_rejects_incomplete_survey()
+    test_poses_generate_rejects_out_of_range_overlap_with_400()
     print("\nScan job (gate -> generate -> run -> insert) tests passed.")

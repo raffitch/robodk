@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -19,11 +20,13 @@ from ...core.rdk_io import link_real_robot
 from ..base import ServiceContainer, WorkflowModule
 from ..calibration.service import SimTourJob
 from .color_boundary import color_work_boundary
+from .five_position import FivePositionSurvey
 from .sam_boundary import SamBoundaryWorker
 from .service import (annotate_pose_liveness, camera_pose_moved, ScanCaptureJob,
-                      ScanParams, ScanResult, generate_scan_targets, insert_scan,
-                      live_scan_telemetry_payload, LockedScanSurface, lock_scan_surface,
-                      stabilize_live_scan_payload)
+                      ScanParams, ScanResult, five_position_capture, generate_scan_targets,
+                      insert_scan, live_scan_telemetry_payload, LockedScanSurface,
+                      lock_scan_surface, stabilize_live_scan_payload)
+from .survey_contract import camera_calibration_id, refresh_robot_state
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
@@ -48,6 +51,10 @@ class SurfaceRegionBody(BaseModel):
     height_mm: float
 
 
+class SurveyRecaptureBody(BaseModel):
+    kind: str
+
+
 class ScanModule(WorkflowModule):
     id = "scan"
     title = "Scan"
@@ -70,6 +77,11 @@ class ScanModule(WorkflowModule):
         self._planned_survey: dict | None = None
         self._targets_token: str = ""
         self._locked_surface: LockedScanSurface | None = None
+        # Task 13: the in-progress guided center + four-corner survey (the
+        # alternative to a single compact/crop lock, for a platform too large
+        # for one camera view). None when no survey is active; /survey/begin
+        # creates one, /survey/finish (on success) or /survey/cancel clear it.
+        self._five_survey: FivePositionSurvey | None = None
         # Task 8: the identity of the CURRENT lock, independent of
         # self._locked_surface (which poses_generate() clears once it has
         # consumed the lock to build targets, forcing a fresh lock before the
@@ -202,7 +214,7 @@ class ScanModule(WorkflowModule):
                 self._targets_token = result_dict.get("lock_token") or ""
             self._locked_surface = None
             return result_dict
-        except RuntimeError as e:
+        except (RuntimeError, ValueError, KeyError) as e:
             raise HTTPException(400, str(e))
         except Exception as e:
             raise HTTPException(503, f"RoboDK/camera unavailable: {e}")
@@ -241,6 +253,116 @@ class ScanModule(WorkflowModule):
             survey=self._planned_survey))
         services.jobs.start(self._active_job, name="scan")
         return {"status": "started"}
+
+    def survey_begin(self) -> dict:
+        """Start a fresh guided five-position (center + four-corner) survey.
+
+        A real bound method — same pattern as ``surface_lock`` — so it is
+        directly callable by tests and by the thin POST /survey/begin route.
+        Replaces any prior in-progress survey (its captures are discarded;
+        nothing was locked yet, so there is nothing to invalidate).
+        """
+        self._five_survey = FivePositionSurvey(self.services.config.scan)
+        return self._five_survey.state()
+
+    def survey_state(self) -> dict:
+        """The in-progress survey's state, or ``{"step": None}`` when inactive
+        (no survey begun yet, or the last one finished/was cancelled) — the
+        guided UI polls this to know what to render."""
+        if self._five_survey is None:
+            return {"step": None}
+        return self._five_survey.state()
+
+    def survey_capture(self) -> dict:
+        """Perform one authoritative step-and-measure capture for whichever
+        position the active survey currently expects.
+
+        ``five_position_capture`` stops the live preview itself (the same
+        camera-lease contention concern ``surface_lock`` has — see
+        ``_authoritative_acquisition``), so this restarts it afterwards
+        (success OR failure — a failed capture is exactly when the operator
+        most needs the live view back to re-aim) if it was running before and
+        the router has wired up a restart hook (``self._live_start``, set by
+        ``router()`` when ``/live/start`` is registered; absent in the plain
+        bound-method unit tests, which have no live loop to restart anyway).
+        """
+        from fastapi import HTTPException
+
+        services = self.services
+        if services.jobs.running:
+            raise HTTPException(409, "a job is already running")
+        if self._five_survey is None:
+            raise HTTPException(400, "no five-position survey in progress - begin one first")
+        was_running = services.live.running
+        try:
+            return five_position_capture(services, self._five_survey)
+        except (RuntimeError, ValueError, KeyError) as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            raise HTTPException(503, f"RoboDK/camera unavailable: {e}")
+        finally:
+            live_start = getattr(self, "_live_start", None)
+            if was_running and live_start is not None and not services.live.running:
+                try:
+                    live_start()
+                except Exception:
+                    pass
+
+    def survey_recapture(self, body: SurveyRecaptureBody) -> dict:
+        """Discard a previously accepted capture so the operator can redo it."""
+        from fastapi import HTTPException
+
+        if self._five_survey is None:
+            raise HTTPException(400, "no five-position survey in progress - begin one first")
+        try:
+            return self._five_survey.recapture(body.kind)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    def survey_finish(self) -> dict:
+        """Finish the five-position survey (all five captures accepted, every
+        quality gate passed) into a locked ``LockedScanSurface`` — the
+        five-position counterpart to ``surface_lock``'s compact/crop lock.
+
+        Mirrors ``surface_lock``'s bookkeeping exactly (ambiguity resolution
+        #3): stores the fresh ``lock_token`` in BOTH ``self._locked_surface``
+        and ``self._current_lock_token`` so run()'s Task 8 "targets predate
+        the current lock" guard works identically for this path.
+        """
+        from fastapi import HTTPException
+
+        services = self.services
+        if services.jobs.running:
+            raise HTTPException(409, "a job is already running")
+        if self._five_survey is None:
+            raise HTTPException(400, "no five-position survey in progress - begin one first")
+        cfg = services.config
+        try:
+            record = self._five_survey.finish(
+                calibration_id=camera_calibration_id(cfg.camera),
+                locked_robot=refresh_robot_state(services.rdk))
+        except (RuntimeError, ValueError, KeyError) as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            raise HTTPException(503, f"RoboDK unavailable: {e}")
+        self._locked_surface = LockedScanSurface(
+            frame=None, reading=None, survey=None,
+            gate_payload={"ok": True, "live": False, "surface_mode": "five_position",
+                         "boundary_provenance": record.boundary_provenance,
+                         "survey": record.to_dict()},
+            seed_T=record.locked_robot.camera_T_np(),
+            seed_joints=list(record.locked_robot.joints),
+            locked_at=record.locked_at, survey_record=record,
+            lock_token=uuid.uuid4().hex)
+        self._current_lock_token = self._locked_surface.lock_token
+        self._five_survey = None
+        return {"status": "locked", **record.quality}
+
+    def survey_cancel(self) -> dict:
+        """Discard the in-progress five-position survey (nothing was locked
+        yet, so there is nothing else to invalidate)."""
+        self._five_survey = None
+        return {"status": "cancelled"}
 
     def router(self) -> "APIRouter":
         from fastapi import APIRouter, HTTPException, Response
@@ -515,6 +637,15 @@ class ScanModule(WorkflowModule):
                 raise HTTPException(409, str(e))
             return {"status": "started"}
 
+        # Exposed so survey_capture() (a plain bound method, called both by tests
+        # and by the /survey/capture route below) can restart the SAME live preview
+        # this closure builds after an authoritative five-position capture stops it
+        # — without duplicating this ~170-line closure's video/boundary-engine
+        # wiring. Set once, when the router is mounted (real app startup); absent
+        # in unit tests that construct ScanModule directly without calling
+        # router(), which survey_capture() tolerates (nothing to restart there).
+        self._live_start = live_start
+
         @router.post("/live/stop")
         def live_stop() -> dict:
             services.live.stop()
@@ -549,6 +680,30 @@ class ScanModule(WorkflowModule):
         @router.post("/surface/region")
         def surface_region(body: SurfaceRegionBody) -> dict:
             return self.surface_region(body)
+
+        @router.post("/survey/begin")
+        def survey_begin() -> dict:
+            return self.survey_begin()
+
+        @router.get("/survey/state")
+        def survey_state() -> dict:
+            return self.survey_state()
+
+        @router.post("/survey/capture")
+        def survey_capture() -> dict:
+            return self.survey_capture()
+
+        @router.post("/survey/recapture")
+        def survey_recapture(body: SurveyRecaptureBody) -> dict:
+            return self.survey_recapture(body)
+
+        @router.post("/survey/finish")
+        def survey_finish() -> dict:
+            return self.survey_finish()
+
+        @router.post("/survey/cancel")
+        def survey_cancel() -> dict:
+            return self.survey_cancel()
 
         @router.post("/poses/generate")
         def poses_generate() -> dict:

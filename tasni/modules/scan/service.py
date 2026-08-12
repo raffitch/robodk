@@ -43,11 +43,15 @@ from ..calibration.service import (
     BOARD_KEEPOUT_NAME as CALIB_BOARD_KEEPOUT_NAME,
     TARGET_PREFIX as CALIB_TARGET_PREFIX,
     _camera_hold, dry_tour_required, ensure_camera_tool, ensure_real_robot_link)
+from .color_boundary import color_work_boundary
+from .corner_evidence import extract_corner_evidence
 from .depth_gate import ScanGateThresholds, evaluate_depth_gate
+from .five_position import FivePositionSurvey
 from .plane import (bounded_work_plane, fit_plane, rectangle_in_frame,
                     reticle_plane_square, work_plane_from_points)
 from .planner import (ScanPlan, _largest_contiguous_empty_block, _tile_grid_dims,
                      plan_rect_tour, plan_scan)
+from .sam_boundary import sam_work_boundary
 from .survey import SurveyThresholds, survey_surface
 from .survey_contract import (
     MODE_COMPACT, MODE_FIVE_POSITION, MODE_USER_SPECIFIED, PROVENANCE_BY_MODE,
@@ -262,9 +266,37 @@ def _planned_surface_standoff_mm(
     return float(scfg.ideal_distance_mm)
 
 
-def lock_scan_surface(services, *, force_crop: bool = False,
-                      user_region_mm: tuple[float, float] | None = None) -> LockedScanSurface:
-    """Freeze one authoritative RGBD measurement and the matching robot pose."""
+def _authoritative_acquisition(services, *, owner: str):
+    """Shared step-and-measure acquisition core (spec §9) for every
+    authoritative scan capture -- the compact/crop lock (:func:`lock_scan_surface`)
+    AND the guided five-position survey (:func:`five_position_capture`) both
+    call this, so the two capture paths cannot silently drift apart.
+
+    Mounts the camera tool, stops any live preview (so the capture never
+    contends the camera lease with the video loop), grabs + fuses
+    ``scfg.surface_measure_frames`` depth+colour frames, then computes BOTH
+    readiness views of the fused frame -- the coarse centre-patch gate
+    (``reading``) and the full-frame plane survey (``measurement``) -- plus
+    an explicit REAL robot-state refresh (``snapshot``, a genuine double-read
+    of the robot's joints; see :func:`survey_contract.refresh_robot_state`).
+
+    Returns ``(frame, n_frames, reading, measurement, snapshot)`` where
+    ``frame`` is a ``SimpleNamespace(color, depth, timestamp)`` -- bundling
+    colour/depth/timestamp together (rather than as separate tuple members)
+    is deliberate: every downstream consumer of a "capture" (``CaptureRecord.
+    measurement_ts``, ``_survey_record_from_lock``) needs the frame's
+    timestamp, and the acquisition site (this function) is the only place
+    that legitimately reads ``frames[-1].timestamp`` off the raw camera
+    frames.
+
+    Deciding what to DO with a non-stationary ``snapshot`` is each caller's
+    own responsibility: ``lock_scan_surface`` still records it either way
+    (unchanged, pre-existing behaviour for the compact/crop path);
+    ``five_position_capture`` rejects it outright (a five-position survey
+    combines FIVE separately-registered positions, so a stale/moving pose at
+    any one of them would silently corrupt the cross-position plane/rectangle
+    fit -- see that function's own docstring).
+    """
     cfg = services.config
     scfg = cfg.scan
     rdk: RdkIO = services.rdk
@@ -276,7 +308,7 @@ def lock_scan_surface(services, *, force_crop: bool = False,
 
     measure_frames = max(1, int(getattr(scfg, "surface_measure_frames", 1)))
     frames = []
-    with _camera_hold(services, "scan-surface-lock"):
+    with _camera_hold(services, owner):
         for _ in range(measure_frames):
             fr = services.camera.grab(with_depth=True, timeout=scfg.grab_timeout_s)
             if fr.depth is not None:
@@ -289,8 +321,21 @@ def lock_scan_surface(services, *, force_crop: bool = False,
         timestamp=getattr(frames[-1], "timestamp", time.time()))
     reading = evaluate_depth_gate(
         frame.depth, K, scan_gate_thresholds(scfg), depth_scale=scfg.depth_scale)
-    survey = survey_surface(
+    measurement = survey_surface(
         frame.depth, K, _survey_thresholds(scfg), depth_scale=scfg.depth_scale)
+    snapshot = refresh_robot_state(rdk)
+    return frame, len(frames), reading, measurement, snapshot
+
+
+def lock_scan_surface(services, *, force_crop: bool = False,
+                      user_region_mm: tuple[float, float] | None = None) -> LockedScanSurface:
+    """Freeze one authoritative RGBD measurement and the matching robot pose."""
+    cfg = services.config
+    scfg = cfg.scan
+    rdk: RdkIO = services.rdk
+    K = cfg.camera.K
+    frame, n_frames, reading, survey, snapshot = _authoritative_acquisition(
+        services, owner="scan-surface-lock")
     depth = np.asarray(frame.depth) if frame.depth is not None else np.zeros((0, 0))
     full_frame_valid_frac = float(np.mean(depth > 0)) if depth.size else 0.0
     surface_overruns_view = bool(
@@ -359,12 +404,11 @@ def lock_scan_surface(services, *, force_crop: bool = False,
             # the LockedScanSurface.survey the caller/generate_scan_targets reads).
             survey = replace(survey, corners_cam_mm=crop_corners_cam_mm)
 
-    # Explicit robot-state refresh (§9): a real double-read of joints + the derived
-    # camera pose, tagged stationary/moving, rather than a bare current_joints() call.
-    # This is the authoritative state for THIS measurement, so it is captured before
-    # the survey record / gate event are built — even on a failing gate the operator's
-    # HUD should reflect the robot state the failed reading was taken at.
-    snapshot = refresh_robot_state(rdk)
+    # Robot-state snapshot (§9): already an authoritative double-read of joints +
+    # the derived camera pose, tagged stationary/moving (see
+    # _authoritative_acquisition) -- fetched before the survey record / gate event
+    # are built, so even on a failing gate the operator's HUD reflects the robot
+    # state the failed reading was taken at.
     seed_T = snapshot.camera_T_np()
     seed_joints = list(snapshot.joints)
 
@@ -384,7 +428,7 @@ def lock_scan_surface(services, *, force_crop: bool = False,
         plane_rms = _plane_rms_mm(depth, K)
         record = _survey_record_from_lock(
             survey, seed_T, snapshot, services.config.camera,
-            mode=mode, n_frames=len(frames), measurement_ts=frame.timestamp,
+            mode=mode, n_frames=n_frames, measurement_ts=frame.timestamp,
             valid_frac=gate_payload.get("valid_frac", 0.0), plane_rms_mm=plane_rms)
         if record is not None:
             gate_payload["survey"] = record.to_dict()
@@ -400,7 +444,7 @@ def lock_scan_surface(services, *, force_crop: bool = False,
         services.bus.publish(JobEvent("frame", {
             "jpeg_b64": base64.b64encode(jpeg.tobytes()).decode("ascii")}))
     services.bus.publish(JobEvent("gate", {
-        **gate_payload, "live": False, "measure_frames": len(frames)}))
+        **gate_payload, "live": False, "measure_frames": n_frames}))
 
     if not gate_payload["ok"]:
         bad = [name for name, good in final_gates.items() if not good]
@@ -448,6 +492,164 @@ def _backproject_depth(depth: np.ndarray, K: np.ndarray, *,
         return np.zeros((0, 3), float)
     z_mm = d[ys, xs] / float(depth_scale) * 1000.0
     return np.column_stack([(xs - cx) / fx * z_mm, (ys - cy) / fy * z_mm, z_mm])
+
+
+def _deproject_plane_points_mm(depth, K, T_base_cam, stride: int = 6) -> np.ndarray:
+    """Deproject a strided grid of valid depth pixels to BASE-frame millimetres.
+
+    Explicit millimetres throughout -- deliberately the SAME pattern as
+    ``corner_evidence._deproject_base`` (depth is the raw uint16 RealSense frame,
+    read directly as millimetres; no ``depth_scale`` division). This module does
+    NOT reuse ``_backproject_depth`` above for this: that helper returns
+    CAMERA-frame points scaled by ``depth_scale``, an extra parameter/convention a
+    caller has to know to apply correctly, whereas the five-position survey (the
+    one caller of this function) needs BASE-frame mm points and nothing else --
+    matching ``corner_evidence``'s own unambiguous, self-contained convention
+    keeps the whole five-position pipeline's units consistent end to end.
+
+    ``stride`` subsamples the frame (every ``stride``-th row/col): the per-capture
+    local plane this feeds (``rect_fit.fit_global_plane``, via
+    ``FivePositionSurvey.add_capture``) only needs a representative sample of this
+    one position's surface, not every pixel.
+    """
+    d = np.asarray(depth, dtype=float)
+    if d.ndim != 2 or d.size == 0:
+        return np.zeros((0, 3), dtype=float)
+    h, w = d.shape
+    ys, xs = np.mgrid[0:h:stride, 0:w:stride]
+    z = d[ys, xs]
+    valid = z > 0
+    if not np.any(valid):
+        return np.zeros((0, 3), dtype=float)
+    xs_v = xs[valid].astype(float)
+    ys_v = ys[valid].astype(float)
+    z_v = z[valid].astype(float)
+    fx, fy, cx, cy = float(K[0][0]), float(K[1][1]), float(K[0][2]), float(K[1][2])
+    x_cam = (xs_v - cx) / fx * z_v
+    y_cam = (ys_v - cy) / fy * z_v
+    pts_cam_h = np.column_stack([x_cam, y_cam, z_v, np.ones_like(z_v)])
+    T = np.asarray(T_base_cam, dtype=float)
+    return (pts_cam_h @ T.T)[:, :3]
+
+
+def _boundary_polygon_uv(scfg, color) -> "np.ndarray | None":
+    """Segment the object under the reticle with the configured boundary engine.
+
+    Mirrors the live-preview dispatch in ``module.py``'s ``/live/start`` (colour
+    only for ``"color"``; SAM with an optional colour fallback for ``"sam"`` /
+    ``"sam_then_color"``) but runs INLINE/synchronously rather than through
+    ``SamBoundaryWorker``'s background thread: that worker exists so ~450 ms/frame
+    SAM inference never hitches the ~6 fps live video, but a five-position capture
+    is a single one-shot authoritative measurement, not a video frame, so a
+    blocking call is the right shape here (and the simplest one that cannot get out
+    of sync with the frame it was asked to segment).
+
+    Returns the boundary's ``polygon_uv`` (normalized 0-1 image coords, a CLOSED
+    contour -- see the ``closed=True`` note where this feeds
+    ``extract_corner_evidence``) or ``None`` when every configured engine abstains.
+    """
+    if not scfg.color_boundary_enabled:
+        return None
+    cb = None
+    if scfg.boundary_engine in ("sam", "sam_then_color"):
+        try:
+            cb = sam_work_boundary(
+                color, model_dir=scfg.sam_model_dir, encoder_file=scfg.sam_encoder_file,
+                decoder_file=scfg.sam_decoder_file, min_score=scfg.sam_min_score,
+                max_fill_frac=scfg.sam_max_fill_frac, point_uv=(0.5, 0.5))
+        except Exception:
+            cb = None
+        if cb is None and scfg.boundary_engine == "sam_then_color":
+            try:
+                cb = color_work_boundary(
+                    color, reticle_frac=scfg.center_patch_frac,
+                    min_color_dist=scfg.color_boundary_min_color_dist,
+                    seg_width=scfg.color_boundary_seg_width)
+            except Exception:
+                cb = None
+    else:
+        try:
+            cb = color_work_boundary(
+                color, reticle_frac=scfg.center_patch_frac,
+                min_color_dist=scfg.color_boundary_min_color_dist,
+                seg_width=scfg.color_boundary_seg_width)
+        except Exception:
+            cb = None
+    if cb is None:
+        return None
+    return np.asarray(cb["polygon_uv"], dtype=float)
+
+
+def five_position_capture(services, survey: FivePositionSurvey) -> dict:
+    """One authoritative step-and-measure acquisition for the guided five-position
+    workframe survey (spec §7/§9) -- whichever position ``survey.step`` currently
+    expects (``"center"`` or ``"corner1"``..``"corner4"``).
+
+    Reuses ``_authoritative_acquisition`` -- the SAME camera-hold / grab / fuse /
+    readiness-survey / robot-state-refresh sequence :func:`lock_scan_surface` uses
+    -- so the two authoritative capture paths cannot silently drift apart; only the
+    logic AFTER acquisition (evidence extraction, ``CaptureRecord`` shape, and what
+    to do with the result) differs, matching what is genuinely different between a
+    single compact lock and one position of a five-position survey.
+
+    A five-position survey combines FIVE separately-registered positions, so
+    (unlike the compact lock, which merely records ``robot.stationary``) a moving
+    robot at capture time is rejected here explicitly and immediately -- before any
+    further per-frame compute -- rather than silently accepted: this is the core
+    safety contract of the whole feature (a stale/live pose blend at any one
+    position would corrupt the cross-position plane/rectangle fit in a way no
+    downstream check could distinguish from a real geometry error).
+    """
+    K = services.config.camera.K
+    scfg = services.config.scan
+    kind = survey.step
+    if kind == "review":
+        raise RuntimeError("survey already has all five captures")
+
+    frame, n_frames, reading, measurement, snapshot = _authoritative_acquisition(
+        services, owner="scan-five-position")
+    if not snapshot.stationary:
+        raise RuntimeError("robot was moving during the capture - stop and remeasure")
+    if not measurement.detected:
+        raise RuntimeError(
+            f"{kind} capture: no usable surface plane detected - reposition and recapture")
+
+    T_base_cam = snapshot.camera_T_np()
+    plane_points_base = _deproject_plane_points_mm(frame.depth, K, T_base_cam)
+
+    R, t = T_base_cam[:3, :3], T_base_cam[:3, 3]
+    normal_base = R @ np.asarray(measurement.normal_cam, dtype=float)
+    if normal_base[2] < 0:
+        normal_base = -normal_base
+    point_base = R @ np.asarray(measurement.centroid_cam_mm, dtype=float) + t
+
+    record = CaptureRecord(
+        kind=kind, robot=snapshot, measurement_ts=float(frame.timestamp),
+        captured_at=snapshot.fetched_at, n_frames=int(n_frames),
+        standoff_mm=float(measurement.standoff_mm), tilt_deg=float(measurement.tilt_deg),
+        valid_frac=float(reading.valid_frac), plane_rms_mm=_plane_rms_mm(frame.depth, K),
+        plane_normal_base=tuple(float(v) for v in normal_base),
+        plane_point_base=tuple(float(v) for v in point_base))
+
+    evidence = None
+    if kind != "center":
+        polygon_uv = _boundary_polygon_uv(scfg, frame.color)
+        if polygon_uv is not None:
+            # CRITICAL: production boundary polygons (color_work_boundary /
+            # sam_work_boundary, both via mask_to_boundary's cv2.findContours) are
+            # CLOSED contours -- closed=True lets the corner's arm walk wrap around
+            # the array end to find its other arm when the corner sits near the
+            # contour's start/end vertex. Omitting it fails safe (returns None, an
+            # operator-visible "no usable edge evidence" rejection) but silently
+            # loses real wraparound coverage; see corner_evidence.extract_corner_evidence's
+            # own docstring.
+            evidence = extract_corner_evidence(
+                frame.depth, K, polygon_uv, T_base_cam,
+                corner_hint_uv=(0.5, 0.5), closed=True)
+
+    state = survey.add_capture(record, plane_points_base, evidence)
+    services.bus.publish(JobEvent("survey", state))
+    return state
 
 
 def _densify_quad(corners: np.ndarray, n: int = 6) -> np.ndarray:
