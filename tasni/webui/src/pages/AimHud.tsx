@@ -141,8 +141,14 @@ function Hud({ gate, mode = "scan", coverageDots = null, liveBoundary = null }:
         // color frame at video rate — reliable + real-time); fall back to the depth-
         // fitted outline (locked snapshot, or when color abstains on a low-contrast
         // scene). The depth silhouette + metric grid are depth diagnostics, shown only
-        // with the depth box.
-        const usingColor = !!(liveBoundary && liveBoundary.outline.length >= 3);
+        // with the depth box. Once a locked (live: false) gate has arrived, the color
+        // boundary must never win even if the parent hasn't cleared its liveBoundary
+        // prop yet — the lock WS event can land before the /surface/lock HTTP response
+        // resolves (which is what the parent gates liveBoundary on), so without this
+        // check there is a narrow window where a stale color rectangle would render
+        // over the just-locked authoritative outline_uv.
+        const usingColor = !!(liveBoundary && liveBoundary.outline.length >= 3
+          && gate?.live !== false);
         const region = usingColor ? liveBoundary!.outline
           : (gate?.outline_uv && gate.outline_uv.length >= 3 ? gate.outline_uv : null);
         if (!region) return null;

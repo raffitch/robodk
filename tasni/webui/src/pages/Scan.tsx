@@ -541,10 +541,19 @@ export default function Scan() {
       }>("/surface/lock", { mode: surfaceMode });
       setLive(false); resetStream();
       // The lock snapshot (r.gate) is the sole authoritative geometry — display it
-      // as sent, with no client-side latch/repair (spec §11).
+      // as sent, with no client-side latch/repair (spec §11). resetCoverage() here
+      // matters too: coverageDots is a LIVE-only accumulator (see accumulateCoverage
+      // above), and AimHud renders it ahead of the gate's own points_uv whenever it
+      // is non-empty. Without clearing it at the moment of lock, the HUD would keep
+      // showing the pre-lock accumulated dot union — stale live geometry — on top of
+      // the just-locked authoritative snapshot, for as long as the surface stays
+      // locked (this call is the only place surfaceLocked ever becomes true, so it
+      // covers every path into the locked-review state, including a manual
+      // "Accept region & create targets" click).
       setGate(r.gate);
       setSurfaceLocked(true);
       setSurfaceStable(false);
+      resetCoverage();
       addLog(r.surface_mode === "crop" && r.crop_size_mm
         ? `surface locked — generic ${Math.round(r.crop_size_mm[0])} x ${Math.round(r.crop_size_mm[1])} mm work area; creating targets`
         : `surface locked — detected platform${
