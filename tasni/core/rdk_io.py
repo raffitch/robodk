@@ -1012,7 +1012,219 @@ class RdkIO:
         import robolink
 
         items = self.rdk.ItemList(robolink.ITEM_TYPE_TOOL)
-        return [i.Name() for i in items]
+        return sorted(i.Name() for i in items)
+
+    def list_frames(self) -> list[str]:
+        """Sorted reference-frame names available for a fabrication plan."""
+        import robolink
+
+        return sorted(i.Name() for i in self.rdk.ItemList(robolink.ITEM_TYPE_FRAME))
+
+    def list_programs(self) -> list[str]:
+        """Sorted standard-program names (Python macros excluded)."""
+        import robolink
+
+        return sorted(i.Name() for i in self.rdk.ItemList(robolink.ITEM_TYPE_PROGRAM))
+
+    def program_instructions(self, name: str) -> list[str]:
+        """Human-readable instruction texts for a standard program."""
+        import robolink
+
+        program = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+        if not program.Valid():
+            return []
+        return [str(program.Instruction(index)[0])
+                for index in range(program.InstructionCount())]
+
+    def item_exists_as(self, name: str, kind: str) -> bool:
+        """Exact-type existence check used for untrusted UI selections."""
+        import robolink
+
+        types = {
+            "tool": robolink.ITEM_TYPE_TOOL,
+            "frame": robolink.ITEM_TYPE_FRAME,
+            "target": robolink.ITEM_TYPE_TARGET,
+            "program": robolink.ITEM_TYPE_PROGRAM,
+        }
+        if kind not in types or not name:
+            return False
+        return bool(self.rdk.Item(name, types[kind]).Valid())
+
+    def use_named_tool_frame(self, tool_name: str, frame_name: str) -> np.ndarray:
+        """Activate exact selected TOOL and FRAME items; return flange->TCP."""
+        import robolink
+
+        tool = self.rdk.Item(tool_name, robolink.ITEM_TYPE_TOOL)
+        frame = self.rdk.Item(frame_name, robolink.ITEM_TYPE_FRAME)
+        if not tool.Valid():
+            raise RuntimeError(f"tool {tool_name!r} not found")
+        if not frame.Valid():
+            raise RuntimeError(f"frame {frame_name!r} not found")
+        robot = self.robot()
+        robot.setPoseTool(tool)
+        robot.setPoseFrame(frame)
+        self._tool_pose = pose_to_T(tool.PoseTool())
+        self._frame = frame
+        return self._tool_pose
+
+    @staticmethod
+    def xyzrpy_pose_T(xyz_mm, rpy_deg) -> np.ndarray:
+        """Build a RoboDK-convention XYZ+RPW pose as a numpy transform."""
+        import robodk.robomath as robomath
+
+        xyz = [float(v) for v in xyz_mm]
+        rpy = [float(v) for v in rpy_deg]
+        return pose_to_T(robomath.xyzrpw_2_pose(xyz + rpy))
+
+    def ensure_mock_valve_programs(self, prefix: str = "TasniDry") -> tuple[str, str]:
+        """Create comment-only dry-run valve programs (never touch I/O)."""
+        import robolink
+
+        names = (f"{prefix}AirOn", f"{prefix}AirOff")
+        for name, state in zip(names, ("ON", "OFF")):
+            old = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+            if old.Valid():
+                old.Delete()
+            prog = self.rdk.AddProgram(name, self.robot())
+            prog.RunInstruction(
+                f"DRY_RUN mock valve {state}; physical outputs blocked",
+                robolink.INSTRUCTION_COMMENT)
+        return names
+
+    def create_extrusion_layer_program(
+            self, *, name: str, points_xyz: np.ndarray, orientation_rpy_deg,
+            print_tool: str, work_frame: str, speed_mm_s: float,
+            approach_clearance_mm: float, retreat_clearance_mm: float,
+            air_on_program: str, air_off_program: str) -> dict:
+        """Create one complete layer program and its temporary targets.
+
+        Motion order is identical for dry and live modes: approach (valve off),
+        descend to the first path point, path-start event, closed linear path,
+        path-finish event, and retreat. Inspection is a separate program so live
+        execution can command/verify OFF *before* any inspection motion. The caller
+        chooses real or comment-only valve program names.
+        """
+        import robolink
+
+        pts = np.asarray(points_xyz, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 3:
+            raise ValueError("extrusion path must be a finite Nx3 array")
+        if not np.isfinite(pts).all():
+            raise ValueError("extrusion path contains non-finite coordinates")
+        required = ((print_tool, "tool"), (work_frame, "frame"),
+                    (air_on_program, "program"), (air_off_program, "program"))
+        missing = [f"{kind} {value!r}" for value, kind in required
+                   if not self.item_exists_as(value, kind)]
+        if missing:
+            raise RuntimeError("missing station item(s): " + ", ".join(missing))
+
+        robot = self.robot()
+        frame = self.rdk.Item(work_frame, robolink.ITEM_TYPE_FRAME)
+        print_tcp = self.rdk.Item(print_tool, robolink.ITEM_TYPE_TOOL)
+        old = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+        if old.Valid():
+            old.Delete()
+        program = self.rdk.AddProgram(name, robot)
+        program.setPoseFrame(frame)
+        program.setPoseTool(print_tcp)
+        program.setSpeed(float(speed_mm_s))
+
+        target_names: list[str] = []
+
+        def add_target(suffix: str, xyz) -> object:
+            target_name = f"{name}_{suffix}"
+            existing = self.rdk.Item(target_name, robolink.ITEM_TYPE_TARGET)
+            if existing.Valid():
+                existing.Delete()
+            target = self.rdk.AddTarget(target_name, frame, robot)
+            target.setAsCartesianTarget()
+            target.setPose(T_to_pose(self.xyzrpy_pose_T(xyz, orientation_rpy_deg)))
+            target_names.append(target_name)
+            return target
+
+        approach_xyz = pts[0].copy()
+        approach_xyz[2] += float(approach_clearance_mm)
+        retreat_xyz = pts[-1].copy()
+        retreat_xyz[2] += float(retreat_clearance_mm)
+        approach = add_target("Approach", approach_xyz)
+        start = add_target("Path0000", pts[0])
+        program.MoveJ(approach)
+        program.MoveL(start)
+        program.RunInstruction(air_on_program, robolink.INSTRUCTION_CALL_PROGRAM)
+        for index, xyz in enumerate(pts[1:], start=1):
+            program.MoveL(add_target(f"Path{index:04d}", xyz))
+        program.RunInstruction(air_off_program, robolink.INSTRUCTION_CALL_PROGRAM)
+        program.MoveL(add_target("Retreat", retreat_xyz))
+        return {"program": name, "targets": target_names, "point_count": len(pts)}
+
+    def create_inspection_program(self, *, name: str, inspection_tool: str,
+                                  inspection_target: str, speed_mm_s: float) -> dict:
+        """Create the post-OFF inspection move as its own auditable program."""
+        import robolink
+
+        required = ((inspection_tool, "tool"), (inspection_target, "target"))
+        missing = [f"{kind} {value!r}" for value, kind in required
+                   if not self.item_exists_as(value, kind)]
+        if missing:
+            raise RuntimeError("missing station item(s): " + ", ".join(missing))
+        robot = self.robot()
+        tool = self.rdk.Item(inspection_tool, robolink.ITEM_TYPE_TOOL)
+        target = self.rdk.Item(inspection_target, robolink.ITEM_TYPE_TARGET)
+        old = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+        if old.Valid():
+            old.Delete()
+        program = self.rdk.AddProgram(name, robot)
+        parent = target.Parent()
+        if parent.Valid() and parent.Type() == robolink.ITEM_TYPE_FRAME:
+            program.setPoseFrame(parent)
+        program.setPoseTool(tool)
+        program.setSpeed(float(speed_mm_s))
+        program.MoveJ(target)
+        return {"program": name, "targets": [], "inspection_target": inspection_target}
+
+    def update_program(self, name: str, *, collisions: bool = True) -> dict:
+        """RoboDK program validation (instructions, time, distance, % feasible)."""
+        import robolink
+
+        program = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+        if not program.Valid():
+            raise RuntimeError(f"program {name!r} not found")
+        result = program.Update(robolink.COLLISION_ON if collisions else robolink.COLLISION_OFF)
+        return {"instructions_ok": int(result[0]), "time_s": float(result[1]),
+                "distance_mm": float(result[2]), "percent_ok": float(result[3]) * 100.0,
+                "problems": str(result[4] or "")}
+
+    def start_program(self, name: str, *, real_robot: bool) -> int:
+        """Start a named program with an explicit simulator/robot run type."""
+        import robolink
+
+        program = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+        if not program.Valid():
+            raise RuntimeError(f"program {name!r} not found")
+        program.setRunType(robolink.PROGRAM_RUN_ON_ROBOT if real_robot
+                           else robolink.PROGRAM_RUN_ON_SIMULATOR)
+        return int(program.RunCode())
+
+    def program_busy(self, name: str) -> bool:
+        import robolink
+
+        return bool(self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM).Busy())
+
+    def stop_program(self, name: str) -> None:
+        import robolink
+
+        program = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+        if program.Valid():
+            program.Stop()
+
+    def run_station_program(self, name: str, *, real_robot: bool) -> None:
+        """Run a station program to completion with explicit run type."""
+        started = self.start_program(name, real_robot=real_robot)
+        if started < 0:
+            raise RuntimeError(f"program {name!r} could not start")
+        while self.program_busy(name):
+            import time
+            time.sleep(0.05)
 
     def set_tool_pose(self, tool_name: str, T: np.ndarray) -> None:
         import robolink

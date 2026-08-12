@@ -28,10 +28,12 @@ The programs were read in a private, headless RoboDK session; neither was run.
 - `AirOn`: `Set IO_508=1`, then `Set IO_601=1`.
 - `AirOff`: `Set IO_508=0`, then `Set IO_601=0`.
 
-This proves the legacy station mapping and polarity. It does **not** constitute an
-approved physical I/O test. Tasni therefore keeps `hardware_io_test_approved=false`
-and live print remains locked. `tools/setup_extrusion_station.py` reproduces these
-programs without executing them.
+This proves the legacy station mapping and polarity. It does **not** by itself
+constitute an approved physical I/O test. Tasni therefore keeps the committed
+default `hardware_io_test_approved=false`; an authorized operator can set the
+interlock only in the ignored local `tasni.config.json` after approving the cell.
+This workstation's operator explicitly approved it on 2026-08-12. The setup tool
+reproduces the programs without executing them.
 
 On 2026-08-12 the first setup attempt used Tasni's generic isolated-session helper,
 which launches RoboDK with `-SKIPINI`. That private process did not load the user's
@@ -48,7 +50,8 @@ py -3.10 tools\setup_extrusion_station.py Tasni.rdk --inplace
 The corrected setup was then run successfully. A second fresh private RoboDK
 instance reopened `Tasni.rdk` and verified `AirOn` contains `Set IO_508=1` and
 `Set IO_601=1`, while `AirOff` contains the corresponding `=0` instructions.
-Neither program was executed; the approved physical I/O test remains outstanding.
+Neither program was executed by the setup utility; approval remains a separate,
+operator-owned local interlock and is never inferred from station setup or licensing.
 
 ## Effective processing defaults
 

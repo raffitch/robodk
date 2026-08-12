@@ -29,6 +29,20 @@ class CylinderRecipe(_Record):
     material: list[MaterialComponent] = Field(default_factory=list)
 
 
+class CylinderSetup(_Record):
+    """Every station/motion choice that changes what the robot will execute."""
+
+    print_tool: str = Field(min_length=1)
+    work_frame: str = Field(min_length=1)
+    inspection_tool: str = Field(min_length=1)
+    inspection_target: str = Field(min_length=1)
+    center_x_mm: float = 0.0
+    center_y_mm: float = 0.0
+    orientation_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    approach_clearance_mm: float = Field(default=40.0, gt=0, le=500)
+    retreat_clearance_mm: float = Field(default=60.0, gt=0, le=500)
+
+
 class PathPoint(_Record):
     x_mm: float
     y_mm: float
@@ -45,6 +59,7 @@ class CylinderPlan(_Record):
     schema_version: str = "1.0"
     fingerprint: str
     recipe: CylinderRecipe
+    setup: CylinderSetup
     layers: list[LayerPath]
     total_path_length_mm: float
 
@@ -75,6 +90,7 @@ class LayerManifest(_Record):
     corrected_path_file: str | None = None
     color_file: str | None = None
     depth_file: str | None = None
+    pointcloud_file: str | None = None
     metrics: DeviationMetrics | None = None
     processing: dict[str, Any] = Field(default_factory=dict)
     provenance: dict[str, Any] = Field(default_factory=dict)

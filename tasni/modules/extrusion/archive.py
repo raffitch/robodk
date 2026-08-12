@@ -31,13 +31,26 @@ class ExtrusionArchive:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "toolpath_fingerprint": plan.fingerprint,
             "recipe": plan.recipe.model_dump(mode="json"),
+            "setup": plan.setup.model_dump(mode="json"),
             "layer_count": len(plan.layers), "provenance": provenance or {},
         }
         (trial / "trial.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return trial
 
+    def layer_dir(self, trial_id: str, layer_index: int, *, require: bool = True) -> Path:
+        if layer_index < 1:
+            raise ValueError("layer index must be positive")
+        layer = self.root / _segment(trial_id, "trial id") / f"layer-{layer_index:03d}"
+        if require and not (layer / "manifest.json").is_file():
+            raise FileNotFoundError(
+                f"archived layer does not exist: {trial_id}/layer-{layer_index:03d}")
+        return layer
+
     def write_layer(self, manifest: LayerManifest, *, nominal_xyz, commanded_xyz,
-                    measured_xyz=None, corrected_xyz=None, color=None, depth=None) -> Path:
+                    measured_xyz=None, corrected_xyz=None, color=None, depth=None,
+                    pointcloud_xyz=None,
+                    derived_images: dict[str, np.ndarray] | None = None,
+                    report: dict | None = None) -> Path:
         trial = self.root / _segment(manifest.trial_id, "trial id")
         if not (trial / "trial.json").is_file():
             raise FileNotFoundError(f"trial does not exist: {manifest.trial_id}")
@@ -55,6 +68,50 @@ class ExtrusionArchive:
                 raise OSError("failed to write color.png")
         if depth is not None:
             np.save(layer / "depth.npy", np.asarray(depth))
+        if pointcloud_xyz is not None:
+            points = np.asarray(pointcloud_xyz, dtype=float)
+            if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+                raise ValueError("archived point cloud must be a finite Nx3 array")
+            np.save(layer / "height-or-pointcloud.npy", points)
+        if derived_images:
+            import cv2
+            allowed = {"segmentation.png", "skeleton.png", "comparison.png"}
+            for name, image in derived_images.items():
+                if name not in allowed:
+                    raise ValueError(f"unsupported derived image name: {name!r}")
+                if not cv2.imwrite(str(layer / name), np.asarray(image)):
+                    raise OSError(f"failed to write {name}")
+        if report is not None:
+            (layer / "report.json").write_text(json.dumps(report, indent=2),
+                                                encoding="utf-8")
+        (layer / "manifest.json").write_text(
+            manifest.model_dump_json(indent=2), encoding="utf-8")
+        return layer
+
+    def rewrite_processing(self, manifest: LayerManifest, *, measured_xyz,
+                           corrected_xyz=None, pointcloud_xyz=None,
+                           derived_images: dict[str, np.ndarray], report: dict) -> Path:
+        """Replace derived artifacts for a saved raw observation, never raw input."""
+        layer = self.layer_dir(manifest.trial_id, manifest.layer_index)
+        self._json_path(layer / "measured_path.json", measured_xyz)
+        corrected_path = layer / "corrected_path.json"
+        if corrected_xyz is not None:
+            self._json_path(corrected_path, corrected_xyz)
+        elif corrected_path.exists():
+            corrected_path.unlink()
+        if pointcloud_xyz is not None:
+            points = np.asarray(pointcloud_xyz, dtype=float)
+            if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+                raise ValueError("archived point cloud must be a finite Nx3 array")
+            np.save(layer / "height-or-pointcloud.npy", points)
+        import cv2
+        allowed = {"segmentation.png", "skeleton.png", "comparison.png"}
+        if set(derived_images) - allowed:
+            raise ValueError("unsupported derived image name")
+        for name, image in derived_images.items():
+            if not cv2.imwrite(str(layer / name), np.asarray(image)):
+                raise OSError(f"failed to write {name}")
+        (layer / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         (layer / "manifest.json").write_text(
             manifest.model_dump_json(indent=2), encoding="utf-8")
         return layer

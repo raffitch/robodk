@@ -148,18 +148,33 @@ old `macros/3DScan.py` (OpenCV/Open3D popups, concatenation-not-fusion, WSL/NKSR
 - Later modes of this module: object scan (same engine), a camera-feedback loop (the
   live depth gate is the seam), and optional marker-anchored framing.
 
-## Cylinder Test module (#3, implementation in progress)
+## Cylinder Test module (#3)
 
-The first safe slice of the post-extrusion workflow is registered at
-`/m/extrusion`: typed recipe inputs, deterministic closed circular layers, an SVG
-preview, toolpath fingerprinting/invalidation, geometry preflight, measured-circle
-metrics, bounded opt-in compensation, and versioned trial/layer archive writers.
+The post-extrusion workflow is registered at `/m/extrusion`: typed recipe inputs,
+dynamic RoboDK tool/frame/inspection-target selection, deterministic closed layers,
+a bird's-eye all-layer preview, immutable toolpath fingerprints, geometry preflight,
+and a complete collision-checked RoboDK simulation using comment-only valve mocks.
+Live mode revalidates the exact station selections and valve program bodies, forces
+`AirOff` before approach/inspection and on every exit, prints one layer at a time,
+captures exactly one synchronized RGB-D observation per layer, reconstructs the
+centreline, calculates measured-circle metrics and bounded opt-in compensation, and
+returns to the captured start joints.
+
+Every layer archives nominal/commanded/measured/corrected paths, raw color/depth,
+the filtered work-frame point cloud, segmentation/skeleton/comparison diagnostics,
+metrics, valve events, camera pose/intrinsics, calibration identity, processing
+configuration, and git commit under `runs/extrusion/<trial-id>/`. A saved layer can
+be reprocessed offline through
+`POST /api/modules/extrusion/trials/{trial}/layers/{layer}/reprocess` without robot
+or camera access.
+
 The verified legacy valve mapping is `IO_508 + IO_601` (`1` on, `0` off), kept
 separate from extrusion rate and reproduced by `tools/setup_extrusion_station.py`.
 
 `AirOn`/`AirOff` are now saved and independently reopened/verified in `Tasni.rdk`.
-Live execution remains intentionally locked until a current-path RoboDK dry tour is
-implemented and the physical I/O approval interlock is set. Geometry preflight
-explicitly does not claim a RoboDK dry-run pass. See
-`docs/extrusion-legacy-trace.md` for the traced legacy sequence and deliberate
+Live execution is fail-closed until the exact current fingerprint passes its RoboDK
+dry run, `hardware_io_test_approved` is true in the operator's local configuration,
+and the operator checks the explicit live confirmation. Extrusion rate remains
+record-only because no independently verified rate controller mapping was found.
+See `docs/extrusion-legacy-trace.md` for the traced legacy sequence and deliberate
 correction change.

@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from tasni.core.config import AppConfig, ExtrusionConfig
 from tasni.modules.extrusion.archive import ExtrusionArchive
 from tasni.modules.extrusion.comparison import compare_circle, corrected_circle
-from tasni.modules.extrusion.models import CylinderRecipe, LayerManifest
+from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup, LayerManifest
 from tasni.modules.extrusion.service import geometry_preflight
 from tasni.modules.extrusion.toolpath import generate_cylinder_plan, points_array
 from tasni.webapp.server import create_app
@@ -26,11 +26,27 @@ def recipe(**updates) -> CylinderRecipe:
     return CylinderRecipe(**values)
 
 
+def setup(**updates) -> CylinderSetup:
+    values = dict(print_tool="Nozzle", work_frame="BuildFrame",
+                  inspection_tool="Camera", inspection_target="Inspect",
+                  center_x_mm=10, center_y_mm=-5,
+                  orientation_rpy_deg=(180, 0, 90),
+                  approach_clearance_mm=30, retreat_clearance_mm=50)
+    values.update(updates)
+    return CylinderSetup(**values)
+
+
+def generate_payload(**recipe_updates) -> dict:
+    return {"recipe": recipe(**recipe_updates).model_dump(mode="json"),
+            "setup": setup().model_dump(mode="json")}
+
+
 def test_config_keeps_verified_mapping_separate_from_hardware_approval():
     config = ExtrusionConfig()
     assert config.valve_outputs == ["IO_508", "IO_601"]
     assert config.valve_mapping_verified is True
     assert config.hardware_io_test_approved is False
+    assert config.default_print_tool == "" and config.default_work_frame == ""
     assert expected_instructions(config.valve_outputs, 1) == ["Set IO_508=1", "Set IO_601=1"]
     assert expected_instructions(config.valve_outputs, 0) == ["Set IO_508=0", "Set IO_601=0"]
     assert "-NEWINSTANCE" in LICENSED_ISOLATED_ARGS
@@ -39,7 +55,7 @@ def test_config_keeps_verified_mapping_separate_from_hardware_approval():
 
 
 def test_plan_is_closed_layered_and_fingerprinted():
-    plan = generate_cylinder_plan(recipe())
+    plan = generate_cylinder_plan(recipe(), setup())
     assert len(plan.layers) == 3
     assert [layer.nominal_z_mm for layer in plan.layers] == [3, 8, 13]
     for layer in plan.layers:
@@ -47,12 +63,14 @@ def test_plan_is_closed_layered_and_fingerprinted():
         assert pts.shape == (73, 3)
         np.testing.assert_allclose(pts[0], pts[-1], atol=0)
     assert math.isclose(plan.total_path_length_mm, 3 * 2 * math.pi * 40)
-    changed = generate_cylinder_plan(recipe(radius_mm=41))
+    changed = generate_cylinder_plan(recipe(radius_mm=41), setup())
     assert changed.fingerprint != plan.fingerprint
+    changed_setup = generate_cylinder_plan(recipe(), setup(print_tool="OtherNozzle"))
+    assert changed_setup.fingerprint != plan.fingerprint
 
 
 def test_geometry_preflight_does_not_claim_robodk_dry_run():
-    result = geometry_preflight(generate_cylinder_plan(recipe()))
+    result = geometry_preflight(generate_cylinder_plan(recipe(), setup()))
     assert result["all_ok"] is True
     assert result["dry_run_passed"] is False
     assert all(event["physical_output_blocked"] for event in result["simulated_valve_events"])
@@ -63,19 +81,19 @@ def test_circle_metrics_and_bounded_correction():
     measured = np.column_stack((42 * np.cos(theta) + 3,
                                 42 * np.sin(theta) - 4,
                                 np.full_like(theta, 8)))
-    metrics = compare_circle(measured, 40)
+    metrics = compare_circle(measured, 40, nominal_center_mm=(3, -4))
     assert metrics.valid
     assert math.isclose(metrics.measured_radius_mm, 42, abs_tol=1e-9)
     assert math.isclose(metrics.rms_mm, 2, abs_tol=1e-9)
-    corrected = corrected_circle(measured, 40, 8, point_count=72,
+    corrected = corrected_circle(measured, 40, 8, nominal_center_mm=(3, -4), point_count=72,
                                  gain=1, smoothing_points=9, max_correction_mm=5)
-    radii = np.linalg.norm(corrected[:, :2], axis=1)
+    radii = np.linalg.norm(corrected[:, :2] - np.array([3, -4]), axis=1)
     np.testing.assert_allclose(radii, 38, atol=1e-8)
     np.testing.assert_allclose(corrected[0], corrected[-1])
 
 
 def test_archive_writes_reprocessable_layer(tmp_path: Path):
-    plan = generate_cylinder_plan(recipe(layer_count=1))
+    plan = generate_cylinder_plan(recipe(layer_count=1), setup())
     archive = ExtrusionArchive(tmp_path)
     trial = archive.create_trial("trial-001", plan, provenance={"git_commit": "abc"})
     pts = points_array(plan.layers[0])
@@ -97,12 +115,12 @@ def test_api_registers_module_and_invalidates_preflight_on_regeneration():
     client = TestClient(create_app(AppConfig()))
     modules = client.get("/api/modules").json()["modules"]
     assert "extrusion" in {module["id"] for module in modules}
-    payload = recipe().model_dump(mode="json")
+    payload = generate_payload()
     first = client.post("/api/modules/extrusion/generate", json=payload).json()
     ok = client.post("/api/modules/extrusion/preflight",
                      json={"fingerprint": first["fingerprint"]})
     assert ok.status_code == 200 and ok.json()["all_ok"]
-    payload["radius_mm"] = 41
+    payload["recipe"]["radius_mm"] = 41
     client.post("/api/modules/extrusion/generate", json=payload)
     stale = client.post("/api/modules/extrusion/preflight",
                         json={"fingerprint": first["fingerprint"]})
@@ -111,8 +129,7 @@ def test_api_registers_module_and_invalidates_preflight_on_regeneration():
 
 def test_api_live_print_is_fail_closed():
     client = TestClient(create_app(AppConfig()))
-    plan = client.post("/api/modules/extrusion/generate",
-                       json=recipe().model_dump(mode="json")).json()
+    plan = client.post("/api/modules/extrusion/generate", json=generate_payload()).json()
     response = client.post("/api/modules/extrusion/print",
                            json={"fingerprint": plan["fingerprint"]})
     assert response.status_code == 409

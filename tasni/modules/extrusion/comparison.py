@@ -26,11 +26,13 @@ def fit_circle_xy(measured_xyz) -> tuple[np.ndarray, float]:
 
 
 def compare_circle(measured_xyz, nominal_radius_mm: float, *,
+                   nominal_center_mm: tuple[float, float] = (0.0, 0.0),
                    min_points: int = 24, min_completeness: float = 0.90,
                    max_gap_deg: float = 30.0) -> DeviationMetrics:
     pts = _points(measured_xyz)
     center, measured_radius = fit_circle_xy(pts)
-    radii = np.linalg.norm(pts[:, :2] - center, axis=1)
+    nominal_center = np.asarray(nominal_center_mm, dtype=float)
+    radii = np.linalg.norm(pts[:, :2] - nominal_center, axis=1)
     deviation = radii - float(nominal_radius_mm)
     angles = np.mod(np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0]), 2 * math.pi)
     ordered = np.sort(np.unique(angles))
@@ -58,11 +60,12 @@ def compare_circle(measured_xyz, nominal_radius_mm: float, *,
 
 
 def corrected_circle(measured_xyz, nominal_radius_mm: float, nominal_z_mm: float, *,
+                     nominal_center_mm: tuple[float, float] = (0.0, 0.0),
                      point_count: int = 180, gain: float = 1.0,
                      smoothing_points: int = 9, max_correction_mm: float = 10.0) -> np.ndarray:
     """Mirror measured radial error into a bounded, cyclically smoothed command."""
     pts = _points(measured_xyz)
-    center, _ = fit_circle_xy(pts)
+    center = np.asarray(nominal_center_mm, dtype=float)
     angles = np.mod(np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0]), 2 * math.pi)
     radial_error = np.linalg.norm(pts[:, :2] - center, axis=1) - nominal_radius_mm
     order = np.argsort(angles)
@@ -80,6 +83,7 @@ def corrected_circle(measured_xyz, nominal_radius_mm: float, nominal_z_mm: float
                             np.ones(width) / width, mode="valid")
     correction = np.clip(-gain * error, -max_correction_mm, max_correction_mm)
     radius = nominal_radius_mm + correction
-    result = np.column_stack((radius * np.cos(theta), radius * np.sin(theta),
+    result = np.column_stack((center[0] + radius * np.cos(theta),
+                              center[1] + radius * np.sin(theta),
                               np.full(point_count, nominal_z_mm)))
     return np.vstack((result, result[0]))

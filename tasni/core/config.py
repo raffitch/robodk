@@ -608,9 +608,20 @@ class ExtrusionConfig(_Model):
     correction_smoothing_points: int = Field(default=9, ge=1, le=101)
     correction_max_mm: float = Field(default=10.0, gt=0, le=100)
 
-    extruder_tool: str = "Extruder"
-    work_frame: str = "woodFrame"
-    inspection_target: str = "camTarg"
+    # Optional UI preferences only. Station items are discovered dynamically and
+    # the chosen names are embedded in every plan fingerprint; blank means the
+    # operator must select explicitly. Nothing here is a mandatory station name.
+    default_print_tool: str = ""
+    default_work_frame: str = ""
+    default_inspection_tool: str = ""
+    default_inspection_target: str = ""
+    center_x_mm: float = 0.0
+    center_y_mm: float = 0.0
+    orientation_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    approach_clearance_mm: float = Field(default=40.0, gt=0, le=500)
+    retreat_clearance_mm: float = Field(default=60.0, gt=0, le=500)
+    settle_s: float = Field(default=1.0, ge=0, le=30)
+    grab_timeout_s: float = Field(default=15.0, gt=0, le=120)
     air_on_program: str = "AirOn"
     air_off_program: str = "AirOff"
     valve_outputs: list[str] = Field(default_factory=lambda: ["IO_508", "IO_601"])
@@ -630,7 +641,13 @@ class ExtrusionConfig(_Model):
     cluster_eps_m: float = Field(default=0.005, gt=0)
     cluster_min_points: int = Field(default=10, ge=2)
     upwards_normal_z: float = Field(default=0.92, ge=-1, le=1)
+    normal_cluster_eps_m: float = Field(default=0.02, gt=0)
     branch_guard_max_attempts: int = Field(default=3, ge=1, le=20)
+    deposit_min_height_mm: float = Field(default=0.5, ge=0, le=100)
+    deposit_height_margin_mm: float = Field(default=15.0, gt=0, le=100)
+    radial_roi_margin_mm: float = Field(default=30.0, gt=0, le=200)
+    raster_mm_per_pixel: float = Field(default=1.0, gt=0, le=10)
+    measured_spline_points: int = Field(default=180, ge=24, le=4000)
 
 
 class WebConfig(_Model):
