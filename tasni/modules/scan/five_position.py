@@ -183,8 +183,40 @@ class FivePositionSurvey:
         # bound)` -- the pattern the standoff check just below already used
         # correctly (`not (lo <= x <= hi)` correctly rejects a NaN standoff;
         # `x < lo or x > hi` would not have).
-        if not (record.valid_frac >= float(self._scfg.min_valid_depth_frac)):
-            raise RuntimeError("not enough valid depth in the capture")
+        #
+        # THRESHOLD is step-aware, not just the metric feeding it (Task 13 review,
+        # remedy ii, round 3): five_position_capture already computes a DIFFERENT
+        # valid_frac per step -- the CENTRE step's coarse centre-patch fraction
+        # (the reticle really does sit on the surface there, so it routinely reads
+        # close to 1.0) vs. a CORNER step's plane-inlier PURITY (of the depth
+        # actually measured, how much lies on the work plane). Those two metrics
+        # have structurally different achievable ranges: centring the reticle on a
+        # 90-degree corner means at most one quadrant of the frame can ever be the
+        # work surface, capping a mathematically PERFECT corner aim's purity at
+        # ~25% (see ScanConfig.survey_corner_min_plane_coverage_frac's own
+        # comment) -- comfortably below min_valid_depth_frac's default (0.5,
+        # documented as "this fraction of the PATCH", tuned for the centre-patch
+        # metric and never redesigned for a whole-frame corner one). Applying that
+        # single threshold to both meant EVERY corner capture against a real
+        # (non-silent) background was rejected regardless of aim quality -- not an
+        # edge case on a physical cell with a floor/fixtures inside D435i range,
+        # but the common one. Corner steps are instead gated against
+        # survey_corner_min_plane_coverage_frac -- reused rather than adding a
+        # near-duplicate key: at the ceiling, purity and coverage are the SAME
+        # quantity (their denominators coincide whenever the background returns
+        # real depth), so the "admit the ~25% ceiling with margin" reasoning
+        # documented on that key applies equally to both metrics.
+        if expected == "center":
+            if not (record.valid_frac >= float(self._scfg.min_valid_depth_frac)):
+                raise RuntimeError("not enough valid depth in the capture")
+        else:
+            corner_min_frac = float(self._scfg.survey_corner_min_plane_coverage_frac)
+            if not (record.valid_frac >= corner_min_frac):
+                raise RuntimeError(
+                    f"{expected} capture: only {record.valid_frac:.0%} of the depth "
+                    f"measured is trustworthy work-plane data (< {corner_min_frac:.0%} "
+                    "minimum) - too little of the table is in view; move closer to "
+                    "the corner or reposition and recapture")
         if not (record.tilt_deg <= float(self._scfg.survey_max_tilt_deg)):
             raise RuntimeError("camera tilt exceeds the survey tolerance - level and remeasure")
         if not (float(self._scfg.accurate_min_mm) * 0.8 <= record.standoff_mm

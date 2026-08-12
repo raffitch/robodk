@@ -1569,26 +1569,28 @@ def test_five_position_survey_accepts_captures_with_zero_background_depth():
           "accepted (purity ~1.0 at every corner) + finish() succeeded")
 
 
-def test_five_position_survey_rejects_too_little_table_in_view():
-    """Finding 1 remedy (ii)'s end-to-end negative proof (the other half of
-    "pin the metric in both directions"): a corner capture whose reticle sits
-    exactly on the table corner sees a REAL, coherent off-plane surface (a
-    floor 750 mm below) filling ~74% of the frame -- only ~26% is genuinely
-    trustworthy table. That is exactly "too little of the table in view" in
-    the sense that matters (most of what this capture measured is NOT the
-    work surface), and must still be REJECTED, not waved through just
-    because the plane-inlier COPLANARITY fix (Finding 1's Critical remedy)
-    can salvage the minority table points for the RMS calculation.
+def test_five_position_survey_accepts_well_aimed_corner_with_real_background():
+    """Finding 1 remedy (ii) round-3 ruling: a corner capture whose reticle sits
+    EXACTLY on the table corner -- the BEST POSSIBLE aim -- against a REAL,
+    coherent off-plane surface (a floor 750 mm below, filling ~74% of the
+    frame; only ~26.25% is genuinely trustworthy table) MUST BE ACCEPTED.
+    Aiming at corners with real background in frame (a floor, fixtures, a
+    wall within D435i range) is the entire premise of the five-position
+    path -- rejecting the geometric best case a corner shot can ever achieve
+    would make the feature unusable on any real cell.
 
-    This reuses the SAME fixture the original Finding-1 "accepts real
-    background" test used before this round -- once corner steps compare a
-    genuine purity/coverage fraction (~26%) against
-    scan.min_valid_depth_frac (0.5) and scan.survey_corner_min_plane_coverage_frac
-    (0.10), the ~26% purity fails the FIRST (broader) gate. (The narrower
-    coverage gate, calibrated to the ~25% ceiling for a WELL-aimed corner, is
-    exercised separately by the tiny-sliver test below -- purity is what
-    actually fires here, since it is the stricter of the two for a frame this
-    contaminated.)"""
+    Round 2 fed corner steps' CaptureRecord.valid_frac the new plane-inlier
+    PURITY metric but left it gated by five_position.py's SHARED
+    min_valid_depth_frac (0.5): since purity for a well-aimed corner with a
+    real background is the true table fraction (~26%), and 26% < 0.5 always,
+    that left EVERY such capture rejected regardless of aim quality -- the
+    bug this test now pins. five_position.py now gates corner steps against
+    survey_corner_min_plane_coverage_frac (0.10) instead of the shared 0.5,
+    so ~26% clears it with room to spare.
+
+    Table fraction produced by this fixture: 26.25% (567 of 2160 stride-grid
+    points; see test_deproject_plane_points_mm_filters_background_to_plane_inliers,
+    which measures the identical geometry directly)."""
     services, state = _build_fakes_five_position_background(background="floor")
     services.config.scan.boundary_engine = "color"
     survey = FivePositionSurvey(services.config.scan)
@@ -1601,15 +1603,92 @@ def test_five_position_survey_rejects_too_little_table_in_view():
 
         state["cur_kind"] = "corner1"
         patched.cur = "corner1"
+        st = scan_service.five_position_capture(services, survey)
+        assert st["step"] == "corner2"
+        purity = survey._accepted["corner1"].record.valid_frac
+        assert 0.2 < purity < 0.3, purity   # the true ~26% table fraction, not a fabricated pass
+    finally:
+        unpatch()
+    print(f"[Finding 1 remedy ii, round 3] well-aimed corner + real background "
+          f"(purity={purity:.3f}, ~26% table) -> ACCEPTED")
+
+
+def test_five_position_capture_rejects_genuinely_bad_aim_with_real_background():
+    """The other half of the round-3 ruling's regression pin: a corner capture
+    with a REAL background must still be REJECTED when the aim is genuinely
+    bad -- well below the ~25% geometric ceiling a well-aimed shot achieves,
+    not merely "a real background is present." Shrinks the table to the SAME
+    80x80 mm sliver the zero-background coverage-gate test uses, but pairs it
+    with the REAL floor fixture instead of silence: with a real background,
+    purity and coverage are numerically the same quantity (both denominators
+    equal when the background returns real depth), so BOTH the coverage gate
+    (five_position_capture, checked first) and the now-step-aware purity gate
+    (five_position.add_capture) would independently catch this -- verified
+    (see the fix report) that the coverage gate fires first in practice, with
+    a message naming corner1 and "too little of the table is in view", proving
+    the accept test above is not simply "the gate never fires."
+
+    Table fraction produced by this fixture: 4.23% (3249 of 76800 pixels) --
+    comfortably below both the 10% gate and the ~25% ceiling."""
+    tiny_half_mm = 40.0
+    cx, cy = _FIVE_POS_WORLD_CORNERS["corner1"]
+    T = _look_at((cx, cy, 420.0), (cx, cy, 0.0))
+
+    def render_tiny_with_floor(T_base_cam):
+        fx, fy, ccx, ccy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        us, vs = np.meshgrid(np.arange(W), np.arange(H))
+        dirs_cam = np.stack([(us - ccx) / fx, (vs - ccy) / fy, np.ones_like(us, float)], -1)
+        R, t = T_base_cam[:3, :3], T_base_cam[:3, 3]
+        dirs_base = dirs_cam @ R.T
+        dz = dirs_base[..., 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s_table = (0.0 - t[2]) / dz
+        P_table = t + s_table[..., None] * dirs_base
+        on_table = ((np.abs(P_table[..., 0] - cx) <= tiny_half_mm)
+                    & (np.abs(P_table[..., 1] - cy) <= tiny_half_mm)
+                    & (s_table > 0) & np.isfinite(s_table))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s_floor = (_FLOOR_Z_MM - t[2]) / dz
+        valid_floor = (s_floor > 0) & np.isfinite(s_floor)
+        depth = np.where(on_table, s_table, np.where(valid_floor, s_floor, 0)).astype(np.uint16)
+        color = np.full((H, W, 3), 128, np.uint8)
+        return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP)
+
+    services, state = _build_fakes_five_position_background(background="floor")
+    real_grab = services.camera.grab
+
+    def grab_bad_aim_for_corner1(*a, **kw):
+        if state["cur_kind"] == "corner1":
+            state["cam"] = T
+            return render_tiny_with_floor(T)
+        return real_grab(*a, **kw)
+
+    services.camera.grab = grab_bad_aim_for_corner1
+    services.config.scan.boundary_engine = "color"
+    survey = FivePositionSurvey(services.config.scan)
+    patched, unpatch = _patch_boundary_and_plane_for_five_position_background({})
+    try:
+        state["cur_kind"] = "center"
+        patched.cur = "center"
+        scan_service.five_position_capture(services, survey)
+        assert survey.step == "corner1"
+
+        state["cur_kind"] = "corner1"
+        patched.cur = "corner1"
         try:
             scan_service.five_position_capture(services, survey)
-            raise AssertionError("expected the majority-background corner capture to be rejected")
+            raise AssertionError("expected the genuinely bad-aim corner capture to be rejected")
         except RuntimeError as e:
-            assert "not enough valid depth" in str(e), e
+            msg = str(e)
+            # Actionable for the operator: names the step, the problem, and a fix --
+            # not a bare "not enough valid depth" that doesn't say WHAT to do at a
+            # corner specifically (round-3 ruling item 3).
+            assert "corner1" in msg and "too little of the table is in view" in msg, msg
         assert survey.step == "corner1"   # rejected capture must not have been accepted
     finally:
         unpatch()
-    print("[Finding 1 remedy ii] majority-background corner capture (~26% purity) correctly rejected")
+    print("[Finding 1 remedy ii, round 3] genuinely bad-aim corner (4.2% table) + "
+          "real background -> correctly REJECTED with an actionable message")
 
 
 def test_five_position_capture_rejects_tiny_table_sliver_via_coverage_gate():
@@ -2075,12 +2154,16 @@ if __name__ == "__main__":
     test_sparse_measured_support_is_rejected()
     test_five_position_tiled_tour_spans_multiple_tiles()
     test_five_position_tiled_tour_coverage_gate_catches_missing_tiles()
+    test_five_position_tiled_tour_contiguous_hole_caught_even_when_fraction_passes()
     test_five_position_tiled_tour_small_rectangle_is_single_tile()
     test_five_position_capture_uses_fresh_robot_state()
     test_five_position_capture_rejects_disconnected_driver()
     test_five_position_capture_rejects_moving_robot()
     test_deproject_plane_points_mm_filters_background_to_plane_inliers()
-    test_five_position_survey_accepts_captures_with_real_background_depth()
+    test_five_position_survey_accepts_captures_with_zero_background_depth()
+    test_five_position_survey_accepts_well_aimed_corner_with_real_background()
+    test_five_position_capture_rejects_genuinely_bad_aim_with_real_background()
+    test_five_position_capture_rejects_tiny_table_sliver_via_coverage_gate()
     test_five_position_survey_still_rejects_genuine_noncoplanarity_with_background()
     test_deproject_plane_points_mm_regression_pin_against_pre_fix_behaviour()
     test_five_position_capture_corner_step_passes_closed_true_to_corner_evidence()

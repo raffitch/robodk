@@ -762,6 +762,22 @@ def five_position_capture(services, survey: FivePositionSurvey) -> dict:
         plane_point_cam=measurement.centroid_cam_mm,
         band_mm=float(scfg.survey_plane_inlier_band_mm))
 
+    # PRECONDITION (logged for hardware validation, not fixed here -- Task 13 review
+    # round 3): purity_frac and coverage_frac are only as trustworthy as the plane
+    # `measurement` (survey_surface's own RANSAC) actually selected. If the real
+    # background at a corner is itself a large, COHERENT surface -- e.g. this exact
+    # ~26/74 table/floor geometry, measured in round 1 -- survey_surface's RANSAC can
+    # lock onto the BACKGROUND instead of the table (majority wins the vote). When
+    # that happens, both metrics are computed relative to the WRONG plane: floor
+    # points read as "inliers," table points read as "off-plane," so purity/coverage
+    # both come back HIGH and this capture is silently accepted with FLOOR geometry
+    # mislabelled as table geometry -- surfacing only later, and only as a confusing
+    # whole-survey "not coplanar" rejection at finish() that does not name the real
+    # cause. This module's own tests sidestep the failure by overriding the returned
+    # plane with independently-computed ground truth; on real hardware there is no
+    # such override. Plane SELECTION is survey_surface's responsibility, not this
+    # function's, and is explicitly out of scope here.
+    #
     # CaptureRecord.valid_frac: the CENTRE step keeps the coarse centre-patch metric
     # (`reading.valid_frac`) -- the reticle really does sit ON the surface there, so
     # "is the centre of frame valid?" is the right question, matching the compact
