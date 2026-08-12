@@ -177,9 +177,15 @@ class FivePositionSurvey:
         if not capture_is_fresh(record, now=self._clock(),
                                 max_age_s=float(self._scfg.survey_capture_max_age_s)):
             raise RuntimeError("capture is stale - remeasure")
-        if record.valid_frac < float(self._scfg.min_valid_depth_frac):
+        # NaN-safe by construction: `x < lo` / `x > hi` silently PASS a NaN
+        # (every comparison against NaN is False, including `nan < lo` and
+        # `nan > hi`), so these gates are written as `not (x satisfies the
+        # bound)` -- the pattern the standoff check just below already used
+        # correctly (`not (lo <= x <= hi)` correctly rejects a NaN standoff;
+        # `x < lo or x > hi` would not have).
+        if not (record.valid_frac >= float(self._scfg.min_valid_depth_frac)):
             raise RuntimeError("not enough valid depth in the capture")
-        if record.tilt_deg > float(self._scfg.survey_max_tilt_deg):
+        if not (record.tilt_deg <= float(self._scfg.survey_max_tilt_deg)):
             raise RuntimeError("camera tilt exceeds the survey tolerance - level and remeasure")
         if not (float(self._scfg.accurate_min_mm) * 0.8 <= record.standoff_mm
                 <= float(self._scfg.accurate_max_mm) * 1.2):
@@ -192,12 +198,23 @@ class FivePositionSurvey:
             if evidence.corner_base_mm is None:
                 raise RuntimeError("corner depth missing - reposition and recapture")
         pts = np.asarray(plane_points_base, dtype=float).reshape(-1, 3)
+        # A single non-finite plane point silently defeats the coplanarity
+        # gates downstream (fit_global_plane's per-position RMS becomes NaN,
+        # and NaN compares False against every threshold -- see finish()'s
+        # own defensive check for the full story), so this is the gate layer
+        # and it is rejected here at intake, not left for finish() to trust.
+        if not np.all(np.isfinite(pts)):
+            raise RuntimeError(
+                f"{expected} capture has non-finite plane points (NaN/Inf) - "
+                "reposition and recapture")
         if len(pts) < 50:
             raise RuntimeError("too few plane points in the capture - reposition and recapture")
         self._accepted[expected] = _Accepted(record, pts, evidence)
         return self.state()
 
     def recapture(self, kind: str) -> dict:
+        if kind not in SURVEY_STEPS:
+            raise ValueError(f"unknown capture kind {kind!r} - expected one of {SURVEY_STEPS}")
         self._accepted.pop(kind, None)
         return self.state()
 
@@ -210,17 +227,41 @@ class FivePositionSurvey:
         # -- coplanarity: two-tier warn/reject (ambiguity resolution #3) ----
         plane = fit_global_plane([a.plane_points_base for a in acc])
         flags: list[str] = []
-        worst = max(plane.per_set_rms_mm)
+        local_warnings: list[str] = []
+        per_rms = np.asarray(plane.per_set_rms_mm, dtype=float)
+        # Defense in depth (add_capture already blocks non-finite plane points
+        # at intake, but this must not silently trust its own inputs either):
+        # Python's/numpy's max() returns NaN whenever any element is NaN, and
+        # `nan > threshold` is False -- so an unguarded `max()` + `>` pipeline
+        # would silently PASS both coplanarity tiers on exactly the surface
+        # they exist to reject. Refuse loudly instead of computing a worst
+        # value from tainted data.
+        if not np.all(np.isfinite(per_rms)):
+            bad = ", ".join(SURVEY_STEPS[i] for i in range(len(per_rms))
+                            if not np.isfinite(per_rms[i]))
+            raise RuntimeError(
+                f"capture(s) {bad} produced non-finite plane geometry (NaN/Inf) - "
+                "reposition and recapture; do not trust this survey")
+        worst_idx = int(np.argmax(per_rms))
+        worst = float(per_rms[worst_idx])
+        worst_capture = SURVEY_STEPS[worst_idx]
         if worst > float(self._scfg.survey_coplanar_reject_mm):
             raise RuntimeError(
-                "captures are not coplanar (worst per-position plane RMS "
-                f"{worst:.1f} mm > {float(self._scfg.survey_coplanar_reject_mm):.1f} mm) - "
-                "re-survey the surface; if this is a genuinely non-flat table, loosen "
-                "survey_coplanar_reject_mm in the config")
+                f"captures are not coplanar (worst offender: {worst_capture}, "
+                f"per-position plane RMS {worst:.1f} mm > "
+                f"{float(self._scfg.survey_coplanar_reject_mm):.1f} mm) - re-survey the "
+                f"surface starting with {worst_capture}; if this is a genuinely non-flat "
+                "table, loosen survey_coplanar_reject_mm in the config")
         if worst > float(self._scfg.survey_coplanar_warn_mm):
             flags.append("non_flat")
-            self.warnings.append(
-                f"surface labeled non-flat: per-position plane RMS up to {worst:.1f} mm")
+            local_warnings.append(
+                f"surface labeled non-flat: worst offender {worst_capture}, "
+                f"per-position plane RMS {worst:.1f} mm")
+        # Assign (never append/accumulate): finish() can legitimately be
+        # called more than once on the same survey (e.g. after a recapture),
+        # and self.warnings must reflect only the MOST RECENT run, not carry
+        # a stale warning describing a capture that has since been replaced.
+        self.warnings = local_warnings
 
         normal = np.asarray(plane.normal)
         point = np.asarray(plane.point)
@@ -262,17 +303,22 @@ class FivePositionSurvey:
                 "trust an unverified rectangle (this indicates a bug, not an "
                 "operator error)")
         if rect.corner_agreement_mm > float(self._scfg.survey_corner_agreement_mm):
+            corner_deltas = np.linalg.norm(ordered2d - np.asarray(rect.corners2d), axis=1)
+            worst_corner = f"C{int(np.argmax(corner_deltas)) + 1}"
             raise RuntimeError(
                 "surveyed corners disagree with the fitted rectangle (corner "
                 f"agreement {rect.corner_agreement_mm:.1f} mm > "
-                f"{float(self._scfg.survey_corner_agreement_mm):.1f} mm) - a capture is "
-                "likely mis-registered; reposition and recapture the weakest corner")
+                f"{float(self._scfg.survey_corner_agreement_mm):.1f} mm, worst at "
+                f"{worst_corner}) - {worst_corner} is likely mis-registered; reposition "
+                f"and recapture it")
         if rect.discrepancy_mm > float(self._scfg.survey_rect_discrepancy_mm):
+            i = int(np.argmax(np.asarray(rect.edge_rms_mm)))
+            worst_edge = f"C{i + 1}-C{(i + 1) % 4 + 1}"
             raise RuntimeError(
                 "rectangle evidence is inconsistent (unconstrained-vs-constrained "
                 f"discrepancy {rect.discrepancy_mm:.1f} mm > "
-                f"{float(self._scfg.survey_rect_discrepancy_mm):.1f} mm) - reposition and "
-                "recapture the weakest corner")
+                f"{float(self._scfg.survey_rect_discrepancy_mm):.1f} mm, worst edge "
+                f"{worst_edge}) - reposition and recapture around {worst_edge}")
 
         corners3d = lift_points_3d(np.asarray(rect.corners2d), point, u, v)
         corners3d = order_corners_clockwise(corners3d, normal)

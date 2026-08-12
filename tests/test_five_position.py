@@ -97,6 +97,10 @@ def test_happy_path_recovers_the_rectangle():
     assert len(survey.captures) == 5
     assert survey.quality["discrepancy_mm"] < 5.0
     assert survey.quality["corner_agreement_mm"] < 5.0
+    # Backstops the warn tier's LOWER bound: without this, a warn threshold
+    # of 0.0 (or a warn tier that fires on ordinary measurement noise) would
+    # pass every other test in this file too.
+    assert survey.quality["flags"] == []
 
 
 def test_step_ordering_enforced_and_wrong_kind_rejected():
@@ -144,9 +148,49 @@ def test_noncoplanar_warns_then_rejects():
     warn = _run_all(_survey(), z_offsets=(0, 0, 12.0, 0, 0))
     survey = warn.finish(calibration_id="c", locked_robot=_snap())
     assert "non_flat" in survey.quality.get("flags", [])
+    # Finding 4: the message/warning must name WHICH capture is the outlier
+    # (z_offsets[2] perturbed "corner2") -- the single most useful fact on a
+    # five-position survey of a large table.
+    assert any("corner2" in w for w in survey.quality["warnings"])
     bad = _run_all(_survey(), z_offsets=(0, 0, 30.0, 0, 0))
-    with pytest.raises(RuntimeError, match="coplanar"):
+    with pytest.raises(RuntimeError, match="coplanar") as excinfo:
         bad.finish(calibration_id="c", locked_robot=_snap())
+    assert "corner2" in str(excinfo.value)
+
+
+def test_finish_does_not_accumulate_warnings_across_calls():
+    """Finding 3: ``finish()`` can legitimately be called more than once (the
+    UI may re-review before locking); ``self.warnings`` must reflect only the
+    most recent call, not grow with each one.
+    """
+    s = _run_all(_survey(), z_offsets=(0, 0, 12.0, 0, 0))
+    survey1 = s.finish(calibration_id="c", locked_robot=_snap())
+    survey2 = s.finish(calibration_id="c", locked_robot=_snap())
+    assert len(survey1.quality["warnings"]) == 1
+    assert survey1.quality["warnings"] == survey2.quality["warnings"]
+
+
+def test_recapture_then_finish_does_not_carry_stale_warnings():
+    """Finding 3: recapturing the offending corner flat and finishing again
+    must produce an EMPTY warnings list, not a stale one still describing a
+    capture that has since been replaced. ``LockedWorkframeSurvey`` is the
+    authoritative provenance record for review/insertion, so it must never
+    contradict its own ``flags``.
+    """
+    s = _run_all(_survey(), z_offsets=(0, 0, 12.0, 0, 0))
+    survey1 = s.finish(calibration_id="c", locked_robot=_snap())
+    assert survey1.quality["flags"] == ["non_flat"]
+    assert len(survey1.quality["warnings"]) == 1
+
+    s.recapture("corner2")
+    s.add_capture(_record("corner2"), _plane_points(_CORNERS[1][:2], seed=1),
+                  _corner_evidence(1, seed=1))
+    survey2 = s.finish(calibration_id="c", locked_robot=_snap())
+    assert survey2.quality["flags"] == []
+    assert survey2.quality["warnings"] == []
+
+
+_CORNER_AGREEMENT_MSG = r"corner agreement|surveyed corners disagree"
 
 
 def test_biased_corner_is_rejected_by_the_corner_agreement_gate():
@@ -155,10 +199,20 @@ def test_biased_corner_is_rejected_by_the_corner_agreement_gate():
     see rect_fit's module docstring and test_discrepancy_is_blind_to_pure_
     translation_but_corner_agreement_catches_it). The brief's original test
     asserted this would fail the DISCREPANCY gate, which is not something the
-    metric can do; reworked here to assert the survey is still REJECTED (via
-    whichever gate the implementation actually fires -- measured to be the
-    corner-agreement gate) rather than silently accepting a 40 mm-wrong
-    rectangle.
+    metric can do; reworked here to assert the survey is still REJECTED
+    rather than silently accepting a 40 mm-wrong rectangle.
+
+    NOTE (review finding 2): this fixture shifts BOTH ``corner_base_mm`` AND
+    ``edge_points_base`` together, which shears the two adjacent edges'
+    fitted DIRECTION too -- genuine angular inconsistency, so measured here
+    BOTH gates actually fire (discrepancy ~24.8 mm, corner agreement
+    ~17.4 mm); since corner-agreement is checked first in finish(), its
+    message is what is raised, and the regex below is tightened to match
+    ONLY that message (not the shared "reposition" wording every gate uses)
+    so this test cannot pass via some other gate if corner-agreement were
+    ever removed. See test_corner_only_bias_is_caught_solely_by_corner_
+    agreement below for the fixture that isolates the corner-agreement gate
+    on its own (this one does not, by itself, constrain it).
     """
     s = _survey()
     s.add_capture(_record("center"), _plane_points([1000, 800]), None)
@@ -171,8 +225,99 @@ def test_biased_corner_is_rejected_by_the_corner_agreement_gate():
                                 shifted)
         s.add_capture(_record(f"corner{i + 1}"),
                       _plane_points(_CORNERS[i][:2], seed=i + 1), ev)
-    with pytest.raises(RuntimeError, match="agreement|reposition"):
+    with pytest.raises(RuntimeError, match=_CORNER_AGREEMENT_MSG) as excinfo:
         s.finish(calibration_id="c", locked_robot=_snap())
+    assert "C3" in str(excinfo.value)  # Finding 4: names the worst corner
+
+
+def test_corner_only_bias_is_caught_solely_by_corner_agreement():
+    """Finding 2: the test above does not, by itself, prove the corner-
+    agreement gate is doing anything -- with ``survey_corner_agreement_mm``
+    set arbitrarily loose, that fixture is STILL rejected by the discrepancy
+    gate alone (its shared "reposition" wording made the old, looser regex
+    match either way). This is the in-module analogue of rect_fit's own
+    ``test_discrepancy_is_blind_to_pure_translation_but_corner_agreement_
+    catches_it``: bias ONLY ``corner_base_mm`` (the surveyed corner-depth
+    sample) and leave the arm evidence (``edge_points_base``) TRUE, so the
+    adjacent edges' fitted lines are undisturbed -- no angular inconsistency
+    for discrepancy_mm to see.
+    """
+    def _biased(bias_mm, scfg=None):
+        s = _survey(scfg)
+        s.add_capture(_record("center"), _plane_points([1000, 800]), None)
+        for i in range(4):
+            ev = _corner_evidence(i)
+            if i == 2:
+                ev = CornerEvidence(
+                    ev.corner_uv,
+                    tuple(np.asarray(ev.corner_base_mm) + [bias_mm, 0.0, 0.0]),
+                    ev.edge_points_base)  # arms left TRUE -- only the corner sample moves
+            s.add_capture(_record(f"corner{i + 1}"),
+                          _plane_points(_CORNERS[i][:2], seed=i + 1), ev)
+        return s
+
+    # With the corner-agreement gate disabled, discrepancy_mm alone must NOT
+    # reject this bias at either magnitude -- proving the real (default)
+    # gate is the only thing standing between this rectangle and a
+    # confidently-accepted, badly-wrong result. (Verified against the
+    # pre-fix implementation too: with the gate present but the assertion
+    # below removed, this still demonstrates the gap the reviewer measured.)
+    loose = ScanConfig(survey_corner_agreement_mm=1e9)
+    for bias_mm in (10.0, 150.0):
+        survey = _biased(bias_mm, loose).finish(calibration_id="c", locked_robot=_snap())
+        assert survey.quality["discrepancy_mm"] < 6.0
+        assert survey.quality["corner_agreement_mm"] > bias_mm * 0.9
+
+    # With the real (default) gate, the survey must be rejected via the
+    # corner-agreement message specifically.
+    for bias_mm in (10.0, 150.0):
+        with pytest.raises(RuntimeError, match=_CORNER_AGREEMENT_MSG):
+            _biased(bias_mm).finish(calibration_id="c", locked_robot=_snap())
+
+
+def test_nan_plane_point_rejected_at_capture():
+    """Finding 1: a single non-finite plane point silently defeats BOTH
+    coplanarity tiers downstream (Python's/numpy's ``max()`` returns NaN when
+    NaN is present, and every ``x > threshold`` comparison against NaN is
+    False) -- so this is rejected at intake, before it can ever reach
+    ``finish()``.
+    """
+    s = _survey()
+    pts = _plane_points([1000, 800])
+    pts[5, 2] = np.nan
+    with pytest.raises(RuntimeError, match="non-finite"):
+        s.add_capture(_record("center"), pts, None)
+
+
+def test_noncoplanar_rejected_even_with_a_nan_present():
+    """Finding 1, reproduced end to end exactly as the reviewer demonstrated:
+    a genuinely 30 mm non-coplanar corner (the exact case the reject tier
+    exists for -- see test_noncoplanar_warns_then_rejects) PLUS one NaN in
+    the centre capture's plane points. ``add_capture`` now blocks NaN at
+    intake (see the test above), so this reaches the corrupted state by
+    directly mutating the accepted capture's stored array after a normal
+    accept -- simulating a NaN reaching ``finish()`` by some path other than
+    ``add_capture`` (defense in depth: the sibling modules already treat
+    non-finite input as a live hazard, and this module -- the designated
+    gate layer -- must not silently trust its own internals either). Against
+    the pre-fix ``max()`` + ``>`` pipeline this survey was silently ACCEPTED
+    with ``flags=[]`` despite the 30 mm outlier being right there in
+    ``per_position_rms_mm``.
+    """
+    s = _run_all(_survey(), z_offsets=(0, 0, 30.0, 0, 0))
+    s._accepted["center"].plane_points_base[0, 2] = np.nan
+    with pytest.raises(RuntimeError, match="non-finite"):
+        s.finish(calibration_id="c", locked_robot=_snap())
+
+
+def test_recapture_rejects_an_unknown_kind():
+    """The UI must not be told a capture was dropped when it never existed as
+    a survey step in the first place."""
+    s = _survey()
+    with pytest.raises(ValueError):
+        s.recapture("corner5")
+    with pytest.raises(ValueError):
+        s.recapture("banana")
 
 
 def test_none_corner_agreement_is_treated_as_a_failed_check(monkeypatch):
