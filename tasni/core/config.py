@@ -492,6 +492,11 @@ class ScanConfig(_Model):
     live_frame_margin_uv: float = 0.02     # fitted-rectangle corners this far inside the
     #                                        frame => the object is bounded in view (draw
     #                                        the rectangle), not an overrun (generic square)
+    # Compact-eligibility classifier (two-path plan §6)
+    compact_guard_uv: float = 0.06        # raw corners must sit this far inside the frame
+    compact_center_tol_uv: float = 0.15   # outline centroid distance from image center
+    compact_identity_frames: int = 5      # consecutive frames the rectangle must agree
+    compact_identity_tol_uv: float = 0.04 # max corner drift across those frames
     # Vision safety net for the hold: the live rectangle is depth-derived, so it must
     # still track a physical camera move even if RoboDK is not mirroring the arm. A
     # standoff/tilt shift past these releases the hold regardless of the pose gate.
