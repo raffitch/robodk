@@ -14,6 +14,7 @@ interface Recipe {
 interface Setup {
   print_tool: string; work_frame: string; inspection_tool: string;
   inspection_target: string; center_x_mm: number; center_y_mm: number;
+  build_plane_z_mm: number;
   orientation_rpy_deg: [number, number, number];
   approach_clearance_mm: number; retreat_clearance_mm: number;
 }
@@ -222,6 +223,25 @@ export default function Extrusion() {
     updateSetup("orientation_rpy_deg", next);
   };
 
+  const seedFromCurrentTcp = async () => {
+    if (!setup || !recipe || !setup.print_tool || !setup.work_frame) return;
+    setBusy(true); setMessage("Reading the selected TCP pose from RoboDK…");
+    try {
+      const pose = await api.post<{ xyz_mm: number[]; rpy_deg: number[] }>("/current-tcp", {
+        print_tool: setup.print_tool, work_frame: setup.work_frame,
+      });
+      const next: Setup = {
+        ...setup,
+        // Circle angle zero is center + radius on X, so make it the current TCP.
+        center_x_mm: pose.xyz_mm[0] - recipe.radius_mm,
+        center_y_mm: pose.xyz_mm[1],
+        build_plane_z_mm: pose.xyz_mm[2] - recipe.bead_diameter_mm / 2,
+        orientation_rpy_deg: pose.rpy_deg as [number, number, number],
+      };
+      setSetup(next); invalidate("Path start and orientation captured from the current TCP — generate coordinates next.");
+    } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
+  };
+
   const connect = async () => {
     setBusy(true); setMessage("Loading RoboDK station…");
     try {
@@ -245,7 +265,12 @@ export default function Extrusion() {
     setBusy(true);
     try {
       const value = await api.post<any>("/preflight", { fingerprint: plan.fingerprint });
-      setPreflight(value); setMessage(value.station?.ready ? value.note : "Geometry passed, but selected station items are missing.");
+      setPreflight(value);
+      const unreachable = value.station?.reachability?.first_unreachable;
+      setMessage(value.station?.ready ? value.note
+        : unreachable
+          ? `No IK solution at sampled ${value.station.reachability.frame} coordinate (${unreachable.xyz_mm.map((v: number) => v.toFixed(1)).join(", ")}) mm. Re-seed from the current TCP.`
+          : value.station?.error || "Geometry passed, but station placement or selected items are not ready.");
       refreshStatus();
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
@@ -291,7 +316,7 @@ export default function Extrusion() {
     const theta = Array.from({ length: recipe.points_per_circle + 1 }, (_, index) =>
       index * 2 * Math.PI / recipe.points_per_circle);
     const layers = Array.from({ length: recipe.layer_count }, (_, index): Layer => {
-      const z = recipe.bead_diameter_mm / 2 + index * recipe.layer_height_mm;
+      const z = setup.build_plane_z_mm + recipe.bead_diameter_mm / 2 + index * recipe.layer_height_mm;
       return {
         layer_index: index + 1,
         nominal_z_mm: z,
@@ -344,11 +369,15 @@ export default function Extrusion() {
           <div className="motion-number-grid">
             <label>Center X (mm)<input type="number" value={setup.center_x_mm} onChange={(e) => updateSetup("center_x_mm", Number(e.target.value))} /></label>
             <label>Center Y (mm)<input type="number" value={setup.center_y_mm} onChange={(e) => updateSetup("center_y_mm", Number(e.target.value))} /></label>
+            <label>Build plane Z (mm)<input type="number" value={setup.build_plane_z_mm} onChange={(e) => updateSetup("build_plane_z_mm", Number(e.target.value))} /></label>
             {["A / roll", "B / pitch", "C / yaw"].map((label, i) => <label key={label}>{label} (°)<input type="number" value={setup.orientation_rpy_deg[i]} onChange={(e) => updateOrientation(i, Number(e.target.value))} /></label>)}
             <label>Approach (mm)<input type="number" min="1" value={setup.approach_clearance_mm} onChange={(e) => updateSetup("approach_clearance_mm", Number(e.target.value))} /></label>
             <label>Retreat (mm)<input type="number" min="1" value={setup.retreat_clearance_mm} onChange={(e) => updateSetup("retreat_clearance_mm", Number(e.target.value))} /></label>
           </div>
-          <div className="hint">Orientation uses RoboDK XYZRPW in the selected work frame. Approach/retract follow the curve normal. These exact values are fingerprinted and dry-run.</div>
+          <div className="btn-row"><button className="secondary" disabled={!connected || busy || !setup.print_tool || !setup.work_frame}
+            onClick={seedFromCurrentTcp}>Seed path start from current TCP</button></div>
+          <div className="hint">Jog the selected print TCP to the intended circle start, then seed it. Center, build-plane Z, and RoboDK XYZRPW are expressed in the selected work frame. Approach/retract follow the curve normal. These exact values are fingerprinted and dry-run.</div>
+          {setup.work_frame === "World" && <div className="hint warn-text">World is allowed, but every X/Y/Z value is then a station-world coordinate. Use the current-TCP seed button unless world zero is deliberately your build plane.</div>}
         </>}
       </div>
 
@@ -402,6 +431,7 @@ export default function Extrusion() {
       <p className="status-line">{message}</p>
       {(busy || status?.running) && <><div className="progress"><div style={{ width: `${pct}%` }} /></div><div className="status-line">{progress.message}</div></>}
       {config && <div className="io-note">Valve: <code>{config.integration.valve_outputs.join(" + ")}</code> via {config.integration.air_on_program}/{config.integration.air_off_program}. Hardware approval: <b>{config.integration.hardware_io_test_approved ? "APPROVED" : "NOT APPROVED"}</b>.</div>}
+      {preflight?.station?.reachability && <div className="io-note">Path IK sample: <b>{preflight.station.reachability.reachable_count}/{preflight.station.reachability.sample_count}</b> reachable in <code>{preflight.station.reachability.frame}</code>. Full curve generation and collision validation still run in the dry run.</div>}
       <div className="btn-row"><button disabled={!plan || !preflight?.all_ok || !stationReady || busy || status?.running} onClick={() => startJob("dry-run")}>Run complete RoboDK dry run</button>
         {(busy || status?.running) && <button className="secondary" onClick={cancel}>Cancel safely</button>}</div>
       <label className="live-confirm"><input type="checkbox" checked={confirmLive} onChange={(e) => setConfirmLive(e.target.checked)} disabled={!status?.dry_run_passed || status?.running} />

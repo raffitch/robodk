@@ -72,6 +72,13 @@ def test_plan_is_closed_layered_and_fingerprinted():
     assert changed_motion.fingerprint != plan.fingerprint
 
 
+def test_build_plane_z_offsets_every_layer_and_changes_fingerprint():
+    baseline = generate_cylinder_plan(recipe(), setup())
+    raised = generate_cylinder_plan(recipe(), setup(build_plane_z_mm=125))
+    assert [layer.nominal_z_mm for layer in raised.layers] == [128, 133, 138]
+    assert raised.fingerprint != baseline.fingerprint
+
+
 def test_geometry_preflight_does_not_claim_robodk_dry_run():
     result = geometry_preflight(generate_cylinder_plan(recipe(), setup()))
     assert result["all_ok"] is True

@@ -134,6 +134,22 @@ def test_dry_run_uses_mock_outputs_and_restores_mode(tmp_path, monkeypatch):
     assert rdk.mode == 6
 
 
+def test_failed_dry_run_keeps_path_for_inspection_but_deletes_mock_io(tmp_path, monkeypatch):
+    svc, rdk, _ = services(tmp_path)
+    monkeypatch.setattr(service_mod, "new_run_dir",
+                        lambda module, stamp: _mkdir(tmp_path / module / stamp))
+    rdk.update_program = lambda name, collisions=True: {
+        "instructions_ok": 1, "time_s": 0, "distance_mm": 0,
+        "percent_ok": 2.6, "problems": "Collision detected at MoveJ 1",
+    }
+    ctx = Ctx()
+    with pytest.raises(RuntimeError, match="Collision detected"):
+        CylinderDryRunJob(svc, plan(layers=1))(ctx)
+    assert any(name.startswith("TasniDry_") for name in rdk.deleted)
+    assert not any(name.startswith("TasniCylinder_") for name in rdk.deleted)
+    assert any("kept in RoboDK" in message for message in ctx.logs)
+
+
 def _mkdir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path

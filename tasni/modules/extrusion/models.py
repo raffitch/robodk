@@ -40,6 +40,7 @@ class CylinderSetup(_Record):
     inspection_target: str = Field(min_length=1)
     center_x_mm: float = 0.0
     center_y_mm: float = 0.0
+    build_plane_z_mm: float = 0.0
     orientation_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
     approach_clearance_mm: float = Field(default=40.0, gt=0, le=500)
     retreat_clearance_mm: float = Field(default=60.0, gt=0, le=500)

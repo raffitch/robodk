@@ -35,7 +35,8 @@ def generate_cylinder_plan(recipe: CylinderRecipe, setup: CylinderSetup) -> Cyli
     x[-1], y[-1] = x[0], y[0]
     layers: list[LayerPath] = []
     for index in range(recipe.layer_count):
-        z = recipe.bead_diameter_mm / 2.0 + index * recipe.layer_height_mm
+        z = (setup.build_plane_z_mm + recipe.bead_diameter_mm / 2.0
+             + index * recipe.layer_height_mm)
         points = [PathPoint(x_mm=float(px), y_mm=float(py), z_mm=float(z))
                   for px, py in zip(x, y)]
         layers.append(LayerPath(layer_index=index + 1, nominal_z_mm=z, points=points))

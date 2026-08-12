@@ -137,7 +137,9 @@ class CylinderDryRunJob:
         prior_mode = rdk.current_run_mode()
         start_joints = rdk.current_joints()
         current_program = None
-        artifacts: list[str] = []
+        mock_artifacts: list[str] = []
+        path_artifacts: list[str] = []
+        completed = False
         reports: list[dict] = []
         valve_events: list[dict] = []
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -146,7 +148,7 @@ class CylinderDryRunJob:
             rdk.apply_run_mode("simulate")
             mock_on, mock_off = rdk.ensure_mock_valve_programs(
                 f"TasniDry_{self.plan.fingerprint[:8]}_")
-            artifacts.extend((mock_on, mock_off))
+            mock_artifacts.extend((mock_on, mock_off))
             ctx.log("DRY_RUN: SIMULATE mode; physical valve/rate outputs blocked")
             total = len(self.plan.layers)
             for index, layer in enumerate(self.plan.layers, start=1):
@@ -164,7 +166,7 @@ class CylinderDryRunJob:
                     approach_clearance_mm=self.plan.setup.approach_clearance_mm,
                     retreat_clearance_mm=self.plan.setup.retreat_clearance_mm,
                     air_on_program=mock_on, air_off_program=mock_off)
-                artifacts.extend(built["artifacts"])
+                path_artifacts.extend(built["artifacts"])
                 current_program = name
                 validation = rdk.update_program(name, collisions=True)
                 _require_program_valid(validation, layer.layer_index)
@@ -185,7 +187,7 @@ class CylinderDryRunJob:
                     inspection_tool=self.plan.setup.inspection_tool,
                     inspection_target=self.plan.setup.inspection_target,
                     speed_mm_s=self.plan.recipe.travel_speed_mm_s)
-                artifacts.append(inspect["program"])
+                path_artifacts.append(inspect["program"])
                 inspection_validation = rdk.update_program(inspection_name, collisions=True)
                 _require_program_valid(inspection_validation, layer.layer_index)
                 current_program = inspection_name
@@ -214,6 +216,7 @@ class CylinderDryRunJob:
             if self.on_pass is not None:
                 self.on_pass(self.plan.fingerprint)
             ctx.log("dry run PASS: complete path, collisions, valve mocks, inspection, return-to-start")
+            completed = True
             return report
         finally:
             if current_program:
@@ -226,9 +229,13 @@ class CylinderDryRunJob:
             except Exception:
                 pass
             try:
-                rdk.delete_items(list(dict.fromkeys(reversed(artifacts))))
+                cleanup = mock_artifacts + (path_artifacts if completed else [])
+                rdk.delete_items(list(dict.fromkeys(reversed(cleanup))))
             except Exception:
                 pass
+            if not completed and path_artifacts:
+                ctx.log("dry run failed: native curve/project/program kept in RoboDK; "
+                        "Reset / clean RoboDK path removes them")
             rdk.set_run_mode_raw(prior_mode)
 
 

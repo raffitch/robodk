@@ -1067,6 +1067,66 @@ class RdkIO:
         self._frame = frame
         return self._tool_pose
 
+    def current_tcp_xyzrpw(self, tool_name: str, frame_name: str) -> list[float]:
+        """Read the selected tool TCP pose in the selected frame without motion."""
+        import robodk.robomath as robomath
+
+        self.use_named_tool_frame(tool_name, frame_name)
+        return [float(value) for value in
+                robomath.pose_2_xyzrpw(T_to_pose(self.tcp_pose_T()))]
+
+    def extrusion_reachability_report(
+            self, *, points_xyz: np.ndarray, orientation_rpy_deg,
+            print_tool: str, work_frame: str, maximum_samples: int = 24) -> dict:
+        """Sample exact fixed-orientation path poses with IK, without robot motion.
+
+        This is an early placement check, not a replacement for Curve Follow
+        generation or the collision-enabled complete program dry run.
+        """
+        pts = np.asarray(points_xyz, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 3 or not len(pts):
+            raise ValueError("reachability path must be an Nx3 array")
+        if not np.isfinite(pts).all():
+            raise ValueError("reachability path contains non-finite coordinates")
+        self.use_named_tool_frame(print_tool, work_frame)
+        robot = self.robot()
+        seed = robot.Joints()
+        orientation = self.xyzrpy_pose_T([0.0, 0.0, 0.0], orientation_rpy_deg)
+        count = min(max(1, int(maximum_samples)), len(pts))
+        indices = sorted(set(int(round(v)) for v in
+                             np.linspace(0, len(pts) - 1, count)))
+        samples: list[dict] = []
+        for index in indices:
+            target = orientation.copy()
+            target[:3, 3] = pts[index]
+            try:
+                joints = self._ik_to_joints(self._solve_ik(target, seed), seed)
+                if joints is None:
+                    joints = self._ik_to_joints(self._solve_ik(target), seed)
+            except Exception:
+                joints = None
+            reachable = joints is not None
+            samples.append({
+                "point_index": index,
+                "xyz_mm": [float(v) for v in pts[index]],
+                "reachable": reachable,
+            })
+            if reachable:
+                seed = joints
+        failed = [sample for sample in samples if not sample["reachable"]]
+        return {
+            "all_reachable": not failed,
+            "sample_count": len(samples),
+            "reachable_count": len(samples) - len(failed),
+            "first_unreachable": failed[0] if failed else None,
+            "frame": work_frame,
+            "tool": print_tool,
+            "orientation_rpy_deg": [float(v) for v in orientation_rpy_deg],
+            "note": ("Sampled poses have IK solutions; full curve/collision dry run is still required."
+                     if not failed else
+                     "At least one sampled path pose has no IK solution."),
+        }
+
     @staticmethod
     def xyzrpy_pose_T(xyz_mm, rpy_deg) -> np.ndarray:
         """Build a RoboDK-convention XYZ+RPW pose as a numpy transform."""
@@ -1153,10 +1213,18 @@ class RdkIO:
         project.setJoints(robot.Joints())
         program, setup_status = project.setMachiningParameters(part=curve)
         if not program.Valid() or setup_status < 0:
-            project.Delete()
-            curve.Delete()
+            bounds_min = pts.min(axis=0)
+            bounds_max = pts.max(axis=0)
             raise RuntimeError(
-                f"RoboDK could not generate the curve-follow program (status {setup_status})")
+                "RoboDK found no feasible start/path for the Curve Follow Project "
+                f"(status {setup_status}). Frame={work_frame!r}, tool={print_tool!r}, "
+                f"XYZ bounds=[{bounds_min[0]:.1f}..{bounds_max[0]:.1f}, "
+                f"{bounds_min[1]:.1f}..{bounds_max[1]:.1f}, "
+                f"{bounds_min[2]:.1f}..{bounds_max[2]:.1f}] mm, "
+                f"XYZRPW={[float(v) for v in orientation_rpy_deg]}. "
+                f"The failed artifacts {curve_name!r} and {project_name!r} were kept "
+                "for inspection; Reset removes them. Jog the selected TCP to the intended "
+                "path start and seed the coordinates again.")
         program.setName(name)
         project.setParam("Machining", {
             "Algorithm": 0,
@@ -1188,15 +1256,18 @@ class RdkIO:
         project.setParam("UpdatePath")
         generation = project.Update(robolink.COLLISION_OFF)
         if float(generation[3]) < 0:
-            project.Delete()
-            curve.Delete()
             raise RuntimeError(
-                "RoboDK Curve Follow Project generation failed: " + str(generation[4] or ""))
+                "RoboDK Curve Follow Project generation failed: "
+                + str(generation[4] or "unspecified path problem")
+                + f". Failed artifacts {curve_name!r}, {project_name!r}, and any "
+                  f"linked {name!r} program were kept; "
+                  "Reset removes them.")
         program = project.getLink(robolink.ITEM_TYPE_PROGRAM)
         if not program.Valid():
-            project.Delete()
-            curve.Delete()
-            raise RuntimeError("Curve Follow Project has no linked generated program")
+            raise RuntimeError(
+                "Curve Follow Project has no linked generated program. "
+                f"Failed artifacts {curve_name!r} and {project_name!r} were kept; "
+                "Reset removes them.")
         program.setName(name)
         # Curve normals constrain tool Z and the project optimizes the redundant
         # rotation about it. This workflow exposes an exact fixed XYZRPW instead,

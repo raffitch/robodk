@@ -5,6 +5,7 @@ import json
 import time
 from typing import TYPE_CHECKING
 
+import numpy as np
 from pydantic import BaseModel
 
 from ...core.jobrunner import JobBusy
@@ -30,6 +31,11 @@ class FingerprintBody(BaseModel):
 
 class PrintBody(FingerprintBody):
     confirm_live: bool = False
+
+
+class TcpSeedBody(BaseModel):
+    print_tool: str
+    work_frame: str
 
 
 class ExtrusionModule(WorkflowModule):
@@ -68,6 +74,7 @@ class ExtrusionModule(WorkflowModule):
             "inspection_tool": c.default_inspection_tool,
             "inspection_target": c.default_inspection_target,
             "center_x_mm": c.center_x_mm, "center_y_mm": c.center_y_mm,
+            "build_plane_z_mm": c.build_plane_z_mm,
             "orientation_rpy_deg": list(c.orientation_rpy_deg),
             "approach_clearance_mm": c.approach_clearance_mm,
             "retreat_clearance_mm": c.retreat_clearance_mm,
@@ -130,6 +137,19 @@ class ExtrusionModule(WorkflowModule):
             except Exception as exc:
                 raise HTTPException(503, f"RoboDK unavailable: {exc}")
 
+        @router.post("/current-tcp")
+        def current_tcp(body: TcpSeedBody) -> dict:
+            """Read only: selected print TCP expressed in the selected work frame."""
+            if services.jobs.running:
+                raise HTTPException(409, "cannot change the active tool/frame during a robot job")
+            try:
+                xyzrpw = services.rdk.current_tcp_xyzrpw(
+                    body.print_tool, body.work_frame)
+                return {"xyz_mm": xyzrpw[:3], "rpy_deg": xyzrpw[3:],
+                        "tool": body.print_tool, "frame": body.work_frame}
+            except Exception as exc:
+                raise HTTPException(503, f"could not read selected TCP pose: {exc}")
+
         @router.post("/generate")
         def generate(body: GenerateBody) -> dict:
             if services.jobs.running:
@@ -151,12 +171,30 @@ class ExtrusionModule(WorkflowModule):
                                      "error": "connect RoboDK to validate selected station items"}
             else:
                 try:
-                    result["station"] = station_requirements(
+                    station = station_requirements(
                         services.rdk, self._plan, services.config.extrusion)
+                    if station["ready"]:
+                        sampled_xyz = []
+                        for layer in self._plan.layers:
+                            layer_xyz = [[p.x_mm, p.y_mm, p.z_mm] for p in layer.points]
+                            take = np.linspace(0, len(layer_xyz) - 1, 9, dtype=int)
+                            sampled_xyz.extend(layer_xyz[index] for index in take)
+                        reachability = services.rdk.extrusion_reachability_report(
+                            points_xyz=np.asarray(sampled_xyz, dtype=float),
+                            orientation_rpy_deg=self._plan.setup.orientation_rpy_deg,
+                            print_tool=self._plan.setup.print_tool,
+                            work_frame=self._plan.setup.work_frame)
+                        station["reachability"] = reachability
+                        station["ready"] = bool(reachability["all_reachable"])
+                    result["station"] = station
                 except Exception as exc:
                     result["station"] = {"ready": False, "error": str(exc)}
-            if result["all_ok"]:
+            result["workflow_ready"] = bool(
+                result["all_ok"] and result["station"]["ready"])
+            if result["workflow_ready"]:
                 self._geometry_preflight_fingerprint = self._plan.fingerprint
+            else:
+                self._geometry_preflight_fingerprint = None
             return result
 
         @router.post("/dry-run")
@@ -243,6 +281,10 @@ class ExtrusionModule(WorkflowModule):
                 "status": services.jobs.status, "running": services.jobs.running,
                 "result": services.jobs.result, "error": services.jobs.error,
                 "fingerprint": fingerprint,
+                "setup": (self._plan.setup.model_dump(mode="json")
+                          if self._plan else None),
+                "recipe": (self._plan.recipe.model_dump(mode="json")
+                           if self._plan else None),
                 "geometry_preflight_passed": bool(
                     fingerprint and fingerprint == self._geometry_preflight_fingerprint),
                 "dry_run_passed": bool(
