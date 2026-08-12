@@ -305,8 +305,17 @@ class ScanModule(WorkflowModule):
             if was_running and live_start is not None and not services.live.running:
                 try:
                     live_start()
-                except Exception:
-                    pass
+                except Exception as e:
+                    # A failed restart (e.g. CameraBusy) must not be silent: the
+                    # operator would otherwise see a frozen/dead preview with no
+                    # explanation. This is a best-effort log, not a re-raise --
+                    # the capture's own result/exception above is still authoritative.
+                    try:
+                        services.bus.publish(JobEvent(
+                            "log", {"message": f"WARNING: live preview restart "
+                                    f"after the survey capture failed: {e}"}))
+                    except Exception:
+                        pass
 
     def survey_recapture(self, body: SurveyRecaptureBody) -> dict:
         """Discard a previously accepted capture so the operator can redo it."""
@@ -615,6 +624,17 @@ class ScanModule(WorkflowModule):
             # is selected (or the boundary layer is off). A missing model / onnxruntime
             # does NOT fail here — the worker detects it on its own thread and flips to the
             # colour fallback (or idle), logging once, so the video always starts.
+            #
+            # Stop any worker from a PRIOR /live/start before dropping the reference (Task
+            # 13 review Finding 3): survey_capture()'s post-capture restart calls this
+            # closure a second time while an earlier worker may still be alive (only the
+            # video loop was stopped for the capture, not this background thread) — without
+            # this, the old worker's daemon thread is orphaned (never .stop()ped, so it
+            # polls its 1 s Event forever) and a fresh one is created on top of it every
+            # single five-position capture, leaking ~5-10 threads per survey by default
+            # (boundary_engine defaults to "sam_then_color").
+            if self._sam_worker is not None:
+                self._sam_worker.stop()
             self._sam_worker = None
             if sc.color_boundary_enabled and sc.boundary_engine in ("sam", "sam_then_color"):
                 fallback = _color_boundary if sc.boundary_engine == "sam_then_color" else None

@@ -93,6 +93,11 @@ def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
         def connect_robot(self, ip="", *, timeout_s=10.0, poll_s=0.4):
             return True, "ROBOTCOM_READY"
         def robot_connection_params(self): return {"ip": "10.0.0.5", "port": 7000}
+        # (ready, message) for the physical driver link -- Task 13 review Finding 2's
+        # five_position_capture check. Healthy by default so every pre-existing test
+        # (which assumes a connected driver) is unaffected; tests for the disconnected
+        # case override this attribute directly.
+        def robot_connected(self): return True, "ROBOTCOM_READY"
         def use_camera_tool(self, tool): return mount
         def camera_pose_T(self): return state["cam"]
         # A constant 6-element list (not the old opaque "HOME" sentinel): the new
@@ -1172,9 +1177,41 @@ def test_five_position_capture_uses_fresh_robot_state():
     assert state["step"] == "corner1"          # center accepted, machine advanced
     assert survey._accepted["center"].record.robot.stationary is True
     assert survey._accepted["center"].evidence is None  # no corner evidence for "center"
+    # Bundled minor (fix round): an earlier review found measurement_ts silently
+    # pinned to 0.0 on the sibling (compact-lock) path when it read a key that
+    # didn't exist; pin it here too rather than assume the SimpleNamespace/
+    # timestamp plumbing (_authoritative_acquisition's returned `frame`) is right.
+    assert survey._accepted["center"].record.measurement_ts == FRAME_TIMESTAMP
+    assert survey._accepted["center"].record.measurement_ts != 0.0
     survey_events = [e for e in events if e.type == "survey"]
     assert survey_events and survey_events[-1].payload["step"] == "corner1"
     print("[five-position capture] center accepted -> step corner1; JobEvent published")
+
+
+def test_five_position_capture_rejects_disconnected_driver():
+    """Review Finding 2: refresh_robot_state's "stationary" read only means the
+    real arm didn't move ACCORDING TO ROBODK'S OWN MODEL -- with the driver
+    down (or never linked), that model freezes at its last commanded pose
+    while the physical arm can be anywhere, so a dead link reads as a
+    perfectly "stationary" robot every time. A five-position survey is
+    uniquely exposed: it depends on the pose genuinely differing across five
+    captures, so a frozen mirror would silently register all five at the same
+    fictional pose. Checked BEFORE the (multi-second, Wi-Fi) camera grab, so
+    this must fail fast -- verified below via the fake camera's own grab
+    counter, which must stay at zero."""
+    services, _state = _build_fakes()
+    services.rdk.robot_connected = lambda: (False, "ROBOTCOM_DISCONNECTED")
+    survey = FivePositionSurvey(services.config.scan)
+
+    try:
+        scan_service.five_position_capture(services, survey)
+        raise AssertionError("expected a disconnected driver to be rejected")
+    except RuntimeError as e:
+        assert "not connected" in str(e) or "driver" in str(e), e
+    assert survey.step == "center"                  # never reached add_capture
+    assert services.camera.grabs == 0, (             # failed BEFORE the slow grab
+        "driver-liveness check must run before the camera grab, not after")
+    print("[five-position capture] disconnected driver rejected before any camera grab")
 
 
 def test_five_position_capture_rejects_moving_robot():
@@ -1186,7 +1223,17 @@ def test_five_position_capture_rejects_moving_robot():
     five-position survey combines FIVE separately-registered positions, so a
     stale/live pose blend at any one of them would corrupt the cross-position
     plane/rectangle fit in a way no downstream check could distinguish from a
-    real geometry error."""
+    real geometry error.
+
+    Review Finding 4: five_position_capture's own rejection and
+    FivePositionSurvey.add_capture's backstop rejection used to raise
+    byte-identical strings, so a test asserting only on message text could not
+    tell WHICH layer fired -- deleting the early orchestration-layer check
+    would have left a same-looking test green. Made load-bearing two ways:
+    (1) the two messages are now worded differently (checked below), and (2)
+    add_capture is spied on and asserted NEVER CALLED -- proving the rejection
+    happens before a CaptureRecord is even built, not merely inside the state
+    machine's own defence-in-depth check."""
     services, _state = _build_fakes()
     survey = FivePositionSurvey(services.config.scan)
 
@@ -1197,13 +1244,348 @@ def test_five_position_capture_rejects_moving_robot():
         return [0.0, 0.0, 0.0, 0.0, 0.0, float(calls["n"])]   # different every read
 
     services.rdk.current_joints = moving_joints
+    add_capture_calls = []
+    orig_add_capture = survey.add_capture
+    survey.add_capture = lambda *a, **k: add_capture_calls.append((a, k)) or orig_add_capture(*a, **k)
     try:
         scan_service.five_position_capture(services, survey)
         raise AssertionError("expected a moving robot to be rejected")
     except RuntimeError as e:
-        assert "moving" in str(e), e
+        msg = str(e)
+        assert "moved" in msg, e                      # five_position_capture's own wording
+        assert "was moving during the capture" not in msg, (  # NOT add_capture's wording
+            "message matches add_capture's backstop text -- cannot tell which layer fired")
+    assert add_capture_calls == [], "add_capture must never be reached for a moving robot"
     assert survey.step == "center"       # rejected capture must not have been accepted
-    print("[five-position capture] moving robot correctly rejected before acceptance")
+    print("[five-position capture] moving robot correctly rejected before add_capture was ever called")
+
+
+# -- Review Finding 1: _deproject_plane_points_mm must filter to PLANE
+# INLIERS, not every valid depth pixel. A corner capture aims the camera at a
+# table corner (corner_hint_uv=(0.5, 0.5)), so on real hardware a meaningful
+# fraction of the frame legitimately looks PAST the table's two near edges at
+# background (floor, fixtures) far off the work plane. _render() (the fixture
+# used everywhere else in this file) returns 0 depth outside the synthetic
+# table, which cannot exercise this at all -- these fixtures render a REAL
+# floor plane 750 mm below the table so the off-plane background returns
+# real, valid depth, exactly like a D435i pointed at a table near a floor.
+_FLOOR_Z_MM = -750.0
+# The four physical table corners (matching the 300x300 mm table _render()
+# already uses) -- a five-position survey visits these in order.
+_FIVE_POS_WORLD_CORNERS = {
+    "corner1": (150.0, 150.0), "corner2": (150.0, -150.0),
+    "corner3": (-150.0, -150.0), "corner4": (-150.0, 150.0),
+}
+
+
+def _render_with_floor(T_base_cam, *, table_z=0.0, floor_z=_FLOOR_Z_MM):
+    """Like _render(), but rays that miss the (table_z-height) table hit a
+    real floor plane floor_z below instead of returning 0 -- so a corner
+    capture's off-plane background is real, valid depth, not silence."""
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    us, vs = np.meshgrid(np.arange(W), np.arange(H))
+    dirs_cam = np.stack([(us - cx) / fx, (vs - cy) / fy, np.ones_like(us, float)], -1)
+    R, t = T_base_cam[:3, :3], T_base_cam[:3, 3]
+    dirs_base = dirs_cam @ R.T
+    dz = dirs_base[..., 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        s_table = (table_z - t[2]) / dz
+    P_table = t + s_table[..., None] * dirs_base
+    on_table = ((np.abs(P_table[..., 0]) <= TABLE_HALF_MM) & (np.abs(P_table[..., 1]) <= TABLE_HALF_MM)
+                & (s_table > 0) & np.isfinite(s_table))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        s_floor = (floor_z - t[2]) / dz
+    valid_floor = (s_floor > 0) & np.isfinite(s_floor)
+    depth = np.where(on_table, s_table, np.where(valid_floor, s_floor, 0)).astype(np.uint16)
+    color = np.full((H, W, 3), 128, np.uint8)
+    return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP)
+
+
+def _corner_polygon_uv(cx, cy, arm=0.3):
+    """A minimal open/closed 3-vertex corner polygon (uv) whose two axis-
+    aligned arms stay inside the TABLE quadrant as seen by a camera centred
+    directly above world corner (cx, cy) and looking straight down -- matches
+    this file's _look_at basis (image u = world Y, image v = world X, derived
+    and verified by direct ray-tracing against _render_with_floor): stepping
+    INTO the table from image-centre (where the reticle sits, matching the
+    corner_hint_uv=(0.5, 0.5) five_position_capture always uses) is -u when
+    cy > 0 else +u, and -v when cx > 0 else +v."""
+    u_dir = -1.0 if cy > 0 else 1.0
+    v_dir = -1.0 if cx > 0 else 1.0
+    u0, v0 = 0.5, 0.5
+    p_minus = (u0 + u_dir * arm, v0)
+    p_plus = (u0, v0 + v_dir * arm)
+    return [p_minus, (u0, v0), p_plus]
+
+
+def _render_table_only(T_base_cam, *, table_z=0.0):
+    """Like _render(), but the table sits at table_z instead of always 0 --
+    used only to compute a ground-truth reference plane (see
+    _true_table_plane_cam), never as a capture's actual depth frame."""
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    us, vs = np.meshgrid(np.arange(W), np.arange(H))
+    dirs_cam = np.stack([(us - cx) / fx, (vs - cy) / fy, np.ones_like(us, float)], -1)
+    R, t = T_base_cam[:3, :3], T_base_cam[:3, 3]
+    dirs_base = dirs_cam @ R.T
+    dz = dirs_base[..., 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        s = (table_z - t[2]) / dz
+    P = t + s[..., None] * dirs_base
+    valid = ((np.abs(P[..., 0]) <= TABLE_HALF_MM) & (np.abs(P[..., 1]) <= TABLE_HALF_MM)
+             & (s > 0) & np.isfinite(s))
+    return np.where(valid, s, 0).astype(np.uint16)
+
+
+def _true_table_plane_cam(cx, cy, *, table_z=0.0):
+    """The REAL table plane (camera frame), computed from a table-only render
+    at the same pose -- ground truth, independent of whether RANSAC would
+    itself pick the table over a majority-background frame (a separate
+    question from Finding 1's -- see the "isolates" note on
+    _patch_boundary_and_plane_for_five_position_background below)."""
+    from tasni.modules.scan.survey import SurveyThresholds, survey_surface as real_survey_surface
+
+    T = _look_at((cx, cy, 420.0), (cx, cy, table_z))
+    depth_clean = _render_table_only(T, table_z=table_z)
+    th = SurveyThresholds(accurate_min_mm=300.0, accurate_max_mm=800.0, survey_max_tilt_deg=6.0,
+                          grid_target_px=64, frame_margin_uv=0.02, work_crop_mm=(1000.0, 1000.0),
+                          min_valid_depth_frac=0.05)
+    m = real_survey_surface(depth_clean, K, th, depth_scale=1000.0)
+    assert m.detected, "table-only reference render must be detected"
+    return m.normal_cam, m.centroid_cam_mm, m.standoff_mm, m.tilt_deg
+
+
+def _build_fakes_five_position_background(table_z_by_kind=None):
+    """A five-position-survey fake harness whose camera renders a REAL
+    background (floor) beyond the table edges (Finding 1's fixture), and
+    whose pose depends on state["cur_kind"] (set by the caller before each
+    capture) -- "center" looks straight down at the table centre; "cornerN"
+    looks straight down at that physical corner, matching how the guided UI
+    instructs the operator to centre the reticle on each position in turn.
+    """
+    table_z_by_kind = table_z_by_kind or {}
+    state = {"cam": _look_at((0.0, 0.0, 420.0), (0.0, 0.0, 0.0)), "cur_kind": "center"}
+    mount = Rt_to_T(np.eye(3), np.array([40.0, -15.0, 55.0]))
+
+    def _pose_for(kind):
+        cx, cy = (0.0, 0.0) if kind == "center" else _FIVE_POS_WORLD_CORNERS[kind]
+        return _look_at((cx, cy, 420.0), (cx, cy, 0.0)), cx, cy
+
+    class FakeRdk:
+        def item_exists(self, name): return True
+        def use_camera_tool(self, tool): return mount
+        def camera_pose_T(self): return state["cam"]
+        def current_joints(self): return [0.0] * 6
+        def robot_connected(self): return True, "ROBOTCOM_READY"
+
+    class FakeCamera:
+        def __init__(self): self.grabs = 0
+        def grab(self, with_depth=False, timeout=None, color_only=False):
+            self.grabs += 1
+            T, _cx, _cy = _pose_for(state["cur_kind"])
+            state["cam"] = T
+            tz = table_z_by_kind.get(state["cur_kind"], 0.0)
+            return _render_with_floor(T, table_z=tz)
+
+    cfg = AppConfig()
+    cfg.camera.intrinsics = {"320x240": K.tolist()}
+    cfg.camera.resolution = "320x240"
+    services = SimpleNamespace(config=cfg, rdk=FakeRdk(), camera=FakeCamera(),
+                               camera_lease=CameraLease(),
+                               bus=SimpleNamespace(publish=lambda *a, **k: None),
+                               live=SimpleNamespace(running=False, stop=lambda: None))
+    return services, state
+
+
+def _patch_boundary_and_plane_for_five_position_background(table_z_by_kind):
+    """Context-manager-free patch/unpatch pair for the two module-level names
+    five_position_capture() looks up (scan_service.survey_surface,
+    scan_service.color_work_boundary), used by both Finding-1 pipeline tests.
+
+    The survey_surface patch delegates to the REAL function and only
+    overrides the plane fields (normal/centroid/standoff/tilt) with the known-
+    true table plane -- it does NOT fabricate detected/valid_frac, both of
+    which come from the real function on the real (floor-containing) depth.
+    This deliberately ISOLATES Finding 1's actual mechanism (does the
+    DEPROJECTION correctly filter background once a plane is known) from a
+    separate, real, but out-of-scope question this fixture surfaced during
+    development: an operator centring the reticle EXACTLY on a 90-degree
+    table corner gets AT MOST 25% real table coverage (an exact geometric
+    ceiling -- image-centre lines always quarter a rectangular frame), so
+    RANSAC's own plane vote would favour a majority background over the
+    table. That is a characteristic of survey_surface's plane SELECTION,
+    pre-existing to Task 13 and not touched by this fix -- flagged in the fix
+    report, not silently worked around here.
+    """
+    orig_survey_surface = scan_service.survey_surface
+    orig_color_boundary = scan_service.color_work_boundary
+
+    def patched_survey_surface(depth, K_, th, **kw):
+        real = orig_survey_surface(depth, K_, th, **kw)
+        if not real.detected:
+            return real
+        import dataclasses
+        kind = patched_survey_surface.cur
+        cx, cy = (0.0, 0.0) if kind == "center" else _FIVE_POS_WORLD_CORNERS[kind]
+        tz = table_z_by_kind.get(kind, 0.0)
+        normal, centroid, standoff, tilt = _true_table_plane_cam(cx, cy, table_z=tz)
+        return dataclasses.replace(real, normal_cam=normal, centroid_cam_mm=centroid,
+                                   standoff_mm=standoff, tilt_deg=tilt)
+    patched_survey_surface.cur = "center"
+
+    def patched_color_boundary(color, **kw):
+        kind = patched_survey_surface.cur
+        if kind not in _FIVE_POS_WORLD_CORNERS:
+            return None
+        cx, cy = _FIVE_POS_WORLD_CORNERS[kind]
+        poly = _corner_polygon_uv(cx, cy)
+        return {"outline_uv": poly, "polygon_uv": poly, "fill_frac": 0.1,
+                "border_touch": 0.0, "overruns": False, "contrast": 50.0}
+
+    scan_service.survey_surface = patched_survey_surface
+    scan_service.color_work_boundary = patched_color_boundary
+
+    def unpatch():
+        scan_service.survey_surface = orig_survey_surface
+        scan_service.color_work_boundary = orig_color_boundary
+
+    return patched_survey_surface, unpatch
+
+
+def test_deproject_plane_points_mm_filters_background_to_plane_inliers():
+    """The exact before/after measurement the review asked for: on a
+    synthetic corner capture with a REAL floor 750 mm below the table (25%
+    table / 75% floor -- an operator centred exactly on the corner), the
+    UNFILTERED deprojection (this function's original behaviour, reproduced
+    here via an effectively-infinite band) mixes in the floor and inflates
+    fit_global_plane's per-set RMS to ~384 mm against the 8 mm
+    survey_coplanar_reject_mm gate -- i.e. it would refuse every real corner
+    capture as "not coplanar." Filtering to a tight band around the plane
+    survey_surface already fit for this exact frame (this function's fixed
+    behaviour) collapses that to ~0 mm (only floating-point residue from the
+    synthetic ray-plane intersection remains)."""
+    cx, cy = 150.0, 150.0
+    T = _look_at((cx, cy, 420.0), (cx, cy, 0.0))
+    normal_cam, centroid_cam_mm, standoff_mm, _tilt = _true_table_plane_cam(cx, cy)
+    assert abs(standoff_mm - 420.0) < 1.0, standoff_mm     # sanity: the real table plane
+
+    depth_bg = _render_with_floor(T).depth
+    bg_frac = float(np.mean(depth_bg > 1000))
+    assert bg_frac > 0.7, bg_frac      # a genuinely majority-background frame
+
+    pts_before = scan_service._deproject_plane_points_mm(
+        depth_bg, K, T, plane_normal_cam=normal_cam, plane_point_cam=centroid_cam_mm,
+        band_mm=1.0e6)                 # effectively unfiltered -- reproduces the pre-fix behaviour
+    pts_after = scan_service._deproject_plane_points_mm(
+        depth_bg, K, T, plane_normal_cam=normal_cam, plane_point_cam=centroid_cam_mm,
+        band_mm=6.0)                   # the scan.survey_plane_inlier_band_mm default
+
+    from tasni.modules.scan.rect_fit import fit_global_plane
+    rms_before = fit_global_plane([pts_before]).per_set_rms_mm[0]
+    rms_after = fit_global_plane([pts_after]).per_set_rms_mm[0]
+
+    assert rms_before > 300.0, rms_before      # measured 384.26 mm
+    assert rms_after < 1.0, rms_after          # measured 0.00 mm
+    assert len(pts_after) < len(pts_before)    # background points were actually dropped
+    assert np.all(np.abs(pts_after[:, 2]) < 1.0), "filtered points must be on the table (z~0), not the floor"
+    print(f"[Finding 1] bg_frac={bg_frac:.3f} n_before={len(pts_before)} rms_before={rms_before:.2f} mm "
+          f"-> n_after={len(pts_after)} rms_after={rms_after:.4f} mm")
+
+
+def test_five_position_survey_accepts_captures_with_real_background_depth():
+    """Finding 1's end-to-end positive proof: a full five-position survey
+    (center + 4 corners) driven through the REAL five_position_capture, with
+    a REAL floor visible beyond every corner's near edges, is ACCEPTED at
+    every step (plane_points_base land on the table, not the floor) and
+    finish() succeeds -- a genuinely flat, coplanar table is not refused just
+    because its corner captures see real background."""
+    services, state = _build_fakes_five_position_background()
+    services.config.scan.boundary_engine = "color"
+    survey = FivePositionSurvey(services.config.scan)
+    patched, unpatch = _patch_boundary_and_plane_for_five_position_background({})
+    try:
+        for kind in ("center", "corner1", "corner2", "corner3", "corner4"):
+            state["cur_kind"] = kind
+            patched.cur = kind
+            st = scan_service.five_position_capture(services, survey)
+            pts = survey._accepted[kind].plane_points_base
+            assert np.all(np.abs(pts[:, 2]) < 1.0), (kind, pts[:, 2].min(), pts[:, 2].max())
+        assert survey.step == "review"
+        record = survey.finish(calibration_id="cam-test",
+                               locked_robot=scan_service.refresh_robot_state(services.rdk))
+        assert record.mode == MODE_FIVE_POSITION
+        assert max(record.quality["per_position_rms_mm"]) < 1.0, record.quality
+    finally:
+        unpatch()
+    print("[Finding 1] full 5-position survey with real background depth -> accepted + finish() succeeded")
+
+
+def test_five_position_survey_still_rejects_genuine_noncoplanarity_with_background():
+    """Finding 1's end-to-end negative proof: the SAME background-contaminated
+    pipeline must still REFUSE a genuinely non-coplanar surface -- proving the
+    per-capture plane-inlier filter (which only removes THIS capture's own
+    off-plane background) does not also defeat the SEPARATE cross-position
+    coplanarity check (fit_global_plane's per-set RMS against the pooled
+    global plane). corner4's table is rendered 50 mm above the other four
+    positions' -- each capture is still internally flat (passes add_capture
+    on its own), but finish() must catch the cross-position discrepancy."""
+    table_z_by_kind = {"corner4": 50.0}
+    # BOTH the fake camera (the actual rendered depth) and the plane stub (what
+    # survey_surface is told the true plane is) must agree on the shift, or the
+    # deprojection band filter and the rendered depth describe two different
+    # heights and every point gets filtered out as "off-plane" -- a fixture
+    # bug, not a production one; caught by this test itself failing loudly
+    # ("too few plane points") rather than silently mis-testing something else.
+    services, state = _build_fakes_five_position_background(table_z_by_kind)
+    services.config.scan.boundary_engine = "color"
+    survey = FivePositionSurvey(services.config.scan)
+    patched, unpatch = _patch_boundary_and_plane_for_five_position_background(table_z_by_kind)
+    try:
+        for kind in ("center", "corner1", "corner2", "corner3", "corner4"):
+            state["cur_kind"] = kind
+            patched.cur = kind
+            st = scan_service.five_position_capture(services, survey)     # each capture still accepted
+            assert st["step"] != kind
+        assert survey.step == "review"
+        try:
+            survey.finish(calibration_id="cam-test",
+                          locked_robot=scan_service.refresh_robot_state(services.rdk))
+            raise AssertionError("expected the shifted corner4 to be rejected as non-coplanar")
+        except RuntimeError as e:
+            assert "not coplanar" in str(e) and "corner4" in str(e), e
+    finally:
+        unpatch()
+    print("[Finding 1] genuinely non-coplanar corner4 (+50 mm) still rejected through the real pipeline")
+
+
+def test_deproject_plane_points_mm_regression_pin_against_pre_fix_behaviour():
+    """Regression pin (verified against pre-fix code): with
+    scan.survey_plane_inlier_band_mm set to reproduce the ORIGINAL unfiltered
+    behaviour (an effectively-infinite band), the exact same genuinely flat,
+    coplanar five-position survey from the accept test above is INCORRECTLY
+    REJECTED by finish() -- proving this fixture reproduces the reported bug,
+    not just a synthetic RMS number in isolation."""
+    services, state = _build_fakes_five_position_background()
+    services.config.scan.boundary_engine = "color"
+    services.config.scan.survey_plane_inlier_band_mm = 1.0e6      # simulate the pre-fix (unfiltered) code
+    survey = FivePositionSurvey(services.config.scan)
+    patched, unpatch = _patch_boundary_and_plane_for_five_position_background({})
+    try:
+        for kind in ("center", "corner1", "corner2", "corner3", "corner4"):
+            state["cur_kind"] = kind
+            patched.cur = kind
+            scan_service.five_position_capture(services, survey)
+        assert survey.step == "review"
+        try:
+            survey.finish(calibration_id="cam-test",
+                          locked_robot=scan_service.refresh_robot_state(services.rdk))
+            raise AssertionError(
+                "expected the pre-fix (unfiltered) band to reproduce the reported "
+                "not-coplanar failure on a genuinely flat table")
+        except RuntimeError as e:
+            assert "not coplanar" in str(e), e
+            print(f"[Finding 1 regression pin] pre-fix band reproduces the bug: {e}")
+    finally:
+        unpatch()
 
 
 def test_five_position_capture_corner_step_passes_closed_true_to_corner_evidence():
@@ -1372,6 +1754,98 @@ def test_survey_finish_route_rejects_incomplete_survey():
     print("[survey finish] incomplete survey -> 400, survey left intact for the operator")
 
 
+class _FakeSamWorker:
+    """Records .stop() instead of spinning a real background thread/ONNX
+    session -- used by both Finding 3/5 tests below to prove a worker is
+    stopped, not merely dereferenced."""
+    def __init__(self, *a, **k): self.stopped = False
+    def stop(self): self.stopped = True
+    def submit(self, *a, **k): pass
+
+
+class _FakeLive:
+    """A services.live fake that actually implements .start()/.running --
+    every OTHER fake in this file (_build_fakes's SimpleNamespace) has no
+    .start() at all, which is exactly why the restart path had zero
+    coverage (Finding 5): was_running was always False, so the restart
+    branch never even executed."""
+    def __init__(self): self.running = False; self.start_calls = 0
+    def start(self, analyze, **kwargs): self.running = True; self.start_calls += 1
+    def stop(self): self.running = False
+
+
+def test_live_start_stops_existing_sam_worker_before_replacing_it():
+    """Review Finding 3: _authoritative_acquisition stops the VIDEO loop for
+    a capture but never touches self._sam_worker (unlike /live/stop), so the
+    prior worker's daemon thread is orphaned -- never .stop()ped -- the
+    moment live_start() is called again (as survey_capture()'s restart
+    does). Reproduced directly here: calling the SAME /live/start closure
+    twice in a row must stop the FIRST worker before building the second,
+    not just drop the reference."""
+    import tasni.modules.scan.module as scan_module
+
+    services, _state, _started = _build_fakes_with_jobs()
+    services.live = _FakeLive()
+    services.config.scan.boundary_engine = "sam"   # forces a SamBoundaryWorker
+
+    orig_worker_cls = scan_module.SamBoundaryWorker
+    scan_module.SamBoundaryWorker = _FakeSamWorker
+    try:
+        mod = scan_module.ScanModule(services)
+        mod.router()               # wires self._live_start (real app-startup path)
+        mod._live_start()
+        first = mod._sam_worker
+        assert first is not None and not first.stopped
+
+        services.live.stop()       # matches _authoritative_acquisition's own stop()
+        mod._live_start()          # the restart survey_capture() performs
+        assert first.stopped, "orphaned SamBoundaryWorker thread leaked across a restart"
+        assert mod._sam_worker is not None and mod._sam_worker is not first
+        assert not mod._sam_worker.stopped
+    finally:
+        scan_module.SamBoundaryWorker = orig_worker_cls
+    print("[live restart] prior SamBoundaryWorker stopped before being replaced")
+
+
+def test_survey_capture_restarts_live_preview_and_its_sam_worker_cleanly():
+    """Review Finding 5: the /live/start restart path (survey_capture's
+    finally block) had zero coverage -- every existing fake's services.live
+    has no .start() at all, so was_running was always False and the branch
+    never ran. Covers BOTH the restart itself AND its interaction with
+    Finding 3's worker-leak fix, driven through the real route method (not
+    just the raw closure), on a genuine "center" capture against the
+    synthetic table fixture."""
+    import tasni.modules.scan.module as scan_module
+
+    services, _state, _started = _build_fakes_with_jobs()
+    services.live = _FakeLive()
+    services.config.scan.boundary_engine = "sam"
+
+    orig_worker_cls = scan_module.SamBoundaryWorker
+    scan_module.SamBoundaryWorker = _FakeSamWorker
+    try:
+        mod = scan_module.ScanModule(services)
+        mod.router()                        # wires self._live_start
+        mod._live_start()                   # the operator's initial /live/start
+        first_worker = mod._sam_worker
+        assert first_worker is not None and not first_worker.stopped
+        services.live.running = True        # the preview WAS running before the capture
+
+        mod.survey_begin()
+        result = mod.survey_capture()       # five_position_capture stops live internally
+
+        assert result["step"] == "corner1"
+        assert services.live.running is True, "live preview must be restarted after the capture"
+        assert services.live.start_calls == 2, services.live.start_calls  # initial + restart
+        assert first_worker.stopped, "the pre-capture SamBoundaryWorker must not leak across the restart"
+        assert mod._sam_worker is not None and mod._sam_worker is not first_worker
+        assert not mod._sam_worker.stopped
+    finally:
+        scan_module.SamBoundaryWorker = orig_worker_cls
+    print("[survey capture restart] live preview restarted; prior SamBoundaryWorker "
+          "stopped, not leaked (start_calls=%d)" % services.live.start_calls)
+
+
 def test_poses_generate_rejects_out_of_range_overlap_with_400():
     """Bundled cleanup (ambiguity resolution #5, a review finding from the
     previous task): poses_generate()'s except-chain used to map ONLY
@@ -1428,12 +1902,19 @@ if __name__ == "__main__":
     test_five_position_tiled_tour_coverage_gate_catches_missing_tiles()
     test_five_position_tiled_tour_small_rectangle_is_single_tile()
     test_five_position_capture_uses_fresh_robot_state()
+    test_five_position_capture_rejects_disconnected_driver()
     test_five_position_capture_rejects_moving_robot()
+    test_deproject_plane_points_mm_filters_background_to_plane_inliers()
+    test_five_position_survey_accepts_captures_with_real_background_depth()
+    test_five_position_survey_still_rejects_genuine_noncoplanarity_with_background()
+    test_deproject_plane_points_mm_regression_pin_against_pre_fix_behaviour()
     test_five_position_capture_corner_step_passes_closed_true_to_corner_evidence()
     test_survey_begin_state_capture_cancel_routes()
     test_survey_routes_require_an_active_survey()
     test_survey_recapture_route_rejects_unknown_kind()
     test_survey_finish_route_locks_and_sets_current_lock_token()
     test_survey_finish_route_rejects_incomplete_survey()
+    test_live_start_stops_existing_sam_worker_before_replacing_it()
+    test_survey_capture_restarts_live_preview_and_its_sam_worker_cleanly()
     test_poses_generate_rejects_out_of_range_overlap_with_400()
     print("\nScan job (gate -> generate -> run -> insert) tests passed.")

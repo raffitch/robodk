@@ -494,8 +494,11 @@ def _backproject_depth(depth: np.ndarray, K: np.ndarray, *,
     return np.column_stack([(xs - cx) / fx * z_mm, (ys - cy) / fy * z_mm, z_mm])
 
 
-def _deproject_plane_points_mm(depth, K, T_base_cam, stride: int = 6) -> np.ndarray:
-    """Deproject a strided grid of valid depth pixels to BASE-frame millimetres.
+def _deproject_plane_points_mm(depth, K, T_base_cam, *, plane_normal_cam,
+                               plane_point_cam, band_mm: float,
+                               stride: int = 6) -> np.ndarray:
+    """Deproject a strided grid of depth pixels that lie within ``band_mm`` of the
+    ALREADY-FITTED local plane to BASE-frame millimetres.
 
     Explicit millimetres throughout -- deliberately the SAME pattern as
     ``corner_evidence._deproject_base`` (depth is the raw uint16 RealSense frame,
@@ -511,6 +514,28 @@ def _deproject_plane_points_mm(depth, K, T_base_cam, stride: int = 6) -> np.ndar
     local plane this feeds (``rect_fit.fit_global_plane``, via
     ``FivePositionSurvey.add_capture``) only needs a representative sample of this
     one position's surface, not every pixel.
+
+    ``plane_normal_cam``/``plane_point_cam`` (CAMERA frame -- exactly what
+    ``survey_surface`` already fit via RANSAC for this same depth frame,
+    ``measurement.normal_cam``/``measurement.centroid_cam_mm``) and ``band_mm`` are
+    REQUIRED, not optional: Task 13 review Finding 1 found that deprojecting every
+    valid pixel unfiltered (this function's original behaviour) is NOT "plane
+    inliers" the brief's own spec asked for. A five-position CORNER capture aims the
+    camera at a table corner (``corner_hint_uv=(0.5, 0.5)``), so a large fraction of
+    the frame legitimately looks PAST the table's two edges at background (floor,
+    fixtures) tens of centimetres away on a real D435i. Those off-plane points, fed
+    unfiltered into ``fit_global_plane``'s per-set RMS (a plain, non-robust RMS, not
+    a further RANSAC pass), inflate it by roughly ``d * sqrt(f)`` for an off-plane
+    fraction ``f`` at distance ``d`` -- MEASURED on a synthetic 300x300 mm table with
+    a floor 750 mm below and a corner capture whose reticle sits exactly on the
+    corner (~75% of the frame is floor at this geometry): per-set RMS **384 mm**,
+    against the ``survey_coplanar_reject_mm`` gate of 8 mm -- i.e. every real corner
+    capture would fail as "not coplanar" (see the Task 13 review fix report for the
+    full before/after measurement). Filtering to a band around the plane
+    ``survey_surface`` already fit for THIS exact frame turns this into a genuine
+    plane-inlier cloud, matching what ``fit_global_plane`` needs -- verified: the
+    same fixture now measures **0.00 mm** per-set RMS (only exact-zero floating-point
+    residual from the synthetic ray-plane intersection remains).
     """
     d = np.asarray(depth, dtype=float)
     if d.ndim != 2 or d.size == 0:
@@ -527,7 +552,17 @@ def _deproject_plane_points_mm(depth, K, T_base_cam, stride: int = 6) -> np.ndar
     fx, fy, cx, cy = float(K[0][0]), float(K[1][1]), float(K[0][2]), float(K[1][2])
     x_cam = (xs_v - cx) / fx * z_v
     y_cam = (ys_v - cy) / fy * z_v
-    pts_cam_h = np.column_stack([x_cam, y_cam, z_v, np.ones_like(z_v)])
+    pts_cam = np.column_stack([x_cam, y_cam, z_v])
+
+    n = np.asarray(plane_normal_cam, dtype=float)
+    n = n / max(float(np.linalg.norm(n)), 1e-9)
+    p0 = np.asarray(plane_point_cam, dtype=float)
+    dist = np.abs((pts_cam - p0) @ n)
+    pts_cam = pts_cam[dist <= float(band_mm)]
+    if len(pts_cam) == 0:
+        return np.zeros((0, 3), dtype=float)
+
+    pts_cam_h = np.column_stack([pts_cam, np.ones(len(pts_cam))])
     T = np.asarray(T_base_cam, dtype=float)
     return (pts_cam_h @ T.T)[:, :3]
 
@@ -598,24 +633,61 @@ def five_position_capture(services, survey: FivePositionSurvey) -> dict:
     further per-frame compute -- rather than silently accepted: this is the core
     safety contract of the whole feature (a stale/live pose blend at any one
     position would corrupt the cross-position plane/rectangle fit in a way no
-    downstream check could distinguish from a real geometry error).
+    downstream check could distinguish from a real geometry error). The rejection
+    is INTENTIONALLY worded differently from ``FivePositionSurvey.add_capture``'s
+    own "robot was moving during the capture" message (Task 13 review Finding 4):
+    the two are genuinely different layers checking genuinely different things (this
+    one never even builds a ``CaptureRecord`` -- ``add_capture`` is not called at
+    all -- whereas ``add_capture``'s check is a defence-in-depth backstop for a
+    record that DID get built), and distinct text keeps a test able to tell which
+    layer actually fired instead of both raising byte-identical strings.
+
+    Also checks the RoboDK driver is actually connected to the physical controller
+    (Task 13 review Finding 2) BEFORE trusting anything ``_authoritative_acquisition``
+    reads: ``refresh_robot_state`` reads ``current_joints()`` twice and calls them
+    "stationary" when they agree, but that only means the arm didn't move ACCORDING
+    TO THE MODEL POSE RODK IS TRACKING -- with the driver down (or never connected),
+    RoboDK's model freezes at its last commanded pose while the physical arm can be
+    anywhere, so a dead link reads as a perfectly "stationary" robot every time. A
+    five-position survey is uniquely exposed to this: it *depends* on the pose
+    genuinely differing across five captures, so a frozen mirror would silently
+    register all five positions at the same fictional pose -- checked first (before
+    the camera grab, not just before trusting the snapshot) since it is a cheap
+    RoboDK round trip next to a multi-second Wi-Fi depth grab, so a disconnected
+    driver fails in milliseconds instead of after burning that grab for nothing.
+    Scoped to this function only -- ``lock_scan_surface``/``_authoritative_acquisition``
+    are untouched, so the compact/crop lock path's behaviour does not change.
     """
     K = services.config.camera.K
     scfg = services.config.scan
+    rdk = services.rdk
     kind = survey.step
     if kind == "review":
         raise RuntimeError("survey already has all five captures")
 
+    driver_ok, driver_msg = rdk.robot_connected()
+    if not driver_ok:
+        raise RuntimeError(
+            f"{kind} capture: RoboDK is not connected to the physical robot "
+            f"controller ({driver_msg or 'driver not ready'}) - a robot-state read "
+            "cannot be trusted while the driver link is down; reconnect the driver "
+            "and remeasure")
+
     frame, n_frames, reading, measurement, snapshot = _authoritative_acquisition(
         services, owner="scan-five-position")
     if not snapshot.stationary:
-        raise RuntimeError("robot was moving during the capture - stop and remeasure")
+        raise RuntimeError(
+            f"{kind} capture: the robot moved between the two robot-state reads "
+            "taken for this capture - stop the robot and remeasure")
     if not measurement.detected:
         raise RuntimeError(
             f"{kind} capture: no usable surface plane detected - reposition and recapture")
 
     T_base_cam = snapshot.camera_T_np()
-    plane_points_base = _deproject_plane_points_mm(frame.depth, K, T_base_cam)
+    plane_points_base = _deproject_plane_points_mm(
+        frame.depth, K, T_base_cam, plane_normal_cam=measurement.normal_cam,
+        plane_point_cam=measurement.centroid_cam_mm,
+        band_mm=float(scfg.survey_plane_inlier_band_mm))
 
     R, t = T_base_cam[:3, :3], T_base_cam[:3, 3]
     normal_base = R @ np.asarray(measurement.normal_cam, dtype=float)

@@ -514,6 +514,18 @@ class ScanConfig(_Model):
                                               # the one that catches translational registration
                                               # error (rect_fit.RectangleSolution.corner_agreement_mm)
     survey_min_edge_points: int = 20         # min pooled points per edge after band filtering
+    # Per-capture PLANE-INLIER band (mm, camera frame) for the coplanarity check's raw
+    # input (Task 13 review Finding 1): a corner capture aims at a table corner, so a
+    # large fraction of the frame legitimately looks past the table's two edges at
+    # background (floor, fixtures) far off the work plane. Deprojecting every valid
+    # depth pixel unfiltered inflates fit_global_plane's per-set RMS by roughly
+    # d*sqrt(f) for an off-plane fraction f at distance d -- measured 384 mm on a
+    # synthetic table with a floor 750 mm below, against the 8 mm reject gate above,
+    # i.e. every real corner capture would fail as "not coplanar." This band re-selects
+    # inliers around the plane survey_surface already fit (via RANSAC) for that exact
+    # frame -- matches its own default RANSAC inlier distance (survey.SurveyThresholds.
+    # ransac_distance_mm) so "inlier" means the same thing in both places.
+    survey_plane_inlier_band_mm: float = 6.0
     # -- tiled close-range tour over a five-position-surveyed rectangle -----
     # (Task 12) A platform too large for one camera view is measured by the
     # five-position survey above, then TILED with overlapping close-range
