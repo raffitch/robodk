@@ -514,6 +514,13 @@ class ScanConfig(_Model):
                                               # the one that catches translational registration
                                               # error (rect_fit.RectangleSolution.corner_agreement_mm)
     survey_min_edge_points: int = 20         # min pooled points per edge after band filtering
+    # -- tiled close-range tour over a five-position-surveyed rectangle -----
+    # (Task 12) A platform too large for one camera view is measured by the
+    # five-position survey above, then TILED with overlapping close-range
+    # views (plan_rect_tour) instead of backing the camera off — backing off
+    # would frame the whole thing but destroy depth quality.
+    survey_tour_overlap: float = 0.30        # target overlap fraction between adjacent tiles
+    survey_tour_views_per_tile: int = 2      # captured views per tile (angle diversity for fusion)
     # Vision safety net for the hold: the live rectangle is depth-derived, so it must
     # still track a physical camera move even if RoboDK is not mirroring the arm. A
     # standoff/tilt shift past these releases the hold regardless of the pose gate.

@@ -12,8 +12,10 @@ robot's current pose, so the fused surface + work frame are checked end to end.
 """
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,12 +27,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tasni.core import runs  # noqa: E402
 from tasni.core.camera_lease import CameraLease  # noqa: E402
-from tasni.core.config import AppConfig  # noqa: E402
+from tasni.core.config import AppConfig, ScanConfig  # noqa: E402
 from tasni.core.geometry import Rt_to_T  # noqa: E402
 from tasni.core.jobrunner import JobContext  # noqa: E402
 from tasni.modules.scan import service as scan_service  # noqa: E402
+from tasni.modules.scan.corner_evidence import CornerEvidence  # noqa: E402
+from tasni.modules.scan.five_position import FivePositionSurvey  # noqa: E402
 from tasni.modules.scan.survey_contract import (  # noqa: E402
-    MODE_COMPACT, MODE_USER_SPECIFIED, PROVENANCE_COMPACT, PROVENANCE_USER_SPECIFIED)
+    MODE_COMPACT, MODE_FIVE_POSITION, MODE_USER_SPECIFIED, PROVENANCE_COMPACT,
+    PROVENANCE_USER_SPECIFIED, CaptureRecord, RobotStateSnapshot)
 
 W, H = 320, 240
 K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
@@ -891,6 +896,153 @@ def test_sparse_measured_support_is_rejected():
     print("[surface quality] sparse measured support rejected:", len(reasons), "reasons")
 
 
+# -- Task 12: five-position survey -> tiled tour wiring ---------------------
+# generate_scan_targets' new FIRST branch (taken when the locked surface has a
+# survey_record with mode=MODE_FIVE_POSITION) plans plan_rect_tour instead of
+# the single-aim orbit. This reuses Task 11's real FivePositionSurvey happy
+# path (mirrors tests/test_five_position.py's _run_all/_survey helpers) to
+# build a genuinely validated LockedWorkframeSurvey, rather than hand-rolling
+# one -- so this also exercises Task 11's own gates on the way in.
+_FP_CLOCK = [100.0]
+
+
+def _fp_snap():
+    return RobotStateSnapshot((0.0,) * 6, tuple(map(tuple, np.eye(4))), _FP_CLOCK[0], True)
+
+
+def _fp_record(kind, standoff=350.0, tilt=1.0):
+    snap = RobotStateSnapshot((0.0,) * 6, tuple(map(tuple, np.eye(4))), _FP_CLOCK[0], True)
+    return CaptureRecord(kind=kind, robot=snap, measurement_ts=1.0, captured_at=_FP_CLOCK[0],
+                         n_frames=5, standoff_mm=standoff, tilt_deg=tilt, valid_frac=0.9,
+                         plane_rms_mm=0.6, plane_normal_base=(0, 0, 1),
+                         plane_point_base=(1000, 800, 0))
+
+
+def _fp_plane_points(center, n=300, seed=0):
+    rng = np.random.default_rng(seed)
+    xy = rng.uniform(-150, 150, (n, 2)) + np.asarray(center, float)
+    return np.column_stack([xy, rng.normal(0, 0.3, n)])
+
+
+def _fp_corner_evidence(corners, i, seed=None):
+    c, prev_c, next_c = corners[i], corners[(i - 1) % 4], corners[(i + 1) % 4]
+    rng = np.random.default_rng(seed if seed is not None else i)
+    pts = []
+    for other in (prev_c, next_c):
+        t = np.linspace(0.02, 0.30, 40)[:, None]
+        seg = c + t * (other - c)
+        seg = seg + np.column_stack([rng.normal(0, 0.4, 40), rng.normal(0, 0.4, 40),
+                                     np.zeros(40)])
+        pts.append(seg)
+    return CornerEvidence(corner_uv=(0.5, 0.5), corner_base_mm=tuple(c),
+                          edge_points_base=np.concatenate(pts, axis=0))
+
+
+def _five_position_locked_survey(corners: np.ndarray):
+    """Task 11's happy-path survey (center + four corners, in order) driven to
+    completion -> a real, fully-gated LockedWorkframeSurvey (mode =
+    MODE_FIVE_POSITION) for ``corners``, not a hand-rolled stand-in."""
+    s = FivePositionSurvey(ScanConfig(), clock=lambda: _FP_CLOCK[0])
+    s.add_capture(_fp_record("center"), _fp_plane_points(corners.mean(axis=0)[:2]), None)
+    for i in range(4):
+        s.add_capture(_fp_record(f"corner{i + 1}"),
+                      _fp_plane_points(corners[i][:2], seed=i + 1),
+                      _fp_corner_evidence(corners, i, seed=i + 1))
+    assert s.step == "review"
+    return s.finish(calibration_id="cam-test-five-position", locked_robot=_fp_snap())
+
+
+def _locked_five_position_scan_surface(state, corners: np.ndarray, *,
+                                       lock_token="five-pos-test"):
+    rec = _five_position_locked_survey(corners)
+    assert rec.mode == MODE_FIVE_POSITION
+    return scan_service.LockedScanSurface(
+        frame=None, reading=None, survey=None, gate_payload={},
+        seed_T=state["cam"].copy(), seed_joints=[0.0] * 6,
+        locked_at=time.monotonic(), survey_record=rec, lock_token=lock_token)
+
+
+# A rectangle too large for one camera view at this fake's K/resolution
+# (900 x 700 mm; the fake 320x240 camera's tile footprint is ~286x214 mm).
+_FP_LARGE_CORNERS = np.array([[300.0, 400.0, 0.0], [1200.0, 400.0, 0.0],
+                              [1200.0, 1100.0, 0.0], [300.0, 1100.0, 0.0]])
+
+
+def test_five_position_tiled_tour_spans_multiple_tiles():
+    """A five-position locked surface (a platform surveyed because it is too
+    large for one camera view) is planned as a TILED close-range tour
+    (plan_rect_tour), not the single-aim orbit -- generate_scan_targets' new
+    FIRST branch (Task 12 ambiguity resolution #4). The 900x700 mm rectangle
+    needs > 1 tile at this fake camera's K/resolution, so the created targets
+    must span more than one tile, named TasniScan_T{tile:02d}_{k}."""
+    services, state = _build_fakes()
+    locked = _locked_five_position_scan_surface(state, _FP_LARGE_CORNERS)
+
+    gen = scan_service.generate_scan_targets(services, locked)
+    assert gen["mode"] == "quality", gen
+    assert gen["plan"]["mode"] == "large_survey", gen["plan"]
+    assert gen["tile_count"] > 1, gen["tile_count"]
+    assert gen["created"] > 0, gen
+
+    tile_ids = set()
+    for name in gen["targets"]:
+        m = re.match(r"TasniScan_T(\d+)_\d+$", name)
+        assert m, name
+        tile_ids.add(int(m.group(1)))
+    assert len(tile_ids) > 1, tile_ids
+    assert gen["surface_coverage"] is not None
+    assert gen["surface_coverage"] >= services.config.scan.min_surface_coverage
+    assert len(services.rdk.list_targets("TasniScan_")) == gen["created"]
+    print(f"[five-position tiled tour] {gen['tile_count']} tiles planned, "
+          f"{len(tile_ids)} produced targets, {gen['created']} targets total, "
+          f"coverage {gen['surface_coverage']:.0%}")
+
+
+def test_five_position_tiled_tour_coverage_gate_catches_missing_tiles():
+    """§10's coverage hard gate must apply ACROSS ALL TILES (ambiguity
+    resolution #5), not just report near-100% because whichever tiles DID get
+    a pose each fill their own close-range frame on their own. Force roughly
+    half the surveyed rectangle's tiles to have zero reachable poses (as if
+    that half were outside the workspace) and confirm the gate refuses rather
+    than silently shipping a target set that leaves half the surface unscanned."""
+    services, state = _build_fakes()
+    locked = _locked_five_position_scan_surface(state, _FP_LARGE_CORNERS)
+
+    midpoint_y = float(_FP_LARGE_CORNERS[:, 1].mean())
+    real_is_reachable = services.rdk.is_reachable
+    services.rdk.is_reachable = lambda T: float(np.asarray(T)[1, 3]) < midpoint_y
+    try:
+        with pytest.raises(RuntimeError, match="coverage"):
+            scan_service.generate_scan_targets(services, locked)
+    finally:
+        services.rdk.is_reachable = real_is_reachable
+    print("[coverage gate] missing-tile scenario (half the rectangle "
+          "unreachable) correctly refused instead of reporting a false-pass")
+
+
+def test_five_position_tiled_tour_small_rectangle_is_single_tile():
+    """A rectangle small enough to fit this fake camera's own footprint still
+    goes through the tiled-tour branch (mode=five_position), collapsing to a
+    single tile -- the branch must not require multiple tiles to work.
+
+    Sized well clear of the ~200x150 mm single/double-tile boundary at this
+    fake's K/config (not right AT it), so the survey's own measurement noise
+    (a few mm, like any real fit) cannot tip it into a second tile.
+    """
+    services, state = _build_fakes()
+    small = np.array([[940.0, 730.0, 0.0], [1060.0, 730.0, 0.0],
+                      [1060.0, 820.0, 0.0], [940.0, 820.0, 0.0]])
+    locked = _locked_five_position_scan_surface(state, small)
+
+    gen = scan_service.generate_scan_targets(services, locked)
+    assert gen["tile_count"] == 1, gen["tile_count"]
+    assert gen["created"] > 0, gen
+    for name in gen["targets"]:
+        assert name.startswith("TasniScan_T01_"), name
+    print("[five-position tiled tour] small rectangle -> single tile,",
+          gen["created"], "targets")
+
+
 if __name__ == "__main__":
     test_generate_run_insert()
     test_provenance_flows_lock_to_insert()
@@ -918,4 +1070,7 @@ if __name__ == "__main__":
     test_run_starts_normally_after_lock_and_generate()
     test_run_not_blocked_when_targets_token_was_never_set()
     test_sparse_measured_support_is_rejected()
+    test_five_position_tiled_tour_spans_multiple_tiles()
+    test_five_position_tiled_tour_coverage_gate_catches_missing_tiles()
+    test_five_position_tiled_tour_small_rectangle_is_single_tile()
     print("\nScan job (gate -> generate -> run -> insert) tests passed.")

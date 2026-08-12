@@ -46,10 +46,10 @@ from ..calibration.service import (
 from .depth_gate import ScanGateThresholds, evaluate_depth_gate
 from .plane import (bounded_work_plane, fit_plane, rectangle_in_frame,
                     reticle_plane_square, work_plane_from_points)
-from .planner import ScanPlan, plan_scan
+from .planner import ScanPlan, plan_rect_tour, plan_scan
 from .survey import SurveyThresholds, survey_surface
 from .survey_contract import (
-    MODE_COMPACT, MODE_USER_SPECIFIED, PROVENANCE_BY_MODE,
+    MODE_COMPACT, MODE_FIVE_POSITION, MODE_USER_SPECIFIED, PROVENANCE_BY_MODE,
     CaptureRecord, LockedWorkframeSurvey, camera_calibration_id,
     frame_from_rectangle, order_corners_clockwise, refresh_robot_state)
 from .reconstruct import (ScanView, clean_measured_surface_mesh, cloud_points_m,
@@ -1163,6 +1163,282 @@ def annotate_pose_liveness(metrics: dict, *, pose_T, driver_ok: bool) -> dict:
     return metrics
 
 
+def _clear_prior_scan_targets(rdk: RdkIO, prefix: str, pub) -> None:
+    """Delete previous ``TasniScan_*`` targets and any stray calibration
+    targets/keep-out before writing a fresh target set.
+
+    Shared by the single-aim and tiled-tour generators (Task 12) — pure code
+    motion out of ``generate_scan_targets``, same behaviour as before.
+    """
+    prior = rdk.list_targets(prefix)
+    if prior:
+        rdk.delete_items(prior)
+    calib_prior = rdk.list_targets(CALIB_TARGET_PREFIX)
+    removed_calib_keepout = False
+    if calib_prior:
+        rdk.delete_items(calib_prior)
+    if rdk.item_exists(CALIB_BOARD_KEEPOUT_NAME):
+        rdk.delete_items([CALIB_BOARD_KEEPOUT_NAME])
+        removed_calib_keepout = True
+    if calib_prior or removed_calib_keepout:
+        pub(f"cleared {len(calib_prior)} calibration target(s)"
+            + (" and board keep-out" if removed_calib_keepout else "")
+            + " before creating scan targets")
+
+
+def _screen_scan_collision_candidates(
+    services, scfg, reachable: list[tuple[int, np.ndarray]], n_reach: int,
+) -> tuple[list[tuple[int, np.ndarray]], list, bool, int, bool, list[str]]:
+    """Collision-screen reachable scan candidates.
+
+    Shared by the single-aim and tiled-tour generators (Task 12) — pure code
+    motion out of ``generate_scan_targets``, same semantics as before: a
+    STRICT hard-fail by default (a production target set the real robot is
+    about to run), with a soft bypass only when the operator has explicitly
+    opted into it via ``scan.collision_filter_hard_fail = False``.
+
+    Returns ``(reachable, reach_joints, col_checked, n_collide,
+    collision_filter_bypassed, pair_examples)`` — ``reachable`` narrowed to
+    the collision-free survivors (or, on a soft bypass, restored to the full
+    pre-collision reachable set).
+    """
+    rdk: RdkIO = services.rdk
+    guard_skip = None
+    if scfg.collision_filter and scfg.collision_self_pairs:
+        guard_skip = scfg.collision_skip_wrist_links
+        guard = rdk.ensure_mounted_tool_collision_pairs(scfg.collision_skip_wrist_links)
+        n_pairs = (guard or {}).get("pairs_enabled", 0)
+        services.bus.publish(JobEvent("log", {"message":
+            f"collision guard: enabled {n_pairs} tool↔arm pair(s) "
+            f"(RoboDK omits these by default)" if n_pairs else
+            "WARNING: collision guard enabled 0 tool↔arm pairs — confirm the camera "
+            "is mounted on the robot in RoboDK"}))
+
+    n_collide = 0
+    col_checked = False
+    collision_filter_bypassed = False
+    pair_examples: list[str] = []
+    reach_joints: list = [None] * n_reach
+    reachable_before_collision = list(reachable)
+    if scfg.collision_filter:
+        mask, col_checked, jts, col_details = rdk.screen_collisions(
+            [T for _, T in reachable],
+            guard_skip=guard_skip,
+            ignore_pairs=scfg.collision_ignore_pairs,
+            return_details=True)
+        kept = [k for k in range(n_reach) if mask[k]]
+        if col_checked:
+            n_collide = n_reach - len(kept)
+        reachable = [reachable[k] for k in kept]
+        reach_joints = [jts[k] for k in kept]
+        services.bus.publish(JobEvent("log", {"message":
+            f"collision screen: {'ACTIVE' if col_checked else 'unavailable'}; swept "
+            f"{n_reach} reachable pose(s), {n_collide} collided and were dropped"}))
+        if col_checked and n_collide:
+            for d in col_details.get("poses", []):
+                if d.get("collides") and d.get("pairs"):
+                    for p in d["pairs"]:
+                        if p not in pair_examples:
+                            pair_examples.append(p)
+                        if len(pair_examples) >= 8:
+                            break
+                if len(pair_examples) >= 8:
+                    break
+            if pair_examples:
+                services.bus.publish(JobEvent("log", {"message":
+                    "collision pairs causing dropped scan targets: "
+                    + "; ".join(pair_examples)}))
+        if col_checked and len(reachable) < SCAN_MIN_VIEWS:
+            if scfg.collision_filter_hard_fail:
+                raise RuntimeError(
+                    f"only {len(reachable)} collision-free poses ({n_collide} of {n_reach} "
+                    f"would collide) — jog to a more open part of the workspace and retry")
+            collision_filter_bypassed = True
+            reachable = reachable_before_collision
+            reach_joints = [None] * len(reachable)
+            services.bus.publish(JobEvent("log", {"message":
+                "WARNING: RoboDK reported too many scan candidate poses as colliding, "
+                "so target creation is continuing with reachable poses only. This is "
+                "often a noisy/stale collision map or oversized wall/fixture collision "
+                "geometry. Inspect the targets in RoboDK and run the dry tour before "
+                "moving the real robot; set scan.collision_filter_hard_fail to true "
+                "for strict refusal."}))
+    return (reachable, reach_joints, col_checked, n_collide,
+            collision_filter_bypassed, pair_examples)
+
+
+def _generate_tiled_scan_targets(
+    services, locked: LockedScanSurface, seed_T: np.ndarray, seed_joints,
+    tool_offset_mm: float, pub,
+) -> dict:
+    """Tour a five-position-surveyed rectangle too large for one camera view
+    (Task 12): plan a TILED close-range tour (:func:`plan_rect_tour`) and feed
+    it through the SAME per-aim candidate generation / reachability /
+    collision / diversity machinery the single-aim path uses — just once per
+    tile instead of once for the whole surface, accumulating candidates
+    across tiles (brief step 3).
+
+    Reachability/collision screening is reused verbatim via
+    :func:`_screen_scan_collision_candidates`; diversity selection reuses
+    :func:`select_diverse`, but per tile (each tile already IS the coverage
+    unit — unlike the single-aim orbit, there is no single wide footprint to
+    spread rotation over). Targets are named ``TasniScan_T{tile:02d}_{k}``.
+    """
+    cfg = services.config
+    scfg = cfg.scan
+    rdk: RdkIO = services.rdk
+    K = cfg.camera.K
+    W, H = cfg.camera.size
+    prefix = scfg.target_prefix
+    rec = locked.survey_record
+
+    plan = plan_rect_tour(rec.corners_np(), np.asarray(rec.plane_normal_base, float),
+                          K, (W, H), scfg)
+    pub(f"five-position survey: tiling a {rec.size_mm[0]:.0f}×{rec.size_mm[1]:.0f} mm "
+        f"surface into {len(plan.aims)} tile(s) at {plan.standoff_mm:.0f} mm standoff, "
+        f"voxel={plan.voxel_size_m * 1000:.1f} mm")
+
+    _clear_prior_scan_targets(rdk, prefix, pub)
+
+    # Per-aim candidate generation (reuses generate_calibration_poses exactly
+    # as the single-aim path does — once per tile, centred/aimed at that
+    # tile's own AimPoint), accumulated across all tiles.
+    tile_candidates: list[tuple[int, np.ndarray]] = []
+    for t, aim in enumerate(plan.aims):
+        cands = generate_calibration_poses(
+            seed_T, count=aim.n_views, look_distance_mm=aim.standoff_mm,
+            cone_half_angle_deg=aim.cone_half_angle_deg, roll_max_deg=aim.roll_max_deg,
+            distance_jitter=scfg.distance_jitter,
+            target_center=np.asarray(aim.point_base_mm, float),
+            target_normal=-np.asarray(aim.view_dir_base, float),
+            min_perpendicular_mm=aim.min_perpendicular_mm)
+        tile_candidates.extend((t, T) for T in cands)
+
+    reachable = [(t, T) for t, T in tile_candidates if rdk.is_reachable(T)]
+    n_reach = len(reachable)
+    if n_reach < SCAN_MIN_VIEWS:
+        raise RuntimeError(
+            f"only {n_reach} reachable pose(s) across {len(plan.aims)} tile(s) of the "
+            f"surveyed rectangle (need >= {SCAN_MIN_VIEWS}) — jog to a more open part of "
+            "the workspace and retry")
+
+    (reachable, reach_joints, col_checked, n_collide, collision_filter_bypassed,
+     pair_examples) = _screen_scan_collision_candidates(services, scfg, reachable, n_reach)
+
+    # Per-tile diversity selection: each tile already targets its own patch of
+    # the surface, so diversity is spread WITHIN a tile's own reachable,
+    # collision-free candidates (angle variety for TSDF fusion), not across
+    # tiles the way the single-aim path spreads across a shared footprint.
+    by_tile: dict[int, list[int]] = {}
+    for k, (t, _T) in enumerate(reachable):
+        by_tile.setdefault(t, []).append(k)
+
+    chosen: list[tuple[int, np.ndarray, object]] = []   # (tile, T, joints)
+    for t, aim in enumerate(plan.aims):
+        idxs = by_tile.get(t, [])
+        if not idxs:
+            continue
+        tile_T = [reachable[k][1] for k in idxs]
+        want = min(int(aim.n_views), len(tile_T))
+        sel = select_diverse(tile_T, want, seed_fwd=seed_T[:3, 2])
+        for s in sel:
+            k = idxs[s]
+            chosen.append((t, reachable[k][1], reach_joints[k]))
+
+    empty_tiles = len(plan.aims) - len({t for t, _, _ in chosen})
+    if not chosen:
+        raise RuntimeError(
+            "no reachable, collision-free poses survived tiling across the surveyed "
+            "rectangle — jog to a more open part of the workspace and retry")
+
+    _, eff_max, eff_mean = viewing_angle_span([T for _, T, _ in chosen], seed_T[:3, 2])
+
+    # Coverage prediction across ALL tiles (§10 hard gate, ambiguity
+    # resolution #5): the brief's own prescription was to feed the survey's
+    # whole densified rectangle (via _densify_quad) into the EXISTING
+    # projected_corner_coverage call, the same one the single-aim path uses.
+    # Measured that this is NOT a valid metric here and corrected it (see the
+    # Task 12 report for the numbers): projected_corner_coverage buckets
+    # touched cells WITHIN EACH POSE'S OWN IMAGE FRAME — a
+    # metric built for "do several angled views around ONE spot collectively
+    # see the whole (frame-filling) board", not "did a close-range tour visit
+    # every physical tile of a multi-metre rectangle". Every tile is deliberately
+    # sized so its own physical extent is close to (or smaller than) the full
+    # accurate-standoff frame, so a densified WHOLE-RECTANGLE footprint only
+    # ever lands in the centre few grid cells of any one pose's frame — this
+    # reports ~50% for an entirely correctly-covered single tile (measured:
+    # 0.5 for a 120x90 mm rectangle within one ~286x214 mm tile footprint,
+    # regardless of pose diversity), a false failure that has nothing to do
+    # with whether the surface was actually captured. What DOES detect a
+    # missing tile is tile_coverage_frac: the fraction of tiles that produced
+    # >= 1 reachable/collision-free pose. Each tile is, by the tiling formula's
+    # own overlap guarantee (tests/test_scan_planner.py), an equal-ish patch of
+    # the surveyed rectangle, so this fraction is a correct, robust proxy for
+    # physical surface coverage — and it is what is reported/gated here.
+    tile_coverage_frac = 1.0 - empty_tiles / len(plan.aims)
+    surface_coverage = tile_coverage_frac
+    if surface_coverage < float(scfg.min_surface_coverage):
+        message = (
+            f"the chosen tour views cover only {surface_coverage:.0%} of the surveyed "
+            f"rectangle (< {scfg.min_surface_coverage:.0%} min_surface_coverage; "
+            f"{empty_tiles} of {len(plan.aims)} tile(s) have zero reachable/collision-free "
+            "poses) — part of the surface would not be captured. Re-run the five-position "
+            "survey from a more open pose, or reposition and retry.")
+        if getattr(scfg, "surface_coverage_hard_fail", False):
+            raise RuntimeError(message)
+        services.bus.publish(JobEvent("log", {"message": f"WARNING: {message}"}))
+
+    created: list[str] = []
+    n_backfilled = 0
+    per_tile_counts: dict[int, int] = {}
+    for t, T, joints in chosen:
+        if joints is None:
+            joints = rdk.solve_joints_for_pose(T, seed_joints)
+            if joints is not None:
+                n_backfilled += 1
+        k = per_tile_counts.get(t, 0) + 1
+        per_tile_counts[t] = k
+        name = f"{prefix}T{t + 1:02d}_{k}"
+        rdk.add_target(name, T, joints=joints)
+        created.append(name)
+
+    collide_note = (f"; collision filter bypassed after {n_collide} reported collision(s)"
+                    if collision_filter_bypassed else
+                    (f"; {n_collide} dropped for collision" if col_checked and n_collide
+                     else ("; collision-checked" if col_checked
+                           else "; collisions NOT checked")))
+    cover_note = f"; predicted coverage {surface_coverage:.0%}"
+    services.bus.publish(JobEvent("log", {"message":
+        f"created {len(created)} scan targets across {len(plan.aims) - empty_tiles}/"
+        f"{len(plan.aims)} tile(s) of the surveyed rectangle (standoff "
+        f"~{plan.standoff_mm:.0f} mm; {n_reach}/{len(tile_candidates)} candidates "
+        f"reachable; effective cone ~{eff_max:.0f}°{collide_note}{cover_note}) — "
+        f"inspect them in RoboDK"}))
+
+    return {"mode": "quality", "created": len(created), "targets": created,
+            "look_distance_mm": plan.standoff_mm,
+            "gate": locked.gate_payload, "candidates_reachable": n_reach,
+            "candidates_total": len(tile_candidates), "collisions_checked": col_checked,
+            "candidates_collided": n_collide, "effective_cone_deg": round(eff_max, 1),
+            "collision_pairs": pair_examples,
+            "surface_coverage": round(surface_coverage, 3),
+            "planned_cone_deg": float(scfg.flat_cone_deg), "planned_views": len(created),
+            "boundary_views_enabled": False, "boundary_aim_offsets": 0,
+            "camera_tool_offset_mm": round(tool_offset_mm, 1),
+            "calibration_on_file": tool_offset_mm >= 15.0,
+            "collision_filter_enabled": scfg.collision_filter,
+            "collision_filter_bypassed": collision_filter_bypassed,
+            "extent_mm": [float(rec.size_mm[0]), float(rec.size_mm[1])],
+            "crop_size_mm": None,
+            "voxel_size_m": plan.voxel_size_m,
+            "plan": plan.to_dict(),
+            "tile_count": len(plan.aims),
+            "tiles_with_targets": len(plan.aims) - empty_tiles,
+            "boundary_provenance": rec.boundary_provenance,
+            "survey": rec.to_dict(),
+            "lock_token": locked.lock_token}
+
+
 def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> dict:
     """Gate-gated scan-target creation (synchronous, no robot motion).
 
@@ -1215,6 +1491,15 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
         raise RuntimeError(
             f"robot moved after surface lock ({moved_mm:.1f} mm, {moved_deg:.1f}°) — "
             "reposition and lock the surface again")
+
+    # Task 12, ambiguity resolution #4: a five-position-surveyed surface (too
+    # large for one camera view) is a completely different geometry problem —
+    # tile it with a close-range tour instead of the single-aim orbit below.
+    # Taken as the FIRST branch so every other path (compact/user-specified/
+    # crop/reference/quality) is completely untouched.
+    if locked.survey_record is not None and locked.survey_record.mode == MODE_FIVE_POSITION:
+        return _generate_tiled_scan_targets(services, locked, seed_T, seed_joints,
+                                            tool_offset_mm, pub)
 
     look = float(reading.distance_mm or scfg.look_distance_mm)
     target_center = None
@@ -1304,20 +1589,7 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
         pub("survey: no trustworthy full-frame extent; using the stable centre-patch "
             "standoff gate and default cone/voxel settings for targets")
 
-    prior = rdk.list_targets(prefix)
-    if prior:
-        rdk.delete_items(prior)
-    calib_prior = rdk.list_targets(CALIB_TARGET_PREFIX)
-    removed_calib_keepout = False
-    if calib_prior:
-        rdk.delete_items(calib_prior)
-    if rdk.item_exists(CALIB_BOARD_KEEPOUT_NAME):
-        rdk.delete_items([CALIB_BOARD_KEEPOUT_NAME])
-        removed_calib_keepout = True
-    if calib_prior or removed_calib_keepout:
-        pub(f"cleared {len(calib_prior)} calibration target(s)"
-            + (" and board keep-out" if removed_calib_keepout else "")
-            + " before creating scan targets")
+    _clear_prior_scan_targets(rdk, prefix, pub)
 
     candidates = generate_calibration_poses(
         seed_T, count=target_count, look_distance_mm=look,
@@ -1328,72 +1600,13 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
         aim_offsets=boundary_aim_offsets)
     reachable = [(i, T) for i, T in enumerate(candidates) if rdk.is_reachable(T)]
     n_reach = len(reachable)
-    reachable_before_collision = list(reachable)
     if n_reach < SCAN_MIN_VIEWS:
         raise RuntimeError(
             f"only {n_reach} reachable poses around this view (need >= {SCAN_MIN_VIEWS}) "
             f"— jog to a more open part of the workspace (still framing the table) and retry")
 
-    # Collision screen (identical machinery to calibration; uses scan's knobs).
-    guard_skip = None
-    if scfg.collision_filter and scfg.collision_self_pairs:
-        guard_skip = scfg.collision_skip_wrist_links
-        guard = rdk.ensure_mounted_tool_collision_pairs(scfg.collision_skip_wrist_links)
-        n_pairs = (guard or {}).get("pairs_enabled", 0)
-        services.bus.publish(JobEvent("log", {"message":
-            f"collision guard: enabled {n_pairs} tool↔arm pair(s) "
-            f"(RoboDK omits these by default)" if n_pairs else
-            "WARNING: collision guard enabled 0 tool↔arm pairs — confirm the camera "
-            "is mounted on the robot in RoboDK"}))
-
-    n_collide = 0
-    col_checked = False
-    collision_filter_bypassed = False
-    pair_examples: list[str] = []
-    reach_joints: list = [None] * n_reach
-    if scfg.collision_filter:
-        mask, col_checked, jts, col_details = rdk.screen_collisions(
-            [T for _, T in reachable],
-            guard_skip=guard_skip,
-            ignore_pairs=scfg.collision_ignore_pairs,
-            return_details=True)
-        kept = [k for k in range(n_reach) if mask[k]]
-        if col_checked:
-            n_collide = n_reach - len(kept)
-        reachable = [reachable[k] for k in kept]
-        reach_joints = [jts[k] for k in kept]
-        services.bus.publish(JobEvent("log", {"message":
-            f"collision screen: {'ACTIVE' if col_checked else 'unavailable'}; swept "
-            f"{n_reach} reachable pose(s), {n_collide} collided and were dropped"}))
-        if col_checked and n_collide:
-            for d in col_details.get("poses", []):
-                if d.get("collides") and d.get("pairs"):
-                    for p in d["pairs"]:
-                        if p not in pair_examples:
-                            pair_examples.append(p)
-                        if len(pair_examples) >= 8:
-                            break
-                if len(pair_examples) >= 8:
-                    break
-            if pair_examples:
-                services.bus.publish(JobEvent("log", {"message":
-                    "collision pairs causing dropped scan targets: "
-                    + "; ".join(pair_examples)}))
-        if col_checked and len(reachable) < SCAN_MIN_VIEWS:
-            if scfg.collision_filter_hard_fail:
-                raise RuntimeError(
-                    f"only {len(reachable)} collision-free poses ({n_collide} of {n_reach} "
-                    f"would collide) — jog to a more open part of the workspace and retry")
-            collision_filter_bypassed = True
-            reachable = reachable_before_collision
-            reach_joints = [None] * len(reachable)
-            services.bus.publish(JobEvent("log", {"message":
-                "WARNING: RoboDK reported too many scan candidate poses as colliding, "
-                "so target creation is continuing with reachable poses only. This is "
-                "often a noisy/stale collision map or oversized wall/fixture collision "
-                "geometry. Inspect the targets in RoboDK and run the dry tour before "
-                "moving the real robot; set scan.collision_filter_hard_fail to true "
-                "for strict refusal."}))
+    (reachable, reach_joints, col_checked, n_collide, collision_filter_bypassed,
+     pair_examples) = _screen_scan_collision_candidates(services, scfg, reachable, n_reach)
 
     n_usable = len(reachable)
     reach_T = [T for _, T in reachable]
