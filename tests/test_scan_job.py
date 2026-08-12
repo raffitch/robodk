@@ -357,6 +357,43 @@ def test_lock_gate_event_carries_survey_and_provenance():
           payload["boundary_provenance"])
 
 
+def test_surface_region_route_updates_lock_dimensions():
+    """POST /surface/region persists an operator-declared work-region size and
+    feeds it into subsequent surface_lock() calls (Task 3's user_region_mm
+    param) without changing the force_crop-only provenance discriminator.
+
+    ScanModule's route handlers are nested closures inside router() (see
+    surface_lock), so this exercises the module's real bound method
+    (self.surface_region), which the router registers as a thin wrapper — the
+    same object the fixtures in this file already use for the fake services.
+    """
+    import tasni.modules.scan.module as scan_module
+    from fastapi import HTTPException
+
+    services, _state = _build_fakes()
+    saved = {}
+    orig_save_overrides = scan_module.save_overrides
+    scan_module.save_overrides = lambda updates: saved.update(updates)
+    try:
+        mod = scan_module.ScanModule(services)
+        body = scan_module.SurfaceRegionBody(width_mm=1200.0, height_mm=900.0)
+        out = mod.surface_region(body)
+        assert out["user_region_mm"] == [1200.0, 900.0]
+        assert saved == {"scan": {"work_crop_mm": [1200.0, 900.0]}}
+        assert mod._user_region_mm == (1200.0, 900.0)
+
+        try:
+            mod.surface_region(scan_module.SurfaceRegionBody(width_mm=50.0, height_mm=900.0))
+            raise AssertionError("expected out-of-range region to be rejected")
+        except HTTPException as e:
+            assert e.status_code == 422
+        # A rejected update must not clobber the last accepted region.
+        assert mod._user_region_mm == (1200.0, 900.0)
+    finally:
+        scan_module.save_overrides = orig_save_overrides
+    print("[surface region] declared 1200x900 mm persisted; out-of-range rejected")
+
+
 def test_targets_report_surface_coverage_from_footprint():
     """A fully-framed surface now drives COVERAGE-aware view selection (mirroring
     calibration), so target creation reports the predicted surface coverage and the
@@ -666,6 +703,7 @@ if __name__ == "__main__":
     test_lock_crop_is_user_specified_with_declared_size()
     test_lock_auto_crop_overrun_builds_no_survey_record_but_warns()
     test_lock_gate_event_carries_survey_and_provenance()
+    test_surface_region_route_updates_lock_dimensions()
     test_targets_report_surface_coverage_from_footprint()
     test_save_views_persists_per_pose_frames()
     test_burst_capture_path()

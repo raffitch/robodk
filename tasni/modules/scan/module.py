@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
 
+from ...core.config import save_overrides
 from ...core.events import JobEvent
 from ...core.rdk_io import link_real_robot
 from ..base import ServiceContainer, WorkflowModule
@@ -40,6 +41,11 @@ class SurfaceLockBody(BaseModel):
     mode: str = "auto"       # "auto" | "crop"
 
 
+class SurfaceRegionBody(BaseModel):
+    width_mm: float
+    height_mm: float
+
+
 class ScanModule(WorkflowModule):
     id = "scan"
     title = "Scan"
@@ -61,6 +67,32 @@ class ScanModule(WorkflowModule):
         # Background SAM boundary worker (lives with the live preview; None for the
         # classical colour engine). Runs the ~450 ms/frame model off the video thread.
         self._sam_worker: "SamBoundaryWorker | None" = None
+        # Operator-declared work-region size (mm), passed into every surface_lock()
+        # call (Task 3: provenance is decided solely by force_crop, not by whether
+        # this happens to be passed — safe to always pass). Defaults from config,
+        # refreshed by POST /surface/region and persisted there under the same
+        # scan.work_crop_mm key. NOTE: this host-side value is authoritative; the
+        # Jetson's live overlay square (server/server_unicast_syncronous.py,
+        # WORK_CROP_MM) is display-only and intentionally left out of sync — that
+        # server change is out of scope here.
+        self._user_region_mm: tuple[float, float] = tuple(
+            float(v) for v in services.config.scan.work_crop_mm)
+
+    def surface_region(self, body: SurfaceRegionBody) -> dict:
+        """Declare the work-region size (mm) used for crop locks.
+
+        A real bound method (not a router() closure) so it is directly callable
+        — by tests with fake services, and by the POST /surface/region route
+        below, which is a thin wrapper mirroring surface_lock's registration.
+        """
+        from fastapi import HTTPException
+
+        w, h = float(body.width_mm), float(body.height_mm)
+        if not (100.0 <= w <= 4000.0 and 100.0 <= h <= 4000.0):
+            raise HTTPException(422, "region dimensions must be 100-4000 mm")
+        self._user_region_mm = (w, h)
+        save_overrides({"scan": {"work_crop_mm": [w, h]}})
+        return {"user_region_mm": [w, h]}
 
     def router(self) -> "APIRouter":
         from fastapi import APIRouter, HTTPException, Response
@@ -347,7 +379,8 @@ class ScanModule(WorkflowModule):
             if body.mode not in ("auto", "crop"):
                 raise HTTPException(400, "surface lock mode must be 'auto' or 'crop'")
             try:
-                self._locked_surface = lock_scan_surface(services, force_crop=force_crop)
+                self._locked_surface = lock_scan_surface(
+                    services, force_crop=force_crop, user_region_mm=self._user_region_mm)
                 gate = self._locked_surface.gate_payload
                 crop = gate.get("crop_size_mm")
                 extent = gate.get("extent_mm")
@@ -369,6 +402,10 @@ class ScanModule(WorkflowModule):
         def surface_unlock() -> dict:
             self._locked_surface = None
             return {"status": "unlocked"}
+
+        @router.post("/surface/region")
+        def surface_region(body: SurfaceRegionBody) -> dict:
+            return self.surface_region(body)
 
         @router.post("/poses/generate")
         def poses_generate() -> dict:
