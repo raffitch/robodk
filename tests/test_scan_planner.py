@@ -387,6 +387,229 @@ def test_rect_tour_aims_lie_on_a_tilted_offset_plane():
           f"max plane residual {max(residuals):.2e} mm")
 
 
+# -- post-review fixes (Findings 1/2 + follow-ups 3/4) -----------------------
+
+def test_rect_tour_rejects_overlap_equal_to_one():
+    """Finding 1 (post-review): overlap=1.0 -> step=0 -> would divide by zero
+    inside the tile-count math. Must fail loudly with a clear ValueError, not
+    a raw ZeroDivisionError (which module.py used to turn into a misleading
+    HTTP 503 'RoboDK/camera unavailable' for what is really a config typo)."""
+    import numpy as np
+    from tasni.modules.scan.planner import plan_rect_tour
+    from tasni.core.config import ScanConfig
+    corners = np.array([[0, 0, 0], [2000, 0, 0], [2000, 1200, 0], [0, 1200, 0]], float)
+    K = [[900.0, 0, 640], [0, 900.0, 360], [0, 0, 1]]
+    cfg = ScanConfig(survey_tour_overlap=1.0)
+    with pytest.raises(ValueError, match="survey_tour_overlap"):
+        plan_rect_tour(corners, [0, 0, 1], K, (1280, 720), cfg)
+    print("[rect-tour] overlap=1.0 correctly rejected (no ZeroDivisionError)")
+
+
+def test_rect_tour_rejects_overlap_above_one():
+    """overlap=1.3 -> step=-0.3 -> ceil(negative) collapses through max(1, ...)
+    to a SINGLE tile for the whole platform while the coverage gate (which
+    assumes one tile per patch) would report 100% -- must be rejected."""
+    import numpy as np
+    from tasni.modules.scan.planner import plan_rect_tour
+    from tasni.core.config import ScanConfig
+    corners = np.array([[0, 0, 0], [2000, 0, 0], [2000, 1200, 0], [0, 1200, 0]], float)
+    K = [[900.0, 0, 640], [0, 900.0, 360], [0, 0, 1]]
+    cfg = ScanConfig(survey_tour_overlap=1.3)
+    with pytest.raises(ValueError, match="survey_tour_overlap"):
+        plan_rect_tour(corners, [0, 0, 1], K, (1280, 720), cfg)
+    print("[rect-tour] overlap=1.3 correctly rejected")
+
+
+def test_rect_tour_rejects_negative_overlap():
+    """overlap=-0.5 -> step=1.5 -> spacing exceeds the footprint, opening a
+    gap between every tile -- must be rejected, not silently tiled with holes."""
+    import numpy as np
+    from tasni.modules.scan.planner import plan_rect_tour
+    from tasni.core.config import ScanConfig
+    corners = np.array([[0, 0, 0], [2000, 0, 0], [2000, 1200, 0], [0, 1200, 0]], float)
+    K = [[900.0, 0, 640], [0, 900.0, 360], [0, 0, 1]]
+    cfg = ScanConfig(survey_tour_overlap=-0.5)
+    with pytest.raises(ValueError, match="survey_tour_overlap"):
+        plan_rect_tour(corners, [0, 0, 1], K, (1280, 720), cfg)
+    print("[rect-tour] overlap=-0.5 correctly rejected")
+
+
+def test_rect_tour_valid_overlap_boundary_zero_is_allowed():
+    """overlap=0.0 (step=1.0, tiles exactly touching, no overlap) is the
+    minimum VALID value and must NOT be rejected -- confirms the guard's
+    boundary is [0.0, 1.0), not (0.0, 1.0)."""
+    import numpy as np
+    from tasni.modules.scan.planner import plan_rect_tour
+    from tasni.core.config import ScanConfig
+    corners = np.array([[0, 0, 0], [2000, 0, 0], [2000, 1200, 0], [0, 1200, 0]], float)
+    K = [[900.0, 0, 640], [0, 900.0, 360], [0, 0, 1]]
+    cfg = ScanConfig(survey_tour_overlap=0.0)
+    plan = plan_rect_tour(corners, [0, 0, 1], K, (1280, 720), cfg)
+    assert len(plan.aims) >= 1
+    print("[rect-tour] overlap=0.0 (touching tiles) accepted,", len(plan.aims), "tiles")
+
+
+def test_tile_grid_dims_matches_plan_rect_tour_aim_count():
+    """_tile_grid_dims (factored out for the contiguous-empty-tile check,
+    Finding 2) must describe EXACTLY the grid plan_rect_tour actually built:
+    nx*ny == len(plan.aims), for both a multi-tile and a single-tile case."""
+    import numpy as np
+    from tasni.modules.scan.planner import _tile_grid_dims, plan_rect_tour
+    from tasni.core.config import ScanConfig
+    K = [[900.0, 0, 640], [0, 900.0, 360], [0, 0, 1]]
+    cfg = ScanConfig()
+    for corners in (
+        np.array([[0, 0, 0], [2000, 0, 0], [2000, 1200, 0], [0, 1200, 0]], float),
+        np.array([[0, 0, 0], [200, 0, 0], [200, 150, 0], [0, 150, 0]], float),
+    ):
+        plan = plan_rect_tour(corners, [0, 0, 1], K, (1280, 720), cfg)
+        nx, ny, foot_w, foot_h = _tile_grid_dims(corners, K, (1280, 720), cfg)
+        assert nx * ny == len(plan.aims), (nx, ny, len(plan.aims))
+        assert foot_w > 0 and foot_h > 0
+    print("[rect-tour] _tile_grid_dims grid shape matches plan_rect_tour aim count")
+
+
+def test_largest_contiguous_empty_block_basic_shapes():
+    """Pure combinatorics sanity check for the Finding 2 helper: an empty
+    grid, isolated singletons, an L-shape, and a solid 3x3 block."""
+    from tasni.modules.scan.planner import _largest_contiguous_empty_block
+    assert _largest_contiguous_empty_block(set()) == 0
+    assert _largest_contiguous_empty_block({(0, 0)}) == 1
+    # two DIAGONAL (not 4-connected) singletons -> largest block is still 1
+    assert _largest_contiguous_empty_block({(0, 0), (1, 1)}) == 1
+    # a 2-tile horizontal run
+    assert _largest_contiguous_empty_block({(0, 0), (1, 0)}) == 2
+    # an L-shape (3 tiles, 4-connected)
+    assert _largest_contiguous_empty_block({(0, 0), (1, 0), (1, 1)}) == 3
+    # a solid 3x3 block among scattered singleton noise elsewhere
+    block = {(i, j) for i in range(3, 6) for j in range(3, 6)}
+    noise = {(0, 0), (7, 7)}
+    assert _largest_contiguous_empty_block(block | noise) == 9
+    print("[contiguous-block] basic shapes verified")
+
+
+def test_rect_tour_epsilon_guard_never_undertiles():
+    """Independent re-verification (post-review) that the epsilon subtracted
+    before ceil() (added to fix the float-boundary bug) cannot instead cause
+    UNDER-tiling: a gap needs tile-centre spacing (Lx/nx) to exceed the
+    footprint, which needs nx to be too SMALL by a factor of >= 1/step (~1.43x
+    at the default 0.30 overlap) versus the eps-free ratio -- 1e-9 is nowhere
+    near that. Swept across 5 orders of magnitude (200 mm to 1e6 mm, i.e. a
+    tabletop up to a kilometre-scale platform)."""
+    import numpy as np
+    from tasni.modules.scan.planner import _tile_grid_dims
+    from tasni.core.config import ScanConfig
+    K = [[900.0, 0, 640], [0, 900.0, 360], [0, 0, 1]]
+    cfg = ScanConfig()
+    for L in (200.0, 381.0, 500.0, 1000.0, 2000.0, 12345.678, 1e5, 1e6):
+        corners = np.array([[0, 0, 0], [L, 0, 0], [L, L * 0.6, 0], [0, L * 0.6, 0]], float)
+        nx, ny, foot_w, foot_h = _tile_grid_dims(corners, K, (1280, 720), cfg)
+        Lx, Ly = L, L * 0.6
+        step_x, step_y = Lx / nx, Ly / ny
+        assert step_x <= foot_w + 1e-6, (L, step_x, foot_w)
+        assert step_y <= foot_h + 1e-6, (L, step_y, foot_h)
+    print("[rect-tour] epsilon guard never under-tiles across L=200 mm..1e6 mm")
+
+
+def _pinhole_ground_footprint(T, K, size_px, plane_point, plane_normal):
+    """Ray-plane intersection of the four image corners -> the camera's
+    actual observed ground footprint (a quadrilateral, generally a trapezoid
+    under tilt). Test-only verification tool (not production code) -- pure
+    numpy, no matplotlib (not a declared project dependency)."""
+    K = np.asarray(K, dtype=float)
+    W, H = size_px
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    R, origin = np.asarray(T)[:3, :3], np.asarray(T)[:3, 3]
+    pts = []
+    for u, v in ((0, 0), (W, 0), (W, H), (0, H)):
+        dir_cam = np.array([(u - cx) / fx, (v - cy) / fy, 1.0])
+        dir_base = R @ dir_cam
+        denom = float(np.dot(dir_base, plane_normal))
+        if abs(denom) < 1e-9:
+            return None
+        s = float(np.dot(plane_point - origin, plane_normal)) / denom
+        if s <= 0:
+            return None
+        pts.append(origin + s * dir_base)
+    return np.array(pts)
+
+
+def _points_in_convex_quad(pts, quad):
+    """Vectorized point-in-convex-polygon via consistent edge cross-product
+    sign (test-only; avoids an undeclared matplotlib dependency — verified
+    against matplotlib.path.Path.contains_points during development, same
+    result to 10+ significant figures)."""
+    n = quad.shape[0]
+    signs = None
+    inside = np.ones(len(pts), dtype=bool)
+    for i in range(n):
+        a, b = quad[i], quad[(i + 1) % n]
+        edge = b - a
+        rel = pts - a
+        cross = edge[0] * rel[:, 1] - edge[1] * rel[:, 0]
+        s = cross >= -1e-6
+        if signs is None:
+            signs = s
+        inside &= (s == signs)
+    return inside
+
+
+def test_rect_tour_worst_tilt_pose_per_tile_covers_the_rectangle():
+    """Follow-up 4 (post-review): pins the premise the tile-completeness gate
+    depends on -- "at least one surviving pose for a tile implies that
+    tile's patch is actually imaged." Holds today by measurement (world-space
+    union coverage >= 0.999 even keeping only the WIDEST-TILT candidate per
+    tile, the worst case for ground-footprint size/shape), but a later change
+    to flat_cone_deg / frame_margin / distance_jitter could break it silently
+    -- this test pins it so such a change fails loudly HERE instead of only
+    showing up as a mysterious hole in a real scan."""
+    import numpy as np
+    from tasni.modules.calibration.poses import generate_calibration_poses
+    from tasni.modules.scan.planner import plan_rect_tour
+    from tasni.core.config import ScanConfig
+
+    corners = np.array([[0, 0, 0], [2000, 0, 0], [2000, 1200, 0], [0, 1200, 0]], float)
+    K = np.array([[900.0, 0, 640], [0, 900.0, 360], [0, 0, 1]])
+    W, H = 1280, 720
+    cfg = ScanConfig()
+    plan = plan_rect_tour(corners, [0, 0, 1], K, (W, H), cfg)
+    seed_T = np.eye(4)
+    seed_T[2, 3] = 900.0
+    plane_point = corners.mean(axis=0)
+    plane_normal = np.array([0.0, 0.0, 1.0])
+
+    worst_quads = []
+    for aim in plan.aims:
+        cands = generate_calibration_poses(
+            seed_T, count=aim.n_views, look_distance_mm=aim.standoff_mm,
+            cone_half_angle_deg=aim.cone_half_angle_deg, roll_max_deg=aim.roll_max_deg,
+            distance_jitter=cfg.distance_jitter,
+            target_center=np.asarray(aim.point_base_mm, float),
+            target_normal=-np.asarray(aim.view_dir_base, float),
+            min_perpendicular_mm=aim.min_perpendicular_mm)
+        # Widest-tilt candidate: largest angle of its forward axis from
+        # straight down -- the worst case for ground-footprint size/shape.
+        angles = [float(np.degrees(np.arccos(np.clip(
+            float(np.dot(T[:3, 2], [0, 0, -1])), -1.0, 1.0)))) for T in cands]
+        worst = cands[int(np.argmax(angles))]
+        q = _pinhole_ground_footprint(worst, K, (W, H), plane_point, plane_normal)
+        assert q is not None, "worst-tilt candidate must still see the plane"
+        worst_quads.append(q)
+
+    res = 4.0
+    xs = np.arange(0, 2000 + res, res)
+    ys = np.arange(0, 1200 + res, res)
+    XX, YY = np.meshgrid(xs, ys, indexing="ij")
+    pts = np.column_stack([XX.ravel(), YY.ravel()])
+    covered = np.zeros(len(pts), dtype=bool)
+    for q in worst_quads:
+        covered |= _points_in_convex_quad(pts, q[:, :2])
+    coverage = float(covered.mean())
+    assert coverage >= 0.999, coverage
+    print(f"[rect-tour] worst-tilt-pose-per-tile world-space union coverage "
+          f"= {coverage:.4%} ({len(plan.aims)} tiles)")
+
+
 if __name__ == "__main__":
     test_small_surface_quality_mode()
     test_large_surface_reference_mode()
@@ -405,4 +628,12 @@ if __name__ == "__main__":
     test_rect_tour_min_perpendicular_matches_plan_scan_convention()
     test_rect_tour_tiles_overlap_and_cover_rectangle_by_construction()
     test_rect_tour_aims_lie_on_a_tilted_offset_plane()
+    test_rect_tour_rejects_overlap_equal_to_one()
+    test_rect_tour_rejects_overlap_above_one()
+    test_rect_tour_rejects_negative_overlap()
+    test_rect_tour_valid_overlap_boundary_zero_is_allowed()
+    test_tile_grid_dims_matches_plan_rect_tour_aim_count()
+    test_largest_contiguous_empty_block_basic_shapes()
+    test_rect_tour_epsilon_guard_never_undertiles()
+    test_rect_tour_worst_tilt_pose_per_tile_covers_the_rectangle()
     print("\nplanner.py scan-plan tests passed.")

@@ -46,7 +46,8 @@ from ..calibration.service import (
 from .depth_gate import ScanGateThresholds, evaluate_depth_gate
 from .plane import (bounded_work_plane, fit_plane, rectangle_in_frame,
                     reticle_plane_square, work_plane_from_points)
-from .planner import ScanPlan, plan_rect_tour, plan_scan
+from .planner import (ScanPlan, _largest_contiguous_empty_block, _tile_grid_dims,
+                     plan_rect_tour, plan_scan)
 from .survey import SurveyThresholds, survey_surface
 from .survey_contract import (
     MODE_COMPACT, MODE_FIVE_POSITION, MODE_USER_SPECIFIED, PROVENANCE_BY_MODE,
@@ -1345,7 +1346,9 @@ def _generate_tiled_scan_targets(
             k = idxs[s]
             chosen.append((t, reachable[k][1], reach_joints[k]))
 
-    empty_tiles = len(plan.aims) - len({t for t, _, _ in chosen})
+    present_tiles = {t for t, _, _ in chosen}
+    empty_lin = sorted(set(range(len(plan.aims))) - present_tiles)
+    empty_tiles = len(empty_lin)
     if not chosen:
         raise RuntimeError(
             "no reachable, collision-free poses survived tiling across the surveyed "
@@ -1354,36 +1357,59 @@ def _generate_tiled_scan_targets(
     _, eff_max, eff_mean = viewing_angle_span([T for _, T, _ in chosen], seed_T[:3, 2])
 
     # Coverage prediction across ALL tiles (§10 hard gate, ambiguity
-    # resolution #5): the brief's own prescription was to feed the survey's
-    # whole densified rectangle (via _densify_quad) into the EXISTING
-    # projected_corner_coverage call, the same one the single-aim path uses.
-    # Measured that this is NOT a valid metric here and corrected it (see the
-    # Task 12 report for the numbers): projected_corner_coverage buckets
-    # touched cells WITHIN EACH POSE'S OWN IMAGE FRAME — a
-    # metric built for "do several angled views around ONE spot collectively
-    # see the whole (frame-filling) board", not "did a close-range tour visit
-    # every physical tile of a multi-metre rectangle". Every tile is deliberately
-    # sized so its own physical extent is close to (or smaller than) the full
-    # accurate-standoff frame, so a densified WHOLE-RECTANGLE footprint only
-    # ever lands in the centre few grid cells of any one pose's frame — this
-    # reports ~50% for an entirely correctly-covered single tile (measured:
-    # 0.5 for a 120x90 mm rectangle within one ~286x214 mm tile footprint,
-    # regardless of pose diversity), a false failure that has nothing to do
-    # with whether the surface was actually captured. What DOES detect a
-    # missing tile is tile_coverage_frac: the fraction of tiles that produced
-    # >= 1 reachable/collision-free pose. Each tile is, by the tiling formula's
-    # own overlap guarantee (tests/test_scan_planner.py), an equal-ish patch of
-    # the surveyed rectangle, so this fraction is a correct, robust proxy for
-    # physical surface coverage — and it is what is reported/gated here.
+    # resolution #5, refined post-review — Findings 2/3): the brief's own
+    # prescription was to feed the survey's whole densified rectangle (via
+    # _densify_quad) into the EXISTING projected_corner_coverage call, the
+    # same one the single-aim path uses. Measured this is NOT a valid metric
+    # here, on BOTH sides of the failure: for a SINGLE, correctly-covered
+    # tile (a 120x90 mm rectangle inside one ~286x214 mm tile footprint) it
+    # reports 0.5 regardless of pose diversity — a false FAIL, because the
+    # whole-rectangle footprint only ever lands in the centre columns of that
+    # one pose's own 4x3 image-frame grid. For the MULTI-tile case it does
+    # the opposite: on the brief's own 2000x1200 mm / 64-tile example it
+    # reports EXACTLY 1.000 whether or not a 3x3 block of 9 tiles is missing
+    # (checked at densification n=6, 12 and 40) — a false PASS, because each
+    # SURVIVING tile's own pose already fills nearly all of the shared 4x3
+    # grid on its own; the grid is indexed by position WITHIN the frame, not
+    # in the world, so it cannot tell "world region A was seen" from "world
+    # region B was seen instead."
+    #
+    # What DOES detect a missing tile is tile_coverage_frac: the fraction of
+    # tiles that produced >= 1 reachable/collision-free pose. But the
+    # fraction alone still has a blind spot (Finding 2): it treats one large
+    # CONTIGUOUS hole (a single, real, unscanned patch — e.g. the reported
+    # 3x3/9-tile block, which passes a 0.85 fraction gate at 0.859) exactly
+    # like the same count of misses SCATTERED across the grid (which are
+    # mostly absorbed by neighbouring tiles' own overlap margin). So this
+    # also gates on the largest 4-connected contiguous block of empty tiles
+    # (see _largest_contiguous_empty_block + survey_tour_max_contiguous_
+    # empty_tiles) — a scattered handful of edge-of-workspace misses passes,
+    # a single sizeable hole does not, regardless of what the fraction says.
+    nx, ny, _foot_w, _foot_h = _tile_grid_dims(rec.corners_np(), K, (W, H), scfg)
+    empty_ij = {divmod(t, ny) for t in empty_lin}
+    largest_block = _largest_contiguous_empty_block(empty_ij)
     tile_coverage_frac = 1.0 - empty_tiles / len(plan.aims)
     surface_coverage = tile_coverage_frac
+
+    max_contig = int(scfg.survey_tour_max_contiguous_empty_tiles)
+    problems: list[str] = []
     if surface_coverage < float(scfg.min_surface_coverage):
+        problems.append(
+            f"only {surface_coverage:.0%} of the surveyed rectangle is covered "
+            f"(< {scfg.min_surface_coverage:.0%} min_surface_coverage)")
+    if largest_block > max_contig:
+        problems.append(
+            f"a contiguous block of {largest_block} adjacent empty tile(s) forms a "
+            f"single unscanned hole (> {max_contig} allowed)")
+    if problems:
+        empty_names = ", ".join(f"T{t + 1:02d}" for t in empty_lin[:20])
+        if len(empty_lin) > 20:
+            empty_names += f", … ({len(empty_lin) - 20} more)"
         message = (
-            f"the chosen tour views cover only {surface_coverage:.0%} of the surveyed "
-            f"rectangle (< {scfg.min_surface_coverage:.0%} min_surface_coverage; "
-            f"{empty_tiles} of {len(plan.aims)} tile(s) have zero reachable/collision-free "
-            "poses) — part of the surface would not be captured. Re-run the five-position "
-            "survey from a more open pose, or reposition and retry.")
+            "; ".join(problems) + f" — {empty_tiles} of {len(plan.aims)} tile(s) have "
+            f"zero reachable/collision-free poses: {empty_names}. Part of the surface "
+            "would not be captured. Re-run the five-position survey from a more open "
+            "pose, or reposition and retry.")
         if getattr(scfg, "surface_coverage_hard_fail", False):
             raise RuntimeError(message)
         services.bus.publish(JobEvent("log", {"message": f"WARNING: {message}"}))
@@ -1422,7 +1448,15 @@ def _generate_tiled_scan_targets(
             "candidates_collided": n_collide, "effective_cone_deg": round(eff_max, 1),
             "collision_pairs": pair_examples,
             "surface_coverage": round(surface_coverage, 3),
-            "planned_cone_deg": float(scfg.flat_cone_deg), "planned_views": len(created),
+            "empty_tile_count": empty_tiles,
+            "largest_contiguous_empty_tiles": largest_block,
+            "planned_cone_deg": float(scfg.flat_cone_deg),
+            # PLANNED figure (mirrors the single-aim path's target_count
+            # semantics — the intended capture count, not how many actually
+            # got created after reachability/collision/selection): the sum of
+            # each tile's own n_views, i.e. what a fully-reachable, fully-
+            # collision-free tour would have produced.
+            "planned_views": int(sum(a.n_views for a in plan.aims)),
             "boundary_views_enabled": False, "boundary_aim_offsets": 0,
             "camera_tool_offset_mm": round(tool_offset_mm, 1),
             "calibration_on_file": tool_offset_mm >= 15.0,

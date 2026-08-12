@@ -521,6 +521,18 @@ class ScanConfig(_Model):
     # would frame the whole thing but destroy depth quality.
     survey_tour_overlap: float = 0.30        # target overlap fraction between adjacent tiles
     survey_tour_views_per_tile: int = 2      # captured views per tile (angle diversity for fusion)
+    # Post-review fix (Finding 2): the tile-completeness FRACTION gate alone
+    # tolerates one large CONTIGUOUS hole exactly as easily as the same count
+    # of misses scattered across the grid (measured: a 3x3 block, 9 of 64
+    # tiles, passes a 0.85 fraction gate at 0.859 while the true measured
+    # world-space coverage is only ~0.90-0.95 -- a single real, unscanned
+    # patch of the surface). Measured world-coverage loss per contiguous block
+    # size on the same 2000x1200 mm / 64-tile example: 1 tile ~0.4-0.6%, 2 in
+    # a line ~1.2-1.8%, 3 in a line ~1.9-2.8%, a 2x2 block ~3.6-4%, a 3x3 block
+    # ~9-10%. 2 keeps isolated single misses and short 2-tile runs (workspace-
+    # edge unreachability, essentially harmless) while refusing anything a 2x2
+    # block or larger -- comfortably below the ~9% loss of the reported case.
+    survey_tour_max_contiguous_empty_tiles: int = 2
     # Vision safety net for the hold: the live rectangle is depth-derived, so it must
     # still track a physical camera move even if RoboDK is not mirroring the arm. A
     # standoff/tilt shift past these releases the hold regardless of the pose gate.

@@ -993,6 +993,12 @@ def test_five_position_tiled_tour_spans_multiple_tiles():
     assert gen["surface_coverage"] is not None
     assert gen["surface_coverage"] >= services.config.scan.min_surface_coverage
     assert len(services.rdk.list_targets("TasniScan_")) == gen["created"]
+    # Follow-up 5 (post-review): "planned_views" must report the PLANNED
+    # figure (sum of every tile's own n_views), the same semantics the
+    # single-aim path uses for that key -- not silently alias "created" (this
+    # scenario is fully reachable so the two numbers happen to coincide here;
+    # the contiguous-hole test below exercises a case where they differ).
+    assert gen["planned_views"] == sum(a["n_views"] for a in gen["plan"]["aims"])
     print(f"[five-position tiled tour] {gen['tile_count']} tiles planned, "
           f"{len(tile_ids)} produced targets, {gen['created']} targets total, "
           f"coverage {gen['surface_coverage']:.0%}")
@@ -1018,6 +1024,102 @@ def test_five_position_tiled_tour_coverage_gate_catches_missing_tiles():
         services.rdk.is_reachable = real_is_reachable
     print("[coverage gate] missing-tile scenario (half the rectangle "
           "unreachable) correctly refused instead of reporting a false-pass")
+
+
+# A many-tile rectangle at this fake camera's K/config (300 mm standoff,
+# frame_margin 1.12 -> footprint ~286x214 mm, default overlap 0.30 -> nominal
+# spacing ~200x150 mm) -- comfortably >= 4 tiles per axis regardless of a few
+# mm of survey measurement noise, and regardless of which physical edge
+# order_corners_clockwise happens to label "x" vs "y" for the recovered
+# rectangle (that labelling is not under this test's control -- see below).
+_FP_GRID_CORNERS = np.array([[300.0, 400.0, 0.0], [1800.0, 400.0, 0.0],
+                             [1800.0, 1550.0, 0.0], [300.0, 1550.0, 0.0]])
+
+
+def test_five_position_tiled_tour_contiguous_hole_caught_even_when_fraction_passes():
+    """Finding 2 (post-review): a CONTIGUOUS block of empty tiles is a single,
+    real, unscanned hole in the surface — unlike the same COUNT of misses
+    scattered across the grid (mostly absorbed by neighbouring tiles' own
+    overlap), it slips right past the tile-completeness FRACTION gate alone.
+    Drop a 2x2 block (4 tiles, comfortably above the reported case's own
+    9-of-64 in relative terms is not required — 4 tiles is already > the
+    survey_tour_max_contiguous_empty_tiles=2 default and, on this grid,
+    leaves the fraction comfortably clear of 0.85): the fraction alone PASSES
+    — but the scan must still be refused by the new largest-contiguous-empty-
+    block gate, and the refusal message must name which tiles are empty (the
+    brief's own complaint: it used to report only a count)."""
+    from tasni.modules.scan.planner import _tile_grid_dims, plan_rect_tour
+
+    services, state = _build_fakes()
+    scfg = services.config.scan
+    # Narrow the cone for JUST this test so the reachability filter below (a
+    # geometric "nearest tile centre" classifier, since a real is_reachable()
+    # has no notion of "which tile") cannot misclassify a wide-cone candidate
+    # into the wrong tile — a pure test-robustness knob, independent of (and
+    # not needed by) the tiling math itself.
+    scfg.flat_cone_deg = 8.0
+    locked = _locked_five_position_scan_surface(state, _FP_GRID_CORNERS)
+    rec = locked.survey_record
+    K = services.config.camera.K
+    W, H = services.config.camera.size
+
+    plan = plan_rect_tour(rec.corners_np(), np.asarray(rec.plane_normal_base), K, (W, H), scfg)
+    # nx/ny come from _tile_grid_dims itself -- order_corners_clockwise (Task
+    # 11) re-derives the recovered rectangle's own corner order from the
+    # fitted geometry, not from _FP_GRID_CORNERS' row order, so which physical
+    # edge ends up "x" vs "y" (and therefore the exact nx/ny split) is not
+    # under this test's control; only that BOTH axes have >= 4 tiles is.
+    nx, ny, _fw, _fh = _tile_grid_dims(rec.corners_np(), K, (W, H), scfg)
+    assert nx >= 4 and ny >= 4, (nx, ny)
+    assert len(plan.aims) == nx * ny
+
+    all_centers = np.array([a.point_base_mm for a in plan.aims])[:, :2]
+    bi, bj = nx // 2 - 1, ny // 2 - 1
+    block_lin = {(bi + di) * ny + (bj + dj) for di in range(2) for dj in range(2)}
+    assert len(block_lin) == 4
+    expected_fraction = 1.0 - 4 / (nx * ny)
+    assert expected_fraction >= scfg.min_surface_coverage, expected_fraction  # sanity
+
+    def is_reachable(T):
+        p = np.asarray(T)[:2, 3]
+        nearest = int(np.argmin(np.linalg.norm(all_centers - p, axis=1)))
+        return nearest not in block_lin
+
+    real_is_reachable = services.rdk.is_reachable
+    services.rdk.is_reachable = is_reachable
+    try:
+        with pytest.raises(RuntimeError) as exc:
+            scan_service.generate_scan_targets(services, locked)
+        msg = str(exc.value)
+        assert "contiguous" in msg.lower(), msg
+        for t in sorted(block_lin):
+            assert f"T{t + 1:02d}" in msg, (t, msg)
+
+        # Proves the OLD fraction-only gate would have silently PASSED this
+        # exact scenario: disabling just the new block check (a large
+        # allowance) must now succeed, with the reported fraction confirming
+        # it clears min_surface_coverage (0.85) on its own.
+        scfg.survey_tour_max_contiguous_empty_tiles = 1000
+        gen = scan_service.generate_scan_targets(services, locked)
+        assert gen["surface_coverage"] >= scfg.min_surface_coverage, gen["surface_coverage"]
+        assert gen["empty_tile_count"] == 4, gen["empty_tile_count"]
+        assert gen["largest_contiguous_empty_tiles"] == 4, gen["largest_contiguous_empty_tiles"]
+        # Follow-up 5 (post-review): with 4 whole tiles missing, "planned"
+        # (every tile's own n_views, ignoring reachability) and "created"
+        # (what actually landed in RoboDK) must now DIFFER -- this is exactly
+        # the case that would have caught the old bug (planned_views silently
+        # aliasing len(created), which cannot distinguish the two by
+        # definition).
+        planned = sum(a["n_views"] for a in gen["plan"]["aims"])
+        assert gen["planned_views"] == planned, (gen["planned_views"], planned)
+        assert gen["created"] < gen["planned_views"], gen
+        print(f"[contiguous hole] {nx}x{ny} grid; fraction={gen['surface_coverage']:.3f} "
+              f"(>= {scfg.min_surface_coverage}) would have PASSED alone; the contiguous "
+              f"block gate correctly caught the 4-tile hole "
+              f"(largest={gen['largest_contiguous_empty_tiles']}); planned "
+              f"{gen['planned_views']} vs created {gen['created']}")
+    finally:
+        services.rdk.is_reachable = real_is_reachable
 
 
 def test_five_position_tiled_tour_small_rectangle_is_single_tile():
