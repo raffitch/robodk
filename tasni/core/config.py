@@ -497,6 +497,23 @@ class ScanConfig(_Model):
     compact_center_tol_uv: float = 0.15   # outline centroid distance from image center
     compact_identity_frames: int = 5      # consecutive frames the rectangle must agree
     compact_identity_tol_uv: float = 0.04 # max corner drift across those frames
+
+    # -- five-position survey: center + four-corner (two-path plan §7) ------
+    # Used when the platform is too large to fit in one camera view: the
+    # operator drives to the centre, then each of the four corners in turn.
+    survey_capture_max_age_s: float = 10.0   # a capture must be used within this long
+    survey_coplanar_warn_mm: float = 3.0     # worst per-position plane RMS -> flag "non_flat"
+    survey_coplanar_reject_mm: float = 8.0   # worst per-position plane RMS -> refuse the survey
+    survey_edge_band_mm: float = 25.0        # perpendicular band (mm) around each corner-to-
+                                              # corner segment a candidate edge point must fall in
+    survey_rect_discrepancy_mm: float = 6.0  # unconstrained-vs-constrained corner gate. NOTE:
+                                              # this only detects ANGULAR cross-capture
+                                              # inconsistency, never a pure translational
+                                              # registration error -- see rect_fit.py docstring.
+    survey_corner_agreement_mm: float = 8.0  # surveyed-corner-vs-fitted-rectangle gate; THIS is
+                                              # the one that catches translational registration
+                                              # error (rect_fit.RectangleSolution.corner_agreement_mm)
+    survey_min_edge_points: int = 20         # min pooled points per edge after band filtering
     # Vision safety net for the hold: the live rectangle is depth-derived, so it must
     # still track a physical camera move even if RoboDK is not mirroring the arm. A
     # standoff/tilt shift past these releases the hold regardless of the pose gate.
