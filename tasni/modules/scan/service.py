@@ -1147,6 +1147,22 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg,
     return out
 
 
+def annotate_pose_liveness(metrics: dict, *, pose_T, driver_ok: bool) -> dict:
+    """Mark whether the pose-derived readouts (X/Y move_cam, jog guidance) reflect the
+    PHYSICAL robot right now, or a stale/model pose.
+
+    RoboDK's camera pose only mirrors the real arm while the driver is connected and
+    actively monitoring (see :meth:`RdkIO.robot_connected`). Without that link,
+    ``camera_pose_T()`` still returns *a* pose — RoboDK's last-known/model pose — so
+    the smoothing/hold logic upstream runs exactly the same either way. This flag is
+    the HUD's only signal to tell the operator the difference: ``True`` only when a
+    connected driver AND an actual pose reading both back the current readout.
+    Pure/no I/O so it is testable without hardware.
+    """
+    metrics["pose_live"] = bool(driver_ok and pose_T is not None)
+    return metrics
+
+
 def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> dict:
     """Gate-gated scan-target creation (synchronous, no robot motion).
 

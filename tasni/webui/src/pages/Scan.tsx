@@ -1058,11 +1058,21 @@ function SurfaceGuide({ gate, stable }: { gate: GateReading | null; stable: bool
   const trackedRectangle = gate?.surface_mode === "full" && gate?.fully_framed === true;
   const distanceTol = gate?.distance_tol_mm ?? 50;
   const centerTol = gate?.center_tol_mm ?? 30;
+  // X/Y move_cam guidance only tracks the physical arm while RoboDK's driver is
+  // connected and mirroring it (see GateReading.pose_live). Without that link the
+  // reading can be stale, so Center X/Y degrade instead of reading as trustworthy
+  // "OK"/instruction text. Range/Level/Edge are camera-derived and stay untouched —
+  // true regardless of driver monitoring. Absent/true both mean "live" (no change).
+  const poseLive = gate?.pose_live !== false;
   const range = move ? axisInstruction("Z", move[2], distanceTol, "mm") : "not measured";
-  const centerX = trackedRectangle && !gate?.gates?.center
+  const centerX = !poseLive
+    ? "model pose — not live"
+    : trackedRectangle && !gate?.gates?.center
     ? "rectangle tracked"
     : move ? axisInstruction("X", move[0], centerTol, "mm") : "not measured";
-  const centerY = trackedRectangle && !gate?.gates?.center
+  const centerY = !poseLive
+    ? "model pose — not live"
+    : trackedRectangle && !gate?.gates?.center
     ? "rectangle tracked"
     : move ? axisInstruction("Y", move[1], centerTol, "mm") : "not measured";
   const tiltB = rotationInstruction("B", gate?.tilt_b_deg ?? null);
@@ -1070,8 +1080,10 @@ function SurfaceGuide({ gate, stable }: { gate: GateReading | null; stable: bool
   const yawA = rotationInstruction("A", gate?.yaw_a_deg ?? null);
   const chips = [
     ["Range", range, !!gate?.gates?.distance],
-    ["Center X", centerX, !!gate && (gate.gates?.center || cropSurface || trackedRectangle)],
-    ["Center Y", centerY, !!gate && (gate.gates?.center || cropSurface || trackedRectangle)],
+    ["Center X", centerX,
+      poseLive && !!gate && (gate.gates?.center || cropSurface || trackedRectangle)],
+    ["Center Y", centerY,
+      poseLive && !!gate && (gate.gates?.center || cropSurface || trackedRectangle)],
     ["Level B", tiltB, !!gate?.gates?.angle],
     ["Level C", tiltC, !!gate?.gates?.angle],
     ["Edge A", trackedRectangle && gate?.yaw_a_deg == null ? "rectangle tracked" : yawA,
@@ -1086,12 +1098,17 @@ function SurfaceGuide({ gate, stable }: { gate: GateReading | null; stable: bool
           : "Waiting for live surface telemetry"}</span>
       </div>
       <div className="surface-guide-grid">
-        {chips.map(([label, text, ok]) => (
-          <div key={label} className={"surface-guide-chip " + (ok ? "ok" : "fix")}>
-            <span>{label}</span>
-            <b>{text}</b>
-          </div>
-        ))}
+        {chips.map(([label, text, ok]) => {
+          const degraded = !poseLive && (label === "Center X" || label === "Center Y");
+          return (
+            <div key={label} className={"surface-guide-chip " + (ok ? "ok" : "fix")}
+                 title={degraded
+                   ? "driver not monitoring — X/Y guidance is not real-time" : undefined}>
+              <span>{label}</span>
+              <b>{text}</b>
+            </div>
+          );
+        })}
       </div>
     </div>
   );

@@ -644,6 +644,16 @@ def test_pose_hold_vision_escape_releases_on_real_dolly():
     print("[pose hold] real dolly releases the hold via the vision escape")
 
 
+def test_pose_liveness_flag():
+    import numpy as np
+    from tasni.modules.scan.service import annotate_pose_liveness
+    live = annotate_pose_liveness({}, pose_T=np.eye(4), driver_ok=True)
+    assert live["pose_live"] is True
+    for pose, ok in ((None, True), (np.eye(4), False), (None, False)):
+        assert annotate_pose_liveness({}, pose_T=pose, driver_ok=ok)["pose_live"] is False
+    print("[pose liveness] flag true only when driver is connected AND pose is present")
+
+
 def test_camera_pose_moved_tolerances():
     import numpy as _np
     from tasni.modules.scan.service import camera_pose_moved
@@ -689,4 +699,5 @@ if __name__ == "__main__":
     test_pose_hold_release_is_debounced_against_single_noisy_frame()
     test_pose_hold_vision_escape_releases_on_real_dolly()
     test_camera_pose_moved_tolerances()
+    test_pose_liveness_flag()
     print("\ndepth_gate.py tests passed.")

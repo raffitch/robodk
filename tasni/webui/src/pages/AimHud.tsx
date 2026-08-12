@@ -33,6 +33,12 @@ export interface GateReading {
   tilt_b_deg?: number | null;
   tilt_c_deg?: number | null;
   live?: boolean;
+  // True only when RoboDK's driver is connected AND actively mirroring the physical
+  // arm's pose right now. When false, the X/Y jog guidance below (move_cam[0:2],
+  // JogBar) was computed from a stale/model pose — real, but not real-time — and the
+  // HUD must say so instead of presenting it as live. Absent on older payloads, which
+  // means "assume live" (identical to `true`) so nothing degrades by default.
+  pose_live?: boolean;
   error?: string;
   // Survey fields (full-frame surface measurement — scan module only)
   fully_framed?: boolean | null;
@@ -241,24 +247,53 @@ function Hud({ gate, mode = "scan", coverageDots = null, liveBoundary = null }:
         <text x={48} y={120} fontSize={28} fill={BAD}>{gate.error}</text>
       )}
 
-      {/* jog guidance (camera/TOOL frame) */}
+      {/* jog guidance (camera/TOOL frame). X/Y (and this readout) are only as fresh as
+          RoboDK's mirrored pose: when the driver isn't connected/monitoring
+          (pose_live === false) the arm can move without this reading changing, so we
+          degrade to the same "not real-time" visual language as the other pending
+          readouts instead of presenting stale numbers as live. `pose_live` absent or
+          `true` renders exactly as before. */}
       {detected && gate?.move_cam && (
-        <JogBar move={gate.move_cam} ctol={gate.center_tol_mm ?? 40}
-                dtol={gate.distance_tol_mm ?? 80} />
+        gate.pose_live === false ? (
+          <>
+            <PendingReadout x={40} y={H - 116} width={W - 80} height={96}
+              label="JOG — TOOL frame" text="DRIVER NOT MONITORING — X/Y NOT LIVE" />
+            <PoseModelChip x={40} y={H - 164} />
+          </>
+        ) : (
+          <JogBar move={gate.move_cam} ctol={gate.center_tol_mm ?? 40}
+                  dtol={gate.distance_tol_mm ?? 80} />
+        )
       )}
     </svg>
   );
 }
 
-function PendingReadout({ y, label, text, tall = false }:
-  { y: number; label: string; text: string; tall?: boolean }) {
+function PendingReadout({ y, label, text, tall = false, x = 26, width = 384, height }:
+  { y: number; label: string; text: string; tall?: boolean;
+    x?: number; width?: number; height?: number }) {
+  const h = height ?? (tall ? 132 : 84);
   return (
     <g>
-      <rect x={26} y={y} width={384} height={tall ? 132 : 84} rx={10} fill={INK} />
-      <text x={44} y={y + 30} fontSize={23} fill={DIM}>{label}</text>
-      <text x={44} y={y + 70} fontSize={27} fontWeight={700} fill={DIM}>
+      <rect x={x} y={y} width={width} height={h} rx={10} fill={INK} />
+      <text x={x + 18} y={y + 30} fontSize={23} fill={DIM}>{label}</text>
+      <text x={x + 18} y={y + 70} fontSize={27} fontWeight={700} fill={DIM}>
         {text}
       </text>
+    </g>
+  );
+}
+
+function PoseModelChip({ x, y }: { x: number; y: number }) {
+  // Amber "not real-time" badge for the pose-derived readouts (see `pose_live` on
+  // GateReading). A native <title> gives it a hover tooltip without any extra UI.
+  const label = "POSE: MODEL";
+  const w = 196;
+  return (
+    <g>
+      <title>driver not monitoring — X/Y guidance is not real-time</title>
+      <rect x={x} y={y} width={w} height={34} rx={8} fill={INK} stroke={WARN} strokeWidth={2} />
+      <text x={x + 14} y={y + 23} fontSize={18} fontWeight={800} fill={WARN}>{label}</text>
     </g>
   );
 }

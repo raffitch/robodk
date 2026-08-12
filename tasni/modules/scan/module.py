@@ -8,6 +8,7 @@ the pure ``reconstruct``/``plane``/``depth_gate`` libraries.
 from __future__ import annotations
 
 import threading
+import time
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -19,9 +20,10 @@ from ..base import ServiceContainer, WorkflowModule
 from ..calibration.service import SimTourJob
 from .color_boundary import color_work_boundary
 from .sam_boundary import SamBoundaryWorker
-from .service import (camera_pose_moved, ScanCaptureJob, ScanParams, ScanResult,
-                      generate_scan_targets, insert_scan, live_scan_telemetry_payload,
-                      LockedScanSurface, lock_scan_surface, stabilize_live_scan_payload)
+from .service import (annotate_pose_liveness, camera_pose_moved, ScanCaptureJob,
+                      ScanParams, ScanResult, generate_scan_targets, insert_scan,
+                      live_scan_telemetry_payload, LockedScanSurface, lock_scan_surface,
+                      stabilize_live_scan_payload)
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
@@ -219,6 +221,8 @@ class ScanModule(WorkflowModule):
             last_ideal_mm = None
             last_metrics = None
             anchor_pose_T = None
+            last_driver_check = 0.0
+            driver_ok = False
 
             def _publish_boundary(cb):
                 # The one boundary contract the HUD consumes (identical for every engine).
@@ -238,6 +242,7 @@ class ScanModule(WorkflowModule):
 
             def analyze(frame):
                 nonlocal last_ideal_mm, last_metrics, anchor_pose_T
+                nonlocal last_driver_check, driver_ok
                 if self._live_refresh.is_set():
                     # Operator pressed Refresh: re-read at the current pose. Drop the
                     # hold (last_metrics) and the pose anchor (anchor_pose_T) so the next
@@ -292,12 +297,28 @@ class ScanModule(WorkflowModule):
                         pose_T = services.rdk.camera_pose_T()
                     except Exception:
                         pose_T = None
+                    # Driver-connected status is a cheap RoboDK round trip but not
+                    # free at video frame rate — recheck at most every 2 s, same
+                    # caching pattern as last_ideal_mm. Any failure (RoboDK busy,
+                    # station reloading, etc.) reads as "not live": a driver-status
+                    # probe must never take down the live preview.
+                    now = time.monotonic()
+                    if now - last_driver_check >= 2.0:
+                        last_driver_check = now
+                        try:
+                            driver_ok = bool(services.rdk.robot_connected()[0])
+                        except Exception:
+                            driver_ok = False
                     moved = camera_pose_moved(
                         pose_T, anchor_pose_T,
                         sc.live_hold_pose_trans_mm, sc.live_hold_pose_rot_deg)
                     metrics = stabilize_live_scan_payload(
                         metrics, last_metrics, sc,
                         robot_static=(not moved and pose_T is not None))
+                    # Called AFTER stabilize_live_scan_payload so the freeze/hold logic
+                    # above (which copies dicts wholesale in places) cannot clobber it.
+                    metrics = annotate_pose_liveness(
+                        metrics, pose_T=pose_T, driver_ok=driver_ok)
                     # Re-anchor to the current pose only while the reading is LIVE (not
                     # frozen). During a hold we keep comparing against the pose where it
                     # engaged, so a transient model-pose blip can't drift the anchor and
