@@ -364,7 +364,15 @@ class ScanConfig(_Model):
     # standoff; these bands decide when the HUD lamps go green (all green ->
     # Create targets). Distance is the median depth of a central image patch.
     ideal_distance_mm: float = 500.0    # fallback camera<->surface standoff
-    distance_tol_mm: float = 50.0       # +/- band around the live planned standoff
+    # Widened 50 -> 150 on 2026-08-13, justified by that day's cell characterization:
+    # plane RMS varies only ~0.93-1.12 mm across a +-150 mm window around a typical
+    # ideal standoff, so a +-50 mm gate was enforcing a precision that buys nothing
+    # measurable while making a hand-jogged robot painful to aim and — the reason it
+    # surfaced — making it IMPOSSIBLE to trade frame-fill for edge-measurement margin.
+    # At the 412 mm ideal for an A3 the old band topped out at 462 mm, where the sheet
+    # still fills 88% of the frame height. Framing itself is gated separately (FRAMED /
+    # the compact guard band), so this only relaxes the standoff, never the geometry.
+    distance_tol_mm: float = 150.0       # +/- band around the live planned standoff
     max_tilt_deg: float = 6.0           # surface normal must be close to fronto-parallel
     center_patch_frac: float = 0.25     # central image fraction sampled for depth/normal
     min_valid_depth_frac: float = 0.5   # >= this fraction of the patch must have valid depth
