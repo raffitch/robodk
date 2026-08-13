@@ -157,6 +157,10 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
     ``coverage_frac`` is the mean fraction of the board's inner corners
     detected across the ``n_frames`` captures — how much of the board this
     distance actually let the detector see.
+
+    ``distance_mm`` is the operator's TARGET standoff and is used only for error
+    messages: the returned trial carries the standoff actually MEASURED from the
+    captured depth, so you do not have to hit the nominal value precisely.
     """
     K, depth_scale = cfg.camera.K, cfg.scan.depth_scale
     id_a, id_b, true_mm = _reference_corner_pair(board)
@@ -165,6 +169,7 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
     plane_sets: list[np.ndarray] = []
     length_samples: list[tuple] = []
     coverage_samples: list[float] = []
+    standoff_samples: list[float] = []
 
     for _ in range(max(1, int(n_frames))):
         frame = camera.grab(with_depth=True, timeout=timeout)
@@ -173,6 +178,11 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
         pts = _backproject_valid_mm(frame.depth, K, depth_scale)
         if len(pts):
             plane_sets.append(pts)
+            # What standoff this capture ACTUALLY happened at, measured rather than
+            # assumed. The operator jogs by hand, so the nominal --distances value is
+            # a target, not an achievement; recording the target would silently
+            # mislabel the whole distance-vs-quality curve that d* is chosen from.
+            standoff_samples.append(float(np.median(pts[:, 2])))
 
         found = board.detect_points(frame.color, min_corners=1)
         if found is None:
@@ -194,7 +204,8 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
             f"{n_frames} frame(s) — check the camera/board alignment and retry")
 
     coverage_frac = float(np.mean(coverage_samples)) if coverage_samples else 0.0
-    return summarize_distance_trial(distance_mm, plane_sets, length_samples, coverage_frac)
+    measured_mm = float(np.median(standoff_samples)) if standoff_samples else float(distance_mm)
+    return summarize_distance_trial(measured_mm, plane_sets, length_samples, coverage_frac)
 
 
 def _prompt(message: str) -> None:
@@ -411,7 +422,14 @@ def main(argv=None) -> None:
                 except Exception:
                     pose = None
             camera_T_per_distance.append(pose)
-            print("   " + _format_trial(f"d={d:.0f}mm", trial))
+            drift = trial.distance_mm - d
+            print("   " + _format_trial(
+                f"target {d:.0f}mm -> MEASURED {trial.distance_mm:.0f}mm "
+                f"({drift:+.0f}mm)", trial))
+            if abs(drift) > 60.0:
+                print(f"   note: {abs(drift):.0f} mm off the target. That is fine — the "
+                      "MEASURED value is what gets recorded — but keep the sweep spread "
+                      "out so the distances don't bunch together.")
 
         best = choose_dstar(trials, **budget)
         print("\n=== verdict ===")
@@ -468,6 +486,9 @@ def main(argv=None) -> None:
             # A discovery sweep gated nothing, so its dstar proves nothing. Tagged so
             # the lock-side gate can refuse to treat it as a validated envelope.
             "discovery": bool(args.discovery),
+            # Targets vs what was achieved: every trial's distance_mm is measured, so
+            # keep the requested list alongside it for traceability.
+            "nominal_distances_mm": [float(d) for d in distances],
             "achieved_envelope": envelope,
             "incidence_sweep": incidence,
             "incidence_range_deg": list(band) if band else None,
