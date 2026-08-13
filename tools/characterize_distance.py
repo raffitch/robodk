@@ -107,7 +107,33 @@ def _subsample_for_plane_fit(pts: np.ndarray,
     return pts[::int(np.ceil(n / max_points))]
 
 
-def _backproject_valid_mm(depth, K, depth_scale: float = 1000.0) -> np.ndarray:
+def _board_region_mask(shape, corners_px, *, margin_px: float = 6.0) -> np.ndarray:
+    """Boolean mask of the detected ChArUco region, slightly dilated.
+
+    THE critical step for a distance sweep. Every metric here is meant to describe
+    the BOARD, but a frame also contains the table, the floor and the far wall, and
+    the board's share of it shrinks as the square of the standoff: ~33% of frame
+    area at 300 mm, ~1% at 1.5 m. Fit a plane to the unmasked frame and at range you
+    are measuring the ROOM -- the residual becomes the scene's depth spread (hundreds
+    of mm) and the median depth becomes the background, not the board. Both then
+    degrade smoothly with distance, which looks exactly like a real physical result.
+    """
+    import cv2
+
+    pts = np.asarray(corners_px, dtype=np.float32).reshape(-1, 1, 2)
+    hull = cv2.convexHull(pts)
+    if margin_px:
+        c = hull.reshape(-1, 2).mean(axis=0)
+        v = hull.reshape(-1, 2) - c
+        norms = np.linalg.norm(v, axis=1, keepdims=True)
+        hull = (c + v * (1.0 + margin_px / np.maximum(norms, 1e-6))).reshape(-1, 1, 2)
+    mask = np.zeros(tuple(shape[:2]), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, hull.astype(np.int32), 1)
+    return mask.astype(bool)
+
+
+def _backproject_valid_mm(depth, K, depth_scale: float = 1000.0,
+                          mask: "np.ndarray | None" = None) -> np.ndarray:
     """Every valid (>0) depth pixel, backprojected to camera-frame millimetres.
 
     Mirrors modules/scan/service.py's own ``_backproject_depth`` convention:
@@ -115,11 +141,18 @@ def _backproject_valid_mm(depth, K, depth_scale: float = 1000.0) -> np.ndarray:
     ``depth_scale`` (default 1000.0, RealSense's metres-per-unit) then
     multiplying back by 1000.0 is an identity unless the server ever reports a
     different scale — kept explicit so this stays correct if that changes.
+
+    ``mask``, when given, restricts the result to those pixels — pass the board
+    region (see :func:`_board_region_mask`) so the metrics describe the board
+    rather than whatever else is in frame.
     """
     d = np.asarray(depth, dtype=float)
     fx, fy = float(K[0, 0]), float(K[1, 1])
     cx, cy = float(K[0, 2]), float(K[1, 2])
-    ys, xs = np.nonzero(d > 0)
+    valid = d > 0
+    if mask is not None:
+        valid &= np.asarray(mask, dtype=bool)
+    ys, xs = np.nonzero(valid)
     if len(ys) == 0:
         return np.zeros((0, 3), dtype=float)
     z_mm = d[ys, xs] / float(depth_scale) * 1000.0
@@ -193,12 +226,28 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
     coverage_samples: list[float] = []
     standoff_samples: list[float] = []
 
+    detected_any = False
     for _ in range(max(1, int(n_frames))):
         frame = camera.grab(with_depth=True, timeout=timeout)
         if frame.depth is None:
             continue
-        pts = _subsample_for_plane_fit(_backproject_valid_mm(frame.depth, K, depth_scale))
-        if len(pts):
+
+        # Detect FIRST: the detection defines which pixels are board, and every
+        # plane metric below must be restricted to those. Without that restriction
+        # the fit describes the whole scene (see _board_region_mask).
+        found = board.detect_points(frame.color, min_corners=1)
+        if found is None:
+            coverage_samples.append(0.0)
+            continue
+        detected_any = True
+        corners, ids, _obj = found
+        ids_flat = [int(v) for v in ids.flatten().tolist()]
+        coverage_samples.append(len(ids_flat) / float(total_corners))
+
+        mask = _board_region_mask(np.asarray(frame.depth).shape, corners.reshape(-1, 2))
+        pts = _subsample_for_plane_fit(
+            _backproject_valid_mm(frame.depth, K, depth_scale, mask=mask))
+        if len(pts) >= 3:
             plane_sets.append(pts)
             # What standoff this capture ACTUALLY happened at, measured rather than
             # assumed. The operator jogs by hand, so the nominal --distances value is
@@ -206,13 +255,6 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
             # mislabel the whole distance-vs-quality curve that d* is chosen from.
             standoff_samples.append(float(np.median(pts[:, 2])))
 
-        found = board.detect_points(frame.color, min_corners=1)
-        if found is None:
-            coverage_samples.append(0.0)
-            continue
-        corners, ids, _obj = found
-        ids_flat = [int(v) for v in ids.flatten().tolist()]
-        coverage_samples.append(len(ids_flat) / float(total_corners))
         px_by_id = {cid: corners[i, 0] for i, cid in enumerate(ids_flat)}
         if id_a in px_by_id and id_b in px_by_id:
             pa = _corner_point_mm(frame.depth, K, *px_by_id[id_a], depth_scale)
@@ -221,9 +263,12 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
                 length_samples.append((pa.reshape(1, 3), pb.reshape(1, 3), true_mm))
 
     if not plane_sets:
+        why = ("the board was never detected" if not detected_any else
+               "the board was detected but carried no valid depth")
         raise RuntimeError(
-            f"distance {distance_mm:.0f} mm: no valid depth captured across "
-            f"{n_frames} frame(s) — check the camera/board alignment and retry")
+            f"distance {distance_mm:.0f} mm: {why} across {n_frames} frame(s) — the "
+            "metrics must be measured on the board, so this distance cannot be "
+            "characterized. Move closer, improve lighting, or drop this distance.")
 
     coverage_frac = float(np.mean(coverage_samples)) if coverage_samples else 0.0
     measured_mm = float(np.median(standoff_samples)) if standoff_samples else float(distance_mm)
