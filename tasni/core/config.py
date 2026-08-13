@@ -413,6 +413,14 @@ class ScanConfig(_Model):
     # authoritative 3D work rectangle is still measured from depth at Lock.
     color_boundary_enabled: bool = True
     color_boundary_min_color_dist: float = 14.0  # min Lab object<->table colour distance to trust
+    # Hybrid work-surface extent (cell evidence 2026-08-13): the plane comes from
+    # depth, the EDGES from vision, because stereo depth stops ~20 mm short at the
+    # rim of a raised object (no texture to match across a 630 mm cliff) while the
+    # colour image sees that rim crisply. Vision is corroborated against the depth
+    # extent before it is trusted, and the check is DIRECTIONAL because depth can
+    # only ever under-reach:
+    boundary_trust_envelope_mm: float = 60.0  # vision may exceed depth by at most this
+    boundary_shrink_tol_mm: float = 5.0       # ...and may fall short of it by at most this
     color_boundary_seg_width: int = 480          # downscale width for the segmentation (speed)
 
     # -- learned (SAM) work boundary for low-contrast scenes -------------------

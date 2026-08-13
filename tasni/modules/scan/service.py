@@ -54,7 +54,7 @@ from .color_boundary import color_work_boundary
 from .corner_evidence import extract_corner_evidence
 from .depth_gate import ScanGateThresholds, evaluate_depth_gate
 from .five_position import FivePositionSurvey
-from .plane import (bounded_work_plane, fit_plane, rectangle_in_frame,
+from .plane import (_oriented_rectangle, bounded_work_plane, fit_plane, rectangle_in_frame,
                     reticle_plane_square, work_plane_from_points)
 from .planner import (ScanPlan, _largest_contiguous_empty_block, _tile_grid_dims,
                      plan_rect_tour, plan_scan)
@@ -600,10 +600,28 @@ def lock_scan_surface(services, *, force_crop: bool = False,
             if eligibility.eligible:
                 mode = MODE_COMPACT
                 plane_rms = _plane_rms_mm(depth, K, outline_uv=survey.outline_uv)
+                # Hybrid extent: keep the depth-measured PLANE, take the EDGES from
+                # the boundary the classifier just corroborated. Depth alone stops
+                # ~20 mm short at the rim of a raised object; vision does not.
+                # Falls back to the depth corners whenever vision is untrustworthy,
+                # and either way the source is recorded rather than assumed.
+                vis_corners, boundary_info = _corners_from_boundary_on_plane(
+                    (boundary or {}).get("polygon_uv"), survey, cfg.camera, scfg)
+                if vis_corners is not None:
+                    survey = replace(survey, corners_cam_mm=vis_corners)
+                elif boundary_info.get("reason"):
+                    gate_payload.setdefault("warnings", []).append(
+                        "work-surface edges measured from DEPTH, not vision: "
+                        + boundary_info["reason"])
+                gate_payload["boundary_source"] = boundary_info["boundary_source"]
                 record = _survey_record_from_lock(
                     survey, seed_T, snapshot, services.config.camera,
                     mode=mode, n_frames=n_frames, measurement_ts=frame.timestamp,
                     valid_frac=gate_payload.get("valid_frac", 0.0), plane_rms_mm=plane_rms)
+                if record is not None:
+                    # Provenance must name WHICH sensor measured the boundary — the
+                    # honesty rule Task 3 established, applied to the new split.
+                    record.quality.update(boundary_info)
             else:
                 # Task 18 review, Critical 2c: the guard-band reason alone gave
                 # no direction -- enrich just that one warning line with an
@@ -1048,6 +1066,92 @@ def _work_boundary(scfg, color) -> "dict | None":
         except Exception:
             cb = None
     return cb
+
+
+def _corners_from_boundary_on_plane(polygon_uv, survey, camera_cfg, scfg):
+    """Work-surface corners from the VISION boundary, on the depth-measured plane.
+
+    Why this exists (cell evidence, 2026-08-13). A stereo camera measures a plane
+    beautifully and its EDGES badly: matching needs texture, and at the rim of a
+    raised object the match window straddles two surfaces, so the High-Accuracy
+    preset discards those pixels rather than guess. Measured against the printed
+    ChArUco ruler on an A3 panel 630 mm above the floor, valid depth stopped
+    19.4 mm short of the true top edge and 20.6 mm short of the bottom, while the
+    left/right edges came within 0.3/2.7 mm. The colour image showed all four
+    edges crisply the whole time — white panel on a dark floor.
+
+    So: PLANE from depth (accurate, ~1 mm RMS, repeatable to 0.2 mm), EXTENT from
+    vision. Each boundary pixel becomes an undistorted ray, intersected with the
+    fitted plane; the same oriented-rectangle fit then runs on those points.
+
+    Returns ``(corners_cam_mm, info)``, or ``(None, info)`` when vision cannot be
+    trusted here — ``info["reason"]`` says why, and the caller keeps the depth
+    corners. Corroboration is DIRECTIONAL: depth can only ever under-reach, so a
+    vision edge INSIDE the depth reach means the segmentation grabbed something
+    smaller than the surface (wrong object, shadow, glare) and is rejected; a
+    vision edge implausibly far outside it (beyond ``boundary_trust_envelope_mm``)
+    means it bled onto the background and is likewise rejected.
+    """
+    info: dict = {"boundary_source": "depth"}
+    if polygon_uv is None or survey.normal_cam is None or survey.centroid_cam_mm is None:
+        info["reason"] = "no boundary polygon or no measured plane"
+        return None, info
+    poly = np.asarray(polygon_uv, dtype=float).reshape(-1, 2)
+    if len(poly) < 4:
+        info["reason"] = f"boundary polygon has only {len(poly)} points"
+        return None, info
+
+    K = np.asarray(camera_cfg.K, dtype=float)
+    W, H = camera_cfg.size
+    px = np.column_stack([poly[:, 0] * float(W), poly[:, 1] * float(H)])
+    try:
+        import cv2
+
+        rays = cv2.undistortPoints(
+            px.reshape(-1, 1, 2).astype(np.float64), K,
+            np.asarray(camera_cfg.dist, dtype=np.float64).ravel()).reshape(-1, 2)
+    except Exception as e:                      # pragma: no cover - cv2 always present
+        info["reason"] = f"undistort failed: {e}"
+        return None, info
+    rays = np.column_stack([rays, np.ones(len(rays))])
+
+    n = np.asarray(survey.normal_cam, dtype=float)
+    n = n / max(float(np.linalg.norm(n)), 1e-9)
+    p0 = np.asarray(survey.centroid_cam_mm, dtype=float)
+    denom = rays @ n
+    ok = np.abs(denom) > 1e-9
+    if int(ok.sum()) < 4:
+        info["reason"] = "boundary rays are parallel to the measured plane"
+        return None, info
+    pts = rays[ok] * (float(p0 @ n) / denom[ok])[:, None]
+
+    corners, _a1, _a2, len1, len2 = _oriented_rectangle(pts, n, pts.mean(axis=0))
+    vis = (max(float(len1), float(len2)), min(float(len1), float(len2)))
+    info["vision_extent_mm"] = [round(v, 1) for v in vis]
+
+    depth_extent = survey.extent_mm
+    if depth_extent is None:
+        info["reason"] = "no depth extent to corroborate against"
+        return None, info
+    dep = (max(float(depth_extent[0]), float(depth_extent[1])),
+           min(float(depth_extent[0]), float(depth_extent[1])))
+    info["depth_extent_mm"] = [round(v, 1) for v in dep]
+    envelope = float(getattr(scfg, "boundary_trust_envelope_mm", 60.0))
+    shrink = float(getattr(scfg, "boundary_shrink_tol_mm", 5.0))
+    for axis, (v, d) in enumerate(zip(vis, dep)):
+        if v < d - shrink:
+            info["reason"] = (f"vision boundary is {d - v:.0f} mm SMALLER than the "
+                              f"depth extent on axis {axis} — segmentation caught "
+                              "something smaller than the surface")
+            return None, info
+        if v > d + envelope:
+            info["reason"] = (f"vision boundary is {v - d:.0f} mm larger than the depth "
+                              f"extent on axis {axis} (limit {envelope:.0f}) — it "
+                              "likely bled onto the background")
+            return None, info
+    info["boundary_source"] = "vision"
+    info["gain_mm"] = [round(vis[0] - dep[0], 1), round(vis[1] - dep[1], 1)]
+    return np.asarray(corners, dtype=float), info
 
 
 def _boundary_polygon_uv(scfg, color) -> "np.ndarray | None":
