@@ -1,7 +1,10 @@
 # Scan Workframe Survey - Two-Path Engineering Plan
 
-**Status:** reviewed and revised 2026-08-12 — independent review incorporated (see §17);
-implementation plan: [scan-workframe-implementation-plan.md](scan-workframe-implementation-plan.md)  
+**Status:** IMPLEMENTED 2026-08-13 — all 17 tasks of
+[scan-workframe-implementation-plan.md](scan-workframe-implementation-plan.md) merged to
+branch `calibration-improvements`, 393 tests green (`py -3.10 -m pytest -q`) plus a clean
+frontend build. See the "Hardware validation TODO" section (§18) below for what is
+deliberately still unverified on the real cell.  
 **Purpose:** agreed design for the two-path workframe survey  
 **Scope:** flat work surfaces used to create a RoboDK workframe and visible work rectangle  
 **Out of scope:** general 3D object scanning and the Cylinder Test implementation
@@ -281,14 +284,39 @@ The global fit must not silently force poor data into a perfect rectangle. Repor
 the unconstrained evidence residuals and the constrained result. Reject the survey if
 the discrepancy is too large.
 
-**Conditioning note (review outcome, 2026-08-12):** fitting each edge line from two
-corner-local segments is well-conditioned in *direction* — the corner-to-corner
-baseline is the full edge length, a large lever arm. The real accuracy floor is
-**cross-capture registration**: each of the five captures carries hand-eye plus robot
-absolute-pose error, so edge *positions* inherit a systematic ~1–2 mm uncertainty that
-the constrained fit cannot remove and corner-closure error only partially reveals. The
-Phase 0 error budget must assume this floor for the five-position path; the
-unconstrained-vs-constrained discrepancy report is the primary diagnostic for it.
+**Conditioning note (review outcome, 2026-08-12; corrected 2026-08-13 — see below):**
+fitting each edge line from two corner-local segments is well-conditioned in
+*direction* — the corner-to-corner baseline is the full edge length, a large lever arm.
+The real accuracy floor is **cross-capture registration**: each of the five captures
+carries hand-eye plus robot absolute-pose error, so edge *positions* inherit a
+systematic ~1–2 mm uncertainty that the constrained fit cannot remove and corner-closure
+error only partially reveals. The Phase 0 error budget must assume this floor for the
+five-position path.
+
+**Correction (Task 9 implementation finding, 2026-08-13): the unconstrained-vs-
+constrained discrepancy is NOT the primary diagnostic for cross-capture registration
+error — it is structurally blind to the dominant failure mode.** The constrained
+rectangle model has 5 degrees of freedom (one shared orientation `theta` plus 4
+independent edge offsets); the unconstrained model has 8 (4 independent lines × 2 DOF
+each). The 3 degrees of freedom the constraint removes are **all angular** — the four
+edge offsets are free parameters, fitted identically to the evidence in both models. So
+`discrepancy_mm` can only ever detect **angular** cross-capture inconsistency (one
+capture's edge tilted relative to the others); it cannot see a pure **translational**
+registration error at all — which is exactly the dominant hand-eye/robot-pose error mode
+across five separately-registered capture positions.
+
+This was measured, not just derived: injecting a 150 mm rigid translation into one
+capture's evidence produced a confident, badly-mis-sized rectangle while
+`discrepancy_mm` went *down* (0.084 → 0.070 mm) rather than up. The field that actually
+caught it is `corner_agreement_mm` (the fitted rectangle's corners vs. the surveyed
+corner points), which reported 150.02 mm on the same injected fault.
+
+The implementation (`five_position.py::finish`) therefore gates on **both**
+`survey_rect_discrepancy_mm` (angular consistency) and `survey_corner_agreement_mm`
+(translational consistency — see `rect_fit.py`'s module docstring for the full
+derivation), and treats `corner_agreement_mm is None` as a failed check, never a pass.
+Anyone extending the five-position geometry should treat `corner_agreement_mm` — not
+`discrepancy_mm` — as the primary registration-error diagnostic.
 
 ### Failure and recovery
 
@@ -579,4 +607,56 @@ with named corners is accepted as the single convention; classification runs the
 planner predict-only (§6); and the §12 retained-component list was verified accurate
 against the current code (`work_crop_mm`, the live distance target, and both freeze
 layers all exist and are superseded as described).
+
+## 18. Hardware validation TODO (2026-08-13)
+
+Implementation (all 17 tasks) is complete and unit/synthetic/mock-integration tested
+(393 tests green), but several items were deliberately deferred to the real KUKA cell
+during implementation — recorded here rather than fixed blind, per each task's review.
+None of them block merging the software; all of them block calling the feature
+production-validated. Cross-reference: `docs/scan-workframe-implementation-plan.md`'s
+`progress.md` ledger (Task 13, Task 14, Task 15 entries) has the original findings this
+section summarizes.
+
+1. **Corner-aiming plane selection.** With the reticle centred exactly on a 90° table
+   corner, the camera sees at most ~25% table — a geometric ceiling (the two near edges,
+   each a straight line through image centre, always quarter a rectangular frame),
+   confirmed by ray-tracing all four corners of the test fixture, independent of table
+   size or standoff. `survey_surface`'s plane RANSAC is a pure inlier-count majority
+   vote with no expected-plane hint, so at that ceiling it can select the BACKGROUND
+   plane as "the surface" instead of the table. This fails safe today whenever the
+   background is meaningfully nearer or farther than the table — the standoff gate
+   catches it (a floor-lock case was measured moving the reported standoff from 420 mm
+   to 1170 mm, well outside the accepted window). The residual risk is a background
+   surface at a SIMILAR standoff to the table (e.g. an adjacent panel or fixture near
+   table height) being silently accepted as the table plane. The corner-capture metrics
+   (`purity` / `coverage`, `survey_corner_min_plane_coverage_frac`) are only as
+   trustworthy as the plane RANSAC selected — they cannot detect a wrong-but-plausible
+   plane, only a too-small one. Needs a real-cell check with an adjacent surface at
+   table-like height in frame.
+2. **Survey diagram chirality.** `SurveyPanel.tsx` maps world X/Y straight onto SVG
+   x/y, and SVG's Y axis points down, so whether the accumulating top-down polygon
+   reads clockwise to an operator standing at the robot depends on the handedness of
+   the KUKA base frame in this cell. The diagram exists specifically so the operator
+   can confirm the C1→C2→C3→C4 clockwise order called for in §2 — this needs a
+   physical-cell check (stand at the robot, walk the four corners, confirm the on-screen
+   polygon direction matches).
+3. **`d*` has never been measured.** `tools/characterize_distance.py` exists, has unit
+   tests for its pure-geometry helpers, and is headless-importable — but its
+   interactive, operator-jogged capture path has never run end-to-end against the real
+   D435i/KUKA. Until it does, `accurate_min_mm` (and the rest of the standoff/tilt
+   bands in `ScanConfig`) are placeholders for the experimentally-validated `d*` §5
+   calls for, and the whole error budget in §5 is unvalidated against real hardware.
+4. **The five-position registration floor is an estimate.** The ~1–2 mm systematic
+   cross-capture registration uncertainty assumed in §7's Phase 0 error budget is an
+   engineering estimate (hand-eye + robot absolute-pose error composition), not a
+   measured number. It should be measured once `d*` characterization (item 3) and a
+   real five-position survey of a known rectangle are both available.
+5. **`height_repeat_mm` caveat.** With two capture normals that are exactly opposite
+   (e.g. two views 180° apart in yaw), `height_repeat_mm` reports a misleadingly
+   confident `0.0` (the mean-normal vector's magnitude collapses to zero, and the
+   norm-guard silently avoids a crash rather than surfacing the degeneracy) while
+   `normal_repeat_deg` correctly reports `90`. `choose_dstar`'s selection logic is safe
+   because it gates on both fields together, but any future consumer — a UI, a report,
+   a human — must never read `height_repeat_mm` alone as a health/repeatability number.
 

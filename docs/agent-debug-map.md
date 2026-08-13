@@ -3,7 +3,130 @@
 Current purpose: give future agents a low-token entry point into the Tasni app,
 scan/calibration logic, RoboDK connection, and Jetson camera server.
 
-Last updated: 2026-08-12. Active branch: `calibration-improvements`.
+Last updated: 2026-08-13. Active branch: `calibration-improvements`.
+
+## Two-path workframe survey (2026-08-13)
+
+Implements `docs/scan-workframe-two-path-plan.md` (design) via
+`docs/scan-workframe-implementation-plan.md` (17-task plan, all merged; 393 tests
+green). Three ways to establish a scan workframe now exist side by side, all
+producing the same `LockedWorkframeSurvey` contract:
+
+- **Compact** (`mode="compact"`): the whole platform fits in one camera view at
+  the aiming standoff — the existing single-lock path (`lock_scan_surface` in
+  `service.py`), which still selects compact-vs-crop via the pre-existing
+  `surface_mode` heuristic (`"full"` if the fitted rectangle stays in frame, else
+  `"crop"` — `service.py:1112`), NOT via `classify_compact` (see the
+  `classifier.py` bullet below — **known gap**).
+- **Five-position survey** (`mode="five_position"`): a platform too large for one
+  view — guided CENTER + four-corner pendant-jog capture sequence, driven by
+  `SurveyPanel.tsx` and the `/survey/*` routes.
+- **User-specified region** (`mode="user_specified"`): the old fixed-crop fast
+  path, relabeled with honest provenance (`user specified - plane measured,
+  boundary declared`) — operator-entered rectangle dimensions projected onto the
+  measured plane, via `POST /surface/region`.
+
+New backend modules (`tasni/modules/scan/`):
+
+- `survey_contract.py` — the immutable `LockedWorkframeSurvey` /
+  `CaptureRecord` / `RobotStateSnapshot` frozen dataclasses (spec §11) that ALL
+  three paths funnel into; also `PROVENANCE_*` / `MODE_*` constants, clockwise
+  corner ordering (`order_corners_clockwise`), and capture-freshness checks.
+- `classifier.py` — pure decision logic (no camera/robot/RoboDK access) for
+  compact-vs-large eligibility at `d*` (spec §6): guard band, boundary
+  detection, centering, tilt, rectangle-identity-across-frames, and predicted
+  scan-coverage (predict-only planner run). Returns `CompactEligibility`. **Not
+  wired into any production caller as of Task 17** — `classify_compact` has full
+  unit coverage (`tests/test_scan_classifier.py`) but grep finds zero callers
+  outside that test file; `lock_scan_surface` never imports it. The actual
+  compact/crop decision at lock time is still the older `surface_mode`
+  full/rectangle-in-frame heuristic noted above. Confirm whether this is
+  intentional (spec §6's eligibility gates folded into that heuristic some other
+  way) or a genuine missed-wiring gap before relying on `classify_compact`'s
+  guard/identity/coverage checks actually protecting a real lock.
+- `rect_fit.py` — global plane + constrained-rectangle fit for the
+  five-position survey (spec §7): `fit_global_plane` (RANSAC over all five
+  captures' plane points) and `solve_constrained_rectangle` (closed-form
+  total-least-squares over one shared orientation `theta` + 4 independent edge
+  offsets — 5 DOF vs. the unconstrained 8 DOF). Its module docstring is the
+  canonical statement of the `discrepancy_mm` limitation corrected in
+  `docs/scan-workframe-two-path-plan.md` §7 below — read it before trusting
+  either diagnostic field.
+- `corner_evidence.py` — extracts base-frame corner point + two adjacent edges'
+  points from one corner capture (boundary polygon for direction, depth +
+  camera pose for metric geometry). Interior direction is derived from the
+  polygon's own winding order (not a vertex-mean), so it stays correct on
+  non-convex frame-clipped contours.
+- `five_position.py` — the guided capture state machine (`SURVEY_STEPS =
+  ("center", "corner1", "corner2", "corner3", "corner4")`): `add_capture`,
+  `recapture`, `finish` (fits the global plane + rectangle, gates on
+  coplanarity/discrepancy/corner-agreement, emits the quality report and a
+  `LockedWorkframeSurvey`). Capture orchestration (camera/robot I/O) lives in
+  `service.py`; this module is pure geometry/state.
+- `tasni/core/characterize.py` — pure-geometry (mm, no hardware) metrics for
+  picking the validated optimal standoff `d*` (spec §5, Phase 0):
+  `DistanceTrial`, `plane_metrics`, `choose_dstar` (closest distance that
+  passes every gate, not the best-scoring one). Defines `CHARACTERIZATION_DIR`
+  (`characterization/`, git-ignored) and `latest_characterization()` — the
+  dependency runs `tools/ -> tasni/core/`, never the reverse, because `tools/`
+  is excluded from packaging.
+
+New CLI tool: `tools/characterize_distance.py` — interactive, sweeps operator-
+jogged standoffs over the ChArUco board, writes a dated
+`characterization/characterization-YYYYMMDD.json`. Headless-importable (no
+camera/robot/RoboDK touched above `main()`) so `tests/test_characterize.py` runs
+without hardware. `lock_scan_surface` reads the latest file back and
+warns/refuses on missing or stale characterization via `ScanConfig`'s
+`calibration_max_age_days` / `calibration_expiry_hard_fail`.
+
+New routes under `/api/modules/scan` (`tasni/modules/scan/module.py`):
+
+- `POST /surface/region` — user-specified region fast path (§2, §4 above).
+- `POST /survey/begin` — start a five-position survey (clears any prior state).
+- `GET /survey/state` — current step, accepted captures, accumulating
+  `corners_base`, warnings (polled by `SurveyPanel.tsx` and pushed on the
+  `survey` websocket event).
+- `POST /survey/capture` — authoritative jog→stop→measure capture for the
+  current step; advances the step on acceptance.
+- `POST /survey/recapture` — redo a weak/rejected corner without restarting.
+- `POST /survey/finish` — fit the global plane + constrained rectangle, run the
+  coplanarity/discrepancy/corner-agreement gates, return the quality report and
+  (on pass) lock the `LockedWorkframeSurvey`.
+- `POST /survey/cancel` — abandon the in-progress survey.
+
+New frontend: `tasni/webui/src/pages/SurveyPanel.tsx` — offered by `Scan.tsx`
+whenever `gate.surface_mode === "crop"` (platform too large for one view): a
+"Begin guided survey" button starts it, mounting the panel in place of the
+normal lock controls (`Scan.tsx:845`, `surveyActive` state; also auto-resumes
+on page mount if a survey is already in progress server-side, so a refresh
+can't silently discard captured corners). Renders the CENTER→C1→C2→C3→C4→REVIEW
+step sequence, a top-down SVG polygon diagram (see the chirality caveat in the
+two-path plan's Hardware validation TODO), and the quality report gate before
+`Create targets`.
+
+New `ScanConfig` keys (`tasni/core/config.py`), grouped by the section comment
+that introduced them:
+
+- Compact-eligibility classifier (§6): `compact_guard_uv`,
+  `compact_center_tol_uv`, `compact_identity_frames`, `compact_identity_tol_uv`.
+- Five-position survey (§7): `survey_capture_max_age_s`,
+  `survey_coplanar_warn_mm`, `survey_coplanar_reject_mm`, `survey_edge_band_mm`,
+  `survey_rect_discrepancy_mm`, `survey_corner_agreement_mm`,
+  `survey_min_edge_points`, `survey_plane_inlier_band_mm`,
+  `survey_corner_min_plane_coverage_frac`.
+- Tiled close-range tour over a five-position-surveyed rectangle:
+  `survey_tour_overlap`, `survey_tour_views_per_tile`,
+  `survey_tour_max_contiguous_empty_tiles`.
+- Distance characterization / calibration-age gate (§5, §10, Phase 0):
+  `calibration_max_age_days`, `calibration_expiry_hard_fail`.
+
+Read `docs/scan-workframe-two-path-plan.md` for the design and its Hardware
+validation TODO (deferred, cell-only checks); `docs/scan-workframe-
+implementation-plan.md` for the 17-task build log (each task's brief/report
+pair is under `.superpowers/sdd/scan-workframe-implementation-plan/`, and
+`progress.md` there records every review finding, including the
+`discrepancy_mm` translational-blindness discovery and the corner-aiming /
+SVG-chirality items later moved into the two-path plan's TODO section).
 
 ## Recent scan fixes (2026-07-06)
 
@@ -75,6 +198,8 @@ Use this file before reading the long handoff docs.
 | Scan workflow backend | `tasni/modules/scan/module.py`, `tasni/modules/scan/service.py` |
 | Scan frontend | `tasni/webui/src/pages/Scan.tsx`, `tasni/webui/src/pages/AimHud.tsx` |
 | Scan planner / surface survey | `tasni/modules/scan/planner.py`, `tasni/modules/scan/survey.py` |
+| Two-path workframe survey (compact/five-position/user-specified) | `tasni/modules/scan/survey_contract.py`, `classifier.py`, `rect_fit.py`, `corner_evidence.py`, `five_position.py`; UI `tasni/webui/src/pages/SurveyPanel.tsx`; see the section above |
+| `d*` distance characterization (spec §5) | `tasni/core/characterize.py`, `tools/characterize_distance.py` |
 | Fusion / mesh / work plane | `tasni/modules/scan/reconstruct.py`, `tasni/modules/scan/plane.py` |
 | Calibration workflow | `tasni/modules/calibration/module.py`, `tasni/modules/calibration/service.py` |
 | Shared camera transport | `tasni/core/camera.py`, `tasni/core/livepreview.py` |
@@ -82,7 +207,7 @@ Use this file before reading the long handoff docs.
 | Config defaults and knobs | `tasni/core/config.py`, `tasni.config.json` |
 | Jetson camera server | `server/server_unicast_syncronous.py`, `server/scan_overlay.py` |
 | Jetson deploy / restart | `tools/jetson_deploy.py`, `server/jetson-autopull.sh` |
-| Tests | `tests/test_scan_job.py`, `tests/test_scan_planner.py`, `tests/test_calibration_job.py`, `tests/test_collision_guard.py` |
+| Tests | `tests/test_scan_job.py`, `tests/test_scan_planner.py`, `tests/test_calibration_job.py`, `tests/test_collision_guard.py`, `tests/test_survey_contract.py`, `tests/test_scan_classifier.py`, `tests/test_rect_fit.py`, `tests/test_corner_evidence.py`, `tests/test_five_position.py`, `tests/test_characterize.py` |
 
 ## Current Scan UX Contract
 

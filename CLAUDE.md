@@ -155,6 +155,16 @@ you drive the real cell, not an empty station). Run it on Windows with
 - Then integrate the rest into the same app: scan (with **TSDF fusion** — biggest quality
   win), ArUco-to-plane, target generation. RealSense High-Accuracy preset + filter order
   live in `server/server_unicast_syncronous.py`. Tailscale (off-LAN) deferred.
+- ✅ **Two-path workframe survey implemented** (17-task plan, all merged to
+  `calibration-improvements`, 393 tests green): compact single-view lock, a guided
+  five-position (center + four corners) survey for platforms too large for one camera
+  view, and a relabeled user-specified-region fast path, all producing one immutable
+  `LockedWorkframeSurvey` contract. Design in
+  [docs/scan-workframe-two-path-plan.md](docs/scan-workframe-two-path-plan.md); build log
+  in [docs/scan-workframe-implementation-plan.md](docs/scan-workframe-implementation-plan.md).
+  Hardware validation (corner-aiming plane selection, survey-diagram chirality, `d*`
+  measurement) is still pending on the real cell — see that doc's Hardware validation
+  TODO section.
 
 ## Notes
 - Requires the `robodk` package (installed under Python 3.10) and RoboDK at `C:\RoboDK`.
