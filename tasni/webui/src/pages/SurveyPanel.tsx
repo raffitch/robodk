@@ -23,7 +23,10 @@ export interface SurveyState {
   warnings: string[];
 }
 
-interface SurveyReport {
+// POST /survey/finish returns {status, workflow_goal, surface_scope,
+// can_prepare_frame, **record.quality} — i.e. the locked survey's quality dict
+// flattened alongside the lock's intent (plan Task 2/5).
+export interface SurveyReport {
   status: string;
   plane_rms_mm: number;
   plane_max_residual_mm: number;
@@ -36,6 +39,10 @@ interface SurveyReport {
   size_mm: [number, number];
   flags: string[];
   warnings: string[];
+  workflow_goal?: string;
+  surface_scope?: string;
+  can_prepare_frame?: boolean;
+  dstar_mm?: number;
 }
 
 const STEPS = ["center", "corner1", "corner2", "corner3", "corner4", "review"] as const;
@@ -55,18 +62,24 @@ interface Props {
   // Latest "survey" websocket payload Scan.tsx has forwarded (or null before the
   // first one arrives) — a fallback/resync channel, not the sole source of truth.
   event: SurveyState | null;
+  // The workflow goal currently selected in Scan.tsx (plan Task 2): the lock this
+  // survey mints server-side is bound to it, so it must be sent with /survey/finish
+  // rather than assumed. "frame_only" creates no motion targets at all.
+  goal: "frame_only" | "full_scan";
   // Called once after a successful POST /survey/finish AND the operator has
   // reviewed the quality report and chosen to continue — Scan.tsx re-uses its
-  // existing generateTargets() flow from here (the survey already locked the
-  // surface server-side; see lockAndCreateTargets's post-lock steps).
-  onFinished: () => void;
+  // existing generateTargets() flow from here for a full scan, or shows the
+  // frame-only preparation panel (the survey already locked the surface
+  // server-side; see lockSurface's post-lock steps). The report is handed over so
+  // the caller can display the locked survey's quality before preparing a frame.
+  onFinished: (report: SurveyReport) => void;
   // Called after Cancel succeeds, or if a state read/event ever reports no active
   // survey (server restart, a second tab cancelling it, etc.) — Scan.tsx unmounts
   // this panel and returns to the normal lock controls.
   onCancelled: () => void;
 }
 
-export default function SurveyPanel({ event, onFinished, onCancelled }: Props) {
+export default function SurveyPanel({ event, goal, onFinished, onCancelled }: Props) {
   const [state, setState] = useState<SurveyState | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [captureError, setCaptureError] = useState<string | null>(null);
@@ -158,7 +171,7 @@ export default function SurveyPanel({ event, onFinished, onCancelled }: Props) {
     finishingRef.current = true;
     setFinishing(true); setFinishError(null);
     try {
-      const r = await api.post<SurveyReport>("/survey/finish");
+      const r = await api.post<SurveyReport>("/survey/finish", { workflow_goal: goal });
       doneRef.current = true;
       setReport(r);
     } catch (e: any) {
@@ -271,7 +284,8 @@ export default function SurveyPanel({ event, onFinished, onCancelled }: Props) {
         </>
       )}
 
-      {report && <QualityReport report={report} onContinue={onFinished} />}
+      {report && <QualityReport report={report} goal={goal}
+                                onContinue={() => onFinished(report)} />}
     </div>
   );
 }
@@ -370,8 +384,8 @@ function SurveyDiagram({ state }: { state: SurveyState | null }) {
 
 function fmt(v: number, digits = 2) { return Number.isFinite(v) ? v.toFixed(digits) : "—"; }
 
-function QualityReport({ report, onContinue }:
-  { report: SurveyReport; onContinue: () => void }) {
+function QualityReport({ report, goal, onContinue }:
+  { report: SurveyReport; goal: "frame_only" | "full_scan"; onContinue: () => void }) {
   const hasFlags = report.flags.length > 0;
   const positionLabels = ["CENTER", "C1", "C2", "C3", "C4"];
   return (
@@ -431,10 +445,13 @@ function QualityReport({ report, onContinue }:
         </tbody>
       </table>
       <div className="ok-text" style={{ marginTop: 10, fontSize: 13 }}>
-        ✓ Surface locked from the five-position survey.
+        ✓ Surface locked from the five-position survey — boundary measured at five
+        positions (entire platform).
       </div>
       <div className="btn-row">
-        <button onClick={onContinue}>Create scan targets →</button>
+        <button onClick={onContinue}>
+          {goal === "frame_only" ? "Review & prepare working frame →" : "Create scan targets →"}
+        </button>
       </div>
     </div>
   );
