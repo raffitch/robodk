@@ -180,6 +180,9 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
     ``distance_mm`` is the operator's TARGET standoff and is used only for error
     messages: the returned trial carries the standoff actually MEASURED from the
     captured depth, so you do not have to hit the nominal value precisely.
+
+    Returns ``(trial, measured_tilt_deg)`` — the incidence angle is measured for the
+    same reason, and is ``None`` only if no capture yielded a fittable plane.
     """
     K, depth_scale = cfg.camera.K, cfg.scan.depth_scale
     id_a, id_b, true_mm = _reference_corner_pair(board)
@@ -224,7 +227,8 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
 
     coverage_frac = float(np.mean(coverage_samples)) if coverage_samples else 0.0
     measured_mm = float(np.median(standoff_samples)) if standoff_samples else float(distance_mm)
-    return summarize_distance_trial(measured_mm, plane_sets, length_samples, coverage_frac)
+    trial = summarize_distance_trial(measured_mm, plane_sets, length_samples, coverage_frac)
+    return trial, _measured_tilt_deg(plane_sets)
 
 
 def _prompt(message: str) -> None:
@@ -243,6 +247,31 @@ def _prompt(message: str) -> None:
               "Run it directly in a PowerShell/terminal window rather than through a "
               "wrapper that redirects stdin.")
         raise SystemExit(2)
+
+
+def _measured_tilt_deg(plane_sets) -> "float | None":
+    """Incidence angle actually achieved, from the captured depth (deg).
+
+    0 = fronto-parallel, 90 = edge-on: the angle between the camera's optical axis
+    (+Z in the camera frame these points are in) and the fitted plane normal — the
+    same definition depth_gate's HUD tilt lamp uses.
+
+    Exists for the same reason the standoff is measured rather than assumed: the
+    operator tilts a board by hand, so the ``--tilts`` value is a target. Recording
+    the target would report a permitted incidence band that was never tested.
+    Median over a few captures, so one bad fit cannot move it.
+    """
+    from tasni.modules.scan.plane import fit_plane
+
+    tilts = []
+    for pts in list(plane_sets)[:3]:
+        p = np.asarray(pts, dtype=float).reshape(-1, 3)
+        if len(p) < 3:
+            continue
+        n, _centroid, _mask = fit_plane(p, distance=6.0)
+        nz = float(n[2]) / max(float(np.linalg.norm(n)), 1e-9)
+        tilts.append(float(np.degrees(np.arccos(min(1.0, abs(nz))))))
+    return float(np.median(tilts)) if tilts else None
 
 
 def _format_trial(label: str, trial) -> str:
@@ -431,8 +460,8 @@ def main(argv=None) -> None:
         for d in distances:
             _prompt(f"\n>> Jog the camera to a {d:.0f} mm standoff, fronto-parallel over the "
                    f"ChArUco board. Press Enter when steady...")
-            trial = capture_distance_trial(camera, board, cfg, d, args.frames,
-                                           timeout=cfg.camera.timeout_s)
+            trial, tilt_now = capture_distance_trial(camera, board, cfg, d, args.frames,
+                                                     timeout=cfg.camera.timeout_s)
             trials.append(trial)
             pose = None
             if rdk_io is not None:
@@ -449,6 +478,12 @@ def main(argv=None) -> None:
                 print(f"   note: {abs(drift):.0f} mm off the target. That is fine — the "
                       "MEASURED value is what gets recorded — but keep the sweep spread "
                       "out so the distances don't bunch together.")
+            # These stops are supposed to be fronto-parallel; say so out loud, since a
+            # tilted "distance" capture silently confounds distance with incidence.
+            if tilt_now is not None:
+                print(f"   incidence here: {tilt_now:.1f} deg" + (
+                    "  <-- NOT fronto-parallel; re-level the board/camera and redo this "
+                    "distance, or it confounds the distance curve" if tilt_now > 8.0 else ""))
 
         best = choose_dstar(trials, **budget)
         print("\n=== verdict ===")
@@ -467,13 +502,22 @@ def main(argv=None) -> None:
             _prompt(f"\n>> Incidence check: tilt the board/camera to ~{tilt:.0f} deg at "
                    f"~{oblique_distance:.0f} mm standoff — tolerances must not be validated "
                    "only at normal incidence. Press Enter when steady...")
-            trial = capture_distance_trial(camera, board, cfg, oblique_distance, args.frames,
-                                           timeout=cfg.camera.timeout_s)
+            trial, measured_tilt = capture_distance_trial(
+                camera, board, cfg, oblique_distance, args.frames,
+                timeout=cfg.camera.timeout_s)
             passed = choose_dstar([trial], **budget) is not None
-            print("   " + _format_trial(f"tilt {tilt:.0f}deg", trial)
+            # The MEASURED angle is authoritative, for the same reason the standoff is:
+            # reporting a permitted band at angles that were never actually tested
+            # would be a fabricated envelope. Fall back to the target only if no plane
+            # could be fitted at all.
+            actual = measured_tilt if measured_tilt is not None else float(tilt)
+            print("   " + _format_trial(
+                f"target {tilt:.0f}deg -> MEASURED {actual:.1f}deg", trial)
                  + f" -> {'PASS' if passed else 'FAIL'} against the same budget")
-            incidence.append({"tilt_deg": float(tilt), "trial": trial.to_dict(),
-                              "passed": bool(passed)})
+            incidence.append({"tilt_deg": float(actual),
+                              "target_tilt_deg": float(tilt),
+                              "measured_tilt_deg": measured_tilt,
+                              "trial": trial.to_dict(), "passed": bool(passed)})
 
         band = passing_incidence_range_deg([(e["tilt_deg"], e["passed"]) for e in incidence])
         if band is None:
