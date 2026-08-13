@@ -8,10 +8,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tasni.core.characterize import (
-    choose_dstar, known_length_error_mm, plane_metrics, summarize_distance_trial,
+    choose_dstar, known_length_error_mm, latest_characterization, plane_metrics,
+    summarize_distance_trial,
 )
 from tasni.modules.scan.plane import fit_plane
-from tools.characterize_distance import latest_characterization
 
 
 def _plane_set(z=400.0, sigma=0.3, n=500, seed=0):
@@ -329,9 +329,11 @@ def test_plane_metrics_all_nan_capture_raises():
         plane_metrics([all_nan])
 
 
-# --- Task 16: latest_characterization (the pure, headlessly-importable half of
-# tools/characterize_distance.py -- everything touching the camera/robot lives
-# behind main(), so this is testable with no hardware at all).
+# --- Task 16: latest_characterization. Lives in tasni.core.characterize (moved
+# here from tools/characterize_distance.py in the Task 16 review, Finding 2 --
+# so tasni/ never imports from the tools/ scripts directory); pure, so this is
+# testable with no hardware at all. tools/characterize_distance.py re-exports
+# the same name for backward compatibility (its own main() still calls it).
 
 def test_latest_characterization_reads_newest(tmp_path):
     """The exact contract Task 16 is built to (spec §5/§10): given the
@@ -361,3 +363,108 @@ def test_latest_characterization_skips_malformed_file(tmp_path):
     (tmp_path / "characterization-20260810.json").write_text("{not valid json")
     result = latest_characterization(tmp_path)
     assert result is not None and result["dstar_mm"] == 111
+
+
+# --- Task 16 review, Finding 3: pure geometry helpers in
+# tools/characterize_distance.py had zero coverage. Imported here (not moved to
+# core -- these are CLI-specific capture-folding helpers, not part of the
+# tasni/ dependency-direction fix in Finding 2) and exercised with synthetic
+# depth/K fixtures, the same style test_scan_job.py already uses.
+
+from tools.characterize_distance import (  # noqa: E402
+    _backproject_valid_mm, _corner_point_mm, _parse_distances, _reference_corner_pair,
+)
+
+
+def test_backproject_valid_mm_keeps_only_positive_depth_and_projects_correctly():
+    depth = np.zeros((4, 4), dtype=np.uint16)
+    depth[1, 1] = 500      # one valid pixel
+    depth[2, 2] = 600      # a second, distinct valid pixel
+    K = np.array([[100.0, 0, 2.0], [0, 100.0, 2.0], [0, 0, 1.0]])
+
+    pts = _backproject_valid_mm(depth, K, depth_scale=1000.0)
+
+    assert pts.shape == (2, 3)
+    assert sorted(pts[:, 2].tolist()) == [500.0, 600.0]
+    row_500 = pts[np.isclose(pts[:, 2], 500.0)][0]
+    # pixel (u=1, v=1), K principal point (2, 2), fx=fy=100, z=500:
+    # x = (u - cx) / fx * z = (1 - 2) / 100 * 500 = -5.0 (same for y).
+    assert row_500[0] == pytest.approx(-5.0)
+    assert row_500[1] == pytest.approx(-5.0)
+
+
+def test_backproject_valid_mm_empty_when_no_valid_depth():
+    depth = np.zeros((4, 4), dtype=np.uint16)
+    pts = _backproject_valid_mm(depth, np.eye(3), depth_scale=1000.0)
+    assert pts.shape == (0, 3)
+
+
+def test_corner_point_mm_uses_window_median_and_resists_a_single_outlier():
+    """The median window must both (a) recover from the corner pixel itself
+    having no depth (a common ChArUco-corner artefact -- correlation dips
+    right at a checkerboard edge) and (b) not be dragged toward a single wild
+    outlier elsewhere in the window -- proving it is really a median, not a
+    mean, over the window."""
+    depth = np.full((10, 10), 500, dtype=np.uint16)
+    depth[5, 5] = 0          # the corner pixel itself: no depth
+    depth[4, 4] = 9000       # one wild outlier inside the 5x5 window
+    K = np.array([[200.0, 0, 5.0], [0, 200.0, 5.0], [0, 0, 1.0]])
+
+    pt = _corner_point_mm(depth, K, u=5.0, v=5.0, depth_scale=1000.0, window=2)
+
+    assert pt is not None
+    assert pt[2] == pytest.approx(500.0)   # median resists the 9000 outlier
+    assert pt[0] == pytest.approx(0.0)     # (u,v) == principal point -> x=y=0
+    assert pt[1] == pytest.approx(0.0)
+
+
+def test_corner_point_mm_returns_none_when_window_has_no_valid_depth():
+    depth = np.zeros((10, 10), dtype=np.uint16)
+    assert _corner_point_mm(depth, np.eye(3), u=5.0, v=5.0) is None
+
+
+def test_reference_corner_pair_is_genuinely_diagonally_opposite_on_a_real_board():
+    """The reviewer independently checked that id 0 / id N-1 are diagonally
+    opposite for CharucoTarget.all_obj_points's row-major ordering, but that
+    assumption had no test. Pinned here WITHOUT assuming any particular
+    ordering convention: brute-force every pairwise distance across the
+    board's real inner-corner grid and assert the chosen pair achieves the
+    board's actual maximum separation -- so this test would fail if a future
+    OpenCV version changed the corner ordering, instead of silently trusting
+    "first and last are far apart."""
+    from tasni.core.config import BoardConfig
+    from tasni.modules.calibration.charuco import CharucoTarget
+
+    board = CharucoTarget(BoardConfig())
+    id_a, id_b, true_mm = _reference_corner_pair(board)
+    obj = board.all_obj_points
+
+    assert id_a == 0 and id_b == len(obj) - 1
+    assert true_mm == pytest.approx(float(np.linalg.norm(obj[id_b] - obj[id_a])))
+
+    dists = np.linalg.norm(obj[:, None, :] - obj[None, :, :], axis=-1)
+    assert true_mm == pytest.approx(float(dists.max()), rel=1e-6)
+
+
+# --- Task 16 review, Finding 4: an empty/degenerate --distances crashed with
+# an unhandled IndexError deep in main() (distances[-1] for the oblique-check
+# fallback) instead of an operator-facing message. _parse_distances is the
+# pure validation extracted so this is testable without invoking main() (which
+# needs live hardware imports) at all.
+
+def test_parse_distances_rejects_empty_input():
+    with pytest.raises(ValueError, match="no usable values"):
+        _parse_distances("")
+
+
+def test_parse_distances_rejects_degenerate_comma_only_input():
+    with pytest.raises(ValueError, match="no usable values"):
+        _parse_distances(",,,")
+
+
+def test_parse_distances_parses_normal_input():
+    assert _parse_distances("300,400,500") == [300.0, 400.0, 500.0]
+
+
+def test_parse_distances_tolerates_stray_whitespace_and_trailing_comma():
+    assert _parse_distances(" 300, 400,500, ") == [300.0, 400.0, 500.0]

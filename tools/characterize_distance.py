@@ -52,13 +52,18 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from tasni.core.characterize import choose_dstar, summarize_distance_trial  # noqa: E402
+from tasni.core.characterize import (  # noqa: E402
+    CHARACTERIZATION_DIR, choose_dstar, latest_characterization, summarize_distance_trial)
 from tasni.core.config import load_config  # noqa: E402
 from tasni.modules.calibration.charuco import CharucoTarget  # noqa: E402
 from tasni.modules.scan.survey_contract import camera_calibration_id  # noqa: E402
 
-OUTPUT_DIR = _REPO / "characterization"
-FILENAME_GLOB = "characterization-*.json"
+# `latest_characterization` now lives in tasni.core.characterize (Task 16
+# review, Finding 2 — see that module's docstring for why), re-exported here
+# for backward compatibility: existing callers (and tests) that do
+# `from tools.characterize_distance import latest_characterization` keep
+# working unchanged. OUTPUT_DIR is likewise an alias for the same reason.
+OUTPUT_DIR = CHARACTERIZATION_DIR
 
 # Default error budget for choose_dstar (spec §5). These are conservative
 # placeholders for a D435i eye-in-hand rig at a sub-metre working distance;
@@ -77,39 +82,10 @@ DEFAULT_BUDGET = dict(
 )
 
 
-def latest_characterization(root) -> "dict | None":
-    """The most recently DATED characterization JSON under ``root``, or
-    ``None`` if ``root`` doesn't exist or holds no characterization files.
-
-    "Most recent" is by FILENAME (``characterization-YYYYMMDD.json`` sorts
-    lexicographically by date), not filesystem mtime — the date that matters
-    is the one the operator measured on, which is encoded in the name, not
-    whatever the OS happened to touch the file at (a copy/restore would lie).
-
-    A malformed or unreadable JSON file is SKIPPED, never raised: this is
-    called from modules/scan/service.py's lock_scan_surface on every surface
-    lock (real hardware, mid-operation), so one corrupted file on disk must
-    never turn a routine lock into a crash. It is treated exactly as if that
-    dated measurement doesn't exist — the search falls through to the
-    next-newest file, and returns None if none remain.
-    """
-    root = Path(root)
-    if not root.is_dir():
-        return None
-    for path in sorted(root.glob(FILENAME_GLOB), reverse=True):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if isinstance(data, dict):
-            return data
-    return None
-
-
 # --------------------------------------------------------------------------
 # Capture helpers. Pure numpy/cv2 (no hardware access themselves) — they take
-# already-grabbed Frame objects, so they stay unit-testable in principle even
-# though nothing in this module currently exercises them without hardware.
+# already-grabbed Frame objects, so they are unit-tested directly in
+# tests/test_characterize.py (Task 16 review, Finding 3).
 # --------------------------------------------------------------------------
 
 def _backproject_valid_mm(depth, K, depth_scale: float = 1000.0) -> np.ndarray:
@@ -233,6 +209,24 @@ def _format_trial(label: str, trial) -> str:
            f"coverage={trial.coverage_frac:.0%}")
 
 
+def _parse_distances(raw: str) -> "list[float]":
+    """Parse ``--distances`` into a list of mm floats.
+
+    Pure (no hardware) so this validation is directly unit-testable on its
+    own, independent of main()'s hardware imports. Raises ``ValueError`` with
+    an operator-facing message for an empty/degenerate list (``""``, ``","``,
+    ``",,,"``) instead of letting the caller silently sweep zero distances and
+    crash later with an unhandled ``IndexError`` when the oblique-check
+    fallback indexes ``distances[-1]`` (Task 16 review, Finding 4).
+    """
+    values = [float(x) for x in raw.split(",") if x.strip()]
+    if not values:
+        raise ValueError(
+            f"--distances {raw!r} contains no usable values — pass a "
+            "comma-separated list of standoffs in mm, e.g. --distances 300,400,500")
+    return values
+
+
 def _parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Sweep candidate camera distances over the ChArUco board "
@@ -267,10 +261,14 @@ def main(argv=None) -> None:
     from tasni.core.session import RdkSession
 
     args = _parse_args(argv)
+    try:
+        distances = _parse_distances(args.distances)
+    except ValueError as e:
+        print(f"error: {e}")
+        raise SystemExit(2)
     cfg = load_config(args.config)
     board = CharucoTarget(cfg.board)
     camera = CameraClient(cfg.camera)
-    distances = [float(x) for x in args.distances.split(",") if x.strip()]
     budget = dict(
         max_rms_mm=args.max_rms, max_plane_max_mm=args.max_plane_max,
         max_height_repeat_mm=args.max_height_repeat,
@@ -293,66 +291,74 @@ def main(argv=None) -> None:
         print(f"(no RoboDK connection — continuing without pose logging: {e})")
         session, rdk_io = None, None
 
-    trials = []
-    camera_T_per_distance: list = []
-    for d in distances:
-        input(f"\n>> Jog the camera to a {d:.0f} mm standoff, fronto-parallel over the "
-             f"ChArUco board. Press Enter when steady...")
-        trial = capture_distance_trial(camera, board, cfg, d, args.frames,
-                                       timeout=cfg.camera.timeout_s)
-        trials.append(trial)
-        pose = None
-        if rdk_io is not None:
-            try:
-                pose = rdk_io.camera_pose_T().tolist()
-            except Exception:
-                pose = None
-        camera_T_per_distance.append(pose)
-        print("   " + _format_trial(f"d={d:.0f}mm", trial))
-
-    best = choose_dstar(trials, **budget)
-    print("\n=== verdict ===")
-    if best is None:
-        print("NO distance in the sweep passed every budget criterion — widen the "
-             "sweep or loosen the budget flags and re-run.")
-    else:
-        print("d* = " + _format_trial(f"{best.distance_mm:.0f} mm", best))
-
-    oblique_distance = best.distance_mm if best is not None else distances[-1]
-    input(f"\n>> Oblique-incidence check: tilt the board/camera to ~{args.tilt:.0f} deg "
-         f"(the worst planned tilt) at ~{oblique_distance:.0f} mm standoff — the spec "
-         "requires tolerances not be validated only at normal incidence. "
-         "Press Enter when steady...")
-    oblique_trial = capture_distance_trial(camera, board, cfg, oblique_distance, args.frames,
+    # "Also consider" (Task 16 review): everything from here on can raise
+    # mid-sweep (a bad capture, Ctrl-C between prompts, a camera timeout) — a
+    # try/finally ensures the RoboDK session is always released rather than
+    # only on the happy path. Low-impact (it attaches to an operator-
+    # controlled RoboDK instance, so nothing else is blocked by an open
+    # handle), but cheap and clearly correct, so fixed rather than left.
+    try:
+        trials = []
+        camera_T_per_distance: list = []
+        for d in distances:
+            input(f"\n>> Jog the camera to a {d:.0f} mm standoff, fronto-parallel over the "
+                 f"ChArUco board. Press Enter when steady...")
+            trial = capture_distance_trial(camera, board, cfg, d, args.frames,
                                            timeout=cfg.camera.timeout_s)
-    oblique_passed = choose_dstar([oblique_trial], **budget) is not None
-    print("   " + _format_trial(f"oblique @ {args.tilt:.0f}deg", oblique_trial)
-         + f" -> {'PASS' if oblique_passed else 'FAIL'} against the same budget")
+            trials.append(trial)
+            pose = None
+            if rdk_io is not None:
+                try:
+                    pose = rdk_io.camera_pose_T().tolist()
+                except Exception:
+                    pose = None
+            camera_T_per_distance.append(pose)
+            print("   " + _format_trial(f"d={d:.0f}mm", trial))
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d")
-    out_path = OUTPUT_DIR / f"characterization-{stamp}.json"
-    payload = {
-        "calibration_id": camera_calibration_id(cfg.camera),
-        "date": datetime.now().isoformat(timespec="seconds"),
-        "trials": [t.to_dict() for t in trials],
-        "dstar_mm": best.distance_mm if best is not None else None,
-        "budget": budget,
-        "oblique_check": {
-            "tilt_deg": args.tilt, "distance_mm": oblique_distance,
-            "trial": oblique_trial.to_dict(), "passed": oblique_passed,
-        },
-        "robot_camera_T_mm": camera_T_per_distance,
-        "board": {
-            "dictionary": cfg.board.dictionary, "squares_x": cfg.board.squares_x,
-            "squares_y": cfg.board.squares_y, "square_size_mm": cfg.board.square_size_mm,
-            "marker_size_mm": cfg.board.marker_size_mm,
-        },
-    }
-    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    print(f"\nWrote {out_path}")
-    if session is not None:
-        session.close()
+        best = choose_dstar(trials, **budget)
+        print("\n=== verdict ===")
+        if best is None:
+            print("NO distance in the sweep passed every budget criterion — widen the "
+                 "sweep or loosen the budget flags and re-run.")
+        else:
+            print("d* = " + _format_trial(f"{best.distance_mm:.0f} mm", best))
+
+        oblique_distance = best.distance_mm if best is not None else distances[-1]
+        input(f"\n>> Oblique-incidence check: tilt the board/camera to ~{args.tilt:.0f} deg "
+             f"(the worst planned tilt) at ~{oblique_distance:.0f} mm standoff — the spec "
+             "requires tolerances not be validated only at normal incidence. "
+             "Press Enter when steady...")
+        oblique_trial = capture_distance_trial(camera, board, cfg, oblique_distance, args.frames,
+                                               timeout=cfg.camera.timeout_s)
+        oblique_passed = choose_dstar([oblique_trial], **budget) is not None
+        print("   " + _format_trial(f"oblique @ {args.tilt:.0f}deg", oblique_trial)
+             + f" -> {'PASS' if oblique_passed else 'FAIL'} against the same budget")
+
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d")
+        out_path = OUTPUT_DIR / f"characterization-{stamp}.json"
+        payload = {
+            "calibration_id": camera_calibration_id(cfg.camera),
+            "date": datetime.now().isoformat(timespec="seconds"),
+            "trials": [t.to_dict() for t in trials],
+            "dstar_mm": best.distance_mm if best is not None else None,
+            "budget": budget,
+            "oblique_check": {
+                "tilt_deg": args.tilt, "distance_mm": oblique_distance,
+                "trial": oblique_trial.to_dict(), "passed": oblique_passed,
+            },
+            "robot_camera_T_mm": camera_T_per_distance,
+            "board": {
+                "dictionary": cfg.board.dictionary, "squares_x": cfg.board.squares_x,
+                "squares_y": cfg.board.squares_y, "square_size_mm": cfg.board.square_size_mm,
+                "marker_size_mm": cfg.board.marker_size_mm,
+            },
+        }
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"\nWrote {out_path}")
+    finally:
+        if session is not None:
+            session.close()
 
 
 if __name__ == "__main__":

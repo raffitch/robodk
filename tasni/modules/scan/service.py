@@ -32,20 +32,15 @@ import numpy as np
 
 from ...core import runs
 from ...core.camera import CameraError
+# latest_characterization/CHARACTERIZATION_DIR live in tasni.core.characterize
+# (Task 16 review, Finding 2 — moved OUT of tools/characterize_distance.py,
+# which is excluded from packaging, so a tasni/ module never depends on the
+# tools/ scripts directory; see that module's docstring for the full reasoning).
+from ...core.characterize import CHARACTERIZATION_DIR, latest_characterization
 from ...core.events import JobEvent
 from ...core.jobrunner import JobContext
 from ...core.logging import get_logger, new_run_dir
 from ...core.rdk_io import RdkIO
-# tools/ is a scripts dir, not part of the installed `tasni*` package (see
-# pyproject.toml), but Task 16's characterization store + reader legitimately
-# live there (CLI conventions, not a library). Both this app (run via `py -3.10
-# -m tasni` from the repo root, see start.ps1) and the test suite (`py -3.10 -m
-# pytest` from the repo root) run with the repo root on sys.path, so this
-# import resolves in both; it would need `tools` packaged/installed to survive
-# a real distribution of `tasni` — acceptable for this dev-only cell app today,
-# flagged here for anyone hardening the layering later.
-from tools.characterize_distance import OUTPUT_DIR as CHARACTERIZATION_DIR
-from tools.characterize_distance import latest_characterization
 # Reuse calibration's shared orchestration helpers (one implementation).
 from ..calibration.poses import (frame_aim_offsets, generate_calibration_poses,
                                   projected_corner_coverage, select_diverse,
@@ -449,9 +444,6 @@ def lock_scan_surface(services, *, force_crop: bool = False,
             survey, seed_T, snapshot, services.config.camera,
             mode=mode, n_frames=n_frames, measurement_ts=frame.timestamp,
             valid_frac=gate_payload.get("valid_frac", 0.0), plane_rms_mm=plane_rms)
-        if record is not None:
-            gate_payload["survey"] = record.to_dict()
-            gate_payload["boundary_provenance"] = record.boundary_provenance
     else:
         gate_payload.setdefault("warnings", []).append(
             "the surface overruns the camera view, so its boundary is unverified — "
@@ -465,11 +457,18 @@ def lock_scan_surface(services, *, force_crop: bool = False,
     # it. Checked here regardless of which branch above ran: staleness is a
     # camera/measurement-chain concern, orthogonal to the boundary-provenance
     # warning (a surface can be perfectly framed with a stale characterization, or
-    # vice versa). Same "append to warnings, unless hard-fail" convention as the
-    # boundary-overrun warning above; the actual raise (when hard-fail is on) is
-    # deferred past the telemetry publish below, mirroring the "gate not ok" raise
-    # at the end of this function -- so the operator's HUD still sees the gate/
-    # frame events before the lock is refused, instead of failing silently.
+    # vice versa).
+    #
+    # Task 16 review Finding 1: the warning text is appended to gate_payload
+    # UNCONDITIONALLY when stale -- including the hard-fail branch -- and
+    # hard-fail additionally forces gate_payload["ok"] = False. Without this,
+    # the gate/frame telemetry published just below would be byte-for-byte
+    # identical to a fully healthy lock right up until the RuntimeError below
+    # fires, so a client driven by the event stream could show "surface ready"
+    # for a moment before the call errors. The raise itself is still deferred
+    # past the telemetry publish (mirroring the "gate not ok" raise at the end
+    # of this function) so the operator's HUD sees the now-correctly-flagged
+    # gate event before the lock is refused, rather than failing silently.
     characterization = latest_characterization(CHARACTERIZATION_DIR)
     stale = characterization is None
     if not stale:
@@ -481,13 +480,22 @@ def lock_scan_surface(services, *, force_crop: bool = False,
             stale = True    # an unparsable date is untrustworthy -- treat as stale
     calibration_hard_fail = False
     if stale:
+        gate_payload.setdefault("warnings", []).append(
+            "calibration verification missing or expired")
         if scfg.calibration_expiry_hard_fail:
             calibration_hard_fail = True
-        else:
-            gate_payload.setdefault("warnings", []).append(
-                "calibration verification missing or expired")
+            gate_payload["ok"] = False
     elif record is not None and characterization.get("dstar_mm") is not None:
         record.quality["dstar_mm"] = float(characterization["dstar_mm"])
+
+    # Snapshot the survey record into gate_payload LAST (bundled minor, Task 16
+    # review): record.quality may just have gained "dstar_mm" above, and
+    # to_dict() is a deep copy -- taking this snapshot any earlier would
+    # publish a survey block that never carries dstar_mm even on a healthy,
+    # freshly-characterized lock.
+    if record is not None:
+        gate_payload["survey"] = record.to_dict()
+        gate_payload["boundary_provenance"] = record.boundary_provenance
 
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:

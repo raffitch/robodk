@@ -484,7 +484,7 @@ def test_lock_gate_event_carries_survey_and_provenance():
 
 # --- Task 16: calibration-age gate ---------------------------------------------
 #
-# lock_scan_surface reads tools.characterize_distance.latest_characterization
+# lock_scan_surface reads tasni.core.characterize.latest_characterization
 # (imported into scan_service's own namespace) after building the survey record,
 # and warns (or hard-fails) when the on-file characterization is missing/stale.
 # Patched the same way this file already patches survey_surface/color_work_
@@ -551,6 +551,37 @@ def test_lock_hard_fails_when_characterization_missing_and_hard_fail_enabled():
     finally:
         scan_service.latest_characterization = orig
     print("[characterization gate] calibration_expiry_hard_fail=True -> RuntimeError, lock refused")
+
+
+def test_lock_hard_fail_gate_event_carries_the_warning_before_raising():
+    """Task 16 review, Finding 1: the hard-fail RuntimeError must not be the
+    only signal. Before that fix, the published gate JobEvent in the
+    hard-fail branch was byte-for-byte identical to a healthy lock (no
+    warning text, ok computed earlier and never touched), so a client driven
+    by the event stream could show "surface ready" a moment before the call
+    errors -- directly contradicting the stated rationale for deferring the
+    raise past the publish in the first place. Now the published event must
+    itself show the lock as refused (ok=False) and carry the same warning
+    text a soft (non-hard-fail) stale characterization would."""
+    services, _state = _build_fakes()
+    services.config.scan.calibration_expiry_hard_fail = True
+    events = []
+    services.bus = SimpleNamespace(publish=lambda e: events.append(e))
+    orig = _patch_latest_characterization(lambda root: None)
+    try:
+        try:
+            scan_service.lock_scan_surface(services)
+            raise AssertionError("expected the hard-fail path to raise")
+        except RuntimeError:
+            pass
+    finally:
+        scan_service.latest_characterization = orig
+    gate_events = [e for e in events if e.type == "gate"]
+    assert gate_events, "expected the gate event to still be published before the raise"
+    payload = gate_events[-1].payload
+    assert payload["ok"] is False, payload
+    assert "calibration verification missing or expired" in payload.get("warnings", []), payload
+    print("[characterization gate] hard-fail gate event carries ok=False + warning before raising")
 
 
 def test_surface_region_route_updates_lock_dimensions():
@@ -2210,6 +2241,7 @@ if __name__ == "__main__":
     test_lock_warns_when_characterization_stale()
     test_lock_records_dstar_into_survey_quality_when_fresh()
     test_lock_hard_fails_when_characterization_missing_and_hard_fail_enabled()
+    test_lock_hard_fail_gate_event_carries_the_warning_before_raising()
     test_surface_region_route_updates_lock_dimensions()
     test_targets_report_surface_coverage_from_footprint()
     test_save_views_persists_per_pose_frames()

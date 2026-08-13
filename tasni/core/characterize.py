@@ -21,12 +21,27 @@ for finiteness explicitly before being allowed to pass a gate.
 """
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import numpy as np
 
 from tasni.modules.scan.plane import fit_plane
+
+from .logging import REPO_ROOT
+
+# Where tools/characterize_distance.py writes dated sweep results, and where
+# modules/scan/service.py's lock-side gate reads them back from. Defined here
+# (not in tools/) so tasni/ never has to import from the tools/ scripts
+# directory — tools/ is excluded from packaging ([tool.setuptools.packages.
+# find] include = ["tasni*"]), so the dependency must run tools/ -> tasni/,
+# never the reverse (Task 16 review, Finding 2). tools/characterize_distance.py
+# imports this constant + latest_characterization from here instead of
+# defining its own copies.
+CHARACTERIZATION_DIR = REPO_ROOT / "characterization"
+_CHARACTERIZATION_GLOB = "characterization-*.json"
 
 
 @dataclass(frozen=True)
@@ -209,3 +224,41 @@ def choose_dstar(trials, *, max_rms_mm, max_plane_max_mm, max_height_repeat_mm,
 
     passing = [t for t in trials if _passes(t)]
     return min(passing, key=lambda t: t.distance_mm) if passing else None
+
+
+def latest_characterization(root) -> "dict | None":
+    """The most recently DATED characterization JSON under ``root``, or
+    ``None`` if ``root`` doesn't exist or holds no characterization files.
+
+    "Most recent" is by FILENAME (``characterization-YYYYMMDD.json`` sorts
+    lexicographically by date), not filesystem mtime — the date that matters
+    is the one the operator measured on, which is encoded in the name, not
+    whatever the OS happened to touch the file at (a copy/restore would lie).
+
+    A malformed or unreadable JSON file is SKIPPED, never raised: this is
+    called from modules/scan/service.py's lock_scan_surface on every surface
+    lock (real hardware, mid-operation), so one corrupted file on disk must
+    never turn a routine lock into a crash. It is treated exactly as if that
+    dated measurement doesn't exist — the search falls through to the
+    next-newest file, and returns None if none remain.
+
+    Lives here (not in tools/characterize_distance.py, where Task 16
+    originally put it) so modules/scan/service.py can import it without
+    reaching into the tools/ scripts directory (Task 16 review, Finding 2) —
+    tools/ is excluded from packaging, so a tasni/ module importing from it
+    would work only by the accident of both the app and the test suite
+    always running with the repo root on sys.path, and would crash the whole
+    platform (module.py imports service.py at startup) under a packaged
+    install run from elsewhere.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return None
+    for path in sorted(root.glob(_CHARACTERIZATION_GLOB), reverse=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
