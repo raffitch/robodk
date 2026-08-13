@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from ...core.config import save_overrides
 from ...core.events import JobEvent
+from ...core.logging import get_logger
 from ...core.rdk_io import link_real_robot
 from ..base import ServiceContainer, WorkflowModule
 from ..calibration.service import SimTourJob
@@ -30,6 +31,11 @@ from .survey_contract import camera_calibration_id, refresh_robot_state
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
+
+# Task 19 (Defect 1b): shared with service.py's "tasni.scan" logger so an
+# unexpected /survey/* exception's full traceback lands in the same log stream
+# as the rest of the scan module's diagnostics, not silently swallowed.
+log = get_logger("tasni.scan")
 
 
 class InsertBody(BaseModel):
@@ -299,7 +305,15 @@ class ScanModule(WorkflowModule):
         except (RuntimeError, ValueError, KeyError) as e:
             raise HTTPException(400, str(e))
         except Exception as e:
-            raise HTTPException(503, f"RoboDK/camera unavailable: {e}")
+            # Task 19 (Defect 1b): a genuinely unexpected exception (e.g. a bug
+            # like the numpy/robomath.Mat TypeError this task fixed) must never
+            # be reported as "RoboDK/camera unavailable" -- that actively misled
+            # the operator into thinking hardware was at fault when nothing was.
+            # Log the full traceback server-side (swallowed before, costing real
+            # diagnosis time at the cell) and surface the real exception type.
+            log.exception("unexpected error in /survey/capture")
+            raise HTTPException(
+                500, f"unexpected error ({type(e).__name__}): {e}")
         finally:
             live_start = getattr(self, "_live_start", None)
             if was_running and live_start is not None and not services.live.running:
@@ -327,6 +341,14 @@ class ScanModule(WorkflowModule):
             return self._five_survey.recapture(body.kind)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        except Exception as e:
+            # Task 19 (Defect 1b): same treatment as survey_capture/survey_finish
+            # -- an unexpected exception here has nothing to do with hardware, so
+            # it must not be reported as such (and the traceback must not be
+            # swallowed).
+            log.exception("unexpected error in /survey/recapture")
+            raise HTTPException(
+                500, f"unexpected error ({type(e).__name__}): {e}")
 
     def survey_finish(self) -> dict:
         """Finish the five-position survey (all five captures accepted, every
@@ -353,7 +375,12 @@ class ScanModule(WorkflowModule):
         except (RuntimeError, ValueError, KeyError) as e:
             raise HTTPException(400, str(e))
         except Exception as e:
-            raise HTTPException(503, f"RoboDK unavailable: {e}")
+            # Task 19 (Defect 1b): see survey_capture's identical fix -- an
+            # unexpected exception here is not a hardware problem, so it must not
+            # be reported as one, and the traceback must not be swallowed.
+            log.exception("unexpected error in /survey/finish")
+            raise HTTPException(
+                500, f"unexpected error ({type(e).__name__}): {e}")
         self._locked_surface = LockedScanSurface(
             frame=None, reading=None, survey=None,
             gate_payload={"ok": True, "live": False, "surface_mode": "five_position",

@@ -52,6 +52,46 @@ def test_refresh_robot_state_requires_pose():
         refresh_robot_state(_FakeRdk([[0] * 6] * 2, None), sleep=lambda s: None)
 
 
+class _MatJointsRdk:
+    """Mimics the REAL RdkIO.current_joints() return shape (Defect 1a, Task 19):
+    ``robodk.Item.Joints()`` returns ``robomath.Mat(values)`` built from a flat
+    Python list. ``Mat.__init__`` treats a flat list as a single ROW and
+    transposes it into a COLUMN vector (N rows x 1 col) -- so ``Mat.__len__``
+    (which reports COLUMN count) reads 1, and ``np.asarray(mat, dtype=float)``
+    ends up building a ``(1, N)`` array (one row holding all N joints) instead
+    of the flat ``(N,)`` array every fake/test in this file used before. This
+    class is the minimal real-shape stand-in: every other test here uses a
+    plain Python list, which never triggers the bug because a flat list
+    converts to ``(N,)`` directly.
+    """
+    def __init__(self, T):
+        import robodk.robomath as robomath
+        self._mat = robomath.Mat([0.0, 10.0, 20.0, 0.0, 30.0, 0.0])
+        self._T = T
+
+    def current_joints(self):
+        return self._mat
+
+    def camera_pose_T(self):
+        return self._T
+
+
+def test_refresh_robot_state_handles_robodk_mat_shaped_joints():
+    """Defect 1a (Task 19): on real hardware, ``rdk.current_joints()`` returns a
+    ``robomath.Mat`` column vector, not a flat list/array. Before the fix,
+    ``np.asarray(mat, dtype=float)`` produced a ``(1, N)`` array; iterating it
+    in ``tuple(float(v) for v in j1)`` handed ``float()`` the WHOLE N-element
+    row in one call, raising exactly the operator's reported error: "only
+    size-1 arrays can be converted to Python scalars". This is a hardware-free
+    reproduction -- ``robomath.Mat`` is pure Python/pure math, no RoboDK
+    connection required.
+    """
+    snap = refresh_robot_state(_MatJointsRdk(_T()), sleep=lambda s: None)
+    assert snap.joints == pytest.approx((0.0, 10.0, 20.0, 0.0, 30.0, 0.0))
+    assert snap.stationary is True
+    assert snap.camera_T_np().shape == (4, 4)
+
+
 def _snapshot(T=None):
     return RobotStateSnapshot(joints=(0.0,) * 6,
                               camera_T=tuple(map(tuple, (T if T is not None else _T()))),

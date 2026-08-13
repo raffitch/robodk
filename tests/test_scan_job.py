@@ -2708,6 +2708,122 @@ def test_survey_finish_route_rejects_incomplete_survey():
     print("[survey finish] incomplete survey -> 400, survey left intact for the operator")
 
 
+def test_survey_capture_unexpected_exception_surfaces_as_500_not_hardware_claim():
+    """Task 19 (Defect 1b): survey_capture()'s except-chain used to map EVERY
+    non-(RuntimeError|ValueError|KeyError) exception to a 503 "RoboDK/camera
+    unavailable" -- exactly what happened for the real numpy/robomath.Mat
+    TypeError (Defect 1a, see test_survey_contract.py): the operator saw a
+    false hardware claim instead of the real bug, and the traceback was never
+    logged, costing real diagnosis time at the cell. A genuinely unexpected
+    exception must now surface as a 500 naming its real type, with the full
+    traceback logged server-side (not swallowed)."""
+    import logging as _logging
+    import tasni.modules.scan.module as scan_module
+    from fastapi import HTTPException
+
+    services, _state, _started = _build_fakes_with_jobs()
+    mod = scan_module.ScanModule(services)
+    mod.survey_begin()
+
+    def boom(*a, **k):
+        raise TypeError("only size-1 arrays can be converted to Python scalars")
+    orig = scan_module.five_position_capture
+    scan_module.five_position_capture = boom
+
+    records = []
+    handler = _logging.Handler()
+    handler.emit = lambda record: records.append(record)
+    scan_module.log.addHandler(handler)
+    try:
+        try:
+            mod.survey_capture()
+            raise AssertionError("expected the unexpected exception to propagate")
+        except HTTPException as e:
+            assert e.status_code == 500, e.status_code
+            assert "TypeError" in str(e.detail), e.detail
+            assert "size-1 arrays" in str(e.detail), e.detail
+            assert "unavailable" not in str(e.detail).lower(), e.detail
+    finally:
+        scan_module.five_position_capture = orig
+        scan_module.log.removeHandler(handler)
+
+    assert any(r.exc_info is not None for r in records), (
+        "the full traceback must be logged server-side, not swallowed")
+    print("[survey_capture] unexpected exception -> 500 with real type, traceback logged")
+
+
+def test_survey_finish_unexpected_exception_surfaces_as_500_not_hardware_claim():
+    """Task 19 (Defect 1b): the identical fix, applied to survey_finish()'s
+    except-chain (it had the same 503 "RoboDK unavailable" catch-all)."""
+    import logging as _logging
+    import tasni.modules.scan.module as scan_module
+    from fastapi import HTTPException
+
+    services, state, _started = _build_fakes_with_jobs()
+    mod = scan_module.ScanModule(services)
+    mod._five_survey = FivePositionSurvey(services.config.scan, clock=lambda: _FP_CLOCK[0])
+    mod._five_survey.add_capture(
+        _fp_record("center"), _fp_plane_points(_FP_LARGE_CORNERS.mean(axis=0)[:2]), None)
+    for i in range(4):
+        mod._five_survey.add_capture(
+            _fp_record(f"corner{i + 1}"), _fp_plane_points(_FP_LARGE_CORNERS[i][:2], seed=i + 1),
+            _fp_corner_evidence(_FP_LARGE_CORNERS, i, seed=i + 1))
+    assert mod._five_survey.step == "review"
+    mod._five_survey.finish = lambda **k: (_ for _ in ()).throw(
+        AttributeError("'NoneType' object has no attribute 'x'"))
+
+    records = []
+    handler = _logging.Handler()
+    handler.emit = lambda record: records.append(record)
+    scan_module.log.addHandler(handler)
+    try:
+        try:
+            mod.survey_finish()
+            raise AssertionError("expected the unexpected exception to propagate")
+        except HTTPException as e:
+            assert e.status_code == 500, e.status_code
+            assert "AttributeError" in str(e.detail), e.detail
+            assert "unavailable" not in str(e.detail).lower(), e.detail
+    finally:
+        scan_module.log.removeHandler(handler)
+
+    assert any(r.exc_info is not None for r in records), (
+        "the full traceback must be logged server-side, not swallowed")
+    print("[survey_finish] unexpected exception -> 500 with real type, traceback logged")
+
+
+def test_survey_recapture_unexpected_exception_surfaces_as_500_not_hardware_claim():
+    """Task 19 (Defect 1b): survey_recapture() previously had NO catch-all at
+    all (only ValueError -> 400), so an unexpected exception there would
+    propagate as an unhandled 500 from FastAPI's default middleware with no
+    scan-module traceback logged. Now behaves like survey_capture/finish."""
+    import logging as _logging
+    import tasni.modules.scan.module as scan_module
+    from fastapi import HTTPException
+
+    services, _state, _started = _build_fakes_with_jobs()
+    mod = scan_module.ScanModule(services)
+    mod.survey_begin()
+    mod._five_survey.recapture = lambda kind: (_ for _ in ()).throw(TypeError("boom"))
+
+    records = []
+    handler = _logging.Handler()
+    handler.emit = lambda record: records.append(record)
+    scan_module.log.addHandler(handler)
+    try:
+        try:
+            mod.survey_recapture(scan_module.SurveyRecaptureBody(kind="center"))
+            raise AssertionError("expected the unexpected exception to propagate")
+        except HTTPException as e:
+            assert e.status_code == 500, e.status_code
+            assert "TypeError" in str(e.detail), e.detail
+    finally:
+        scan_module.log.removeHandler(handler)
+
+    assert any(r.exc_info is not None for r in records)
+    print("[survey_recapture] unexpected exception -> 500 with real type, traceback logged")
+
+
 class _FakeSamWorker:
     """Records .stop() instead of spinning a real background thread/ONNX
     session -- used by both Finding 3/5 tests below to prove a worker is

@@ -61,9 +61,21 @@ class RobotStateSnapshot:
 def refresh_robot_state(rdk, *, settle_s: float = 0.15, joint_tol_deg: float = 0.01,
                         clock=time.monotonic, sleep=time.sleep) -> RobotStateSnapshot:
     """Explicitly fetch the real robot state twice; stationary iff both agree (§9)."""
-    j0 = np.asarray(rdk.current_joints(), dtype=float)
+    # Task 19 (Defect 1a): rdk.current_joints() is a flat sequence in every fake/
+    # test, but on REAL RoboDK it returns a robomath.Mat wrapping an Nx1 COLUMN
+    # vector. Mat.__len__ reports the COLUMN count (1 for a column vector), so
+    # np.asarray(mat, dtype=float) does not build the flat (N,) array this code
+    # assumed -- it builds a (1, N) array (one row holding all N joints) instead.
+    # Iterating that row then hands `float()` the WHOLE N-element vector in one
+    # call ("only size-1 arrays can be converted to Python scalars") rather than
+    # one joint at a time -- reproduced hardware-free in test_survey_contract.py
+    # (test_refresh_robot_state_handles_robodk_mat_shaped_joints) using the real
+    # robomath.Mat class. .reshape(-1) collapses (N,), (1, N) and (N, 1) alike to
+    # the same flat N-vector, so this is correct regardless of which shape a given
+    # current_joints() implementation returns.
+    j0 = np.asarray(rdk.current_joints(), dtype=float).reshape(-1)
     sleep(settle_s)
-    j1 = np.asarray(rdk.current_joints(), dtype=float)
+    j1 = np.asarray(rdk.current_joints(), dtype=float).reshape(-1)
     T = rdk.camera_pose_T()
     if T is None:
         raise RuntimeError("robot pose unavailable - cannot take an authoritative capture")
