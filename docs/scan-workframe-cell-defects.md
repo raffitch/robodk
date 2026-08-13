@@ -90,6 +90,38 @@ These are facts about the data path, and they reshape the candidate list:
    It is not on a separate thread there, so a slow plane-fit/trim/grid pass throttles the
    video feeder too.
 
+### Cell finding 2026-08-13: TWO CONCURRENT CAMERA CLIENTS starve each other
+
+Observed while running `tools/characterize_distance.py` with the Tasni live preview open
+at the same time: the HUD's fps element dropped to **"no signal"** intermittently and read
+**1-2 fps** when it recovered.
+
+The server's own comments are **stale and misleading** here. `handle_client` says "this
+server is single-threaded with `listen(1)`"
+(`server/server_unicast_syncronous.py:715`), and the module is literally named
+`server_unicast_syncronous`. The actual `main()` does `listen(5)` and spawns a
+**daemon thread per client** (`:1076-1082`). So a second client is *accepted*, not
+refused — and both threads then pull from the **one** RealSense pipeline via
+`getFrames(pipeline, align, depth_filters)`.
+
+Consequences on a Nano, all of which match the symptom:
+
+- `wait_for_frames()` from two threads splits the stream, roughly halving each client's rate;
+- `align` + the depth filter chain + `scan_plane_telemetry`'s plane fit run **per client**,
+  doubling CPU on a board that was already the suspected bottleneck;
+- `characterize_distance.py` uses `CameraClient.grab()`, which connects/reads/closes **per
+  frame** (5 per capture), so each capture is a burst of new connections contending with the
+  preview's long-lived stream.
+
+**Operational rule until this is fixed: only one camera client at a time.** Stop the Tasni
+live preview before running the sweep.
+
+**This contaminates any latency measurement taken with both running** — check whether the
+original ~10 s observation was made with a second client attached before trusting it as a
+baseline. If a fix is wanted server-side, the honest one is to refuse or queue a second
+client rather than silently degrading both, and per the standing constraints that needs the
+Jetson proven as the cause first.
+
 ### Candidates and their signatures
 
 | Candidate | Signature in the log line |
