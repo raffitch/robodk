@@ -132,7 +132,7 @@ def _board_region_mask(shape, corners_px, *, margin_px: float = 6.0) -> np.ndarr
     return mask.astype(bool)
 
 
-def _reject_off_board_points(pts: np.ndarray, *, band_mm: float = 25.0):
+def _reject_off_board_points(pts: np.ndarray, *, band_mm: float = 25.0, k_sigma: float = 6.0):
     """Drop points too far from the board's own plane to be board. Returns
     ``(kept, n_rejected)``.
 
@@ -156,7 +156,18 @@ def _reject_off_board_points(pts: np.ndarray, *, band_mm: float = 25.0):
     if len(p) < 3:
         return p, 0
     n, c, _mask = fit_plane(p, distance=6.0)
-    keep = np.abs((p - c) @ n) <= float(band_mm)      # NaN -> False -> rejected
+    res = np.abs((p - c) @ n)
+    # A FIXED band silently truncates the residual distribution once the real noise
+    # approaches it, which is exactly what happens at grazing incidence: the live
+    # cell's 20/30 deg captures pinned plane_max at 24.97/25.29 against a 25 mm band,
+    # so their RMS was reported LOWER than the truth. Widen the band to the data's own
+    # robust spread (MAD-based sigma) whenever that exceeds the floor, so genuinely
+    # noisy-but-real board points survive and only wild outliers are cut.
+    finite = res[np.isfinite(res)]
+    if len(finite):
+        sigma = 1.4826 * float(np.median(np.abs(finite - np.median(finite))))
+        band_mm = max(float(band_mm), k_sigma * sigma)
+    keep = res <= float(band_mm)                      # NaN -> False -> rejected
     return p[keep], int((~keep).sum())
 
 
@@ -602,16 +613,28 @@ def main(argv=None) -> None:
             # would be a fabricated envelope. Fall back to the target only if no plane
             # could be fitted at all.
             actual = measured_tilt if measured_tilt is not None else float(tilt)
+            # Under --discovery the budget rejects nothing, so "PASS" is vacuous —
+            # printing it would be the same false green the discovery tag exists to
+            # prevent.
+            verdict = ("(no gating — discovery)" if args.discovery
+                       else f"-> {'PASS' if passed else 'FAIL'} against the same budget")
             print("   " + _format_trial(
-                f"target {tilt:.0f}deg -> MEASURED {actual:.1f}deg", trial)
-                 + f" -> {'PASS' if passed else 'FAIL'} against the same budget")
+                f"target {tilt:.0f}deg -> MEASURED {actual:.1f}deg", trial) + " " + verdict)
             incidence.append({"tilt_deg": float(actual),
                               "target_tilt_deg": float(tilt),
                               "measured_tilt_deg": measured_tilt,
                               "trial": trial.to_dict(), "passed": bool(passed)})
 
-        band = passing_incidence_range_deg([(e["tilt_deg"], e["passed"]) for e in incidence])
-        if band is None:
+        # Only meaningful when a real budget did the gating (see the verdict note
+        # above): with DISCOVERY_BUDGET every tilt "passes", so a range computed from
+        # that would claim an envelope nothing was ever tested against.
+        band = (None if args.discovery else passing_incidence_range_deg(
+            [(e["tilt_deg"], e["passed"]) for e in incidence]))
+        if args.discovery:
+            print("\nincidence: no permitted range — discovery mode gates nothing. "
+                  "The rms-vs-tilt numbers above are the measurement; re-run with a "
+                  "real budget to establish the range.")
+        elif band is None:
             print("\nincidence: NO tilt in the sweep passed — the permitted range is unknown.")
         else:
             print(f"\nincidence: permitted range {band[0]:.0f}-{band[1]:.0f} deg "
