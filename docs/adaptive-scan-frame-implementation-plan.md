@@ -69,8 +69,50 @@ see that commit message for what each task actually changed. Known gaps:
 - The downstream process tolerance that Task 11 gate 1 allocates from is still
   undefined, and Task 5's exit test needs it.
 
-Tasks 6-9 remain deliberately unstarted: they depend on distance characterization
-data that does not exist yet (see the delivery sequence at the end).
+**Milestone B is now UNBLOCKED.** The cell was characterized on 2026-08-13
+(`characterization/characterization-20260813.json`, `discovery: false`, cam
+`cam-858b95e78d20`), so the lock-side gate is satisfied and Tasks 6-9 have real
+numbers instead of guesses. Measured, fronto-parallel, 100% board coverage:
+
+| Measured standoff | Plane RMS | length_err | length_spread |
+|---|---|---|---|
+| 310 mm | 0.934 mm | 0.003 mm | 0.030 mm |
+| 400 mm | 0.982 mm | 0.316 mm | 0.020 mm |
+| 498 mm | 1.115 mm | 0.364 mm | 0.025 mm |
+| 599 mm | 1.512 mm | 0.426 mm | 0.020 mm |
+| 795 mm | 2.049 mm | 0.020 mm | 0.032 mm |
+
+Incidence at ~310 mm: 1.0 deg -> 0.650 mm, 9.1 deg -> 2.006, 19.6 deg -> 4.969,
+29.4 deg -> 7.430. **Permitted incidence band 1-9 deg** against the budget below.
+
+**The two facts that should drive Tasks 6-9:**
+
+1. **Incidence costs ~4x what distance costs.** Distance triples RMS across the
+   whole 310-795 mm band; tilting to 29 deg multiplies it by 11 at a fixed standoff.
+   Pose selection should protect squareness first and standoff second.
+2. **Distance is a real trade, not a free one.** An earlier reading said otherwise;
+   that was measurement contamination, now fixed. For a 2x1 m platform: 310 mm =
+   0.65 mm RMS but 42 tiles, 498 mm = 1.13 mm/16 tiles, 795 mm = 2.05 mm/9 tiles.
+
+Budget used (a REGRESSION DETECTOR derived from the achieved envelope, not a
+process requirement — the downstream tolerance is still undefined):
+`--max-rms 2.5 --max-plane-max 30 --max-height-repeat 0.15 --max-normal-repeat 0.3
+--max-length-err 0.8 --max-length-spread 1.0 --min-coverage 0.95`.
+
+Caveats that must travel with these numbers:
+
+- `choose_dstar` returns the CLOSEST passing trial (310 mm). Task 6 wants the
+  FARTHEST passing (795 mm here). Both are derivable from the stored `trials`.
+- The 1-9 deg incidence band is a consequence of the 2.5 mm RMS budget, which was
+  itself derived from the fronto-parallel sweep. Relaxing RMS widens the band.
+- `plane_max` is unreliable as a quality gate: at 310 mm it reads 24.65 mm, pinned
+  against the outlier-rejection band rather than describing the surface. RMS is the
+  trustworthy residual metric.
+- RMS growth is SUB-quadratic (0.93 -> 2.05 over 2.6x range, versus ~4x predicted by
+  stereo theory). The Jetson's temporal filter likely flatters long range. The
+  production scan uses the same filter, so the numbers stay representative.
+- `height_repeat` (0.019-0.049 mm) is sampled over ~30 s at one pose. It does not
+  capture drift across a real scan tour; do not treat it as scan-scale repeatability.
 
 ## Milestones
 
