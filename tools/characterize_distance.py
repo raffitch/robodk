@@ -154,8 +154,9 @@ def _reject_off_board_points(pts: np.ndarray, *, band_mm: float = 25.0, k_sigma:
 
     p = np.asarray(pts, dtype=float).reshape(-1, 3)
     if len(p) < 3:
-        return p, 0
+        return p, 0, None
     n, c, _mask = fit_plane(p, distance=6.0)
+    plane = (np.asarray(n, float), np.asarray(c, float))
     res = np.abs((p - c) @ n)
     # A FIXED band silently truncates the residual distribution once the real noise
     # approaches it, which is exactly what happens at grazing incidence: the live
@@ -168,7 +169,7 @@ def _reject_off_board_points(pts: np.ndarray, *, band_mm: float = 25.0, k_sigma:
         sigma = 1.4826 * float(np.median(np.abs(finite - np.median(finite))))
         band_mm = max(float(band_mm), k_sigma * sigma)
     keep = res <= float(band_mm)                      # NaN -> False -> rejected
-    return p[keep], int((~keep).sum())
+    return p[keep], int((~keep).sum()), plane
 
 
 def _backproject_valid_mm(depth, K, depth_scale: float = 1000.0,
@@ -222,6 +223,33 @@ def _undistort_uv(uv, K, dist) -> np.ndarray:
     out = cv2.undistortPoints(pts, np.asarray(K, dtype=np.float64),
                               np.asarray(dist, dtype=np.float64).ravel())
     return out.reshape(-1, 2)
+
+
+def _corner_on_plane_mm(u: float, v: float, K, dist, plane) -> "np.ndarray | None":
+    """Locate a board corner by intersecting its ray with the FITTED BOARD PLANE.
+
+    Strictly better than reading depth at the corner pixel, for two reasons the cell
+    made obvious:
+
+    1. **Quantization.** Depth arrives as uint16 MILLIMETRES, so a corner's z is an
+       integer. ``_corner_point_mm`` takes the median of a 5x5 window of integers,
+       which is itself an integer, so the same corner yields the identical z every
+       frame — which is why ``length_spread`` was EXACTLY 0.000 at every stop. The
+       metric had no resolution; it was reporting the quantizer, not the camera.
+    2. **Corners are the worst place to sample depth** — they sit on black/white
+       edges where stereo matching and depth-to-color alignment are least reliable.
+
+    The plane is fitted from tens of thousands of board pixels, so it is accurate to
+    well under the 1 mm quantum, and the corner's PIXEL position comes from ChArUco's
+    sub-pixel detector. Intersecting the two uses the best of both and returns a
+    continuous position. Returns ``None`` if the ray is parallel to the plane.
+    """
+    n, c = plane
+    ray = np.array([*_undistort_uv([[float(u), float(v)]], K, dist)[0], 1.0])
+    denom = float(ray @ n)
+    if abs(denom) < 1e-9:
+        return None
+    return ray * (float(c @ n) / denom)
 
 
 def _corner_point_mm(depth, K, u: float, v: float, depth_scale: float = 1000.0,
@@ -331,7 +359,7 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
         pts = _subsample_for_plane_fit(
             _backproject_valid_mm(frame.depth, K, depth_scale, mask=mask,
                                   dist=cfg.camera.dist))
-        pts, n_rejected = _reject_off_board_points(pts)
+        pts, n_rejected, board_plane = _reject_off_board_points(pts)
         rejected_fracs.append(n_rejected / max(n_rejected + len(pts), 1))
         if len(pts) >= 3:
             plane_sets.append(pts)
@@ -343,10 +371,14 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
 
         px_by_id = {cid: corners[i, 0] for i, cid in enumerate(ids_flat)}
         if id_a in px_by_id and id_b in px_by_id:
-            pa = _corner_point_mm(frame.depth, K, *px_by_id[id_a], depth_scale,
-                                  dist=cfg.camera.dist)
-            pb = _corner_point_mm(frame.depth, K, *px_by_id[id_b], depth_scale,
-                                  dist=cfg.camera.dist)
+            if board_plane is not None:
+                pa = _corner_on_plane_mm(*px_by_id[id_a], K, cfg.camera.dist, board_plane)
+                pb = _corner_on_plane_mm(*px_by_id[id_b], K, cfg.camera.dist, board_plane)
+            else:   # no usable plane this frame — fall back to raw corner depth
+                pa = _corner_point_mm(frame.depth, K, *px_by_id[id_a], depth_scale,
+                                      dist=cfg.camera.dist)
+                pb = _corner_point_mm(frame.depth, K, *px_by_id[id_b], depth_scale,
+                                      dist=cfg.camera.dist)
             if pa is not None and pb is not None:
                 length_samples.append((pa.reshape(1, 3), pb.reshape(1, 3), true_mm))
 
