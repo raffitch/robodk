@@ -264,7 +264,8 @@ def _reference_corner_pair(board: CharucoTarget):
 
 
 def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float,
-                           n_frames: int, *, timeout: float) -> "object":
+                           n_frames: int, *, timeout: float,
+                           frame_interval_s: float = 0.0, sleep=time.sleep) -> "object":
     """Grab ``n_frames`` RGB-D pairs at the current (operator-jogged) standoff
     and fold them into one :class:`~tasni.core.characterize.DistanceTrial`.
 
@@ -296,7 +297,20 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
     rejected_fracs: list[float] = []
 
     detected_any = False
-    for _ in range(max(1, int(n_frames))):
+    window_t0 = time.monotonic()
+    for i in range(max(1, int(n_frames))):
+        # The Jetson builds its depth filter chain ONCE at startup
+        # (server_unicast_syncronous.py:1092) and shares it across every client for
+        # the life of the process, so the rs.temporal_filter() state never resets.
+        # Back-to-back grabs of a static scene therefore return a converged, almost
+        # identical stream -- which is why every repeatability metric read ~0.03 mm
+        # and length_spread was EXACTLY 0.000. Spacing the frames does not
+        # manufacture independence (a converged filter on a static scene stays
+        # converged), but it does let slower variation -- thermal drift, exposure,
+        # filter re-convergence, lighting -- into the sample instead of measuring
+        # one instant five times.
+        if i and frame_interval_s > 0:
+            sleep(float(frame_interval_s))
         frame = camera.grab(with_depth=True, timeout=timeout)
         if frame.depth is None:
             continue
@@ -362,6 +376,17 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
         print(f"   !! {bad:.0%} of board pixels were off-plane garbage (excluded). "
               "Depth quality is poor here — treat this distance with suspicion.")
     trial = summarize_distance_trial(measured_mm, plane_sets, length_samples, coverage_frac)
+    window_s = time.monotonic() - window_t0
+    if len(plane_sets) > 1 and (trial.height_repeat_mm < 0.01
+                                or (length_samples and trial.length_spread_mm == 0.0)):
+        # Degenerate repeatability is not a good result, it is an ABSENT one. Say so
+        # here rather than let a 0.000 mm spread be read as astonishing precision and
+        # copied into a budget nothing can ever fail.
+        print(f"   !! repeatability is degenerate over this {window_s:.1f} s window "
+              f"(height_repeat {trial.height_repeat_mm:.3f} mm, length_spread "
+              f"{trial.length_spread_mm:.3f} mm) — the Jetson's shared temporal filter "
+              "has converged, so these frames are not independent samples. Treat the "
+              "repeatability figures as UNMEASURED; do not set a budget from them.")
     return trial, _measured_tilt_deg(plane_sets)
 
 
@@ -502,6 +527,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
                    help="comma-separated standoffs (mm) to sweep")
     p.add_argument("--frames", type=int, default=5,
                    help="RGB-D frames captured per distance")
+    p.add_argument("--frame-interval", type=float, default=0.4,
+                   help="seconds between frames within one capture. The Jetson's "
+                        "temporal filter is shared and never resets, so back-to-back "
+                        "frames of a static scene are near-identical and the "
+                        "repeatability metrics read as ~0. Spacing them samples slower "
+                        "drift. 0 restores the old back-to-back behaviour")
     p.add_argument("--tilt", type=float, default=25.0,
                    help="worst planned tilt (deg) for the oblique-incidence sanity check "
                         "(ignored when --tilts is given)")
@@ -594,8 +625,9 @@ def main(argv=None) -> None:
         for d in distances:
             _prompt(f"\n>> Jog the camera to a {d:.0f} mm standoff, fronto-parallel over the "
                    f"ChArUco board. Press Enter when steady...")
-            trial, tilt_now = capture_distance_trial(camera, board, cfg, d, args.frames,
-                                                     timeout=cfg.camera.timeout_s)
+            trial, tilt_now = capture_distance_trial(
+                camera, board, cfg, d, args.frames, timeout=cfg.camera.timeout_s,
+                frame_interval_s=args.frame_interval)
             trials.append(trial)
             pose = None
             if rdk_io is not None:
@@ -638,7 +670,7 @@ def main(argv=None) -> None:
                    "only at normal incidence. Press Enter when steady...")
             trial, measured_tilt = capture_distance_trial(
                 camera, board, cfg, oblique_distance, args.frames,
-                timeout=cfg.camera.timeout_s)
+                timeout=cfg.camera.timeout_s, frame_interval_s=args.frame_interval)
             passed = choose_dstar([trial], **budget) is not None
             # The MEASURED angle is authoritative, for the same reason the standoff is:
             # reporting a permitted band at angles that were never actually tested
@@ -698,6 +730,10 @@ def main(argv=None) -> None:
             # Targets vs what was achieved: every trial's distance_mm is measured, so
             # keep the requested list alongside it for traceability.
             "nominal_distances_mm": [float(d) for d in distances],
+            # Repeatability is only interpretable alongside the window it was
+            # sampled over -- see capture_distance_trial on the shared temporal filter.
+            "frames_per_capture": int(args.frames),
+            "frame_interval_s": float(args.frame_interval),
             "achieved_envelope": envelope,
             "incidence_sweep": incidence,
             "incidence_range_deg": list(band) if band else None,
