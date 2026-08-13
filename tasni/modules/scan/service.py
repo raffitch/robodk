@@ -206,9 +206,35 @@ def _large_surface_crop_mm(scfg, K, image_size, look_mm: float,
     return [float(scfg.work_crop_mm[0]), float(scfg.work_crop_mm[1])]
 
 
-def _plane_rms_mm(depth, K, *, stride: int = 8) -> float:
-    """Quick plane-fit RMS (mm) of the fused lock depth, for the quality report."""
+def _plane_rms_mm(depth, K, *, stride: int = 8, outline_uv=None) -> float:
+    """Plane-fit RMS (mm) of the SURVEYED surface, for the quality report.
+
+    ``outline_uv`` (normalized image coords, the survey's own outline) restricts the
+    fit to the surface being locked. Without it the fit spans the whole frame —
+    table edges, floor, background — and the "residual" becomes the scene's depth
+    spread, not the surface's flatness: the first live frame-only insert reported
+    364 mm RMS for a sheet of paper. Same defect class as the characterization
+    tool's whole-frame fit (fixed 2026-08-13); this is the scan-lock instance.
+
+    A loose 25 mm band still drops the few spurious stereo/alignment pixels inside
+    the outline (physically not the surface) before the RMS, mirroring the
+    characterization fix; genuine surface structure sits far below it.
+    """
     d = np.asarray(depth, dtype=float)[::stride, ::stride]
+    if outline_uv is not None and len(outline_uv) >= 3:
+        import cv2
+
+        h, w = d.shape
+        poly = np.asarray(outline_uv, dtype=float)
+        # Shrink 3% toward the centroid: the outline traces the surface EDGE, and a
+        # boundary pixel of the (strided) mask can straddle it, pulling neighbouring
+        # off-surface depth into the fit and inflating the residual.
+        centre = poly.mean(axis=0)
+        poly = centre + (poly - centre) * 0.97
+        px = np.column_stack([poly[:, 0] * w, poly[:, 1] * h]).astype(np.int32)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [px], 1)
+        d = np.where(mask.astype(bool), d, 0.0)
     v, u = np.nonzero(d > 0)
     if len(v) < 50:
         return float("nan")
@@ -220,6 +246,9 @@ def _plane_rms_mm(depth, K, *, stride: int = 8) -> float:
     except Exception:
         return float("nan")
     res = (pts - centroid) @ np.asarray(normal, dtype=float)
+    res = res[np.abs(res) <= 25.0]
+    if len(res) < 50:
+        return float("nan")
     return float(np.sqrt(np.mean(res ** 2)))
 
 
@@ -514,7 +543,7 @@ def lock_scan_surface(services, *, force_crop: bool = False,
     record = None
     if crop_mode:
         mode = MODE_USER_SPECIFIED
-        plane_rms = _plane_rms_mm(depth, K)
+        plane_rms = _plane_rms_mm(depth, K, outline_uv=survey.outline_uv)
         record = _survey_record_from_lock(
             survey, seed_T, snapshot, services.config.camera,
             mode=mode, n_frames=n_frames, measurement_ts=frame.timestamp,
@@ -570,7 +599,7 @@ def lock_scan_surface(services, *, force_crop: bool = False,
             gate_payload["compact_eligibility"] = eligibility.to_dict()
             if eligibility.eligible:
                 mode = MODE_COMPACT
-                plane_rms = _plane_rms_mm(depth, K)
+                plane_rms = _plane_rms_mm(depth, K, outline_uv=survey.outline_uv)
                 record = _survey_record_from_lock(
                     survey, seed_T, snapshot, services.config.camera,
                     mode=mode, n_frames=n_frames, measurement_ts=frame.timestamp,
