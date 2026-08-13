@@ -635,7 +635,14 @@ height = 720;
 # texture, and the IR projector is what supplies it on blank surfaces -- it was
 # running at the 150 default, only 42% of this device's 360 maximum. More projected
 # texture is the most direct lever on edge coverage, so that is the default now.
-RS_VISUAL_PRESET = int(os.environ.get('RS_VISUAL_PRESET', '4'))   # high_density
+# The preset is deliberately LEFT ALONE by default (-1 = don't touch). Today's
+# distance characterization was measured under the preset the device is actually
+# running, so silently changing it would invalidate that dated record; and High
+# Accuracy in particular is the wrong direction here (it raises the confidence
+# threshold, returning fewer but surer points, when the measured defect is missing
+# coverage). Set RS_VISUAL_PRESET=4 to trial high_density as a SEPARATE experiment,
+# with its own before/after measurement.
+RS_VISUAL_PRESET = int(os.environ.get('RS_VISUAL_PRESET', '-1'))
 RS_LASER_POWER = float(os.environ.get('RS_LASER_POWER', '300'))
 
 
@@ -659,10 +666,23 @@ def set_high_accuracy_preset(profile):
     except Exception as e:
         print(f"WARNING: no depth sensor to configure: {e}")
         return
-    for name, option, value in (
-            ('visual_preset', getattr(rs.option, 'visual_preset', None), float(RS_VISUAL_PRESET)),
-            ('laser_power', getattr(rs.option, 'laser_power', None), RS_LASER_POWER),
-            ('emitter_enabled', getattr(rs.option, 'emitter_enabled', None), 1.0)):
+    wanted = [('laser_power', getattr(rs.option, 'laser_power', None), RS_LASER_POWER),
+              # Every client of this server shares one pipeline, so enabling the
+              # emitter here covers scan, calibration, extrusion/cylinder measuring
+              # and the live preview alike — there is no per-feature IR state to
+              # keep in sync, and nothing anywhere turns it back off.
+              ('emitter_enabled', getattr(rs.option, 'emitter_enabled', None), 1.0)]
+    if RS_VISUAL_PRESET >= 0:
+        wanted.insert(0, ('visual_preset', getattr(rs.option, 'visual_preset', None),
+                          float(RS_VISUAL_PRESET)))
+    else:
+        try:
+            cur = sensor.get_option(rs.option.visual_preset)
+            print(f"RealSense: visual_preset left as-is at {cur:g} "
+                  "(set RS_VISUAL_PRESET to change it)")
+        except Exception:
+            pass
+    for name, option, value in wanted:
         if option is None or not sensor.supports(option):
             print(f"RealSense: {name} unsupported on this device/build — skipped")
             continue
