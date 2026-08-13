@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _Record(BaseModel):
@@ -37,7 +37,12 @@ class CylinderSetup(_Record):
     print_tool: str = Field(min_length=1)
     work_frame: str = Field(min_length=1)
     inspection_tool: str = Field(min_length=1)
-    inspection_target: str = Field(min_length=1)
+    # Empty only in automatic mode, where the pose is derived from this placement
+    # and a target is created per layer instead of taught once (see
+    # ``modules/extrusion/inspection.py``). The generated name is deliberately NOT
+    # stored here: it embeds the fingerprint, which is computed from this setup.
+    inspection_target: str = ""
+    inspection_auto: bool = False
     center_x_mm: float = 0.0
     center_y_mm: float = 0.0
     build_plane_z_mm: float = 0.0
@@ -48,6 +53,14 @@ class CylinderSetup(_Record):
     orientation_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
     approach_clearance_mm: float = Field(default=40.0, gt=0, le=500)
     retreat_clearance_mm: float = Field(default=60.0, gt=0, le=500)
+
+    @model_validator(mode="after")
+    def _target_or_auto(self) -> "CylinderSetup":
+        if not self.inspection_auto and not self.inspection_target:
+            raise ValueError(
+                "inspection_target is required unless inspection_auto is set: "
+                "manual inspection must name the taught target it moves to")
+        return self
 
 
 class PathPoint(_Record):

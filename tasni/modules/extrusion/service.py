@@ -17,18 +17,23 @@ from ...core.logging import REPO_ROOT, new_run_dir
 from ...core.rdk_io import RdkIO
 from ..calibration.service import _camera_hold, ensure_real_robot_link
 from .archive import ExtrusionArchive
+from .inspection import (aim_point_mm, cylinder_diameter_mm, framing_standoff,
+                         inspection_plan, pose_candidates)
 from .models import CylinderPlan, CylinderRecipe, CylinderSetup, LayerManifest
 from .processing import process_observation
 from .surface import surface_check
 from .toolpath import generate_cylinder_plan, points_array
 
 
-def geometry_preflight(plan: CylinderPlan, *, surface: dict | None = None) -> dict:
+def geometry_preflight(plan: CylinderPlan, *, surface: dict | None = None,
+                       camera=None, config=None) -> dict:
     """Validate the generated geometry without claiming a RoboDK dry-run pass.
 
     ``surface`` is the currently applied scan surface (``None`` = none applied). A
     surface-placed plan fails here if that surface changed or if the wall overhangs
-    it, before any robot motion is offered.
+    it, before any robot motion is offered. ``camera``/``config`` add the derived
+    inspection geometry (pure — no station), so a cylinder too big to frame within
+    the accurate depth band is caught here rather than mid-dry-run.
     """
     layers: list[dict] = []
     all_ok = True
@@ -49,10 +54,18 @@ def geometry_preflight(plan: CylinderPlan, *, surface: dict | None = None) -> di
         })
     placement = surface_check(plan.setup, plan.recipe, surface)
     all_ok &= bool(placement["ok"])
+    if camera is None or config is None:
+        inspection = {"auto": bool(plan.setup.inspection_auto), "checked": False}
+    else:
+        inspection = {**inspection_plan(plan.recipe, plan.setup, K=camera.K,
+                                        size_px=camera.size, config=config),
+                      "checked": True}
+        if plan.setup.inspection_auto:
+            all_ok &= bool(inspection["ok"])
     return {
         "kind": "geometry_preflight", "fingerprint": plan.fingerprint,
         "all_ok": all_ok, "layers": layers, "surface": placement,
-        "dry_run_passed": False,
+        "inspection": inspection, "dry_run_passed": False,
         "note": "Geometry is valid; RoboDK reachability/collision/program execution is still required.",
         "simulated_valve_events": [
             {"event": "AirOn", "physical_output_blocked": True},
@@ -68,10 +81,13 @@ def station_requirements(rdk: RdkIO, plan: CylinderPlan, config) -> dict:
         ("print_tool", selected.print_tool, "tool"),
         ("work_frame", selected.work_frame, "frame"),
         ("inspection_tool", selected.inspection_tool, "tool"),
-        ("inspection_target", selected.inspection_target, "target"),
         ("air_on_program", config.air_on_program, "program"),
         ("air_off_program", config.air_off_program, "program"),
     ]
+    if not selected.inspection_auto:
+        # In automatic mode there is nothing taught to check: the target is derived
+        # per layer and created (then collision-validated) during the run.
+        checks.insert(3, ("inspection_target", selected.inspection_target, "target"))
     items = [{"role": role, "name": name, "type": kind,
               "present": rdk.item_exists_as(name, kind)}
              for role, name, kind in checks]
@@ -119,11 +135,88 @@ def _wait_program(ctx: JobContext, rdk: RdkIO, name: str) -> None:
         time.sleep(0.05)
 
 
+def _program_valid(report: dict) -> bool:
+    return report["percent_ok"] >= 99.999
+
+
 def _require_program_valid(report: dict, layer_index: int) -> None:
-    if report["percent_ok"] < 99.999:
+    if not _program_valid(report):
         raise RuntimeError(
             f"layer {layer_index} RoboDK validation failed at "
             f"{report['percent_ok']:.1f}%: {report['problems'] or 'unspecified path problem'}")
+
+
+def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
+                           inspection_name: str, config, camera) -> dict:
+    """Create the inspection program for one layer and return its validation.
+
+    Manual mode moves to the taught target, exactly as before. Automatic mode
+    derives the viewpoint from this layer's own geometry (see
+    ``modules/extrusion/inspection.py``) and walks the ordered candidate list —
+    fronto-parallel first — accepting the first that both has an IK solution and
+    passes RoboDK's collision-enabled validation. That validation is the same
+    authoritative gate the taught path already used, so nothing new decides
+    safety here; the candidates only decide which viewpoint gets offered to it.
+
+    Fails loudly with every rejection when none survives. Backing off, tilting
+    past the configured cone, or dropping collision checking to obtain a pass are
+    all deliberately absent: straight down at ~300 mm over a fresh print is the
+    tightest clearance in this workflow, and the print tool shares the flange with
+    the camera.
+    """
+    speed_mm_s = plan.recipe.travel_speed_mm_s
+    if not plan.setup.inspection_auto:
+        created = rdk.create_inspection_program(
+            name=inspection_name, inspection_tool=plan.setup.inspection_tool,
+            inspection_target=plan.setup.inspection_target, speed_mm_s=speed_mm_s)
+        validation = rdk.update_program(inspection_name, collisions=True)
+        _require_program_valid(validation, layer.layer_index)
+        return {"artifacts": [created["program"]], "validation": validation,
+                "target": plan.setup.inspection_target, "pose": None}
+
+    framing = framing_standoff(
+        width_mm=cylinder_diameter_mm(plan.recipe),
+        height_mm=cylinder_diameter_mm(plan.recipe), K=camera.K, size_px=camera.size,
+        frame_margin=config.inspection_frame_margin,
+        near_mm=config.inspection_min_mm, far_mm=config.inspection_max_mm)
+    if not framing["fits"]:
+        raise RuntimeError("; ".join(framing["warnings"]))
+    aim = aim_point_mm(plan.recipe, plan.setup, layer.layer_index)
+    target_name = inspection_name + "_Target"
+    rejected: list[dict] = []
+    for candidate in pose_candidates(aim, framing["standoff_mm"], config):
+        descriptor = {k: v for k, v in candidate.items() if k != "T"}
+        made = rdk.create_inspection_target(
+            name=target_name, T=candidate["T"],
+            inspection_tool=plan.setup.inspection_tool,
+            work_frame=plan.setup.work_frame)
+        if not made["created"]:
+            rejected.append({**descriptor, "reason": made["reason"]})
+            continue
+        created = rdk.create_inspection_program(
+            name=inspection_name, inspection_tool=plan.setup.inspection_tool,
+            inspection_target=target_name, speed_mm_s=speed_mm_s)
+        validation = rdk.update_program(inspection_name, collisions=True)
+        if _program_valid(validation):
+            return {
+                "artifacts": [target_name, created["program"]],
+                "validation": validation, "target": target_name,
+                "pose": {**descriptor, "standoff_mm": framing["standoff_mm"],
+                         "aim_mm": [float(v) for v in aim],
+                         "clamped_to": framing["clamped_to"],
+                         "fill_fraction": framing["fill_fraction"],
+                         "rejected": rejected},
+            }
+        rejected.append({**descriptor,
+                         "reason": (validation["problems"]
+                                    or f"validated at only {validation['percent_ok']:.1f}%")})
+    tried = ", ".join(f"tilt {r['tilt_deg']:.0f}/azimuth {r['azimuth_deg']:.0f}/"
+                      f"roll {r['roll_deg']:.0f} deg: {r['reason']}" for r in rejected)
+    raise RuntimeError(
+        f"layer {layer.layer_index}: no reachable, collision-free inspection pose at "
+        f"{framing['standoff_mm']:.0f} mm above "
+        f"[{aim[0]:.1f}, {aim[1]:.1f}, {aim[2]:.1f}] in {plan.setup.work_frame!r}. "
+        f"Tried {len(rejected)} viewpoint(s) — {tried}")
 
 
 class CylinderDryRunJob:
@@ -190,14 +283,11 @@ class CylinderDryRunJob:
                 _wait_program(ctx, rdk, name)
                 current_program = None
                 inspection_name = name + "_Inspect"
-                inspect = rdk.create_inspection_program(
-                    name=inspection_name,
-                    inspection_tool=self.plan.setup.inspection_tool,
-                    inspection_target=self.plan.setup.inspection_target,
-                    speed_mm_s=self.plan.recipe.travel_speed_mm_s)
-                path_artifacts.append(inspect["program"])
-                inspection_validation = rdk.update_program(inspection_name, collisions=True)
-                _require_program_valid(inspection_validation, layer.layer_index)
+                inspect = _build_inspection_move(
+                    rdk, self.plan, layer, inspection_name=inspection_name,
+                    config=ecfg, camera=self.services.config.camera)
+                path_artifacts.extend(inspect["artifacts"])
+                inspection_validation = inspect["validation"]
                 current_program = inspection_name
                 started = rdk.start_program(inspection_name, real_robot=False)
                 if started < 0:
@@ -206,7 +296,16 @@ class CylinderDryRunJob:
                 _wait_program(ctx, rdk, inspection_name)
                 current_program = None
                 reports.append({"layer_index": layer.layer_index,
-                                "path": validation, "inspection": inspection_validation})
+                                "path": validation, "inspection": inspection_validation,
+                                "inspection_target": inspect["target"],
+                                "inspection_pose": inspect["pose"]})
+                if inspect["pose"]:
+                    pose = inspect["pose"]
+                    ctx.log(f"layer {layer.layer_index}: inspection pose derived — "
+                            f"{pose['standoff_mm']:.0f} mm above the layer top, "
+                            f"tilt {pose['tilt_deg']:.0f}deg / roll {pose['roll_deg']:.0f}deg"
+                            + (f" (after {len(pose['rejected'])} rejected viewpoint(s))"
+                               if pose["rejected"] else ""))
                 ctx.log(f"layer {layer.layer_index}: path + inspection motion simulated; "
                         f"valve ON/OFF shown as mock events")
             rdk.move_j_joints(start_joints)
@@ -354,14 +453,11 @@ class CylinderPrintJob:
                     valve_off(f"layer {layer.layer_index} completion/inspection confirmation",
                               required=True)
                     inspection_name = name + "_Inspect"
-                    inspect = rdk.create_inspection_program(
-                        name=inspection_name,
-                        inspection_tool=self.plan.setup.inspection_tool,
-                        inspection_target=self.plan.setup.inspection_target,
-                        speed_mm_s=self.plan.recipe.travel_speed_mm_s)
-                    artifacts.append(inspect["program"])
-                    inspection_validation = rdk.update_program(inspection_name, collisions=True)
-                    _require_program_valid(inspection_validation, layer.layer_index)
+                    inspect = _build_inspection_move(
+                        rdk, self.plan, layer, inspection_name=inspection_name,
+                        config=ecfg, camera=services.config.camera)
+                    artifacts.extend(inspect["artifacts"])
+                    inspection_validation = inspect["validation"]
                     current_program = inspection_name
                     started = rdk.start_program(inspection_name, real_robot=True)
                     if started < 0:
@@ -391,7 +487,8 @@ class CylinderPrintJob:
                         provenance={**provenance, "work_frame": self.plan.setup.work_frame,
                                     "print_tool": self.plan.setup.print_tool,
                                     "inspection_tool": self.plan.setup.inspection_tool,
-                                    "inspection_target": self.plan.setup.inspection_target,
+                                    "inspection_target": inspect["target"],
+                                    "inspection_pose": inspect["pose"],
                                     "T_work_camera": np.asarray(
                                         T_work_camera, dtype=float).tolist()},
                         valve_transitions=[v for v in valve if v.get("layer_index") in

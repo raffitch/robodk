@@ -12,8 +12,11 @@ from tasni.core import runs
 from tasni.core.config import AppConfig, ExtrusionConfig
 from tasni.modules.extrusion.archive import ExtrusionArchive
 from tasni.modules.extrusion.comparison import compare_circle, corrected_circle
+from tasni.modules.extrusion.inspection import (aim_point_mm, cylinder_diameter_mm,
+                                                framing_standoff, inspection_plan,
+                                                pose_candidates)
 from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup, LayerManifest
-from tasni.modules.extrusion.service import geometry_preflight
+from tasni.modules.extrusion.service import geometry_preflight, station_requirements
 from tasni.modules.extrusion.surface import (active_scan_surface, surface_check,
                                              surface_fit)
 from tasni.modules.extrusion.toolpath import generate_cylinder_plan, points_array
@@ -307,6 +310,161 @@ def test_api_live_print_is_fail_closed():
                            json={"fingerprint": plan["fingerprint"]})
     assert response.status_code == 409
     assert "dry run" in response.json()["detail"]
+
+
+# -- automatic inspection pose ---------------------------------------------
+
+CAMERA = AppConfig().camera            # D435i colour, 1280x720, fx=fy~908 px
+
+
+def framing(width_mm, height_mm, **updates):
+    config = ExtrusionConfig(**updates)
+    return framing_standoff(width_mm=width_mm, height_mm=height_mm, K=CAMERA.K,
+                            size_px=CAMERA.size, frame_margin=config.inspection_frame_margin,
+                            near_mm=config.inspection_min_mm, far_mm=config.inspection_max_mm)
+
+
+def test_a3_sheet_reproduces_the_distance_measured_on_the_cell():
+    """The operator measured an A3 sheet filling the frame at ~380-400 mm.
+
+    Nothing is hardcoded to that: it falls out of the camera's own intrinsics via
+    the same pinhole rule the scan planner uses, with the SHORT side binding
+    (297 mm needs 375 mm; the 420 mm side would only need 298 mm). This test is
+    the anchor that keeps the model honest against the real cell.
+    """
+    bare = framing(420, 297, inspection_frame_margin=1.0)
+    assert 374.0 < bare["d_fit_mm"] < 376.0
+    assert bare["binding_axis"] == "height"
+    assert 385.0 < bare["d_fit_mm"] * 1.05 < 400.0        # inside the measured band
+    assert bare["clamped_to"] is None and bare["fits"] is True
+
+
+def test_small_cylinder_is_held_at_the_accurate_near_limit_not_pushed_closer():
+    """A 95 mm cylinder wants 134 mm to fill the frame — inside the D435i's blind
+    zone. Framing is not the binding constraint at cylinder scale; the depth band
+    is, so the standoff clamps up and the UI is told the object stays small."""
+    fit = framing(95, 95)
+    assert 130.0 < fit["d_fit_mm"] < 140.0
+    assert fit["standoff_mm"] == 300.0 and fit["clamped_to"] == "near"
+    assert fit["fits"] is True
+    assert 0.38 < fit["fill_fraction"]["height"] < 0.42   # ~40% of frame height
+    assert any("near" in warning for warning in fit["warnings"])
+
+
+def test_object_too_big_for_the_accurate_band_is_refused_not_backed_away_from():
+    fit = framing(900, 900)
+    assert fit["fits"] is False and fit["clamped_to"] == "far"
+    assert fit["standoff_mm"] == 800.0
+    assert any("accurate depth band" in warning for warning in fit["warnings"])
+
+
+def test_cylinder_diameter_is_the_outside_of_the_deposited_wall():
+    assert cylinder_diameter_mm(recipe(radius_mm=40, bead_diameter_mm=6)) == 86.0
+
+
+def test_aim_point_tracks_the_top_of_the_layer_just_printed():
+    made = recipe(bead_diameter_mm=6, layer_height_mm=5)
+    placed = setup(center_x_mm=10, center_y_mm=-5, build_plane_z_mm=12)
+    first = aim_point_mm(made, placed, 1)
+    second = aim_point_mm(made, placed, 2)
+    # centre-line = build + bead/2 + i*height; the surface measured is a bead-radius
+    # above that, so layer 1's top is one full bead above the build plane.
+    assert first.tolist() == [10.0, -5.0, 18.0]
+    assert second[2] - first[2] == 5.0
+
+
+def test_the_cylinder_axis_is_the_optical_axis_for_every_candidate():
+    """'Centred in frame' is a geometric guarantee, not a tolerance: the aim point
+    sits on the camera's +Z axis at exactly the standoff, so it projects onto the
+    principal point whatever roll/tilt the reachability search ends up choosing."""
+    aim = np.array([10.0, -5.0, 18.0])
+    for candidate in pose_candidates(aim, 300.0, ExtrusionConfig()):
+        T = candidate["T"]
+        in_camera = np.linalg.inv(T) @ np.append(aim, 1.0)
+        assert np.allclose(in_camera[:3], [0.0, 0.0, 300.0], atol=1e-9)
+        assert np.isclose(np.linalg.norm(T[:3, 3] - aim), 300.0)
+
+
+def test_the_first_candidate_looks_straight_down_because_incidence_costs_most():
+    """Cell characterization (2026-08-13): 29 deg of incidence multiplies plane RMS
+    by 11, while tripling the distance only triples it. So tilt is a last resort
+    and the search must start fronto-parallel."""
+    candidates = pose_candidates(np.array([0.0, 0.0, 0.0]), 300.0, ExtrusionConfig())
+    first = candidates[0]
+    assert first["tilt_deg"] == 0.0 and first["roll_deg"] == 0.0
+    assert np.allclose(first["T"][:3, 3], [0.0, 0.0, 300.0])
+    assert np.allclose(first["T"][:3, 2], [0.0, 0.0, -1.0])    # camera +Z looks down
+    assert max(c["tilt_deg"] for c in candidates) <= 10.0
+    assert len({(c["tilt_deg"], c["azimuth_deg"], c["roll_deg"]) for c in candidates}) == len(candidates)
+
+
+def test_inspection_plan_lifts_the_camera_one_layer_height_per_layer():
+    made = recipe(layer_count=3, layer_height_mm=5, bead_diameter_mm=6)
+    result = inspection_plan(made, setup(), K=CAMERA.K, size_px=CAMERA.size,
+                             config=ExtrusionConfig())
+    heights = [layer["camera_z_mm"] for layer in result["layers"]]
+    assert len(heights) == 3
+    assert np.allclose(np.diff(heights), 5.0)
+    assert result["standoff_mm"] == 300.0
+    assert heights[0] == result["layers"][0]["top_z_mm"] + 300.0
+
+
+def test_auto_mode_allows_an_empty_inspection_target_but_manual_still_requires_one():
+    assert setup(inspection_auto=True, inspection_target="").inspection_auto is True
+    try:
+        setup(inspection_target="")
+    except ValueError as exc:
+        assert "inspection_target" in str(exc)
+    else:
+        raise AssertionError("manual inspection must still name a taught target")
+
+
+def test_switching_to_the_automatic_pose_changes_the_fingerprint():
+    manual = generate_cylinder_plan(recipe(), setup())
+    auto = generate_cylinder_plan(recipe(), setup(inspection_auto=True))
+    assert manual.fingerprint != auto.fingerprint
+
+
+def test_station_requirements_stops_demanding_a_taught_target_in_auto_mode():
+    class Station:
+        def item_exists_as(self, name, kind): return bool(name)
+        def program_instructions(self, name):
+            return (["Set IO_508=1", "Set IO_601=1"] if name == "AirOn"
+                    else ["Set IO_508=0", "Set IO_601=0"])
+
+    config = ExtrusionConfig()
+    auto = generate_cylinder_plan(recipe(), setup(inspection_auto=True, inspection_target=""))
+    report = station_requirements(Station(), auto, config)
+    assert report["ready"] is True
+    assert not any(item["role"] == "inspection_target" for item in report["items"])
+    manual = generate_cylinder_plan(recipe(), setup())
+    assert any(item["role"] == "inspection_target"
+               for item in station_requirements(Station(), manual, config)["items"])
+
+
+def test_preflight_reports_the_derived_inspection_geometry():
+    plan = generate_cylinder_plan(recipe(), setup(inspection_auto=True, inspection_target=""))
+    result = geometry_preflight(plan, camera=CAMERA, config=ExtrusionConfig())
+    assert result["inspection"]["auto"] is True
+    assert result["inspection"]["standoff_mm"] == 300.0
+    assert result["all_ok"] is True
+
+
+def test_api_previews_the_automatic_inspection_pose_without_touching_the_station():
+    client = TestClient(create_app(AppConfig()))
+    payload = generate_payload()
+    payload["setup"]["inspection_auto"] = True
+    payload["setup"]["inspection_target"] = ""
+    plan = client.post("/api/modules/extrusion/generate", json=payload).json()
+    preview = client.post("/api/modules/extrusion/inspection-pose",
+                          json={"fingerprint": plan["fingerprint"]})
+    assert preview.status_code == 200
+    body = preview.json()
+    assert body["standoff_mm"] == 300.0
+    assert body["object_diameter_mm"] == 86.0
+    assert len(body["layers"]) == 3
+    assert body["framing"]["clamped_to"] == "near"
+    assert "T" not in body["layers"][0]["candidates"][0]      # JSON-safe descriptors only
 
 
 def test_api_reset_invalidates_generated_coordinates_without_a_station():

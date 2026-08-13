@@ -1,6 +1,7 @@
 """Extrusion dry/live job safety with fake RoboDK and camera services."""
 from __future__ import annotations
 
+import json
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,7 @@ class FakeRdk:
     def __init__(self):
         self.mode = 6; self.events = []; self.created = []; self.deleted = []
         self.station_calls = 0; self.fail_station_call = None
+        self.targets = []; self.unreachable_targets = 0; self.bad_inspections = 0
     def item_exists_as(self, name, kind): return bool(name)
     def program_instructions(self, name):
         return (["Set IO_508=1", "Set IO_601=1"] if name == "AirOn"
@@ -55,8 +57,19 @@ class FakeRdk:
         self.events.append(("create-inspection", kwargs["name"],
                             kwargs["inspection_tool"], kwargs["inspection_target"]))
         return {"program": kwargs["name"], "targets": []}
+    def create_inspection_target(self, **kwargs):
+        self.targets.append(kwargs)
+        xyz = np.asarray(kwargs["T"], dtype=float)[:3, 3]
+        self.events.append(("create-target", kwargs["name"], tuple(np.round(xyz, 3))))
+        if len(self.targets) <= self.unreachable_targets:
+            return {"created": False, "target": kwargs["name"], "reason": "no IK solution"}
+        return {"created": True, "target": kwargs["name"], "reason": ""}
     def update_program(self, name, collisions=True):
         self.events.append(("update", name, collisions))
+        if name.endswith("_Inspect") and self.bad_inspections:
+            self.bad_inspections -= 1
+            return {"instructions_ok": 1, "time_s": 0, "distance_mm": 0,
+                    "percent_ok": 41.0, "problems": "Collision detected: spindle/Table"}
         return {"instructions_ok": 100, "time_s": 2, "distance_mm": 100,
                 "percent_ok": 100.0, "problems": ""}
     def start_program(self, name, real_robot): self.events.append(("start", name, real_robot)); return 1
@@ -80,14 +93,16 @@ class FakeCamera:
                      depth=np.full((16, 16), 500, np.uint16), timestamp=1.0)
 
 
-def plan(*, layers=2, correction=True):
+def plan(*, layers=2, correction=True, auto_inspection=False):
     return generate_cylinder_plan(
         CylinderRecipe(radius_mm=40, layer_count=layers, layer_height_mm=5,
                        bead_diameter_mm=6, robot_speed_mm_s=75,
                        extrusion_rate_pct=30, points_per_circle=24,
                        correction_enabled=correction),
         CylinderSetup(print_tool="SelectedNozzle", work_frame="SelectedFrame",
-                      inspection_tool="SelectedCamera", inspection_target="SelectedInspect",
+                      inspection_tool="SelectedCamera",
+                      inspection_target="" if auto_inspection else "SelectedInspect",
+                      inspection_auto=auto_inspection,
                       orientation_rpy_deg=(180, 0, 30), approach_clearance_mm=25,
                       retreat_clearance_mm=35))
 
@@ -220,3 +235,74 @@ def test_failed_final_valve_off_inhibits_return_motion(tmp_path, monkeypatch):
         CylinderPrintJob(svc, plan(layers=1))(ctx)
     assert not any(event[0] == "move-joints" for event in rdk.events)
     assert any("return motion inhibited" in message for message in ctx.logs)
+
+
+# -- automatic inspection pose ---------------------------------------------
+
+def test_auto_inspection_creates_one_target_per_layer_at_the_planned_standoff(
+        tmp_path, monkeypatch):
+    svc, rdk, _ = services(tmp_path)
+    monkeypatch.setattr(service_mod, "new_run_dir",
+                        lambda module, stamp: _mkdir(tmp_path / module / stamp))
+    output = CylinderDryRunJob(svc, plan(layers=2, auto_inspection=True))(Ctx())
+    assert output["all_ok"]
+    created = [event for event in rdk.events if event[0] == "create-target"]
+    assert len(created) == 2, "one derived pose per layer, not one for the trial"
+    # The camera rides one layer height up, holding the standoff to the fresh top.
+    assert created[1][2][2] - created[0][2][2] == 5.0
+    assert created[0][2][2] == 6.0 + 300.0        # first layer top + standoff
+    assert all(name.startswith("TasniCylinder_") and name.endswith("_Target")
+               for _, name, _ in created)
+    assert "L001" in created[0][1] and "L002" in created[1][1]
+    # The derived target is what the inspection program actually moves to.
+    inspections = [event for event in rdk.events if event[0] == "create-inspection"]
+    assert [event[3] for event in inspections] == [name for _, name, _ in created]
+    assert all(name in rdk.deleted for _, name, _ in created)
+    assert output["layers"][0]["inspection_pose"]["tilt_deg"] == 0.0
+
+
+def test_auto_inspection_moves_to_the_next_candidate_when_one_collides(
+        tmp_path, monkeypatch):
+    svc, rdk, _ = services(tmp_path)
+    monkeypatch.setattr(service_mod, "new_run_dir",
+                        lambda module, stamp: _mkdir(tmp_path / module / stamp))
+    rdk.unreachable_targets = 1     # straight down has no IK here
+    rdk.bad_inspections = 1         # ...and the next one collides
+    output = CylinderDryRunJob(svc, plan(layers=1, auto_inspection=True))(Ctx())
+    assert output["all_ok"]
+    chosen = output["layers"][0]["inspection_pose"]
+    assert len(rdk.targets) == 3, "tried straight down, then the rejected one, then a third"
+    assert chosen["rejected"][0]["reason"] == "no IK solution"
+    assert "Collision detected" in chosen["rejected"][1]["reason"]
+    assert (chosen["tilt_deg"], chosen["roll_deg"]) != (0.0, 0.0)
+
+
+def test_auto_inspection_fails_loudly_instead_of_inspecting_from_nowhere(
+        tmp_path, monkeypatch):
+    svc, rdk, _ = services(tmp_path)
+    monkeypatch.setattr(service_mod, "new_run_dir",
+                        lambda module, stamp: _mkdir(tmp_path / module / stamp))
+    rdk.unreachable_targets = 99
+    with pytest.raises(RuntimeError, match="no reachable, collision-free inspection pose"):
+        CylinderDryRunJob(svc, plan(layers=1, auto_inspection=True))(Ctx())
+
+
+def test_live_print_archives_the_derived_viewpoint_it_actually_measured_from(
+        tmp_path, monkeypatch):
+    """The measurement is only reproducible if the record says where it was taken
+    from — in auto mode that is a per-layer derived pose, not a taught name."""
+    svc, rdk, _ = services(tmp_path)
+    monkeypatch.setattr(service_mod, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(service_mod, "_git_commit", lambda: "abc123")
+    monkeypatch.setattr(service_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(service_mod.runs, "read_active", lambda module: None)
+    monkeypatch.setattr(service_mod, "process_observation", fake_processing)
+    monkeypatch.setattr(service_mod, "ensure_real_robot_link", lambda *a, **k: None)
+    output = CylinderPrintJob(svc, plan(layers=1, auto_inspection=True))(Ctx())
+    manifest = json.loads((Path(output["trial_dir"]) / "layer-001" / "manifest.json")
+                          .read_text(encoding="utf-8"))
+    provenance = manifest["provenance"]
+    assert provenance["inspection_target"].endswith("_Target")
+    assert provenance["inspection_pose"]["standoff_mm"] == 300.0
+    assert provenance["inspection_pose"]["aim_mm"][2] == 6.0     # top of layer 1
+    assert provenance["inspection_pose"]["tilt_deg"] == 0.0

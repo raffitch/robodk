@@ -106,10 +106,55 @@ Primary code: `tasni/modules/extrusion/surface.py`,
 `tasni/modules/scan/plane.py:rectangle_in_frame`, and the payload written by
 `tasni/modules/scan/service.py:insert_scan`.
 
+## Automatic inspection pose (derived, not taught)
+
+The inspection viewpoint used to be a hand-taught RoboDK target picked from a
+dropdown, so the distance was whatever that pose happened to be and the cylinder
+landed wherever it landed in the frame. With `setup.inspection_auto` (the default
+for new plans) the pose is derived from the same placement the cylinder is built
+on, and a **joint** target is created per layer.
+
+- **Centred by construction.** The aim point is the cylinder axis at the top of the
+  layer just deposited (`build_plane_z + bead + (i-1)*layer_height`). Every
+  candidate pose puts that point on the camera's +Z axis at exactly the standoff,
+  so it projects onto the principal point whatever roll/tilt is chosen.
+- **Distance from the optics, not a constant.** Standoff is the pinhole
+  fit-to-frame distance — the same rule as `scan/planner.py` — clamped into the
+  accurate depth band (`extrusion.inspection_min_mm/_max_mm`, default 300–800 mm).
+  Anchor: the operator measured an A3 sheet filling this camera's frame at ~380–400
+  mm, and 297 mm × fy / H = 375 mm reproduces that from the intrinsics alone (the
+  short side binds). At cylinder scale the near limit binds instead: an 86 mm wall
+  would frame at 138 mm, inside the D435i's blind zone, so the standoff is held at
+  300 mm and the UI says so (`framing.clamped_to = "near"`, ~40% of frame height).
+  An object too large to frame *within* the band is refused, never answered by
+  backing the camera out past `inspection_max_mm`.
+- **Fronto-parallel first.** The 2026-08-13 characterization measured incidence
+  costing ~4× what distance costs, so candidates are ordered straight-down → roll
+  (free: still square to the surface, different wrist config) → 10° tilt.
+- **Same authoritative gate.** Each candidate is created, given an inspection
+  program, and put through `update_program(collisions=True)`; the first to pass is
+  used. If none does, the run fails with every rejection listed. Nothing backs off,
+  tilts past the configured cone, or drops collision checking to obtain a pass —
+  straight down at 300 mm over a fresh print is the tightest clearance in this
+  workflow, and the spindle shares the flange with the camera.
+- Targets are named `<program>_Inspect_Target`, i.e. inside the existing
+  `TasniCylinder_` namespace, so **Reset** and the normal artifact lifecycle already
+  clean them. The chosen pose (and every rejected candidate) is logged in the dry-run
+  report and archived in each layer's `provenance.inspection_pose`.
+
+`POST /api/modules/extrusion/inspection-pose` previews the geometry with no station
+and no motion; `preflight` returns the same block. Manual mode is unchanged — clear
+the checkbox and the dropdown is required again.
+
+Primary code: `tasni/modules/extrusion/inspection.py` (pure numpy),
+`service.py:_build_inspection_move`, `rdk_io.py:create_inspection_target`.
+
 ## Exact operator retry sequence
 
 1. Refresh the Cylinder Test page and connect/refresh the RoboDK station.
-2. Select the actual print tool, inspection tool, and inspection target.
+2. Select the actual print tool and inspection tool. Leave **Derive the inspection
+   pose from the cylinder** checked (an inspection target is only needed if you
+   clear it).
 3. Place the path, preferring the scanned surface:
    - **Preferred:** if the Scan surface row is not green, run the Scan module and insert
      its result, then click **Center on scanned surface**.

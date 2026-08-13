@@ -736,6 +736,27 @@ class ExtrusionConfig(_Model):
     retreat_clearance_mm: float = Field(default=60.0, gt=0, le=500)
     settle_s: float = Field(default=1.0, ge=0, le=30)
     grab_timeout_s: float = Field(default=15.0, gt=0, le=120)
+
+    # -- automatic inspection pose (tasni/modules/extrusion/inspection.py) ---
+    # The camera distance is derived from the cylinder's own diameter and the
+    # camera's intrinsics (pinhole fit-to-frame, same rule as the scan planner),
+    # then clamped into the D435i's accurate depth band. The band mirrors
+    # ScanConfig's but is deliberately a separate copy: inspecting a 90 mm wall at
+    # close range and surveying a table are different jobs, and tuning one must
+    # not silently move the other.
+    inspection_frame_margin: float = Field(default=1.15, ge=1.0, le=3.0)
+    inspection_min_mm: float = Field(default=300.0, gt=0, le=2000)
+    inspection_max_mm: float = Field(default=800.0, gt=0, le=3000)
+    # Candidate search order when the fronto-parallel pose cannot be reached.
+    # Roll first (free — the surface stays square to the sensor, only the wrist
+    # config changes), tilt last and small: the 2026-08-13 cell characterization
+    # measured incidence costing ~4x what distance costs.
+    inspection_roll_candidates_deg: list[float] = Field(
+        default_factory=lambda: [0.0, 180.0, 90.0, 270.0])
+    inspection_tilt_candidates_deg: list[float] = Field(
+        default_factory=lambda: [0.0, 10.0])
+    inspection_azimuth_candidates_deg: list[float] = Field(
+        default_factory=lambda: [0.0, 90.0, 180.0, 270.0])
     air_on_program: str = "AirOn"
     air_off_program: str = "AirOff"
     valve_outputs: list[str] = Field(default_factory=lambda: ["IO_508", "IO_601"])

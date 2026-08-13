@@ -13,7 +13,8 @@ interface Recipe {
 }
 interface Setup {
   print_tool: string; work_frame: string; inspection_tool: string;
-  inspection_target: string; center_x_mm: number; center_y_mm: number;
+  inspection_target: string; inspection_auto: boolean;
+  center_x_mm: number; center_y_mm: number;
   build_plane_z_mm: number; scan_run_id: string | null;
   orientation_rpy_deg: [number, number, number];
   approach_clearance_mm: number; retreat_clearance_mm: number;
@@ -28,6 +29,16 @@ interface ScanSurface {
   frame?: string; rectangle?: string | null; run_id?: string | null;
   applied_at?: string | null; size_mm?: [number, number] | null;
   center_mm?: [number, number] | null;
+}
+interface InspectionPreview {
+  auto: boolean; object_diameter_mm: number; standoff_mm: number; ok: boolean;
+  work_frame: string; warnings: string[];
+  framing: {
+    d_fit_mm: number; clamped_to: string | null; fits: boolean;
+    binding_axis: string; near_mm: number; far_mm: number;
+    fill_fraction: { width: number; height: number };
+  };
+  layers: Array<{ layer_index: number; top_z_mm: number; camera_z_mm: number }>;
 }
 interface Point { x_mm: number; y_mm: number; z_mm: number; }
 interface Layer { layer_index: number; nominal_z_mm: number; points: Point[]; }
@@ -183,6 +194,7 @@ export default function Extrusion() {
   const [busy, setBusy] = useState(false);
   const [confirmLive, setConfirmLive] = useState(false);
   const [surface, setSurface] = useState<ScanSurface | null>(null);
+  const [inspection, setInspection] = useState<InspectionPreview | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
 
   const refreshStatus = useCallback(() => {
@@ -223,7 +235,8 @@ export default function Extrusion() {
   useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [logs]);
 
   const invalidate = (note = "Inputs changed — generate again; prior checks were invalidated.") => {
-    setPlan(null); setPreflight(null); setResult(null); setConfirmLive(false); setMessage(note);
+    setPlan(null); setPreflight(null); setResult(null); setConfirmLive(false);
+    setInspection(null); setMessage(note);
     setStatus((old) => old ? { ...old, geometry_preflight_passed: false, dry_run_passed: false, live_print_enabled: false } : old);
   };
   const updateRecipe = (key: keyof Recipe, value: number | boolean) => {
@@ -290,6 +303,10 @@ export default function Extrusion() {
     try {
       const next = await api.post<Plan>("/generate", { recipe, setup });
       setPlan(next); setSelectedLayer(1); setPreflight(null); setResult(null);
+      // Pure geometry, no station: safe to show the derived viewpoint immediately.
+      const derived = await api.post<InspectionPreview>(
+        "/inspection-pose", { fingerprint: next.fingerprint }).catch(() => null);
+      setInspection(derived);
       setMessage(`Generated ${next.layers.length} complete closed paths.`); refreshStatus();
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
@@ -370,7 +387,8 @@ export default function Extrusion() {
   const visualSelectedLayer = visualPlan
     ? Math.min(visualPlan.layers.length, Math.max(1, selectedLayer)) : 1;
   const layer = visualPlan?.layers[visualSelectedLayer - 1];
-  const selectionsReady = Boolean(setup?.print_tool && setup?.work_frame && setup?.inspection_tool && setup?.inspection_target);
+  const selectionsReady = Boolean(setup?.print_tool && setup?.work_frame && setup?.inspection_tool
+    && (setup?.inspection_auto || setup?.inspection_target));
   const stationReady = Boolean(preflight?.station?.ready);
   const pct = progress.total ? Math.round(progress.step / progress.total * 100) : 0;
   const headlineMetrics = result?.kind === "cylinder_print" ? result.layers : [];
@@ -396,9 +414,17 @@ export default function Extrusion() {
             <option value="">Select frame…</option>{options?.frames.map((v) => <option key={v}>{v}</option>)}</select></label>
           <label>Inspection tool<select value={setup?.inspection_tool || ""} disabled={!options} onChange={(e) => updateSetup("inspection_tool", e.target.value)}>
             <option value="">Select camera tool…</option>{options?.tools.map((v) => <option key={v}>{v}</option>)}</select></label>
-          <label>Inspection target<select value={setup?.inspection_target || ""} disabled={!options} onChange={(e) => updateSetup("inspection_target", e.target.value)}>
-            <option value="">Select target…</option>{options?.targets.map((v) => <option key={v}>{v}</option>)}</select></label>
+          <label>Inspection target<select value={setup?.inspection_target || ""}
+            disabled={!options || Boolean(setup?.inspection_auto)}
+            onChange={(e) => updateSetup("inspection_target", e.target.value)}>
+            <option value="">{setup?.inspection_auto ? "derived per layer" : "Select target…"}</option>
+            {options?.targets.map((v) => <option key={v}>{v}</option>)}</select></label>
         </div>
+        <label className="live-confirm"><input type="checkbox" checked={Boolean(setup?.inspection_auto)}
+          onChange={(e) => updateSetup("inspection_auto", e.target.checked)} />
+          Derive the inspection pose from the cylinder (recommended) — square to the build
+          plane, centred on the cylinder axis, at the distance this camera needs to frame it.
+        </label>
         {setup && <>
           <div className="motion-number-grid">
             <label>Center X (mm)<input type="number" value={setup.center_x_mm} onChange={(e) => updateSetup("center_x_mm", Number(e.target.value))} /></label>
@@ -486,6 +512,17 @@ export default function Extrusion() {
         {preflight.surface.fit?.checked && ` · clearance to surface edge ${preflight.surface.fit.minimum_margin_mm.toFixed(1)} mm`}
         {preflight.surface.problem && ` — ${preflight.surface.problem}`}
         {preflight.surface.advisory && ` — ${preflight.surface.advisory}`}
+      </div>}
+      {inspection?.auto && <div className={`io-note ${inspection.ok ? "" : "warn-text"}`}>
+        Inspection pose: <b>{inspection.standoff_mm.toFixed(0)} mm</b> above each layer top,
+        square to the build plane and centred on the cylinder axis in <code>{inspection.work_frame}</code>.
+        A {inspection.object_diameter_mm.toFixed(0)} mm wall then fills{" "}
+        <b>{(inspection.framing.fill_fraction.height * 100).toFixed(0)}%</b> of the frame height
+        {inspection.framing.clamped_to === "near"
+          ? ` (it would frame at ${inspection.framing.d_fit_mm.toFixed(0)} mm, inside the camera's ${inspection.framing.near_mm.toFixed(0)} mm near limit, so the standoff is held there)`
+          : inspection.framing.clamped_to === "far" ? " — too large to frame inside the accurate depth band" : ""}.
+        Camera Z rises {inspection.layers[0]?.camera_z_mm.toFixed(0)} → {inspection.layers[inspection.layers.length - 1]?.camera_z_mm.toFixed(0)} mm over {inspection.layers.length} layer(s).
+        {inspection.warnings.map((w) => ` ${w}`)}
       </div>}
       {preflight?.station?.reachability && <div className="io-note">Path IK sample: <b>{preflight.station.reachability.reachable_count}/{preflight.station.reachability.sample_count}</b> reachable in <code>{preflight.station.reachability.frame}</code>. Full curve generation and collision validation still run in the dry run.</div>}
       <div className="btn-row"><button disabled={!plan || !preflight?.all_ok || !stationReady || busy || status?.running} onClick={() => startJob("dry-run")}>Run complete RoboDK dry run</button>

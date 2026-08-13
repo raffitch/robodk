@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from ...core.jobrunner import JobBusy
 from ...core.logging import REPO_ROOT
 from ..base import ServiceContainer, WorkflowModule
+from .inspection import inspection_plan
 from .models import CylinderPlan, CylinderRecipe, CylinderSetup
 from .service import (CylinderDryRunJob, CylinderPrintJob, geometry_preflight,
                       reprocess_saved_layer, station_requirements)
@@ -81,6 +82,7 @@ class ExtrusionModule(WorkflowModule):
             "work_frame": c.default_work_frame,
             "inspection_tool": c.default_inspection_tool,
             "inspection_target": c.default_inspection_target,
+            "inspection_auto": True,
             "center_x_mm": c.center_x_mm, "center_y_mm": c.center_y_mm,
             "build_plane_z_mm": c.build_plane_z_mm, "scan_run_id": None,
             "orientation_rpy_deg": list(c.orientation_rpy_deg),
@@ -195,6 +197,21 @@ class ExtrusionModule(WorkflowModule):
                 "surface": surface, "fit": fit,
             }
 
+        @router.post("/inspection-pose")
+        def inspection_pose(body: FingerprintBody) -> dict:
+            """Read only: where the camera will go to inspect each layer.
+
+            Pure geometry — no station, no motion. The targets themselves are
+            created (and collision-validated) per layer during the dry run, so
+            this preview can be shown before RoboDK is even connected.
+            """
+            if self._plan is None or body.fingerprint != self._plan.fingerprint:
+                raise HTTPException(409, "toolpath changed; generate the current recipe again")
+            return inspection_plan(self._plan.recipe, self._plan.setup,
+                                   K=services.config.camera.K,
+                                   size_px=services.config.camera.size,
+                                   config=services.config.extrusion)
+
         @router.post("/generate")
         def generate(body: GenerateBody) -> dict:
             if services.jobs.running:
@@ -210,7 +227,9 @@ class ExtrusionModule(WorkflowModule):
         def preflight(body: FingerprintBody) -> dict:
             if self._plan is None or body.fingerprint != self._plan.fingerprint:
                 raise HTTPException(409, "toolpath changed; generate the current recipe again")
-            result = geometry_preflight(self._plan, surface=active_scan_surface())
+            result = geometry_preflight(self._plan, surface=active_scan_surface(),
+                                        camera=services.config.camera,
+                                        config=services.config.extrusion)
             if not services.session.is_open:
                 result["station"] = {"ready": False,
                                      "error": "connect RoboDK to validate selected station items"}

@@ -1305,6 +1305,34 @@ class RdkIO:
                     removed.append(item_name)
         return removed
 
+    def create_inspection_target(self, *, name: str, T: np.ndarray,
+                                 inspection_tool: str, work_frame: str) -> dict:
+        """Create a derived inspection target at camera pose ``T`` (work frame).
+
+        ``T`` places the **camera** — the inspection tool's TCP — not the flange:
+        :meth:`solve_joints_for_pose` passes the tool mount to ``SolveIK``
+        explicitly, so the joints put the lens at the requested viewpoint. The
+        target is stored as a **joint** target locked to that solution, so the
+        configuration RoboDK then collision-validates is the one actually visited
+        (a cartesian target can be reached in a different, colliding IK branch).
+
+        Returns ``{"created": False, "reason": ...}`` rather than raising when the
+        pose has no IK solution: the caller is walking an ordered candidate list
+        and an unreachable viewpoint is an expected outcome, not a fault.
+        """
+        import robolink
+
+        self.use_named_tool_frame(inspection_tool, work_frame)
+        old = self.rdk.Item(name, robolink.ITEM_TYPE_TARGET)
+        if old.Valid():
+            old.Delete()
+        joints = self.solve_joints_for_pose(T, self.robot().Joints())
+        if joints is None:
+            return {"created": False, "target": name,
+                    "reason": "no IK solution places the camera at this viewpoint"}
+        self.add_target(name, np.asarray(T, dtype=float), joints)
+        return {"created": True, "target": name, "reason": ""}
+
     def create_inspection_program(self, *, name: str, inspection_tool: str,
                                   inspection_target: str, speed_mm_s: float) -> dict:
         """Create the post-OFF inspection move as its own auditable program."""
