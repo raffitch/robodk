@@ -61,9 +61,12 @@ from .planner import (ScanPlan, _largest_contiguous_empty_block, _tile_grid_dims
 from .sam_boundary import sam_work_boundary
 from .survey import SurveyThresholds, survey_surface
 from .survey_contract import (
-    MODE_COMPACT, MODE_FIVE_POSITION, MODE_USER_SPECIFIED, PROVENANCE_BY_MODE,
-    CaptureRecord, LockedWorkframeSurvey, camera_calibration_id,
-    frame_from_rectangle, order_corners_clockwise, refresh_robot_state)
+    GOAL_FRAME_ONLY, GOAL_FULL_SCAN, MODE_COMPACT, MODE_FIVE_POSITION,
+    MODE_USER_SPECIFIED, PROVENANCE_BY_MODE, SCOPE_DECLARED_REGION,
+    SCOPE_ENTIRE_PLATFORM, SURFACE_SCOPES, WORKFLOW_GOALS,
+    CaptureRecord, LockedWorkframeSurvey, camera_calibration_id, lock_fingerprint,
+    order_corners_clockwise, pose_delta, refresh_robot_state,
+    workframe_from_rectangle)
 from .reconstruct import (ScanView, clean_measured_surface_mesh, cloud_points_m,
                           crop_box, fuse_views, look_point_from_views,
                           mesh_preview_points, planar_rectangle_mesh, save_mesh)
@@ -87,6 +90,13 @@ MESH_NAME = "Tasni Scan Mesh"
 # would make the coverage gate unreachable dead code.
 _CORNER_DETECT_SANITY_FRAC = 0.02
 
+# How stale a lock may be, and how far the robot may drift from the pose the
+# measurement was frozen at, before the geometry is no longer trustworthy. Shared by
+# generate_scan_targets (motion planning) and prepare_frame_result (frame-only).
+LOCK_MAX_AGE_S = 120.0
+LOCK_MOVED_TOL_MM = 5.0
+LOCK_MOVED_TOL_DEG = 1.5
+
 
 @dataclass
 class LockedScanSurface:
@@ -99,6 +109,24 @@ class LockedScanSurface:
     locked_at: float
     survey_record: "LockedWorkframeSurvey | None" = None
     lock_token: str = ""
+    # The intent this lock was taken under (plan Task 2). Carried on the lock rather
+    # than kept in frontend state so every mutating request downstream is bound to
+    # the goal/scope that was actually in force when the measurement was frozen.
+    workflow_goal: str = GOAL_FULL_SCAN
+    surface_scope: str = SCOPE_ENTIRE_PLATFORM
+
+
+class LargeSurfaceRequired(RuntimeError):
+    """The platform overruns the camera view but entire-platform scope was asked for.
+
+    Plan Task 3: this is the one case that must NEVER silently become the generic
+    ``work_crop_mm`` square. It carries a structured payload so the UI can offer the
+    five-position survey as the primary action instead of a dead end.
+    """
+
+    def __init__(self, payload: dict):
+        super().__init__(payload.get("message", "large surface requires a survey"))
+        self.payload = payload
 
 
 def _crop_gate_payload(gate_payload: dict, scfg, K, image_size, look_mm: float,
@@ -202,7 +230,7 @@ def _survey_record_from_lock(survey, seed_T, snapshot, camera_cfg, *, mode, n_fr
         normal_base = -normal_base
     centroid_base = R @ np.asarray(survey.centroid_cam_mm, dtype=float) + t
     corners_base = order_corners_clockwise(corners_base, normal_base)
-    frame_T = frame_from_rectangle(corners_base, normal_base)
+    frame_T = workframe_from_rectangle(corners_base, normal_base)
     e1 = float(np.linalg.norm(corners_base[1] - corners_base[0]))
     e2 = float(np.linalg.norm(corners_base[2] - corners_base[1]))
     record = CaptureRecord(
@@ -348,19 +376,51 @@ def _authoritative_acquisition(services, *, owner: str):
 
 
 def lock_scan_surface(services, *, force_crop: bool = False,
-                      user_region_mm: tuple[float, float] | None = None) -> LockedScanSurface:
-    """Freeze one authoritative RGBD measurement and the matching robot pose."""
+                      user_region_mm: tuple[float, float] | None = None,
+                      workflow_goal: str = GOAL_FULL_SCAN,
+                      surface_scope: str | None = None) -> LockedScanSurface:
+    """Freeze one authoritative RGBD measurement and the matching robot pose.
+
+    ``surface_scope`` decides what an overrunning platform means (plan Task 3):
+    ``declared_region`` accepts a sized ROI (declared, not measured), while
+    ``entire_platform`` refuses -- it raises :class:`LargeSurfaceRequired` rather than
+    quietly substituting the generic ``work_crop_mm`` square for the real boundary.
+    ``force_crop`` is the legacy ``mode="crop"`` spelling of ``declared_region``.
+    """
     cfg = services.config
     scfg = cfg.scan
     rdk: RdkIO = services.rdk
     K = cfg.camera.K
+    if surface_scope is None:
+        surface_scope = SCOPE_DECLARED_REGION if force_crop else SCOPE_ENTIRE_PLATFORM
+    if workflow_goal not in WORKFLOW_GOALS:
+        raise ValueError(f"unknown workflow_goal {workflow_goal!r}")
+    if surface_scope not in SURFACE_SCOPES:
+        raise ValueError(f"unknown surface_scope {surface_scope!r}")
+    declared_region = force_crop or surface_scope == SCOPE_DECLARED_REGION
     frame, n_frames, reading, survey, snapshot, raw_frames = _authoritative_acquisition(
         services, owner="scan-surface-lock")
     depth = np.asarray(frame.depth) if frame.depth is not None else np.zeros((0, 0))
     full_frame_valid_frac = float(np.mean(depth > 0)) if depth.size else 0.0
     surface_overruns_view = bool(
         survey.detected and not survey.fully_framed and full_frame_valid_frac >= 0.95)
-    crop_mode = force_crop or surface_overruns_view
+    if surface_overruns_view and not declared_region:
+        # Plan Task 3, the load-bearing invariant: entire-platform scope may not be
+        # satisfied by a fabricated square. Refuse with the one action that CAN
+        # measure this platform's real boundary.
+        extent = [float(v) for v in (survey.extent_mm or ())] or None
+        raise LargeSurfaceRequired({
+            "error": "large_surface_required",
+            "message": ("the platform overruns the camera view, so its full boundary "
+                        "cannot be measured from here — survey it from five positions "
+                        "(center + four corners), or switch to a declared work region."),
+            "extent_mm": extent,
+            "surface_scope": surface_scope,
+            "workflow_goal": workflow_goal,
+            "primary_action": "survey_full_platform",
+            "alternatives": ["declared_region"],
+        })
+    crop_mode = declared_region
     gate_payload = scan_gate_payload(reading, survey)
     ideal_distance = _planned_surface_standoff_mm(
         scfg, K, cfg.camera.size, reading, survey, full_frame_valid_frac)
@@ -375,7 +435,7 @@ def lock_scan_surface(services, *, force_crop: bool = False,
         ),
         "angle": bool(reading.gates.get("angle")),
     }
-    if not force_crop and survey.detected and survey.fully_framed:
+    if not declared_region and survey.detected and survey.fully_framed:
         if survey.centroid_cam_mm is not None:
             final_gates["center"] = bool(
                 abs(float(survey.centroid_cam_mm[0])) <= float(scfg.center_tol_mm)
@@ -435,32 +495,35 @@ def lock_scan_surface(services, *, force_crop: bool = False,
     # Boundary provenance (spec §1 / §12): a survey record is built only when the
     # boundary was either MEASURED (the normal compact path, crop_mode False, AND
     # -- Task 18 -- classify_compact's spec-§6 entry conditions all hold) or
-    # EXPLICITLY DECLARED by the operator (force_crop — today's "region" mode).
-    # crop_mode alone is NOT that discriminator: it also goes true automatically
-    # when the surface overruns the camera view (surface_overruns_view), and that
-    # is the system silently falling back, not the operator specifying anything —
-    # tagging it "user specified" would be a false provenance claim. In that
-    # auto-overrun-without-force_crop case, leave survey_record/boundary_provenance
-    # unset and surface a warning instead; everything else about the lock (gate
-    # readiness, the crop overlay/outline_uv, etc.) is unaffected.
+    # EXPLICITLY DECLARED by the operator (declared_region scope, a.k.a. the legacy
+    # force_crop "region" mode).
+    #
+    # Plan Task 3 removed the third case this branch used to guard against: crop_mode
+    # could previously go true ALL BY ITSELF when the surface overran the view, which
+    # was the system silently falling back rather than the operator declaring
+    # anything (tagging that "user specified" would be a false provenance claim, so
+    # it produced a record-less warning instead). That case now raises
+    # LargeSurfaceRequired above and never reaches here, so crop_mode == declared
+    # region exactly, and it IS a valid provenance discriminator again.
     record = None
-    if force_crop:
+    if crop_mode:
         mode = MODE_USER_SPECIFIED
         plane_rms = _plane_rms_mm(depth, K)
         record = _survey_record_from_lock(
             survey, seed_T, snapshot, services.config.camera,
             mode=mode, n_frames=n_frames, measurement_ts=frame.timestamp,
             valid_frac=gate_payload.get("valid_frac", 0.0), plane_rms_mm=plane_rms)
-    elif not crop_mode:
+    else:
         # Compact path (spec §6, Task 18): "detected + fully framed" alone is not
-        # sufficient to call the boundary MEASURED -- classify_compact (built +
-        # unit-tested in an earlier task, never wired in until now) is the single
+        # sufficient to call the boundary MEASURED -- classify_compact is the single
         # source of truth for the guard band / segmentation-confirmed boundary /
-        # centering / tilt / rectangle-identity gates. A failure follows the EXACT
-        # same honest-provenance shape as the auto-overrun branch below: no
-        # record, no boundary_provenance, a warning naming which condition(s)
-        # failed -- never a raise, so the lock still completes and issues a
-        # lock_token either way.
+        # centering / tilt / rectangle-identity gates, and (plan Task 3) it is the
+        # AUTHORITATIVE boundary evidence for entire-platform scope. The SAM live
+        # boundary feeds it as one input via _work_boundary; promoting SAM to a
+        # gate in its own right would be a separate, deliberately validated change.
+        # A failure keeps the honest-provenance shape: no record, no
+        # boundary_provenance, a warning naming which condition(s) failed -- never a
+        # raise, so the lock still completes and issues a lock_token either way.
         if not survey.detected:
             # Task 18 review, Minor: ``detected`` alone already decides
             # ineligibility (classify_compact adds "no surface detected" and
@@ -519,12 +582,6 @@ def lock_scan_surface(services, *, force_crop: bool = False,
                         reason = reason + " — " + _guard_violation_backoff_hint(
                             survey.outline_uv, scfg.compact_guard_uv, reading.distance_mm)
                     warnings.append(reason)
-    else:
-        gate_payload.setdefault("warnings", []).append(
-            "the surface overruns the camera view, so its boundary is unverified — "
-            "declare a region (crop mode) or run a multi-position survey before "
-            "relying on this lock's geometry.")
-
     # Calibration-age gate (Task 16, spec §10): a distance-characterization sweep
     # (tools/characterize_distance.py) is what actually validates the measurement
     # chain's error budget at the working standoff -- without one on file (or once
@@ -571,6 +628,10 @@ def lock_scan_surface(services, *, force_crop: bool = False,
     if record is not None:
         gate_payload["survey"] = record.to_dict()
         gate_payload["boundary_provenance"] = record.boundary_provenance
+    # Echo the intent back so the HUD/report never has to guess which goal+scope the
+    # frozen measurement was taken under (plan Task 2/Task 10).
+    gate_payload["workflow_goal"] = workflow_goal
+    gate_payload["surface_scope"] = surface_scope
 
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:
@@ -592,7 +653,12 @@ def lock_scan_surface(services, *, force_crop: bool = False,
     return LockedScanSurface(
         frame=frame, reading=reading, survey=survey, gate_payload=gate_payload,
         seed_T=np.asarray(seed_T, float), seed_joints=seed_joints,
-        locked_at=time.monotonic(), survey_record=record, lock_token=uuid.uuid4().hex)
+        locked_at=time.monotonic(), survey_record=record,
+        # Fingerprint-prefixed so goal/scope are part of the token's identity: a
+        # token minted under one intent can never validate under another (Task 2).
+        lock_token=(lock_fingerprint(workflow_goal, surface_scope, user_region_mm)
+                    + "-" + uuid.uuid4().hex),
+        workflow_goal=workflow_goal, surface_scope=surface_scope)
 
 
 def scan_gate_thresholds(scfg) -> ScanGateThresholds:
@@ -1267,6 +1333,101 @@ def _reference_locate(services, frame, survey, seed_T: np.ndarray,
         f"(standoff ~{survey.standoff_mm and round(survey.standoff_mm)} mm, "
         f"inliers {wp.inlier_frac:.0%}). Review, then Insert.")
 
+    return ScanResult(report=report, run_dir=str(run_dir),
+                      frame_T_mm=frame_T_mm, corners_mm=corners_mm, mesh_obj_path=None)
+
+
+def _assert_lock_current(services, locked: LockedScanSurface) -> None:
+    """Age + robot-pose recheck shared by every consumer of a locked surface."""
+    if time.monotonic() - locked.locked_at > LOCK_MAX_AGE_S:
+        raise RuntimeError("locked surface expired — reposition and lock it again")
+    current_T = services.rdk.camera_pose_T()
+    if current_T is None:
+        raise RuntimeError("robot pose unavailable — cannot verify the locked surface")
+    moved_mm, moved_deg = pose_delta(locked.seed_T, np.asarray(current_T, float))
+    if moved_mm > LOCK_MOVED_TOL_MM or moved_deg > LOCK_MOVED_TOL_DEG:
+        raise RuntimeError(
+            f"robot moved after surface lock ({moved_mm:.1f} mm, {moved_deg:.1f}°) — "
+            "reposition and lock the surface again")
+
+
+def prepare_frame_result(services, locked: LockedScanSurface) -> ScanResult:
+    """Turn an immutable locked survey into a reviewable :class:`ScanResult` (Task 4).
+
+    This is the frame-only route: the operator needs a trustworthy RoboDK working
+    frame, not dense surface data, so there is no tour, no motion target, no fusion
+    and no mesh. The locked survey is the ONLY geometry source -- its frame and
+    corners are converted, never refit from another cloud, so what gets inserted is
+    bit-for-bit the geometry the operator reviewed.
+
+    Creates no ``TasniScan_*`` targets and clears none: this is station-geometry
+    preparation, not motion planning.
+    """
+    cfg = services.config
+    pub = _log_pub(services)
+    record = locked.survey_record
+    if record is None:
+        raise RuntimeError(
+            "this lock has no measured boundary survey, so there is no trustworthy "
+            "frame to prepare — fully frame the platform and lock again, run a "
+            "five-position survey, or declare a work region")
+    _assert_lock_current(services, locked)
+
+    live_id = camera_calibration_id(cfg.camera)
+    if record.calibration_id != live_id:
+        raise RuntimeError(
+            f"camera calibration changed since the lock ({record.calibration_id} -> "
+            f"{live_id}) — lock the surface again so the geometry matches the "
+            "intrinsics it was measured with")
+    if record.boundary_provenance not in PROVENANCE_BY_MODE.values():
+        raise RuntimeError(
+            f"locked survey has unknown boundary provenance {record.boundary_provenance!r}")
+    if not record.captures:
+        raise RuntimeError("locked survey has no captures — recapture the surface")
+    size = [float(v) for v in record.size_mm]
+    if min(size) <= 0.0:
+        raise RuntimeError(f"locked survey rectangle is degenerate ({size[0]:.0f}"
+                           f"×{size[1]:.0f} mm) — recapture the surface")
+
+    # Straight conversion. record.frame_T_base / corners_base are already mm in the
+    # robot base frame, which is exactly what insert_scan and RoboDK expect.
+    frame_T_mm = record.frame_np()
+    corners_mm = record.corners_np()
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    run_dir = new_run_dir("scan", stamp)
+    report = {
+        "module": "scan", "stamp": stamp, "run_dir": str(run_dir),
+        "mode": GOAL_FRAME_ONLY,
+        "workflow_goal": locked.workflow_goal,
+        "surface_scope": locked.surface_scope,
+        "acquisition_mode": record.mode,
+        "boundary_provenance": record.boundary_provenance,
+        "calibration_id": record.calibration_id,
+        "lock_token": locked.lock_token,
+        "n_views": len(record.captures), "n_points": 0,
+        "captures": [c.kind for c in record.captures],
+        "mesh_vertices": 0, "mesh_triangles": 0, "mesh_file": None,
+        "plane": {
+            "frame_T_mm": frame_T_mm.tolist(),
+            "corners_mm": corners_mm.tolist(),
+            "size_mm": size,
+            "normal": [float(v) for v in record.plane_normal_base],
+        },
+        "survey": record.to_dict(),
+        "quality": dict(record.quality),
+    }
+    try:
+        (run_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+        runs.write_meta("scan", stamp, {
+            "module": "scan", "stamp": stamp, "mode": GOAL_FRAME_ONLY,
+            "acquisition_mode": record.mode, "tool_name": cfg.robodk.camera_tool})
+    except Exception:
+        pass
+
+    pub(f"working frame prepared: {size[0]:.0f}×{size[1]:.0f} mm from the "
+        f"{record.mode} survey ({record.boundary_provenance}); no robot motion. "
+        "Review, then Insert.")
     return ScanResult(report=report, run_dir=str(run_dir),
                       frame_T_mm=frame_T_mm, corners_mm=corners_mm, mesh_obj_path=None)
 
@@ -2205,7 +2366,7 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
 
     if locked is None:
         locked = lock_scan_surface(services)
-    elif time.monotonic() - locked.locked_at > 120.0:
+    elif time.monotonic() - locked.locked_at > LOCK_MAX_AGE_S:
         raise RuntimeError("locked surface expired — reposition and lock it again")
     frame, reading, survey = locked.frame, locked.reading, locked.survey
     gate_payload = locked.gate_payload
@@ -2215,7 +2376,7 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
     rel_R = seed_T[:3, :3].T @ current_T[:3, :3]
     moved_deg = float(np.degrees(np.arccos(np.clip(
         (np.trace(rel_R) - 1.0) / 2.0, -1.0, 1.0))))
-    if moved_mm > 5.0 or moved_deg > 1.5:
+    if moved_mm > LOCK_MOVED_TOL_MM or moved_deg > LOCK_MOVED_TOL_DEG:
         raise RuntimeError(
             f"robot moved after surface lock ({moved_mm:.1f} mm, {moved_deg:.1f}°) — "
             "reposition and lock the surface again")
@@ -2245,14 +2406,14 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
     force_crop_plan = gate_payload.get("surface_mode") == "crop"
     if survey.detected and survey.extent_mm is not None:
         if force_crop_plan:
-            # Operator chose / auto detected large-platform crop. Do not chase the
-            # measured finite rectangle; use the current reticle plane as the work
-            # region and keep the seed-pose cone.
+            # Operator DECLARED a work region (plan Task 3: this is no longer ever an
+            # automatic fallback). Do not chase the measured finite rectangle; use the
+            # current reticle plane as the work region and keep the seed-pose cone.
             crop_size_mm = gate_payload.get("crop_size_mm") or _large_surface_crop_mm(
                 scfg, K, (W, H), look)
-            pub("survey: using reticle crop mode; ignoring unstable/full rectangle "
-                f"edges and creating a {crop_size_mm[0]:.0f}×{crop_size_mm[1]:.0f} mm "
-                "camera-centred work crop")
+            pub("survey: using the DECLARED work region (boundary declared, not "
+                f"measured); creating a {crop_size_mm[0]:.0f}×{crop_size_mm[1]:.0f} mm "
+                "camera-centred region")
         elif survey.fully_framed:
             plan = plan_scan(survey, K, (W, H), scfg, cam_to_base_T=seed_T)
             planned_voxel_m = plan.voxel_size_m
@@ -2306,13 +2467,30 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
             for w in plan.warnings:
                 pub(f"WARNING (survey): {w}")
         else:
-            # The intended surface continues beyond the image. Define a useful,
-            # camera-centred work region instead of pretending the visible border is
+            # The intended surface continues beyond the image. Plan Task 3: under
+            # entire-platform scope a camera-centred crop is NOT the platform, so
+            # refuse rather than plan a tour over a fabricated region. (The lock
+            # itself already refuses this case; this is the belt-and-braces guard for
+            # a lock whose overrun was too marginal to trip surface_overruns_view.)
+            if locked.surface_scope == SCOPE_ENTIRE_PLATFORM:
+                raise LargeSurfaceRequired({
+                    "error": "large_surface_required",
+                    "message": ("the surface outline touches the image border, so the "
+                                "full platform boundary is unmeasured — survey it from "
+                                "five positions, or switch to a declared work region."),
+                    "extent_mm": [float(v) for v in extent_mm] if extent_mm else None,
+                    "surface_scope": locked.surface_scope,
+                    "workflow_goal": locked.workflow_goal,
+                    "primary_action": "survey_full_platform",
+                    "alternatives": ["declared_region"],
+                })
+            # Declared-region scope: a sized, operator-declared work region. Define a
+            # useful camera-centred region instead of pretending the visible border is
             # the table edge. The final multi-view fit preserves its inclination.
             crop_size_mm = _large_surface_crop_mm(scfg, K, (W, H), look)
             pub("survey: surface outline touches the image border; using the stable "
                 f"centre plane and a {crop_size_mm[0]:.0f}×{crop_size_mm[1]:.0f} mm "
-                "camera-centred work crop")
+                "DECLARED (not measured) camera-centred work region")
     else:
         pub("survey: no trustworthy full-frame extent; using the stable centre-patch "
             "standoff gate and default cone/voxel settings for targets")

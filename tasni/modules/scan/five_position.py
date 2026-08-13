@@ -42,8 +42,8 @@ from .rect_fit import (fit_global_plane, lift_points_3d, project_points_2d,
                        solve_constrained_rectangle)
 from .survey_contract import (MODE_FIVE_POSITION, PROVENANCE_BY_MODE, CaptureRecord,
                               LockedWorkframeSurvey, RobotStateSnapshot,
-                              capture_is_fresh, frame_from_rectangle,
-                              order_corners_clockwise)
+                              capture_is_fresh, order_corners_clockwise,
+                              workframe_from_rectangle)
 
 SURVEY_STEPS = ("center", "corner1", "corner2", "corner3", "corner4")
 
@@ -383,7 +383,7 @@ class FivePositionSurvey:
 
         corners3d = lift_points_3d(np.asarray(rect.corners2d), point, u, v)
         corners3d = order_corners_clockwise(corners3d, normal)
-        frame_T = frame_from_rectangle(corners3d, normal)
+        frame_T = workframe_from_rectangle(corners3d, normal)
         quality = {
             "plane_rms_mm": plane.rms_mm, "plane_max_residual_mm": plane.max_residual_mm,
             "per_position_rms_mm": list(plane.per_set_rms_mm),

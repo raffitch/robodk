@@ -28,6 +28,38 @@ PROVENANCE_BY_MODE = {
     MODE_USER_SPECIFIED: PROVENANCE_USER_SPECIFIED,
 }
 
+# --- Workflow goal / surface scope (adaptive-scan plan Task 2) ----------------
+# Three INDEPENDENT concepts; do not overload ``mode`` above, which records how the
+# geometry was acquired (its provenance) and nothing else.
+#
+#   goal  -- does the user need only the working frame, or also dense surface data?
+#   scope -- must every physical boundary be measured, or is a sized ROI acceptable?
+#   mode  -- (above) the provenance-bearing measurement path that was actually used.
+GOAL_FRAME_ONLY = "frame_only"
+GOAL_FULL_SCAN = "full_scan"
+WORKFLOW_GOALS = (GOAL_FRAME_ONLY, GOAL_FULL_SCAN)
+
+SCOPE_ENTIRE_PLATFORM = "entire_platform"
+SCOPE_DECLARED_REGION = "declared_region"
+SURFACE_SCOPES = (SCOPE_ENTIRE_PLATFORM, SCOPE_DECLARED_REGION)
+
+# Legacy ``SurfaceLockBody.mode`` values map onto scope (goal defaults to full_scan,
+# which is what every pre-Task-2 client did).
+LEGACY_MODE_TO_SCOPE = {"auto": SCOPE_ENTIRE_PLATFORM, "crop": SCOPE_DECLARED_REGION}
+
+
+def lock_fingerprint(goal: str, scope: str, region_mm=None) -> str:
+    """Identity of the *intent* behind a lock (plan Task 2).
+
+    Folded into the lock token so that changing goal or scope invalidates already
+    prepared results and already generated scan targets: a token minted under one
+    intent can never be mistaken for a token minted under another.
+    """
+    region = "" if region_mm is None else ",".join(
+        f"{float(v):.3f}" for v in tuple(region_mm))
+    payload = f"{goal}|{scope}|{region}".encode("utf-8")
+    return hashlib.sha1(payload).hexdigest()[:10]
+
 
 def _as_tuple(arr):
     a = np.asarray(arr, dtype=float)
@@ -133,16 +165,60 @@ def order_corners_clockwise(corners_base, normal_base) -> np.ndarray:
     return np.roll(c, -start, axis=0)
 
 
-def frame_from_rectangle(corners_base, normal_base) -> np.ndarray:
-    """4x4 workframe: origin = center, +X = long edge, +Z = up-oriented normal (§2)."""
-    c = np.asarray(corners_base, dtype=float).reshape(4, 3)
+# Relative length difference below which the two edges meeting C1 count as "equal"
+# and the length rule is abandoned (see _tie_break_edge). 0.5% of a 500 mm side is
+# 2.5 mm -- about depth-noise scale, so a physically square platform lands inside the
+# band while a genuinely oblong rectangle (>=0.5% aspect difference) never does.
+EDGE_TIE_REL_TOL = 0.005
+
+
+def _tie_break_edge(e_next, e_prev, l_next, l_prev):
+    """Pick +X when both edges meeting C1 are the same length to within tolerance.
+
+    On a square the longer-edge rule carries no signal: measurement noise decides it,
+    so the frame flips 90 deg between scans of the same platform. Fall back to the
+    edge better aligned with base +X (then base +Y), which noise cannot flip.
+    """
+    un, up = e_next / l_next, e_prev / l_prev
+    for ref in (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])):
+        an, ap = abs(float(un @ ref)), abs(float(up @ ref))
+        if abs(an - ap) > 1e-9:
+            return e_next if an > ap else e_prev
+    return e_next  # exactly diagonal to both base axes -- canonical order decides
+
+
+def workframe_from_rectangle(corners_base, normal_base) -> np.ndarray:
+    """THE one workframe convention (adaptive-scan plan Task 1). 4x4 base->frame.
+
+    * origin = ``C1``, the rectangle corner nearest the robot base origin;
+    * +X = the LONGER of the two rectangle edges **meeting C1**;
+    * +Z = the up-oriented surface normal;
+    * +Y = Z x X (right-handed).
+
+    This is the convention already deployed by :mod:`plane` and RoboDK insertion, so
+    frames inserted by past runs keep their meaning. It replaces the centre-origin
+    frame this module used to build, which was never the one that got inserted.
+
+    Note the "longer edge **meeting C1**" wording: that is not the same as the
+    rectangle's global long edge whenever the two rules disagree, which they do on a
+    near-square. Corners are canonicalised first, so the result depends only on the
+    rectangle's geometry -- never on the order the caller happens to pass corners in.
+    That order-independence is what makes every acquisition path agree.
+    """
+    c = order_corners_clockwise(corners_base, normal_base)
     n = _up_normal(normal_base)
-    e1, e2 = c[1] - c[0], c[2] - c[1]
-    x = e1 if np.linalg.norm(e1) >= np.linalg.norm(e2) else e2
-    x = x - n * float(x @ n)
-    x = x / np.linalg.norm(x)
+    origin = c[0]
+    e_next, e_prev = c[1] - origin, c[3] - origin
+    l_next = max(float(np.linalg.norm(e_next)), 1e-12)
+    l_prev = max(float(np.linalg.norm(e_prev)), 1e-12)
+    if abs(l_next - l_prev) <= EDGE_TIE_REL_TOL * max(l_next, l_prev):
+        x = _tie_break_edge(e_next, e_prev, l_next, l_prev)
+    else:
+        x = e_next if l_next > l_prev else e_prev
+    x = x - n * float(x @ n)                 # re-orthogonalise against the normal
+    x = x / max(float(np.linalg.norm(x)), 1e-12)
     T = np.eye(4)
-    T[:3, 0], T[:3, 1], T[:3, 2], T[:3, 3] = x, np.cross(n, x), n, c.mean(axis=0)
+    T[:3, 0], T[:3, 1], T[:3, 2], T[:3, 3] = x, np.cross(n, x), n, origin
     return T
 
 

@@ -32,7 +32,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ...core.geometry import Rt_to_T, invert_T, transform_points
+from ...core.geometry import invert_T, transform_points
+from .survey_contract import workframe_from_rectangle
 
 
 @dataclass
@@ -313,18 +314,10 @@ def work_plane_from_points(points: np.ndarray, *, distance: float = 0.006,
     inl = pts[mask]
     corners, ax1, ax2, len1, len2 = _oriented_rectangle(inl, normal, centroid)
 
-    # Origin = the corner nearest the base origin (deterministic + repeatable).
-    o = int(np.argmin(np.linalg.norm(corners, axis=1)))
-    origin = corners[o]
-    nxt, prv = corners[(o + 1) % 4], corners[(o - 1) % 4]
-    edge_nxt, edge_prv = nxt - origin, prv - origin
-    # X = along the LONGER of the two edges meeting the origin corner.
-    x_raw = edge_nxt if np.linalg.norm(edge_nxt) >= np.linalg.norm(edge_prv) else edge_prv
-    z = normal / np.linalg.norm(normal)
-    x = x_raw - (x_raw @ z) * z            # re-orthogonalise against the plane normal
-    x = x / np.linalg.norm(x)
-    y = np.cross(z, x)                     # right-handed [x, y, z]
-    frame_T = Rt_to_T(np.column_stack([x, y, z]), origin)
+    # The one shared convention (origin = corner nearest base, +X = longer edge
+    # meeting it, +Z = up normal) -- see survey_contract.workframe_from_rectangle.
+    frame_T = workframe_from_rectangle(corners, normal)
+    z = frame_T[:3, 2]
 
     return WorkPlane(frame_T=frame_T, corners=corners,
                      size=(max(len1, len2), min(len1, len2)),
@@ -398,15 +391,7 @@ def bounded_work_plane(wp: WorkPlane, center: np.ndarray,
         c + hx * x + hy * y,
         c - hx * x + hy * y,
     ])
-    o = int(np.argmin(np.linalg.norm(corners, axis=1)))
-    origin = corners[o]
-    nxt, prv = corners[(o + 1) % 4], corners[(o - 1) % 4]
-    x_raw = (nxt - origin if np.linalg.norm(nxt - origin) >= np.linalg.norm(prv - origin)
-             else prv - origin)
-    x_axis = x_raw - float(x_raw @ z) * z
-    x_axis /= np.linalg.norm(x_axis)
-    y_axis = np.cross(z, x_axis)
-    frame_T = Rt_to_T(np.column_stack([x_axis, y_axis, z]), origin)
+    frame_T = workframe_from_rectangle(corners, z)
     return WorkPlane(
         frame_T=frame_T, corners=corners, size=(length, width),
         normal=z, centroid=c, inlier_count=wp.inlier_count,

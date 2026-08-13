@@ -25,10 +25,14 @@ from .five_position import FivePositionSurvey
 from .sam_boundary import SamBoundaryWorker
 from .service import (annotate_pose_liveness, camera_pose_moved, ScanCaptureJob,
                       ScanParams, ScanResult, five_position_capture, generate_scan_targets,
-                      insert_scan, live_scan_telemetry_payload, LockedScanSurface,
-                      lock_scan_surface, stabilize_live_scan_payload)
+                      insert_scan, LargeSurfaceRequired, live_scan_telemetry_payload,
+                      LockedScanSurface, lock_scan_surface, prepare_frame_result,
+                      stabilize_live_scan_payload)
 from .live_diag import LiveLatencyProbe
-from .survey_contract import camera_calibration_id, refresh_robot_state
+from .survey_contract import (GOAL_FRAME_ONLY, GOAL_FULL_SCAN, LEGACY_MODE_TO_SCOPE,
+                              SCOPE_DECLARED_REGION, SCOPE_ENTIRE_PLATFORM,
+                              SURFACE_SCOPES, WORKFLOW_GOALS, camera_calibration_id,
+                              lock_fingerprint, refresh_robot_state)
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
@@ -50,7 +54,16 @@ class CollisionIgnoreBody(BaseModel):
 
 
 class SurfaceLockBody(BaseModel):
-    mode: str = "auto"       # "auto" | "crop"
+    """Plan Task 2: goal and scope are independent of each other and of provenance.
+
+    ``mode`` is the pre-Task-2 spelling and stays accepted as a compatibility alias
+    (``auto`` -> entire_platform, ``crop`` -> declared_region, goal full_scan), so
+    existing clients keep working unchanged.
+    """
+
+    mode: str | None = None                  # legacy: "auto" | "crop"
+    workflow_goal: str | None = None         # "frame_only" | "full_scan"
+    surface_scope: str | None = None         # "entire_platform" | "declared_region"
 
 
 class SurfaceRegionBody(BaseModel):
@@ -60,6 +73,12 @@ class SurfaceRegionBody(BaseModel):
 
 class SurveyRecaptureBody(BaseModel):
     kind: str
+
+
+class SurveyFinishBody(BaseModel):
+    # Scope is implicit: a five-position survey exists precisely to measure a whole
+    # platform that overruns the view. Only the goal is still open at this point.
+    workflow_goal: str | None = None
 
 
 class ScanModule(WorkflowModule):
@@ -72,7 +91,9 @@ class ScanModule(WorkflowModule):
     def __init__(self, services: ServiceContainer):
         super().__init__(services)
         self._active_job: ScanCaptureJob | None = None
-        self._reference_result: ScanResult | None = None  # set by reference-mode locate
+        # A ready-to-insert result that needed no capture job: reference-mode locate, or
+        # (plan Task 4) a frame-only preparation straight from the locked survey.
+        self._prepared_result: ScanResult | None = None
         self._planned_voxel_m: float | None = None         # set by /poses/generate for /run
         self._planned_crop_mm: tuple[float, float] | None = None
         self._planned_surface_size_mm: tuple[float, float] | None = None
@@ -146,12 +167,16 @@ class ScanModule(WorkflowModule):
         services = self.services
         if services.jobs.running:
             raise HTTPException(409, "a job is already running")
-        force_crop = body.mode == "crop"
-        if body.mode not in ("auto", "crop"):
-            raise HTTPException(400, "surface lock mode must be 'auto' or 'crop'")
+        goal, scope = self._resolve_goal_scope(body)
+        force_crop = scope == SCOPE_DECLARED_REGION
+        # Changing goal or scope invalidates anything prepared/planned under the old
+        # intent (plan Task 2); a fresh lock also mints a fresh, fingerprint-prefixed
+        # token, so targets generated earlier can no longer pass run()'s guard.
+        self._prepared_result = None
         try:
             self._locked_surface = lock_scan_surface(
-                services, force_crop=force_crop, user_region_mm=self._user_region_mm)
+                services, force_crop=force_crop, user_region_mm=self._user_region_mm,
+                workflow_goal=goal, surface_scope=scope)
             self._current_lock_token = self._locked_surface.lock_token
             gate = self._locked_surface.gate_payload
             crop = gate.get("crop_size_mm")
@@ -162,7 +187,18 @@ class ScanModule(WorkflowModule):
                 "surface_mode": "crop" if crop else "full",
                 "extent_mm": extent,
                 "crop_size_mm": crop,
+                "workflow_goal": goal,
+                "surface_scope": scope,
+                "boundary_provenance": gate.get("boundary_provenance"),
+                "can_prepare_frame": self._locked_surface.survey_record is not None,
             }
+        except LargeSurfaceRequired as e:
+            # Plan Task 3: NOT a generic failure — a specific, recoverable state with
+            # one primary action. 409 so the UI can branch on it instead of parsing
+            # a message string.
+            self._locked_surface = None
+            self._current_lock_token = None
+            raise HTTPException(409, e.payload)
         except RuntimeError as e:
             self._locked_surface = None
             self._current_lock_token = None
@@ -171,6 +207,51 @@ class ScanModule(WorkflowModule):
             self._locked_surface = None
             self._current_lock_token = None
             raise HTTPException(503, f"camera/RoboDK unavailable: {e}")
+
+    def _resolve_goal_scope(self, body: SurfaceLockBody) -> tuple[str, str]:
+        """Validate goal/scope, folding in the legacy ``mode`` alias (plan Task 2)."""
+        from fastapi import HTTPException
+
+        goal = body.workflow_goal or GOAL_FULL_SCAN
+        if goal not in WORKFLOW_GOALS:
+            raise HTTPException(422, f"workflow_goal must be one of {list(WORKFLOW_GOALS)}")
+        scope = body.surface_scope
+        if scope is None:
+            if body.mode is None:
+                scope = SCOPE_ENTIRE_PLATFORM
+            elif body.mode in LEGACY_MODE_TO_SCOPE:
+                scope = LEGACY_MODE_TO_SCOPE[body.mode]
+            else:
+                # Preserve the pre-Task-2 status code for the legacy field exactly.
+                raise HTTPException(400, "surface lock mode must be 'auto' or 'crop'")
+        elif scope not in SURFACE_SCOPES:
+            raise HTTPException(422, f"surface_scope must be one of {list(SURFACE_SCOPES)}")
+        return goal, scope
+
+    def prepare_frame(self) -> dict:
+        """Build a reviewable working frame from the locked survey — no robot motion.
+
+        Plan Task 4/5: the frame-only route's single action. Insertion stays a
+        separate explicit click, exactly as it is for a full scan.
+        """
+        from fastapi import HTTPException
+
+        services = self.services
+        if services.jobs.running:
+            raise HTTPException(409, "a job is already running")
+        if self._locked_surface is None:
+            raise HTTPException(400, "lock and review the surface first")
+        try:
+            result = prepare_frame_result(services, self._locked_surface)
+        except (RuntimeError, ValueError, KeyError) as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:
+            raise HTTPException(503, f"RoboDK/camera unavailable: {e}")
+        # A prepared frame creates no targets, so nothing may run from it.
+        self._prepared_result = result
+        self._active_job = None
+        self._targets_token = ""
+        return {"status": "prepared", "report": result.report}
 
     def surface_unlock(self) -> dict:
         """Drop the current lock.
@@ -196,11 +277,18 @@ class ScanModule(WorkflowModule):
             raise HTTPException(409, "a job is already running")
         if self._locked_surface is None:
             raise HTTPException(400, "lock and review the surface first")
+        if self._locked_surface.workflow_goal == GOAL_FRAME_ONLY:
+            # Plan Task 4: frame-only never creates motion targets. Refuse rather
+            # than silently planning a tour the operator did not ask for.
+            raise HTTPException(
+                409, "this surface is locked for frame-only preparation, which creates "
+                     "no robot targets — use Prepare working frame, or re-lock with "
+                     "goal 'full_scan' to plan a scan tour")
         try:
             result_dict = generate_scan_targets(services, self._locked_surface)
             # Reference mode returns a ready ScanResult with no targets.
             if result_dict.get("mode") == "reference" and "_scan_result" in result_dict:
-                self._reference_result = result_dict.pop("_scan_result")
+                self._prepared_result = result_dict.pop("_scan_result")
                 self._active_job = None
                 self._planned_voxel_m = None
                 self._planned_crop_mm = None
@@ -209,7 +297,7 @@ class ScanModule(WorkflowModule):
                 self._planned_survey = None
                 self._targets_token = ""
             else:
-                self._reference_result = None
+                self._prepared_result = None
                 self._planned_voxel_m = result_dict.get("voxel_size_m")
                 crop = result_dict.get("crop_size_mm")
                 self._planned_crop_mm = tuple(crop) if crop is not None else None
@@ -351,7 +439,7 @@ class ScanModule(WorkflowModule):
             raise HTTPException(
                 500, f"unexpected error ({type(e).__name__}): {e}")
 
-    def survey_finish(self) -> dict:
+    def survey_finish(self, body: SurveyFinishBody | None = None) -> dict:
         """Finish the five-position survey (all five captures accepted, every
         quality gate passed) into a locked ``LockedScanSurface`` — the
         five-position counterpart to ``surface_lock``'s compact/crop lock.
@@ -368,6 +456,9 @@ class ScanModule(WorkflowModule):
             raise HTTPException(409, "a job is already running")
         if self._five_survey is None:
             raise HTTPException(400, "no five-position survey in progress - begin one first")
+        goal = (body.workflow_goal if body is not None else None) or GOAL_FULL_SCAN
+        if goal not in WORKFLOW_GOALS:
+            raise HTTPException(422, f"workflow_goal must be one of {list(WORKFLOW_GOALS)}")
         cfg = services.config
         try:
             record = self._five_survey.finish(
@@ -386,14 +477,20 @@ class ScanModule(WorkflowModule):
             frame=None, reading=None, survey=None,
             gate_payload={"ok": True, "live": False, "surface_mode": "five_position",
                          "boundary_provenance": record.boundary_provenance,
-                         "survey": record.to_dict()},
+                         "survey": record.to_dict(),
+                         "workflow_goal": goal,
+                         "surface_scope": SCOPE_ENTIRE_PLATFORM},
             seed_T=record.locked_robot.camera_T_np(),
             seed_joints=list(record.locked_robot.joints),
             locked_at=record.locked_at, survey_record=record,
-            lock_token=uuid.uuid4().hex)
+            lock_token=lock_fingerprint(goal, SCOPE_ENTIRE_PLATFORM) + "-" + uuid.uuid4().hex,
+            workflow_goal=goal, surface_scope=SCOPE_ENTIRE_PLATFORM)
         self._current_lock_token = self._locked_surface.lock_token
+        self._prepared_result = None
         self._five_survey = None
-        return {"status": "locked", **record.quality}
+        return {"status": "locked", "workflow_goal": goal,
+                "surface_scope": SCOPE_ENTIRE_PLATFORM,
+                "can_prepare_frame": True, **record.quality}
 
     def survey_cancel(self) -> dict:
         """Discard the in-progress five-position survey (nothing was locked
@@ -741,6 +838,10 @@ class ScanModule(WorkflowModule):
         def surface_region(body: SurfaceRegionBody) -> dict:
             return self.surface_region(body)
 
+        @router.post("/surface/prepare-frame")
+        def prepare_frame() -> dict:
+            return self.prepare_frame()
+
         @router.post("/survey/begin")
         def survey_begin() -> dict:
             return self.survey_begin()
@@ -758,8 +859,8 @@ class ScanModule(WorkflowModule):
             return self.survey_recapture(body)
 
         @router.post("/survey/finish")
-        def survey_finish() -> dict:
-            return self.survey_finish()
+        def survey_finish(body: SurveyFinishBody | None = None) -> dict:
+            return self.survey_finish(body)
 
         @router.post("/survey/cancel")
         def survey_cancel() -> dict:
@@ -815,8 +916,8 @@ class ScanModule(WorkflowModule):
             the review UI. The point cloud itself comes from /preview.bin."""
             if self._active_job is not None and self._active_job.result is not None:
                 return self._active_job.result.report
-            if self._reference_result is not None:
-                return self._reference_result.report
+            if self._prepared_result is not None:
+                return self._prepared_result.report
             raise HTTPException(404, "no scan result yet — run a scan first")
 
         @router.get("/preview.bin")
@@ -852,11 +953,11 @@ class ScanModule(WorkflowModule):
 
             has_job_result = (self._active_job is not None
                               and self._active_job.result is not None)
-            if body.run_id is None and not has_job_result and self._reference_result is None:
+            if body.run_id is None and not has_job_result and self._prepared_result is None:
                 raise HTTPException(400, "no scan to insert — run a scan first, or pass a run_id")
             try:
-                if body.run_id is None and not has_job_result and self._reference_result is not None:
-                    return insert_scan(services, result=self._reference_result)
+                if body.run_id is None and not has_job_result and self._prepared_result is not None:
+                    return insert_scan(services, result=self._prepared_result)
                 return insert_scan(services, job=self._active_job, run_id=body.run_id)
             except RunNotFound as e:
                 raise HTTPException(404, str(e))

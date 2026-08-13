@@ -5,8 +5,8 @@ import pytest
 from tasni.modules.scan.survey_contract import (
     MODE_COMPACT, PROVENANCE_BY_MODE, PROVENANCE_COMPACT,
     CaptureRecord, LockedWorkframeSurvey, RobotStateSnapshot,
-    camera_calibration_id, capture_is_fresh, frame_from_rectangle,
-    order_corners_clockwise, pose_delta, refresh_robot_state, robot_moved_since,
+    camera_calibration_id, capture_is_fresh, order_corners_clockwise, pose_delta,
+    refresh_robot_state, robot_moved_since, workframe_from_rectangle,
 )
 
 
@@ -133,12 +133,65 @@ def test_corner_ordering_is_deterministic_and_starts_near_base():
     assert area < 0
 
 
-def test_frame_from_rectangle_convention():
-    T = frame_from_rectangle(order_corners_clockwise(_RECT, [0, 0, 1]), [0, 0, -1])
-    assert np.allclose(T[:3, 3], [600, 400, 0])          # origin = center
+def test_workframe_convention_is_corner_origin_long_edge():
+    # Task 1: the frame the survey publishes is now the one insertion already used --
+    # origin at C1 (nearest the base), NOT the rectangle centre it used to return.
+    T = workframe_from_rectangle(order_corners_clockwise(_RECT, [0, 0, 1]), [0, 0, -1])
+    assert np.allclose(T[:3, 3], [0, 0, 0])               # origin = C1, nearest base
+    assert abs(float(T[:3, 0] @ np.array([1.0, 0, 0]))) > 0.999  # X = the 1200 edge
     assert T[2, 2] > 0.99                                 # +Z up even if normal fed down
     assert abs(T[:3, 0] @ np.array([0, 0, 1])) < 1e-9     # X in plane
     assert np.allclose(np.cross(T[:3, 0], T[:3, 1]), T[:3, 2], atol=1e-9)  # right-handed
+
+
+def _permutations_of(rect):
+    import itertools
+    return [rect[list(p)] for p in itertools.permutations(range(4))]
+
+
+def test_workframe_is_identical_for_every_corner_ordering():
+    """Task 1 acceptance: identical corners -> numerically identical frame.
+
+    The acquisition paths (compact, five-position, reference, fused scan) each build
+    their corner array in their own order. Order-independence here is what makes them
+    agree, so this stands in for "the same rectangle through all result paths".
+    """
+    ref = workframe_from_rectangle(_RECT, [0, 0, 1])
+    for perm in _permutations_of(_RECT):
+        assert np.allclose(workframe_from_rectangle(perm, [0, 0, 1]), ref, atol=1e-12)
+
+
+def test_near_square_tie_break_is_deterministic_and_noise_stable():
+    """The historical bug source: on a near-square the longer-edge rule is noise.
+
+    Inside EDGE_TIE_REL_TOL the length rule is abandoned for base-axis alignment, so
+    a square measured slightly differently twice keeps the SAME frame instead of
+    flipping 90 deg. Outside the band the plain longer-edge rule still decides.
+    """
+    square = np.array([[0, 0, 0], [500, 0, 0], [500, 500, 0], [0, 500, 0]], float)
+    ref = workframe_from_rectangle(square, [0, 0, 1])
+    # a hair longer in Y (0.04% -- inside the tie band) must NOT rotate the frame
+    noisy = square.copy()
+    noisy[2:, 1] = 500.2
+    assert np.allclose(workframe_from_rectangle(noisy, [0, 0, 1]), ref, atol=1e-9)
+    # ...and the choice is stable under corner reordering too
+    for perm in _permutations_of(noisy):
+        assert np.allclose(workframe_from_rectangle(perm, [0, 0, 1]), ref, atol=1e-9)
+    # clearly oblong (10%) -> the longer-edge rule takes over and picks the Y edge
+    oblong = square.copy()
+    oblong[2:, 1] = 550.0
+    assert abs(float(workframe_from_rectangle(oblong, [0, 0, 1])[:3, 0] @
+                     np.array([0, 1.0, 0]))) > 0.999
+
+
+def test_workframe_matches_the_fitted_plane_path():
+    """The fused-scan path (plane.work_plane_from_points) must land on this frame."""
+    from tasni.modules.scan.plane import work_plane_from_points
+    xs, ys = np.meshgrid(np.linspace(200, 600, 60), np.linspace(100, 400, 45))
+    pts = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)])
+    wp = work_plane_from_points(pts, distance=3.0, min_inlier_frac=0.5)
+    assert np.allclose(wp.frame_T, workframe_from_rectangle(wp.corners, wp.normal),
+                       atol=1e-9)
 
 
 class _Cam:
@@ -161,7 +214,7 @@ def test_locked_survey_to_dict_roundtrips_geometry():
         mode=MODE_COMPACT, boundary_provenance=PROVENANCE_BY_MODE[MODE_COMPACT],
         captures=(_record(),), plane_normal_base=(0, 0, 1), plane_point_base=(600, 400, 0),
         corners_base=tuple(map(tuple, corners)), center_base=(600, 400, 0),
-        frame_T_base=tuple(map(tuple, frame_from_rectangle(corners, [0, 0, 1]))),
+        frame_T_base=tuple(map(tuple, workframe_from_rectangle(corners, [0, 0, 1]))),
         size_mm=(1200.0, 800.0), quality={"plane_rms_mm": 0.8}, calibration_id="cam-abc",
         locked_robot=snap, locked_at=100.0)
     d = survey.to_dict()

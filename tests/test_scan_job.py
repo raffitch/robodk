@@ -502,12 +502,71 @@ def test_lock_crop_is_user_specified_with_declared_size():
     print("[survey record] crop lock -> user-specified", rec.size_mm)
 
 
-def test_lock_auto_crop_overrun_builds_no_survey_record_but_warns():
-    """An auto-detected crop (the surface overruns the view, no force_crop) is a
-    silent SYSTEM fallback, not an operator declaration — tagging it USER_SPECIFIED
-    would be a false provenance claim (spec §1/§12). No survey record is built; the
-    gate payload instead carries a human-readable warning. Everything else about the
-    lock (readiness, the crop overlay, the lock_token) still works as before.
+def test_prepare_frame_result_converts_the_locked_survey_verbatim():
+    """Plan Task 4: the frame-only route is a CONVERSION, not a re-measurement.
+
+    What gets inserted must be bit-for-bit the geometry the operator reviewed, so
+    the result's frame/corners are asserted identical to the locked record's -- no
+    refit from another cloud can creep in. It also creates no targets and needs no
+    scan captures, which is the whole point (no robot motion for a working frame).
+    """
+    services, _state = _build_fakes()
+    locked = scan_service.lock_scan_surface(services, force_crop=True,
+                                            user_region_mm=(1200.0, 900.0))
+    rec = locked.survey_record
+    result = scan_service.prepare_frame_result(services, locked)
+
+    assert np.allclose(result.frame_T_mm, rec.frame_np())      # verbatim, not refit
+    assert np.allclose(result.corners_mm, rec.corners_np())
+    assert result.mesh_obj_path is None
+    r = result.report
+    assert r["mode"] == "frame_only" and r["mesh_file"] is None
+    assert r["acquisition_mode"] == MODE_USER_SPECIFIED
+    assert r["boundary_provenance"] == PROVENANCE_USER_SPECIFIED
+    assert r["surface_scope"] == scan_service.SCOPE_DECLARED_REGION
+    assert r["calibration_id"] == rec.calibration_id
+    assert sorted(r["plane"]["size_mm"], reverse=True) == [1200.0, 900.0]
+    print("[frame-only] prepared", r["plane"]["size_mm"], "captures", r["captures"])
+
+
+def test_prepare_frame_result_refuses_when_the_robot_moved():
+    """Same guard the motion path has: geometry frozen at a pose the robot has
+    since left is not the geometry in front of the camera now."""
+    services, state = _build_fakes()
+    locked = scan_service.lock_scan_surface(services, force_crop=True,
+                                            user_region_mm=(1200.0, 900.0))
+    state["cam"] = _look_at((0, 0, 480), (0, 0, 0))       # drive the camera away
+    try:
+        scan_service.prepare_frame_result(services, locked)
+        raise AssertionError("expected a refusal after the robot moved")
+    except RuntimeError as e:
+        assert "robot moved" in str(e), e
+    print("[frame-only] robot moved after lock -> refused")
+
+
+def test_prepare_frame_result_requires_a_survey_record():
+    """No measured/declared boundary record => nothing trustworthy to insert."""
+    services, _state = _build_fakes()
+    locked = scan_service.lock_scan_surface(services, force_crop=True,
+                                            user_region_mm=(1200.0, 900.0))
+    locked.survey_record = None
+    try:
+        scan_service.prepare_frame_result(services, locked)
+        raise AssertionError("expected a refusal without a survey record")
+    except RuntimeError as e:
+        assert "no measured boundary survey" in str(e), e
+    print("[frame-only] missing survey record -> refused")
+
+
+def test_entire_platform_overrun_refuses_instead_of_auto_cropping():
+    """Adaptive-scan plan Task 3, the load-bearing invariant.
+
+    A surface that overruns the camera view used to silently become the generic
+    ``work_crop_mm`` square (a SYSTEM fallback carrying a warning and no survey
+    record). Under ``entire_platform`` scope that fallback is now refused outright:
+    a fabricated square is not the platform, so "entire platform" can never reach
+    Insert through it. The refusal is structured, not a bare message, so the UI can
+    offer the five-position survey as the one action that CAN measure this boundary.
     """
     global TABLE_HALF_MM
     saved = TABLE_HALF_MM
@@ -515,21 +574,47 @@ def test_lock_auto_crop_overrun_builds_no_survey_record_but_warns():
     try:
         services, state = _build_fakes()
         state["cam"] = _look_at((0, 0, 310), (0, 0, 0))
-        locked = scan_service.lock_scan_surface(services)
+        try:
+            scan_service.lock_scan_surface(services)          # default: entire_platform
+            raise AssertionError("expected LargeSurfaceRequired for an overrun platform")
+        except scan_service.LargeSurfaceRequired as e:
+            payload = e.payload
+        assert payload["error"] == "large_surface_required"
+        assert payload["primary_action"] == "survey_full_platform"
+        assert payload["surface_scope"] == scan_service.SCOPE_ENTIRE_PLATFORM
+        assert scan_service.SCOPE_DECLARED_REGION in payload["alternatives"]
+    finally:
+        TABLE_HALF_MM = saved
+    print("[scope] entire-platform overrun -> refused:", payload["message"][:60])
+
+
+def test_declared_region_still_crops_the_same_overrun_surface():
+    """The other half of Task 3: the crop is not gone, it is now OPT-IN.
+
+    Explicitly declaring a work region on the very same overrunning surface still
+    locks, and is labeled user-specified (boundary declared, not measured) — so the
+    capability the auto-fallback provided is preserved with honest provenance.
+    """
+    global TABLE_HALF_MM
+    saved = TABLE_HALF_MM
+    TABLE_HALF_MM = 1000.0
+    try:
+        services, state = _build_fakes()
+        state["cam"] = _look_at((0, 0, 310), (0, 0, 0))
+        locked = scan_service.lock_scan_surface(
+            services, surface_scope=scan_service.SCOPE_DECLARED_REGION)
         assert locked.gate_payload["ok"] is True, locked.gate_payload
         assert locked.gate_payload["surface_mode"] == "crop", locked.gate_payload
-        assert locked.survey_record is None
-        assert "boundary_provenance" not in locked.gate_payload
-        assert "survey" not in locked.gate_payload
-        assert locked.gate_payload.get("warnings"), locked.gate_payload
+        assert locked.surface_scope == scan_service.SCOPE_DECLARED_REGION
+        assert locked.survey_record is not None
+        assert locked.survey_record.mode == MODE_USER_SPECIFIED
+        assert locked.gate_payload["boundary_provenance"] == PROVENANCE_USER_SPECIFIED
         assert locked.lock_token != ""
-        # Task 18: the auto-overrun fallback is a SYSTEM decision, not the compact
-        # path -- classify_compact must not run (and must not be blamed) here.
+        # Still not the compact path -- a declared region is never classified.
         assert "compact_eligibility" not in locked.gate_payload
     finally:
         TABLE_HALF_MM = saved
-    print("[survey record] auto-overrun crop -> no record, warning:",
-          locked.gate_payload["warnings"][-1])
+    print("[scope] declared region on the same surface -> user-specified lock")
 
 
 # --- Task 18: wire classify_compact (spec §6 entry conditions) into the lock ---
@@ -2948,7 +3033,11 @@ if __name__ == "__main__":
     test_lock_then_create_targets_reuses_frozen_surface()
     test_lock_builds_locked_workframe_survey_compact()
     test_lock_crop_is_user_specified_with_declared_size()
-    test_lock_auto_crop_overrun_builds_no_survey_record_but_warns()
+    test_prepare_frame_result_converts_the_locked_survey_verbatim()
+    test_prepare_frame_result_refuses_when_the_robot_moved()
+    test_prepare_frame_result_requires_a_survey_record()
+    test_entire_platform_overrun_refuses_instead_of_auto_cropping()
+    test_declared_region_still_crops_the_same_overrun_surface()
     test_lock_real_guard_band_rejection_at_close_standoff()
     test_lock_never_classifies_the_fabricated_reticle_square_when_not_fully_framed()
     test_lock_falls_back_to_color_when_sam_abstains()
