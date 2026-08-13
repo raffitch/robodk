@@ -32,6 +32,7 @@ from tasni.core.config import AppConfig, ScanConfig  # noqa: E402
 from tasni.core.geometry import Rt_to_T  # noqa: E402
 from tasni.core.jobrunner import JobContext  # noqa: E402
 from tasni.modules.scan import service as scan_service  # noqa: E402
+from tasni.modules.scan.classifier import CompactEligibility  # noqa: E402
 from tasni.modules.scan.corner_evidence import CornerEvidence  # noqa: E402
 from tasni.modules.scan.five_position import FivePositionSurvey  # noqa: E402
 from tasni.modules.scan.survey_contract import (  # noqa: E402
@@ -65,7 +66,7 @@ def _look_at(cam_pos, target):
     return Rt_to_T(np.column_stack([x, y, z]), cam_pos)
 
 
-def _render(T_base_cam):
+def _render(T_base_cam, table_half_mm=None):
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     us, vs = np.meshgrid(np.arange(W), np.arange(H))
     dirs_cam = np.stack([(us - cx) / fx, (vs - cy) / fy, np.ones_like(us, float)], -1)
@@ -75,15 +76,42 @@ def _render(T_base_cam):
     with np.errstate(divide="ignore", invalid="ignore"):
         s = (0.0 - t[2]) / dz
     P = t + s[..., None] * dirs_base
-    valid = ((np.abs(P[..., 0]) <= TABLE_HALF_MM) & (np.abs(P[..., 1]) <= TABLE_HALF_MM)
+    half_mm = TABLE_HALF_MM if table_half_mm is None else table_half_mm
+    valid = ((np.abs(P[..., 0]) <= half_mm) & (np.abs(P[..., 1]) <= half_mm)
              & (s > 0) & np.isfinite(s))
     depth = np.where(valid, s, 0).astype(np.uint16)
-    color = np.full((H, W, 3), 128, np.uint8)
+    # Task 18: color must genuinely distinguish the table from its surroundings so
+    # a REAL segmentation boundary engine (color_work_boundary / sam_work_boundary,
+    # now wired into lock_scan_surface's classify_compact call) can find it --
+    # a flat uniform-gray frame (the old fixture) makes every boundary engine
+    # abstain (verified empirically), which would make classify_compact reject
+    # every synthetic lock as "boundary not confirmed by segmentation" regardless
+    # of geometry. Two-tone, keyed on the same `valid` mask as depth, mirrors how
+    # a real RGB frame actually looks (a light table against a darker surround).
+    color = np.where(np.repeat(valid[..., None], 3, axis=2), 200, 50).astype(np.uint8)
     return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP)
 
 
 def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
-    seed_T = _look_at((0, 0, 420), (0, 0, 0))           # straight down, close framed standoff
+    # Task 18: 440 mm (was 420) -- straight down, close framed standoff, with
+    # enough margin that the 300x300 mm table's raw rectangle clears
+    # compact_guard_uv on BOTH image axes (the 320x240 frame is not square, so
+    # the vertical axis is the tighter one; at 420 mm the table's raw corners sat
+    # at v=0.058/0.942, just OUTSIDE the default 0.06 guard band -- confirmed
+    # empirically). classify_compact now genuinely enforces that gate (it was
+    # never wired in, hence never exercised, before this task), so a scene that
+    # merely LOOKED like a comfortably-framed compact capture needs to actually
+    # be one. 440 mm was chosen (over going further) because the "distance"
+    # gate's own planner-computed ideal standoff for this table sits at ~413-416
+    # mm independent of the CURRENT camera z (it comes from the measured extent,
+    # not from where the camera happens to be) -- so moving the seed too far
+    # trades a guard-band failure for a distance-gate failure instead (confirmed
+    # empirically: 460 mm clears guard_uv but misses distance_tol_mm=50 by ~2
+    # mm). 440 mm sits in the middle of the feasible window, comfortably inside
+    # both gates (~25 mm of the 50 mm distance budget spent either way, guard
+    # margin v=0.079..0.921 vs the 0.06/0.94 band) -- and leaves size_mm
+    # ~296x296 (unchanged within measurement noise from the old 420 mm seed).
+    seed_T = _look_at((0, 0, 440), (0, 0, 0))
     state = {"cam": seed_T, "targets": {}, "joints": {}}
     mount = Rt_to_T(np.eye(3), np.asarray(mount_mm, float))
 
@@ -164,6 +192,12 @@ def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
     cfg.scan.cone_half_angle_deg = 30.0
     cfg.scan.voxel_size_m = 0.005
     cfg.scan.frames_per_pose = 1
+    # Task 18: force the deterministic classical-CV boundary engine for these fakes
+    # rather than the default "sam_then_color" -- the two-tone synthetic color
+    # above is a good target for it, and it avoids a real ONNX inference pass (plus
+    # its unpredictable-on-synthetic-images confidence score) on every lock in
+    # every test in this file.
+    cfg.scan.boundary_engine = "color"
     services = SimpleNamespace(config=cfg, rdk=FakeRdk(), camera=FakeCamera(),
                                camera_lease=CameraLease(),
                                bus=SimpleNamespace(publish=lambda *a, **k: None),
@@ -418,6 +452,13 @@ def test_lock_builds_locked_workframe_survey_compact():
     # gate_payload["measurement_ts"] key.
     assert rec.captures[0].measurement_ts == FRAME_TIMESTAMP
     assert rec.captures[0].measurement_ts != 0.0
+    # Task 18 no-regression pin: MODE_COMPACT must now flow through a REAL (not
+    # monkeypatched) classify_compact call that reports every §6 gate satisfied --
+    # not just an unconditional label as before this task wired it in.
+    elig = locked.gate_payload["compact_eligibility"]
+    assert elig["eligible"] is True and elig["reasons"] == (), elig
+    assert elig["guard_ok"] and elig["boundary_ok"] and elig["centered_ok"]
+    assert elig["tilt_ok"] and elig["identity_ok"]
     print("[survey record] compact lock ->", rec.mode, rec.boundary_provenance,
           "measurement_ts", rec.captures[0].measurement_ts)
 
@@ -434,6 +475,9 @@ def test_lock_crop_is_user_specified_with_declared_size():
     assert rec.mode == MODE_USER_SPECIFIED
     assert rec.boundary_provenance == PROVENANCE_USER_SPECIFIED
     assert sorted(rec.size_mm, reverse=True) == [1200.0, 900.0]
+    # Task 18: classify_compact is a compact-path-only gate -- an operator-declared
+    # region is already honestly labeled and must never be run through it.
+    assert "compact_eligibility" not in locked.gate_payload
     print("[survey record] crop lock -> user-specified", rec.size_mm)
 
 
@@ -458,10 +502,179 @@ def test_lock_auto_crop_overrun_builds_no_survey_record_but_warns():
         assert "survey" not in locked.gate_payload
         assert locked.gate_payload.get("warnings"), locked.gate_payload
         assert locked.lock_token != ""
+        # Task 18: the auto-overrun fallback is a SYSTEM decision, not the compact
+        # path -- classify_compact must not run (and must not be blamed) here.
+        assert "compact_eligibility" not in locked.gate_payload
     finally:
         TABLE_HALF_MM = saved
     print("[survey record] auto-overrun crop -> no record, warning:",
           locked.gate_payload["warnings"][-1])
+
+
+# --- Task 18: wire classify_compact (spec §6 entry conditions) into the lock ---
+#
+# classifier.py's own gate math (guard band, boundary overrun, centering, tilt,
+# rectangle-identity) is unit-tested in test_scan_classifier.py; these tests
+# cover the WIRING -- lock_scan_surface must call it on the compact path only,
+# feed it REAL per-frame evidence (not the fused frame's outline repeated), and
+# follow the exact same honest-provenance shape Task 3 established for the
+# auto-overrun branch when it rejects.
+
+def _patch_classify_compact(fake):
+    """Manual save/restore for scan_service.classify_compact -- same pattern as
+    _patch_latest_characterization above (this module doubles as a standalone
+    script; see the __main__ block, so no pytest fixtures)."""
+    orig = scan_service.classify_compact
+    scan_service.classify_compact = fake
+    return orig
+
+
+def test_lock_wires_classify_compact_and_rejects_when_ineligible():
+    """The core Task 18 behaviour: when classify_compact reports the surface
+    ineligible, lock_scan_surface must follow the EXACT same honest-provenance
+    shape the pre-existing auto-overrun branch uses (Task 3) -- no survey record,
+    no boundary_provenance/survey keys, a warning naming why -- but the lock still
+    completes (a lock_token is still issued, gate_payload["ok"] is untouched)."""
+    services, _state = _build_fakes()
+    fake_result = CompactEligibility(
+        eligible=False, reasons=("rectangle is not sufficiently centered",),
+        guard_ok=True, boundary_ok=True, centered_ok=False, tilt_ok=True,
+        identity_ok=True, coverage_ok=True, predicted_coverage=None)
+    orig = _patch_classify_compact(lambda *a, **k: fake_result)
+    try:
+        locked = scan_service.lock_scan_surface(services)
+    finally:
+        scan_service.classify_compact = orig
+    assert locked.survey_record is None
+    assert "survey" not in locked.gate_payload
+    assert "boundary_provenance" not in locked.gate_payload
+    assert locked.gate_payload["ok"] is True, locked.gate_payload
+    assert locked.lock_token != ""
+    assert locked.gate_payload["compact_eligibility"]["eligible"] is False
+    assert "rectangle is not sufficiently centered" in locked.gate_payload["warnings"]
+    print("[compact eligibility] ineligible -> no record, warning:",
+          locked.gate_payload["warnings"][-1])
+
+
+def test_lock_reports_the_failing_gate_for_each_of_the_five_conditions():
+    """§6 lists five independent hard gates; each must, ON ITS OWN, block the
+    compact label and surface an operator-readable reason naming it -- proven
+    per-gate via a canned CompactEligibility (classify_compact's own gate math is
+    unit-tested separately; this is testing the wiring/branching, not re-deriving
+    that math from synthetic geometry)."""
+    cases = [
+        ("guard_ok", "raw (untrimmed) boundary leaves the guard region"),
+        ("boundary_ok", "four physical boundaries not confirmed by segmentation"),
+        ("centered_ok", "rectangle is not sufficiently centered"),
+        ("tilt_ok", "plane tilt exceeds the survey tolerance"),
+        ("identity_ok", "rectangle identity not consistent across the multi-frame acquisition"),
+    ]
+    for failing_field, reason in cases:
+        services, _state = _build_fakes()
+        flags = {"guard_ok": True, "boundary_ok": True, "centered_ok": True,
+                 "tilt_ok": True, "identity_ok": True}
+        flags[failing_field] = False
+        fake_result = CompactEligibility(
+            eligible=False, reasons=(reason,), coverage_ok=True,
+            predicted_coverage=None, **flags)
+        orig = _patch_classify_compact(lambda *a, **k: fake_result)
+        try:
+            locked = scan_service.lock_scan_surface(services)
+        finally:
+            scan_service.classify_compact = orig
+        assert locked.survey_record is None, failing_field
+        assert "survey" not in locked.gate_payload, failing_field
+        assert "boundary_provenance" not in locked.gate_payload, failing_field
+        assert reason in locked.gate_payload["warnings"], (failing_field, locked.gate_payload)
+        assert locked.gate_payload["compact_eligibility"][failing_field] is False, failing_field
+        assert locked.lock_token != "", failing_field
+    print("[compact eligibility] each of the 5 §6 gates independently blocks the compact label")
+
+
+def test_lock_survey_outline_history_reflects_independent_per_frame_surveys():
+    """The identity gate needs REAL per-frame evidence, not the fused frame's
+    outline repeated n times -- proven by making the raw frames within a single
+    lock genuinely differ (alternating table half-extent) and checking the REAL
+    (non-monkeypatched) classify_compact call rejects on identity alone while
+    every other §6 gate still passes. An implementation that fed
+    outline_history=[survey.outline_uv] * n (the fused result repeated) could
+    never fail this -- a value trivially agrees with itself no matter what the
+    raw frames actually looked like."""
+    services, state = _build_fakes()
+    cam = services.camera
+    calls = {"n": 0}
+
+    def jittered_grab(with_depth=False, timeout=None, color_only=False):
+        calls["n"] += 1
+        cam.grabs += 1
+        # Only the THIRD raw frame shrinks (150 -> 120 mm half-extent); the other
+        # four stay nominal. Per-pixel median fusion is a per-pixel UNION, not an
+        # average -- any pixel reached by ANY frame ends up valid in the fused
+        # result (confirmed empirically) -- so a single smaller frame does not
+        # shrink the fused/"survey" rectangle at all (still governed by the four
+        # nominal frames): fused fully_framed/guard_ok/centered_ok all stay
+        # exactly as in the unjittered baseline. But THAT one frame's own
+        # independent outline differs from the others by ~0.10 normalized uv --
+        # 2.5x compact_identity_tol_uv's default 0.04 -- real evidence a naive
+        # "repeat the fused outline n times" implementation could never produce.
+        half = 120.0 if calls["n"] == 3 else TABLE_HALF_MM
+        return _render(state["cam"], table_half_mm=half)
+    cam.grab = jittered_grab
+
+    locked = scan_service.lock_scan_surface(services)
+    assert calls["n"] == services.config.scan.surface_measure_frames
+    elig = locked.gate_payload["compact_eligibility"]
+    assert elig["identity_ok"] is False, elig
+    assert elig["guard_ok"] and elig["boundary_ok"] and elig["centered_ok"] and elig["tilt_ok"], elig
+    assert elig["eligible"] is False
+    assert locked.survey_record is None
+    assert "survey" not in locked.gate_payload
+    assert "boundary_provenance" not in locked.gate_payload
+    assert any("identity" in w for w in locked.gate_payload["warnings"]), locked.gate_payload
+    assert locked.gate_payload["ok"] is True, locked.gate_payload   # the lock itself still succeeds
+    assert locked.lock_token != ""
+    print("[compact eligibility] genuinely differing raw frames -> identity gate correctly rejects")
+
+
+def test_lock_adapts_identity_frame_requirement_when_measure_frames_is_lower():
+    """If compact_identity_frames (default 5) exceeds surface_measure_frames, the
+    identity gate is UNSATISFIABLE by construction -- classify_compact has no
+    override parameter (it reads scfg.compact_identity_frames directly), so the
+    lock adapts the requirement down to what this acquisition can actually
+    supply, and warns that it did so, rather than silently failing every lock
+    under this configuration. (Adaptation has a floor of 2 -- see the next test.)
+    """
+    services, _state = _build_fakes()
+    services.config.scan.surface_measure_frames = 3
+    locked = scan_service.lock_scan_surface(services)
+    elig = locked.gate_payload["compact_eligibility"]
+    assert elig["identity_ok"] is True, elig
+    assert elig["eligible"] is True, elig
+    assert locked.survey_record is not None
+    assert any("surface_measure_frames" in w and "3" in w
+               for w in locked.gate_payload.get("warnings", [])), locked.gate_payload
+    print("[compact eligibility] measure_frames=3 < identity_frames=5 -> adapted, still eligible")
+
+
+def test_lock_never_vacuously_passes_identity_with_a_single_frame():
+    """A single frame can never demonstrate MULTI-frame identity consistency --
+    adapting the requirement down to 1 would make rectangle_identity_consistent
+    trivially pass (nothing to disagree with), exactly the loophole the gate
+    exists to close. The adaptation therefore has a floor of 2: below that, the
+    nominal (unmet) compact_identity_frames requirement is left in place, so the
+    gate fails honestly instead of rubber-stamping zero real evidence."""
+    services, _state = _build_fakes()
+    services.config.scan.surface_measure_frames = 1
+    locked = scan_service.lock_scan_surface(services)
+    elig = locked.gate_payload["compact_eligibility"]
+    assert elig["identity_ok"] is False, elig
+    assert elig["eligible"] is False, elig
+    assert locked.survey_record is None
+    assert any("identity" in w for w in locked.gate_payload["warnings"]), locked.gate_payload
+    assert any("surface_measure_frames" in w for w in locked.gate_payload["warnings"]), \
+        locked.gate_payload
+    assert locked.lock_token != ""
+    print("[compact eligibility] measure_frames=1 -> identity gate never vacuously passes")
 
 
 def test_lock_gate_event_carries_survey_and_provenance():
@@ -765,8 +978,10 @@ def test_manual_crop_ignores_unstable_framed_rectangle():
     assert gen["crop_size_mm"] == [1000.0, 1000.0], gen
     assert gen["boundary_views_enabled"] is False, gen
     # The normal framed-rectangle path plans a closer standoff from the measured
-    # extent; manual crop keeps the reticle/center-plane fallback.
-    assert abs(gen["look_distance_mm"] - 420.0) < 1.0, gen["look_distance_mm"]
+    # extent; manual crop keeps the reticle/center-plane fallback -- i.e. the
+    # fixture's own seed distance (440 mm, Task 18 -- was 420 before the seed
+    # moved to clear compact_guard_uv; see _build_fakes's own comment).
+    assert abs(gen["look_distance_mm"] - 440.0) < 1.0, gen["look_distance_mm"]
     print("[manual crop] fully framed but unstable rectangle -> reticle crop targets")
 
 
@@ -2236,6 +2451,11 @@ if __name__ == "__main__":
     test_lock_builds_locked_workframe_survey_compact()
     test_lock_crop_is_user_specified_with_declared_size()
     test_lock_auto_crop_overrun_builds_no_survey_record_but_warns()
+    test_lock_wires_classify_compact_and_rejects_when_ineligible()
+    test_lock_reports_the_failing_gate_for_each_of_the_five_conditions()
+    test_lock_survey_outline_history_reflects_independent_per_frame_surveys()
+    test_lock_adapts_identity_frame_requirement_when_measure_frames_is_lower()
+    test_lock_never_vacuously_passes_identity_with_a_single_frame()
     test_lock_gate_event_carries_survey_and_provenance()
     test_lock_warns_when_characterization_missing()
     test_lock_warns_when_characterization_stale()

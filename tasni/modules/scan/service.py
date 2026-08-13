@@ -49,6 +49,7 @@ from ..calibration.service import (
     BOARD_KEEPOUT_NAME as CALIB_BOARD_KEEPOUT_NAME,
     TARGET_PREFIX as CALIB_TARGET_PREFIX,
     _camera_hold, dry_tour_required, ensure_camera_tool, ensure_real_robot_link)
+from .classifier import classify_compact
 from .color_boundary import color_work_boundary
 from .corner_evidence import extract_corner_evidence
 from .depth_gate import ScanGateThresholds, evaluate_depth_gate
@@ -294,22 +295,27 @@ def _authoritative_acquisition(services, *, owner: str):
     an explicit REAL robot-state refresh (``snapshot``, a genuine double-read
     of the robot's joints; see :func:`survey_contract.refresh_robot_state`).
 
-    Returns ``(frame, n_frames, reading, measurement, snapshot)`` where
-    ``frame`` is a ``SimpleNamespace(color, depth, timestamp)`` -- bundling
-    colour/depth/timestamp together (rather than as separate tuple members)
-    is deliberate: every downstream consumer of a "capture" (``CaptureRecord.
-    measurement_ts``, ``_survey_record_from_lock``) needs the frame's
-    timestamp, and the acquisition site (this function) is the only place
-    that legitimately reads ``frames[-1].timestamp`` off the raw camera
+    Returns ``(frame, n_frames, reading, measurement, snapshot, raw_frames)``
+    where ``frame`` is a ``SimpleNamespace(color, depth, timestamp)`` --
+    bundling colour/depth/timestamp together (rather than as separate tuple
+    members) is deliberate: every downstream consumer of a "capture"
+    (``CaptureRecord.measurement_ts``, ``_survey_record_from_lock``) needs the
+    frame's timestamp, and the acquisition site (this function) is the only
+    place that legitimately reads ``frames[-1].timestamp`` off the raw camera
     frames.
 
-    Deciding what to DO with a non-stationary ``snapshot`` is each caller's
-    own responsibility: ``lock_scan_surface`` still records it either way
-    (unchanged, pre-existing behaviour for the compact/crop path);
-    ``five_position_capture`` rejects it outright (a five-position survey
-    combines FIVE separately-registered positions, so a stale/moving pose at
-    any one of them would silently corrupt the cross-position plane/rectangle
-    fit -- see that function's own docstring).
+    ``raw_frames`` (Task 18) is the pre-fusion list of individually-grabbed
+    camera frames (each with its own ``.depth``) that ``frame`` was median-
+    fused from -- returning the list itself costs nothing extra (they are
+    already held here for ``_combine_depth_frames``); it exists so
+    ``lock_scan_surface`` can independently re-survey each raw frame for
+    ``classify_compact``'s multi-frame rectangle-identity gate (spec §6) --
+    fusion collapses frame-to-frame disagreement before a single
+    ``survey_surface`` call ever sees it, so that gate needs the un-fused
+    frames. Callers that do not need per-frame evidence (``five_position_
+    capture``) simply ignore this element; the RANSAC re-survey itself is
+    deferred to (and only ever paid by) the caller that asks for it, not run
+    here.
     """
     cfg = services.config
     scfg = cfg.scan
@@ -338,7 +344,7 @@ def _authoritative_acquisition(services, *, owner: str):
     measurement = survey_surface(
         frame.depth, K, _survey_thresholds(scfg), depth_scale=scfg.depth_scale)
     snapshot = refresh_robot_state(rdk)
-    return frame, len(frames), reading, measurement, snapshot
+    return frame, len(frames), reading, measurement, snapshot, frames
 
 
 def lock_scan_surface(services, *, force_crop: bool = False,
@@ -348,7 +354,7 @@ def lock_scan_surface(services, *, force_crop: bool = False,
     scfg = cfg.scan
     rdk: RdkIO = services.rdk
     K = cfg.camera.K
-    frame, n_frames, reading, survey, snapshot = _authoritative_acquisition(
+    frame, n_frames, reading, survey, snapshot, raw_frames = _authoritative_acquisition(
         services, owner="scan-surface-lock")
     depth = np.asarray(frame.depth) if frame.depth is not None else np.zeros((0, 0))
     full_frame_valid_frac = float(np.mean(depth > 0)) if depth.size else 0.0
@@ -427,7 +433,8 @@ def lock_scan_surface(services, *, force_crop: bool = False,
     seed_joints = list(snapshot.joints)
 
     # Boundary provenance (spec §1 / §12): a survey record is built only when the
-    # boundary was either MEASURED (the normal compact path, crop_mode False) or
+    # boundary was either MEASURED (the normal compact path, crop_mode False, AND
+    # -- Task 18 -- classify_compact's spec-§6 entry conditions all hold) or
     # EXPLICITLY DECLARED by the operator (force_crop — today's "region" mode).
     # crop_mode alone is NOT that discriminator: it also goes true automatically
     # when the surface overruns the camera view (surface_overruns_view), and that
@@ -437,13 +444,41 @@ def lock_scan_surface(services, *, force_crop: bool = False,
     # unset and surface a warning instead; everything else about the lock (gate
     # readiness, the crop overlay/outline_uv, etc.) is unaffected.
     record = None
-    if force_crop or not crop_mode:
-        mode = MODE_USER_SPECIFIED if force_crop else MODE_COMPACT
+    if force_crop:
+        mode = MODE_USER_SPECIFIED
         plane_rms = _plane_rms_mm(depth, K)
         record = _survey_record_from_lock(
             survey, seed_T, snapshot, services.config.camera,
             mode=mode, n_frames=n_frames, measurement_ts=frame.timestamp,
             valid_frac=gate_payload.get("valid_frac", 0.0), plane_rms_mm=plane_rms)
+    elif not crop_mode:
+        # Compact path (spec §6, Task 18): "detected + fully framed" alone is not
+        # sufficient to call the boundary MEASURED -- classify_compact (built +
+        # unit-tested in an earlier task, never wired in until now) is the single
+        # source of truth for the guard band / segmentation-confirmed boundary /
+        # centering / tilt / rectangle-identity gates. A failure follows the EXACT
+        # same honest-provenance shape as the auto-overrun branch below: no
+        # record, no boundary_provenance, a warning naming which condition(s)
+        # failed -- never a raise, so the lock still completes and issues a
+        # lock_token either way.
+        classify_scfg, identity_note = _compact_identity_scfg(scfg)
+        if identity_note:
+            gate_payload.setdefault("warnings", []).append(identity_note)
+        outline_history = _survey_outline_history(raw_frames, K, scfg)
+        boundary = _work_boundary(scfg, frame.color)
+        eligibility = classify_compact(
+            _classify_compact_survey(survey), survey.outline_uv, boundary,
+            classify_scfg, outline_history=outline_history)
+        gate_payload["compact_eligibility"] = eligibility.to_dict()
+        if eligibility.eligible:
+            mode = MODE_COMPACT
+            plane_rms = _plane_rms_mm(depth, K)
+            record = _survey_record_from_lock(
+                survey, seed_T, snapshot, services.config.camera,
+                mode=mode, n_frames=n_frames, measurement_ts=frame.timestamp,
+                valid_frac=gate_payload.get("valid_frac", 0.0), plane_rms_mm=plane_rms)
+        else:
+            gate_payload.setdefault("warnings", []).extend(eligibility.reasons)
     else:
         gate_payload.setdefault("warnings", []).append(
             "the surface overruns the camera view, so its boundary is unverified — "
@@ -540,6 +575,101 @@ def _survey_thresholds(scfg) -> SurveyThresholds:
         frame_margin_uv=float(getattr(scfg, "live_frame_margin_uv", 0.02)),
         work_crop_mm=tuple(scfg.work_crop_mm),
     )
+
+
+def _classify_compact_survey(survey):
+    """Guard a real latent bug in ``classify_compact`` (reviewed, not to be
+    modified -- see its own module docstring) without touching it: it reads
+    tilt via ``getattr(survey, "tilt_deg", 90.0)``, but Python's ``getattr``
+    default only fires when the ATTRIBUTE IS MISSING, not when it exists and is
+    ``None`` -- and ``survey_surface`` sets ``tilt_deg=None`` (not "absent")
+    whenever ``detected`` is False (see ``survey._not_detected``). Calling
+    ``classify_compact`` on an undetected survey (a real path: e.g.
+    ``generate_scan_targets`` locks while the camera is aimed too far away) hits
+    ``float(None)`` and raises ``TypeError`` before its own "no surface
+    detected" reason is ever added -- turning a graceful rejection into a crash.
+
+    classify_compact's own module docstring says it "relies only on duck-typed
+    .detected and .tilt_deg from the survey object", so the caller owns
+    constructing a well-formed pair -- this substitutes the SAME 90.0 sentinel
+    classify_compact's own (currently-dead) getattr default already signals is
+    the intended "undetected/unknown tilt" value, without editing classifier.py.
+    Detected surveys are passed through unchanged (real code path, not this
+    shim) since survey_surface never leaves ``tilt_deg`` None when detected.
+    """
+    if getattr(survey, "tilt_deg", None) is None:
+        return SimpleNamespace(detected=bool(getattr(survey, "detected", False)), tilt_deg=90.0)
+    return survey
+
+
+def _compact_identity_scfg(scfg) -> "tuple[object, str | None]":
+    """Adapt classify_compact's rectangle-identity frame requirement (spec §6) to
+    what a single lock's acquisition can actually supply (Task 18).
+
+    ``_authoritative_acquisition`` grabs ``scfg.surface_measure_frames`` raw
+    frames per lock; ``classify_compact`` hard-codes ``scfg.compact_identity_
+    frames`` consecutive frames as its evidence requirement and has no
+    parameter to override that (see its own module docstring -- it is reviewed,
+    not to be modified). If an operator configures fewer measure-frames than
+    the identity requirement, the gate is UNSATISFIABLE by construction: every
+    compact lock would warn/reject regardless of how consistent the surface
+    genuinely is. Since ``surface_measure_frames`` caps how much identity
+    evidence can ever exist, adapt the requirement down to that cap.
+
+    Never adapt below 2, though: with 0 or 1 samples there is nothing to
+    compare against, and ``rectangle_identity_consistent`` would pass
+    VACUOUSLY (a single outline trivially "agrees" with itself) -- exactly the
+    loophole the identity gate exists to close. Below that floor, the nominal
+    (now unmeetable) requirement is left in place instead, so the gate fails
+    honestly rather than rubber-stamping zero real evidence.
+
+    Returns ``(scfg_for_classify_compact, warning_or_None)``.
+    """
+    nominal = int(scfg.compact_identity_frames)
+    available = int(scfg.surface_measure_frames)
+    if available >= nominal:
+        return scfg, None
+    if available < 2:
+        return scfg, (
+            f"surface_measure_frames ({available}) is below 2 -- too few frames to "
+            "ever establish rectangle-identity consistency (compact_identity_frames "
+            f"requires {nominal}); the identity gate cannot pass until "
+            "surface_measure_frames is raised.")
+    return scfg.model_copy(update={"compact_identity_frames": available}), (
+        f"surface_measure_frames ({available}) is below compact_identity_frames "
+        f"({nominal}); the identity check used {available} frame(s) instead.")
+
+
+def _survey_outline_history(raw_frames, K, scfg) -> list:
+    """Independently survey each RAW (pre-fusion) depth frame from this lock's
+    acquisition and collect its rectangle outline, for classify_compact's §6
+    rectangle-identity gate (Task 18).
+
+    ``_authoritative_acquisition`` median-fuses ``scfg.surface_measure_frames``
+    raw depth frames into ONE depth image before the single ``survey_surface``
+    call that produces the lock's own ``survey`` -- so that fused result alone
+    carries no frame-to-frame evidence at all. This reruns ``survey_surface``
+    on each raw frame independently -- real per-frame RANSAC plane fits, NOT
+    the fused outline repeated -- so a genuinely unstable rectangle can be told
+    apart from a stable one. Cost: up to ``len(raw_frames)`` (default 5) extra
+    ``survey_surface`` passes beyond the one already done on the fused frame --
+    paid ONLY here, i.e. only on the compact (non-crop) lock path, never on a
+    crop/force_crop lock (which never calls classify_compact at all).
+
+    A raw frame that fails to detect a plane on its own contributes nothing to
+    the history (skipped, not padded with a placeholder) -- that omission is
+    itself real evidence of instability, and padding it would manufacture
+    agreement that was never measured.
+    """
+    th = _survey_thresholds(scfg)
+    history = []
+    for fr in raw_frames:
+        if fr.depth is None:
+            continue
+        m = survey_surface(fr.depth, K, th, depth_scale=scfg.depth_scale)
+        if m.outline_uv:
+            history.append(m.outline_uv)
+    return history
 
 
 def _backproject_depth(depth: np.ndarray, K: np.ndarray, *,
@@ -667,21 +797,26 @@ def _deproject_plane_points_mm(depth, K, T_base_cam, *, plane_normal_cam,
     return (pts_cam_h @ T.T)[:, :3], purity_frac, coverage_frac
 
 
-def _boundary_polygon_uv(scfg, color) -> "np.ndarray | None":
+def _work_boundary(scfg, color) -> "dict | None":
     """Segment the object under the reticle with the configured boundary engine.
 
     Mirrors the live-preview dispatch in ``module.py``'s ``/live/start`` (colour
     only for ``"color"``; SAM with an optional colour fallback for ``"sam"`` /
     ``"sam_then_color"``) but runs INLINE/synchronously rather than through
     ``SamBoundaryWorker``'s background thread: that worker exists so ~450 ms/frame
-    SAM inference never hitches the ~6 fps live video, but a five-position capture
-    is a single one-shot authoritative measurement, not a video frame, so a
-    blocking call is the right shape here (and the simplest one that cannot get out
-    of sync with the frame it was asked to segment).
+    SAM inference never hitches the ~6 fps live video, but a compact lock or a
+    five-position capture is a single one-shot authoritative measurement, not a
+    video frame, so a blocking call is the right shape here (and the simplest
+    one that cannot get out of sync with the frame it was asked to segment).
 
-    Returns the boundary's ``polygon_uv`` (normalized 0-1 image coords, a CLOSED
-    contour -- see the ``closed=True`` note where this feeds
-    ``extract_corner_evidence``) or ``None`` when every configured engine abstains.
+    Returns the FULL boundary dict -- ``{outline_uv, polygon_uv, fill_frac,
+    border_touch, overruns[, contrast]}`` (see ``color_work_boundary`` /
+    ``sam_work_boundary``) -- or ``None`` when every configured engine
+    abstains. ``lock_scan_surface`` (Task 18) reads ``overruns`` directly for
+    ``classify_compact``'s segmentation-confirmed-boundary gate;
+    ``_boundary_polygon_uv`` below is a thin backward-compatible wrapper for
+    ``five_position_capture``'s corner-evidence extraction, which only ever
+    needed the polygon.
     """
     if not scfg.color_boundary_enabled:
         return None
@@ -710,6 +845,16 @@ def _boundary_polygon_uv(scfg, color) -> "np.ndarray | None":
                 seg_width=scfg.color_boundary_seg_width)
         except Exception:
             cb = None
+    return cb
+
+
+def _boundary_polygon_uv(scfg, color) -> "np.ndarray | None":
+    """Backward-compatible wrapper around :func:`_work_boundary` returning just
+    ``polygon_uv`` (normalized 0-1 image coords, a CLOSED contour -- see the
+    ``closed=True`` note where this feeds ``extract_corner_evidence``), or
+    ``None`` when every configured engine abstains. Used by
+    ``five_position_capture``'s corner-evidence extraction only."""
+    cb = _work_boundary(scfg, color)
     if cb is None:
         return None
     return np.asarray(cb["polygon_uv"], dtype=float)
@@ -773,7 +918,7 @@ def five_position_capture(services, survey: FivePositionSurvey) -> dict:
             "cannot be trusted while the driver link is down; reconnect the driver "
             "and remeasure")
 
-    frame, n_frames, reading, measurement, snapshot = _authoritative_acquisition(
+    frame, n_frames, reading, measurement, snapshot, _raw_frames = _authoritative_acquisition(
         services, owner="scan-five-position")
     if not snapshot.stationary:
         raise RuntimeError(
