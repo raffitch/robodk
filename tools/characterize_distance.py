@@ -209,22 +209,78 @@ def _format_trial(label: str, trial) -> str:
            f"coverage={trial.coverage_frac:.0%}")
 
 
-def _parse_distances(raw: str) -> "list[float]":
-    """Parse ``--distances`` into a list of mm floats.
+def _parse_floats(raw: str, flag: str, example: str) -> "list[float]":
+    """Parse a comma-separated ``--flag`` value into floats, rejecting empties.
 
-    Pure (no hardware) so this validation is directly unit-testable on its
-    own, independent of main()'s hardware imports. Raises ``ValueError`` with
-    an operator-facing message for an empty/degenerate list (``""``, ``","``,
-    ``",,,"``) instead of letting the caller silently sweep zero distances and
-    crash later with an unhandled ``IndexError`` when the oblique-check
-    fallback indexes ``distances[-1]`` (Task 16 review, Finding 4).
+    Pure (no hardware) so this validation is directly unit-testable on its own,
+    independent of main()'s hardware imports. Raises ``ValueError`` with an
+    operator-facing message for an empty/degenerate list (``""``, ``","``,
+    ``",,,"``) instead of letting the caller silently sweep zero values and crash
+    later with an unhandled ``IndexError`` (Task 16 review, Finding 4).
     """
     values = [float(x) for x in raw.split(",") if x.strip()]
     if not values:
         raise ValueError(
-            f"--distances {raw!r} contains no usable values — pass a "
-            "comma-separated list of standoffs in mm, e.g. --distances 300,400,500")
+            f"{flag} {raw!r} contains no usable values — pass a comma-separated "
+            f"list, e.g. {flag} {example}")
     return values
+
+
+def _parse_distances(raw: str) -> "list[float]":
+    """Parse ``--distances`` into a list of mm floats (see :func:`_parse_floats`)."""
+    return _parse_floats(raw, "--distances", "300,400,500")
+
+
+# Budget that rejects nothing, for a FIRST (discovery) sweep on a new cell: the
+# shipped DEFAULT_BUDGET is a placeholder, so gating against it on run one tells
+# you only that the guess was wrong, not what the cell actually achieves. With
+# this, every trial is recorded and the achieved envelope is printed, and you set
+# a real budget from that. Runs made this way are tagged discovery=True in the
+# JSON so the lock-side gate refuses to accept them as a validated envelope.
+DISCOVERY_BUDGET = dict(
+    max_rms_mm=float("inf"), max_plane_max_mm=float("inf"),
+    max_height_repeat_mm=float("inf"), max_normal_repeat_deg=float("inf"),
+    max_length_err_mm=float("inf"), max_length_spread_mm=float("inf"),
+    min_coverage_frac=0.0,
+)
+
+
+def achieved_envelope(trials) -> dict:
+    """Worst observed value of each metric across ``trials`` (best coverage).
+
+    This is what a discovery sweep is FOR: the numbers a real budget should be
+    derived from. Empty input gives an empty dict rather than raising, so a sweep
+    that captured nothing still reports cleanly.
+    """
+    trials = list(trials)
+    if not trials:
+        return {}
+    return {
+        "max_rms_mm": max(t.plane_rms_mm for t in trials),
+        "max_plane_max_mm": max(t.plane_max_mm for t in trials),
+        "max_height_repeat_mm": max(t.height_repeat_mm for t in trials),
+        "max_normal_repeat_deg": max(t.normal_repeat_deg for t in trials),
+        "max_length_err_mm": max(t.length_err_mm for t in trials),
+        "max_length_spread_mm": max(t.length_spread_mm for t in trials),
+        "min_coverage_frac": min(t.coverage_frac for t in trials),
+    }
+
+
+def passing_incidence_range_deg(incidence_trials) -> "tuple[float, float] | None":
+    """The contiguous tilt band, starting at the smallest tilt, that passes.
+
+    ``incidence_trials`` is ``[(tilt_deg, passed), ...]``. Incidence quality
+    degrades monotonically with tilt, so the useful answer is "up to N degrees",
+    not a scattered set: this walks tilts in increasing order and stops at the
+    first failure. Returns ``None`` when even the smallest tilt fails.
+    """
+    ordered = sorted(incidence_trials, key=lambda p: float(p[0]))
+    band = []
+    for tilt, passed in ordered:
+        if not passed:
+            break
+        band.append(float(tilt))
+    return (min(band), max(band)) if band else None
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -236,7 +292,16 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--frames", type=int, default=5,
                    help="RGB-D frames captured per distance")
     p.add_argument("--tilt", type=float, default=25.0,
-                   help="worst planned tilt (deg) for the oblique-incidence sanity check")
+                   help="worst planned tilt (deg) for the oblique-incidence sanity check "
+                        "(ignored when --tilts is given)")
+    p.add_argument("--tilts", default=None,
+                   help="comma-separated incidence angles (deg) to sweep at d*, e.g. "
+                        "0,10,20,30. Yields the permitted incidence-angle RANGE; without "
+                        "it only the single --tilt sanity check is taken")
+    p.add_argument("--discovery", action="store_true",
+                   help="first run on a new cell: accept every trial (no budget gating) "
+                        "and report the achieved envelope to derive a real budget from. "
+                        "Tagged in the JSON; will NOT satisfy the lock-side gate")
     p.add_argument("--max-rms", type=float, default=DEFAULT_BUDGET["max_rms_mm"])
     p.add_argument("--max-plane-max", type=float, default=DEFAULT_BUDGET["max_plane_max_mm"])
     p.add_argument("--max-height-repeat", type=float,
@@ -266,19 +331,34 @@ def main(argv=None) -> None:
     except ValueError as e:
         print(f"error: {e}")
         raise SystemExit(2)
+    try:
+        tilts = (_parse_floats(args.tilts, "--tilts", "0,10,20,30")
+                 if args.tilts else [float(args.tilt)])
+    except ValueError as e:
+        print(f"error: {e}")
+        raise SystemExit(2)
     cfg = load_config(args.config)
     board = CharucoTarget(cfg.board)
     camera = CameraClient(cfg.camera)
-    budget = dict(
-        max_rms_mm=args.max_rms, max_plane_max_mm=args.max_plane_max,
-        max_height_repeat_mm=args.max_height_repeat,
-        max_normal_repeat_deg=args.max_normal_repeat,
-        max_length_err_mm=args.max_length_err, max_length_spread_mm=args.max_length_spread,
-        min_coverage_frac=args.min_coverage)
+    if args.discovery:
+        budget = dict(DISCOVERY_BUDGET)
+    else:
+        budget = dict(
+            max_rms_mm=args.max_rms, max_plane_max_mm=args.max_plane_max,
+            max_height_repeat_mm=args.max_height_repeat,
+            max_normal_repeat_deg=args.max_normal_repeat,
+            max_length_err_mm=args.max_length_err,
+            max_length_spread_mm=args.max_length_spread,
+            min_coverage_frac=args.min_coverage)
 
     print(f"=== Distance characterization: {distances} mm, {args.frames} frames each ===")
     print(f"Board: {cfg.board.dictionary} {cfg.board.squares_x}x{cfg.board.squares_y} "
          f"@ {cfg.board.square_size_mm:.1f} mm squares")
+    print("!! The board's OWN geometry is the known-length reference, so the PHYSICAL "
+         "board must match those numbers exactly, or every length error is wrong.")
+    if args.discovery:
+        print("DISCOVERY MODE: no budget gating; the achieved envelope is reported at the "
+              "end. This run will NOT satisfy the lock-side characterization gate.")
 
     session = None
     rdk_io = None
@@ -324,15 +404,39 @@ def main(argv=None) -> None:
             print("d* = " + _format_trial(f"{best.distance_mm:.0f} mm", best))
 
         oblique_distance = best.distance_mm if best is not None else distances[-1]
-        input(f"\n>> Oblique-incidence check: tilt the board/camera to ~{args.tilt:.0f} deg "
-             f"(the worst planned tilt) at ~{oblique_distance:.0f} mm standoff — the spec "
-             "requires tolerances not be validated only at normal incidence. "
-             "Press Enter when steady...")
-        oblique_trial = capture_distance_trial(camera, board, cfg, oblique_distance, args.frames,
-                                               timeout=cfg.camera.timeout_s)
-        oblique_passed = choose_dstar([oblique_trial], **budget) is not None
-        print("   " + _format_trial(f"oblique @ {args.tilt:.0f}deg", oblique_trial)
-             + f" -> {'PASS' if oblique_passed else 'FAIL'} against the same budget")
+        # Incidence sweep (plan Task 6): one oblique sample proves a point but not a
+        # RANGE, and the planner needs a permitted incidence band to filter poses by.
+        # Taken at d* so distance is held constant and tilt is the only variable.
+        incidence: list = []
+        for tilt in tilts:
+            input(f"\n>> Incidence check: tilt the board/camera to ~{tilt:.0f} deg at "
+                 f"~{oblique_distance:.0f} mm standoff — tolerances must not be validated "
+                 "only at normal incidence. Press Enter when steady...")
+            trial = capture_distance_trial(camera, board, cfg, oblique_distance, args.frames,
+                                           timeout=cfg.camera.timeout_s)
+            passed = choose_dstar([trial], **budget) is not None
+            print("   " + _format_trial(f"tilt {tilt:.0f}deg", trial)
+                 + f" -> {'PASS' if passed else 'FAIL'} against the same budget")
+            incidence.append({"tilt_deg": float(tilt), "trial": trial.to_dict(),
+                              "passed": bool(passed)})
+
+        band = passing_incidence_range_deg([(e["tilt_deg"], e["passed"]) for e in incidence])
+        if band is None:
+            print("\nincidence: NO tilt in the sweep passed — the permitted range is unknown.")
+        else:
+            print(f"\nincidence: permitted range {band[0]:.0f}-{band[1]:.0f} deg "
+                 f"(contiguous from the smallest tilt tested)")
+        # Preserve the pre-existing single-sample key so older readers keep working.
+        oblique_trial_dict = incidence[-1]["trial"] if incidence else None
+        oblique_passed = bool(incidence[-1]["passed"]) if incidence else False
+
+        envelope = achieved_envelope(trials)
+        if args.discovery:
+            print("\n=== achieved envelope (worst across the distance sweep) ===")
+            for k, v in envelope.items():
+                print(f"   {k} = {v:.3f}")
+            print("Set a real budget from these + your process tolerance, then re-run "
+                  "WITHOUT --discovery to record the official result.")
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d")
@@ -343,9 +447,15 @@ def main(argv=None) -> None:
             "trials": [t.to_dict() for t in trials],
             "dstar_mm": best.distance_mm if best is not None else None,
             "budget": budget,
+            # A discovery sweep gated nothing, so its dstar proves nothing. Tagged so
+            # the lock-side gate can refuse to treat it as a validated envelope.
+            "discovery": bool(args.discovery),
+            "achieved_envelope": envelope,
+            "incidence_sweep": incidence,
+            "incidence_range_deg": list(band) if band else None,
             "oblique_check": {
-                "tilt_deg": args.tilt, "distance_mm": oblique_distance,
-                "trial": oblique_trial.to_dict(), "passed": oblique_passed,
+                "tilt_deg": float(tilts[-1]), "distance_mm": oblique_distance,
+                "trial": oblique_trial_dict, "passed": oblique_passed,
             },
             "robot_camera_T_mm": camera_T_per_distance,
             "board": {

@@ -603,6 +603,12 @@ def lock_scan_surface(services, *, force_crop: bool = False,
     # gate event before the lock is refused, rather than failing silently.
     characterization = latest_characterization(CHARACTERIZATION_DIR)
     stale = characterization is None
+    if not stale and characterization.get("discovery"):
+        # A discovery sweep (tools/characterize_distance.py --discovery) gated
+        # nothing: every trial passed an infinite budget, so its d* proves only that
+        # captures happened. Treating it as a validated envelope would silence this
+        # gate on the strength of a measurement that verified nothing.
+        stale = True
     if not stale:
         try:
             measured_at = datetime.fromisoformat(str(characterization.get("date")))
