@@ -97,6 +97,12 @@ LOCK_MAX_AGE_S = 120.0
 LOCK_MOVED_TOL_MM = 5.0
 LOCK_MOVED_TOL_DEG = 1.5
 
+# Telemetry older than this (by HOST arrival time) means the feed is dead, not
+# merely between payloads: the Jetson's measured production interval is ~3.4 s
+# (2026-08-13, h264+SCAN), so 10 s is ~3 missed cycles. See
+# live_scan_telemetry_payload for why this replaced a 2.0 s cross-clock check.
+TELEMETRY_DEAD_FEED_S = 10.0
+
 
 @dataclass
 class LockedScanSurface:
@@ -1472,8 +1478,30 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
     """Apply workstation scan thresholds to compact Jetson plane telemetry."""
     if not raw:
         return {}
-    stamp = raw.get("timestamp")
-    if stamp is not None and time.time() - float(stamp) > 2.0:
+    # Staleness gating, remeasured on the cell 2026-08-13 (Defect 2's core):
+    #
+    #  * The Jetson produces scan telemetry every ~3.4 s in Tasni's own stream mode
+    #    (h264+SCAN), not the nominal 1.0 s, and each payload reaches the host
+    #    ~2.5 s after its Jetson stamp. The old rule — drop when
+    #    ``time.time() - timestamp > 2.0`` — therefore discarded MOST healthy
+    #    payloads and let the occasional one through: the HUD froze for stretches
+    #    and then jumped, the exact reported symptom. The threshold was tuned for a
+    #    cadence the Jetson does not actually achieve.
+    #  * It is also cross-machine wall-clock arithmetic, which silently breaks if
+    #    the Jetson (no reliable RTC guarantees) drifts.
+    #
+    # The gate's real job is detecting a DEAD feed, not enforcing cadence — the
+    # hold/stabilize layer already smooths gaps between healthy payloads. So: judge
+    # staleness by HOST arrival time (stamped by _TelemetryReader), with a bound
+    # comfortably above the measured production interval. The Jetson stamp is kept
+    # for provenance; the old 2.0 s cross-clock check survives only for payloads
+    # that never went through _TelemetryReader (older tests / direct callers).
+    stamp = raw.get("timestamp")          # Jetson clock; provenance only
+    received = raw.get("_received_at")
+    if received is not None:
+        if time.time() - float(received) > TELEMETRY_DEAD_FEED_S:
+            return {}
+    elif stamp is not None and time.time() - float(stamp) > 2.0:
         return {}
     th = scan_gate_thresholds(scfg)
     detected = bool(raw.get("detected"))

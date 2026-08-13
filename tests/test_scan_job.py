@@ -372,11 +372,15 @@ def test_provenance_flows_lock_to_insert():
 
 
 def test_provenance_absent_when_survey_record_is_none():
-    """An auto-detected crop overrun (the surface overruns the view, no
-    force_crop) builds NO survey_record -- a silent SYSTEM fallback, not an
-    operator declaration (Task 3's honest-provenance rule). The pipeline must
-    still complete end to end: provenance is simply ABSENT throughout (None),
-    never fabricated, never defaulted to a measured-sounding string."""
+    """A record-less lock's provenance must flow as ABSENT (None) end to end --
+    never fabricated, never defaulted to a measured-sounding string.
+
+    Adaptive-scan Task 3 removed the auto-overrun fallback this test originally
+    used to obtain a record-less lock (that case now refuses with
+    LargeSurfaceRequired instead of silently cropping). The one remaining
+    legitimate record-less path is a fully framed surface that classify_compact
+    rejects, so that is how the lock is produced now; the pipeline assertions
+    are unchanged."""
     try:
         import open3d  # noqa: F401
     except Exception:
@@ -384,16 +388,22 @@ def test_provenance_absent_when_survey_record_is_none():
         return
     global TABLE_HALF_MM
     saved = TABLE_HALF_MM
-    TABLE_HALF_MM = 1000.0
     try:
         services, state = _build_fakes()
-        state["cam"] = _look_at((0, 0, 310), (0, 0, 0))
-        # The crop's fixed 1000x1000 mm work region reaches farther than the 8
-        # cone-limited tour views actually capture on this synthetic table, which
-        # would otherwise trip the (unrelated) measured-edge-coverage hard-fail
-        # gate -- this test is about provenance flow, not synthetic mesh coverage.
+        # The generic work region can reach farther than the cone-limited tour
+        # views capture on this synthetic table, which would otherwise trip the
+        # (unrelated) measured-edge-coverage hard-fail gate -- this test is about
+        # provenance flow, not synthetic mesh coverage.
         services.config.scan.actual_coverage_hard_fail = False
-        locked = scan_service.lock_scan_surface(services)
+        ineligible = CompactEligibility(
+            eligible=False, reasons=("rectangle is not sufficiently centered",),
+            guard_ok=True, boundary_ok=True, centered_ok=False, tilt_ok=True,
+            identity_ok=True, coverage_ok=True, predicted_coverage=None)
+        orig = _patch_classify_compact(lambda *a, **k: ineligible)
+        try:
+            locked = scan_service.lock_scan_surface(services)
+        finally:
+            scan_service.classify_compact = orig
         assert locked.survey_record is None
         assert locked.lock_token != ""
 
@@ -1404,10 +1414,15 @@ def test_save_views_persists_per_pose_frames():
 
 
 def test_generate_targets_when_survey_touches_border():
-    """A full-frame survey can mark FRAMED red while the old centre gate is valid.
+    """A border-touching surface still gets a target tour — under DECLARED scope.
 
-    Target creation should still use the current-pose cone, not fail just because the
-    measured surface reaches the image border.
+    Pre-Task-3 this exercised the silent auto-crop: generate with no explicit lock
+    would quietly plan over the generic square. That fallback is gone (the default
+    entire-platform scope now refuses with LargeSurfaceRequired — covered by
+    test_entire_platform_overrun_refuses_instead_of_auto_cropping). The capability
+    itself survives as an explicit declared-region lock, and target creation must
+    still use the current-pose cone rather than fail because the surface reaches
+    the image border.
     """
     global TABLE_HALF_MM
     saved = TABLE_HALF_MM
@@ -1415,20 +1430,24 @@ def test_generate_targets_when_survey_touches_border():
     try:
         services, state = _build_fakes()
         state["cam"] = _look_at((0, 0, 310), (0, 0, 0))
-        gen = scan_service.generate_scan_targets(services)
+        locked = scan_service.lock_scan_surface(
+            services, surface_scope=scan_service.SCOPE_DECLARED_REGION)
+        gen = scan_service.generate_scan_targets(services, locked)
         assert gen["created"] == 8, gen
         assert gen["boundary_views_enabled"] is False, gen
         assert gen["boundary_aim_offsets"] == 0, gen
         assert gen["gate"]["ok"] is True, gen["gate"]
+        # _crop_gate_payload reports framed=False for the HUD (the surface really
+        # does overrun the view) while excluding it from ok — same as before Task 3.
         assert gen["gate"]["gates"].get("framed") is False, gen["gate"]
         assert 300 <= gen["look_distance_mm"] <= 340, gen["look_distance_mm"]
-        # The surface overruns the view, so the work region is the generic fixed
-        # square (scan.work_crop_mm default 1000×1000), not an adaptive FOV-fraction.
+        # The work region is the generic fixed square (scan.work_crop_mm default
+        # 1000×1000) declared around the reticle, not an adaptive FOV-fraction.
         assert gen["crop_size_mm"] is not None
         assert gen["crop_size_mm"] == [1000.0, 1000.0], gen["crop_size_mm"]
     finally:
         TABLE_HALF_MM = saved
-    print("[survey border] framed red but centre gate OK -> created", gen["created"],
+    print("[survey border] declared region -> created", gen["created"],
           "crop", gen["crop_size_mm"])
 
 

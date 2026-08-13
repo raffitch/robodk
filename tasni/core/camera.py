@@ -16,6 +16,7 @@ import socket
 import struct
 import json
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -330,6 +331,14 @@ class _TelemetryReader:
                     raise CameraError(f"invalid telemetry length {n}")
                 payload = json.loads(
                     CameraClient._recv_exact(self._sock, n).decode("utf-8"))
+                # HOST arrival time, for staleness checks. The payload's own
+                # "timestamp" is time.time() ON THE JETSON, and a Nano has no RTC
+                # battery: measured on the cell 2026-08-13, its clock sat 3777 s
+                # behind the host, so any host-clock-minus-jetson-stamp age gate
+                # discarded 100% of telemetry and froze the HUD. Staleness must be
+                # judged by when the payload REACHED US, never by cross-machine
+                # wall-clock arithmetic.
+                payload["_received_at"] = time.time()
                 with self._lock:
                     self._latest = payload
         except (CameraError, OSError, socket.timeout, ValueError, json.JSONDecodeError):
