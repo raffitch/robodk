@@ -270,6 +270,14 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
             "metrics must be measured on the board, so this distance cannot be "
             "characterized. Move closer, improve lighting, or drop this distance.")
 
+    if not length_samples:
+        # summarize_distance_trial folds an empty list into length_err_mm = NaN, and
+        # choose_dstar rejects any non-finite metric -- so this trial is already
+        # doomed. Say why now, at the cell, instead of letting it read as a quality
+        # failure in the verdict later.
+        print("   !! no known-length sample: the two OPPOSITE inner corners of the "
+              "board must BOTH be visible. This capture can never pass — re-aim so "
+              "the whole board is in frame and repeat this stop.")
     coverage_frac = float(np.mean(coverage_samples)) if coverage_samples else 0.0
     measured_mm = float(np.median(standoff_samples)) if standoff_samples else float(distance_mm)
     trial = summarize_distance_trial(measured_mm, plane_sets, length_samples, coverage_frac)
