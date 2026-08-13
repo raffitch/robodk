@@ -655,9 +655,29 @@ def _compact_identity_scfg(scfg) -> "tuple[object, str | None]":
         f"({nominal}); the identity check used {available} frame(s) instead.")
 
 
+#: Task 18 review round 2: the origin-distance start-corner rule below is
+#: unambiguous with a large margin EXCEPT near an in-plane rotation of
+#: 45/135/225/315 degrees for a rectangle centred in view, where two corners
+#: become nearly equidistant from the origin by construction (an exact
+#: algebraic tie for an exactly-centred, exactly-45-degree square) -- see
+#: ``_canonicalize_outline_uv``'s own docstring for the measured before/after
+#: numbers. Below this gap (normalized uv), the two smallest origin-distances
+#: are treated as "too close to trust" and the tie-break described there
+#: takes over instead. Comfortably above the ~0.001-0.03 uv corner-position
+#: noise measured at 0.5-2 mm depth noise (this and the original Critical 1
+#: regression test), and comfortably inside the window where origin-distance
+#: is genuinely near-degenerate: a numeric sweep (0-45 degrees in 1-degree
+#: steps, three aspect ratios -- 1:1, 1.36:1, 1.67:1) shows the gap crosses
+#: below 0.05 only within roughly 3-6 degrees of a 45-degree multiple
+#: (e.g. square: 0.073 at 40 degrees, 0.044 at 42, 0.000 at 45), and is back
+#: above 0.15 by 10 degrees away (e.g. square: 0.145 at 35 degrees) -- so this
+#: fallback engages only in the narrow band where it is actually needed.
+_CANONICALIZE_TIE_EPS_UV = 0.05
+
+
 def _canonicalize_outline_uv(outline_uv) -> list:
     """Canonicalize a 4-corner outline's corner order for CROSS-FRAME comparison
-    (Task 18 review, Critical 1).
+    (Task 18 review, Critical 1; tie-break hardened in review round 2).
 
     ``_oriented_rectangle`` (``plane.py``) fits each frame's rectangle
     independently via its own min-area-rectangle search, so the SAME physical
@@ -675,8 +695,32 @@ def _canonicalize_outline_uv(outline_uv) -> list:
     dedicated noisy-frame regression test for the full before/after numbers).
 
     Normalizes winding via the shoelace signed area (reversing to make it
-    consistently non-negative), then rotates so the corner nearest the image
-    origin (0, 0) -- a fixed, frame-independent reference point -- is index 0.
+    consistently non-negative). The start corner is then the one nearest the
+    image origin (0, 0) -- EXCEPT when the two smallest origin-distances are
+    within ``_CANONICALIZE_TIE_EPS_UV`` of each other, which happens near an
+    in-plane rotation of 45 degrees for a rectangle centred in view (two
+    corners become nearly equidistant from the origin by construction; review
+    round 2 measured an EXACT tie for a perfectly centred, perfectly
+    45-degree square, and a near-tie -- 0.0026-0.0137 normalized-uv gap, well
+    inside real sensor-noise range -- empirically on this project's own
+    rendering + fitting pipeline at 43.6-43.7 degrees, the pipeline's actual
+    crossing point once its own small fitting asymmetries are accounted for).
+    In that regime the start corner is instead the LEXICOGRAPHICALLY smallest
+    (u, then v) -- chosen because it is providably non-degenerate exactly
+    where origin-distance is degenerate: for any rectangle with half-extents
+    a, b > 0 at rotation theta, the four corners' u-coordinates (relative to
+    centroid) are +-(a*cos(theta)+b*sin(theta)) and +-(a*cos(theta)-b*sin(theta));
+    the minimum of the four is UNIQUE for every theta except theta = 0/90/180/
+    270 degrees (where a*cos(theta) or b*sin(theta) is exactly 0) -- i.e.
+    lexicographic order's own degenerate angles are a full 45 degrees away
+    from origin-distance's, so the two criteria's fragile zones never
+    coincide. (Verified both algebraically and with a numeric sweep; at
+    theta=45 degrees exactly the lexicographic gap is close to the
+    rectangle's own scale, not a near-tie.) At theta = 0/90/180/270 degrees
+    themselves origin-distance is fully unambiguous (its own gap is at its
+    MAXIMUM there), so this fallback is never actually exercised at those
+    angles -- the two rules' blind spots are complementary, not shared.
+
     Two representations of the same physical rectangle that differ only in
     starting corner and/or winding map to the IDENTICAL canonical form.
     """
@@ -687,7 +731,12 @@ def _canonicalize_outline_uv(outline_uv) -> list:
         uv[:, 0] * np.roll(uv[:, 1], -1) - np.roll(uv[:, 0], -1) * uv[:, 1])
     if signed_area < 0:
         uv = uv[::-1]
-    start = int(np.argmin(np.linalg.norm(uv, axis=1)))
+    dist = np.linalg.norm(uv, axis=1)
+    order = np.argsort(dist)
+    if len(dist) >= 2 and (dist[order[1]] - dist[order[0]]) < _CANONICALIZE_TIE_EPS_UV:
+        start = int(min(range(len(uv)), key=lambda i: (uv[i, 0], uv[i, 1])))
+    else:
+        start = int(order[0])
     return np.roll(uv, -start, axis=0).tolist()
 
 

@@ -66,7 +66,7 @@ def _look_at(cam_pos, target):
     return Rt_to_T(np.column_stack([x, y, z]), cam_pos)
 
 
-def _render(T_base_cam, table_half_mm=None, noise_mm=0.0, rng=None):
+def _render(T_base_cam, table_half_mm=None, noise_mm=0.0, rng=None, rotation_deg=0.0):
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     us, vs = np.meshgrid(np.arange(W), np.arange(H))
     dirs_cam = np.stack([(us - cx) / fx, (vs - cy) / fy, np.ones_like(us, float)], -1)
@@ -77,7 +77,18 @@ def _render(T_base_cam, table_half_mm=None, noise_mm=0.0, rng=None):
         s = (0.0 - t[2]) / dz
     P = t + s[..., None] * dirs_base
     half_mm = TABLE_HALF_MM if table_half_mm is None else table_half_mm
-    valid = ((np.abs(P[..., 0]) <= half_mm) & (np.abs(P[..., 1]) <= half_mm)
+    # Task 18 review round 2: an in-plane (world Z axis) rotation of the table
+    # square itself, independent of camera pose -- used to reproduce the
+    # canonicalization tie-break's degenerate case (a rectangle rotated near
+    # 45 degrees relative to the image axes while centred in view).
+    if rotation_deg:
+        th = np.radians(rotation_deg)
+        cr, sr = np.cos(th), np.sin(th)
+        Px = P[..., 0] * cr + P[..., 1] * sr
+        Py = -P[..., 0] * sr + P[..., 1] * cr
+    else:
+        Px, Py = P[..., 0], P[..., 1]
+    valid = ((np.abs(Px) <= half_mm) & (np.abs(Py) <= half_mm)
              & (s > 0) & np.isfinite(s))
     if noise_mm > 0:
         # Task 18 review, Critical 1: REAL per-pixel depth noise (Gaussian,
@@ -833,6 +844,67 @@ def test_lock_identity_gate_accepts_a_stationary_rectangle_under_real_depth_nois
     assert locked.survey_record.mode == MODE_COMPACT
     print("[compact eligibility] 1.0 mm real per-frame depth noise -> "
           "identity gate still accepts a stationary rectangle")
+
+
+def test_lock_identity_gate_accepts_a_near_45_degree_centred_rectangle_under_noise():
+    """Task 18 review round 2: the round-1 canonicalization's start-corner
+    rule (nearest the image origin) has an EXACT algebraic tie for a
+    perfectly centred, perfectly 45-degree-rotated square -- two corners are
+    equidistant from the origin by construction. Under noise, the comparison
+    between those two near-equal distances can flip frame to frame,
+    reintroducing Critical 1 narrowed to this one configuration.
+    classify_compact places no constraint on in-plane yaw (only centring via
+    compact_center_tol_uv), so an operator placing a platform near 45 degrees
+    to the camera's roll axis is plausible, not theoretical.
+
+    This project's own rendering + fitting pipeline (_render's perspective
+    projection through _oriented_rectangle's min-area-rectangle fit) has a
+    small internal asymmetry -- confirmed by a fine-grained noiseless sweep
+    before writing this test -- so its actual tie-break crossing is
+    43.6-43.7 degrees rather than exactly 45.0; documented here rather than
+    silently substituted, matching this task's own precedent for adjusting a
+    reviewer-specified scene to what the real pipeline actually produces (see
+    the guard-band test's 400 mm vs. the originally-cited 420 mm). 43.65
+    degrees is used directly. 115 mm half-extent is the largest that still
+    clears every OTHER gate (detected, fully framed, guard, centred) for a
+    45-degree-rotated table on this synthetic 320x240 camera -- a rotated
+    square's corners reach sqrt(2) further than an axis-aligned one of the
+    same size, confirmed by a direct sweep before writing this test.
+
+    The pre-existing "distance" gate (untouched by Task 18) does not clear at
+    this table size/standoff combination for a rotated shape (its planner
+    was tuned for axis-aligned surfaces), so the lock still raises for that
+    unrelated reason -- exactly like the not-fully-framed test above, this
+    reads the identity gate off the published `gate` JobEvent one tick before
+    the raise rather than off a successful return.
+    """
+    services, state = _build_fakes()
+    cam = services.camera
+    # seed=14 independently confirmed (before this fix existed) to trip the
+    # round-1 bug at this exact angle: max cross-frame drift 0.5814 against a
+    # 0.04 tolerance -- see this round's fix report for the full seed sweep.
+    rng = np.random.default_rng(14)
+    events = []
+    services.bus = SimpleNamespace(publish=lambda e: events.append(e))
+
+    def rotated_noisy_grab(with_depth=False, timeout=None, color_only=False):
+        cam.grabs += 1
+        return _render(state["cam"], table_half_mm=115.0, rotation_deg=43.65,
+                       noise_mm=1.0, rng=rng)
+    cam.grab = rotated_noisy_grab
+
+    try:
+        scan_service.lock_scan_surface(services)
+    except RuntimeError:
+        pass
+    gate_events = [e for e in events if e.type == "gate"]
+    assert gate_events, "expected the gate event to still be published before the raise"
+    payload = gate_events[-1].payload
+    elig = payload.get("compact_eligibility")
+    assert elig is not None, payload
+    assert elig["identity_ok"] is True, elig
+    print("[compact eligibility] near-45-degree centred rotation + 1.0 mm noise -> "
+          "identity gate still accepts (tie-break hardened, review round 2)")
 
 
 def test_lock_adapts_identity_frame_requirement_when_measure_frames_is_lower():
@@ -2658,6 +2730,7 @@ if __name__ == "__main__":
     test_lock_reports_the_failing_gate_for_each_of_the_five_conditions()
     test_lock_survey_outline_history_reflects_independent_per_frame_surveys()
     test_lock_identity_gate_accepts_a_stationary_rectangle_under_real_depth_noise()
+    test_lock_identity_gate_accepts_a_near_45_degree_centred_rectangle_under_noise()
     test_lock_adapts_identity_frame_requirement_when_measure_frames_is_lower()
     test_lock_never_vacuously_passes_identity_with_a_single_frame()
     test_lock_gate_event_carries_survey_and_provenance()
