@@ -664,7 +664,7 @@ def set_high_accuracy_preset(profile):
     try:
         sensor = profile.get_device().first_depth_sensor()
     except Exception as e:
-        print(f"WARNING: no depth sensor to configure: {e}")
+        print(f"WARNING: no depth sensor to configure: {e}", flush=True)
         return
     wanted = [('laser_power', getattr(rs.option, 'laser_power', None), RS_LASER_POWER),
               # Every client of this server shares one pipeline, so enabling the
@@ -679,12 +679,12 @@ def set_high_accuracy_preset(profile):
         try:
             cur = sensor.get_option(rs.option.visual_preset)
             print(f"RealSense: visual_preset left as-is at {cur:g} "
-                  "(set RS_VISUAL_PRESET to change it)")
+                  "(set RS_VISUAL_PRESET to change it)", flush=True)
         except Exception:
             pass
     for name, option, value in wanted:
         if option is None or not sensor.supports(option):
-            print(f"RealSense: {name} unsupported on this device/build — skipped")
+            print(f"RealSense: {name} unsupported on this device/build — skipped", flush=True)
             continue
         try:
             rng = sensor.get_option_range(option)
@@ -692,9 +692,9 @@ def set_high_accuracy_preset(profile):
             sensor.set_option(option, clamped)
             print(f"RealSense: {name} -> requested {value:g}, set {clamped:g}, "
                   f"device reports {sensor.get_option(option):g} "
-                  f"(range {rng.min:g}..{rng.max:g})")
+                  f"(range {rng.min:g}..{rng.max:g})", flush=True)
         except Exception as e:
-            print(f"WARNING: could not set {name}={value:g}: {e}")
+            print(f"WARNING: could not set {name}={value:g}: {e}", flush=True)
 
 
 def openPipeline():
