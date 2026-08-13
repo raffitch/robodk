@@ -77,10 +77,11 @@ def _render(T_base_cam, table_half_mm=None, noise_mm=0.0, rng=None, rotation_deg
         s = (0.0 - t[2]) / dz
     P = t + s[..., None] * dirs_base
     half_mm = TABLE_HALF_MM if table_half_mm is None else table_half_mm
-    # Task 18 review round 2: an in-plane (world Z axis) rotation of the table
-    # square itself, independent of camera pose -- used to reproduce the
-    # canonicalization tie-break's degenerate case (a rectangle rotated near
-    # 45 degrees relative to the image axes while centred in view).
+    # Task 18 review rounds 2/3: an in-plane (world Z axis) rotation of the
+    # table square itself, independent of camera pose -- used to test the
+    # identity gate against a rectangle rotated near 45 degrees relative to
+    # the image axes while centred in view (the orientation earlier per-frame
+    # canonicalization attempts had trouble with).
     if rotation_deg:
         th = np.radians(rotation_deg)
         cr, sr = np.cos(th), np.sin(th)
@@ -817,16 +818,18 @@ def test_lock_identity_gate_accepts_a_stationary_rectangle_under_real_depth_nois
     noise can shift which corner that fit calls "first" -- a cyclic rotation
     -- even though the physical rectangle never moved.
     rectangle_identity_consistent compares corner-for-corner BY INDEX, so
-    without canonicalizing each outline first, a genuinely stationary
-    rectangle can spuriously FAIL the identity gate on ordinary sensor noise
-    (measured directly on this exact fixture: 1.0 mm of per-pixel Gaussian
-    depth noise -- squarely inside the D435i's real ~0.5-2 mm RMS band at
-    400-500 mm standoff -- produced a 0.8455 normalized-uv "drift" by naive
-    by-index comparison against the 0.04 tolerance, purely from corner
-    reordering; canonicalizing first drops that to ~0.001, matching the best
-    possible corner relabelling). Complements the test above: that one proves
-    a REAL difference is still caught; this one proves REAL noise without a
-    real difference is not spuriously rejected. Both directions matter."""
+    without aligning each subsequent outline to a common reference first, a
+    genuinely stationary rectangle can spuriously FAIL the identity gate on
+    ordinary sensor noise (measured directly on this exact fixture: 1.0 mm of
+    per-pixel Gaussian depth noise -- squarely inside the D435i's real
+    ~0.5-2 mm RMS band at 400-500 mm standoff -- produced a 0.8455
+    normalized-uv "drift" by naive by-index comparison against the 0.04
+    tolerance, purely from corner reordering; aligning each frame to the
+    first successfully-surveyed frame via _align_polygon_like -- review
+    round 3 -- drops that to ~0.001, matching the best possible corner
+    correspondence). Complements the test above: that one proves a REAL
+    difference is still caught; this one proves REAL noise without a real
+    difference is not spuriously rejected. Both directions matter."""
     services, state = _build_fakes()
     cam = services.camera
     rng = np.random.default_rng(7)   # one shared RNG -> genuinely different noise per frame
@@ -847,12 +850,25 @@ def test_lock_identity_gate_accepts_a_stationary_rectangle_under_real_depth_nois
 
 
 def test_lock_identity_gate_accepts_a_near_45_degree_centred_rectangle_under_noise():
-    """Task 18 review round 2: the round-1 canonicalization's start-corner
-    rule (nearest the image origin) has an EXACT algebraic tie for a
+    """Task 18 review history: round 1's per-frame canonicalization (start
+    corner = nearest the image origin) had an EXACT algebraic tie for a
     perfectly centred, perfectly 45-degree-rotated square -- two corners are
-    equidistant from the origin by construction. Under noise, the comparison
-    between those two near-equal distances can flip frame to frame,
-    reintroducing Critical 1 narrowed to this one configuration.
+    equidistant from the origin by construction, so noise could flip which
+    one "wins" frame to frame. Round 2 tried a secondary per-frame rule
+    (lexicographic tie-break) and fixed this exact angle, but review round 3
+    found that ANY purely-geometric per-frame labelling rule has its OWN
+    degenerate rotation somewhere (a square's 4-fold symmetry guarantees it)
+    -- round 2's fix relocated the singularity to ~37-41 degrees rather than
+    removing it. Round 3 replaced per-frame canonicalization entirely with
+    cross-frame alignment (_align_polygon_like, aligning every frame to the
+    first successfully-surveyed one) -- a comparison, not a labelling rule,
+    with no orientation-dependent singularity (see
+    test_align_polygon_like_has_no_degenerate_rotation_across_full_sweep for
+    the full-range proof). This test keeps the ORIGINAL near-45-degree,
+    centred, noisy scene as a concrete end-to-end regression -- it is no
+    longer "the" hard case for this implementation, just one of many that all
+    now behave identically well.
+
     classify_compact places no constraint on in-plane yaw (only centring via
     compact_center_tol_uv), so an operator placing a platform near 45 degrees
     to the camera's roll axis is plausible, not theoretical.
@@ -860,16 +876,17 @@ def test_lock_identity_gate_accepts_a_near_45_degree_centred_rectangle_under_noi
     This project's own rendering + fitting pipeline (_render's perspective
     projection through _oriented_rectangle's min-area-rectangle fit) has a
     small internal asymmetry -- confirmed by a fine-grained noiseless sweep
-    before writing this test -- so its actual tie-break crossing is
-    43.6-43.7 degrees rather than exactly 45.0; documented here rather than
-    silently substituted, matching this task's own precedent for adjusting a
-    reviewer-specified scene to what the real pipeline actually produces (see
-    the guard-band test's 400 mm vs. the originally-cited 420 mm). 43.65
-    degrees is used directly. 115 mm half-extent is the largest that still
-    clears every OTHER gate (detected, fully framed, guard, centred) for a
-    45-degree-rotated table on this synthetic 320x240 camera -- a rotated
-    square's corners reach sqrt(2) further than an axis-aligned one of the
-    same size, confirmed by a direct sweep before writing this test.
+    before writing this test in round 2 -- so round 1's actual failure
+    crossing on THIS fixture was 43.6-43.7 degrees rather than exactly 45.0;
+    43.65 degrees is used directly, documented rather than silently
+    substituted (matching this task's own precedent for adjusting a
+    reviewer-specified scene to what the real pipeline actually produces --
+    see the guard-band test's 400 mm vs. the originally-cited 420 mm). 115 mm
+    half-extent is the largest that still clears every OTHER gate (detected,
+    fully framed, guard, centred) for a 45-degree-rotated table on this
+    synthetic 320x240 camera -- a rotated square's corners reach sqrt(2)
+    further than an axis-aligned one of the same size, confirmed by a direct
+    sweep in round 2.
 
     The pre-existing "distance" gate (untouched by Task 18) does not clear at
     this table size/standoff combination for a rotated shape (its planner
@@ -880,9 +897,10 @@ def test_lock_identity_gate_accepts_a_near_45_degree_centred_rectangle_under_noi
     """
     services, state = _build_fakes()
     cam = services.camera
-    # seed=14 independently confirmed (before this fix existed) to trip the
-    # round-1 bug at this exact angle: max cross-frame drift 0.5814 against a
-    # 0.04 tolerance -- see this round's fix report for the full seed sweep.
+    # seed=14 independently confirmed in round 2 (before either fix existed)
+    # to trip the round-1 bug at this exact angle: max cross-frame drift
+    # 0.5814 against a 0.04 tolerance -- see the round-2 fix report section
+    # for the full seed sweep.
     rng = np.random.default_rng(14)
     events = []
     services.bus = SimpleNamespace(publish=lambda e: events.append(e))
@@ -904,7 +922,100 @@ def test_lock_identity_gate_accepts_a_near_45_degree_centred_rectangle_under_noi
     assert elig is not None, payload
     assert elig["identity_ok"] is True, elig
     print("[compact eligibility] near-45-degree centred rotation + 1.0 mm noise -> "
-          "identity gate still accepts (tie-break hardened, review round 2)")
+          "identity gate still accepts (cross-frame alignment, review round 3)")
+
+
+def test_align_polygon_like_has_no_degenerate_rotation_across_full_sweep():
+    """Task 18 review round 3 -- the reviewer's own acceptance bar, automated.
+
+    Rounds 1 and 2 each canonicalized a SINGLE outline's corner order using a
+    property of that outline in isolation (nearest the image origin; then a
+    lexicographic tie-break). Both had a degenerate in-plane rotation: round 1
+    near 45 degrees, and round 2's own fix MOVED it to ~37-41 degrees instead
+    (the reviewer measured single-frame wrong-correspondence rates up to
+    ~38% there at 0.01-0.02 normalized-uv noise -- worse than round 1's own
+    45-degree band). A square's 4-fold rotational symmetry means no
+    per-frame, purely-geometric labelling rule can avoid this; it can only
+    relocate the singularity.
+
+    _align_polygon_like (`tasni/modules/scan/service.py`, already written and
+    reviewed for the live-preview rectangle stabiliser) sidesteps the whole
+    class of bug: it answers "is this the same physical rectangle as a
+    REFERENCE" (a comparison, searching all 4 cyclic rotations of the
+    candidate and its reversal for the closest match) rather than "what is
+    this corner's canonical label" (an absolute per-outline rule that always
+    has somewhere to hide a singularity). ``_survey_outline_history`` now
+    aligns every frame after the first to that first frame via this function
+    instead of canonicalizing each one independently.
+
+    This test is the reviewer's stated acceptance bar: sweep in-plane
+    rotation across the FULL 0-90 degree range (a rectangle's own 4-fold
+    symmetry makes that the whole story -- rotating further just repeats it)
+    in 5-degree steps, at both cited noise levels, and assert there is NO
+    rotation with an elevated single-frame flip rate -- not "better on
+    average". Each trial independently relabels a reference and a candidate
+    copy of the same true rectangle with a random cyclic shift + random
+    reversal (mimicking _oriented_rectangle's uncontrolled per-frame
+    ordering), adds independent Gaussian noise to each, aligns the noisy
+    candidate to the noisy reference via the REAL _align_polygon_like, and
+    checks the aligned result against the noiseless correctly-corresponding
+    target -- a "flip" is when alignment picked a WRONG correspondence (error
+    on the order of the rectangle's own scale), not just ordinary noise
+    (error on the order of the noise level itself).
+    """
+    from tasni.modules.scan.service import _align_polygon_like
+
+    def true_corners(theta_deg, a=0.2, b=0.2, cx=0.5, cy=0.5):
+        th = np.radians(theta_deg)
+        c, s = np.cos(th), np.sin(th)
+        local = np.array([[a, b], [-a, b], [-a, -b], [a, -b]])
+        rot = np.array([[c, -s], [s, c]])
+        return (rot @ local.T).T + np.array([cx, cy])
+
+    def relabel(corners, shift, flip):
+        arr = corners[::-1] if flip else corners.copy()
+        return np.roll(arr, shift, axis=0)
+
+    # A correctly-aligned result differs from the noiseless target only by
+    # noise (<= ~0.02 here); a WRONG correspondence differs by ~ the
+    # rectangle's own scale (edge/diagonal length, ~0.28-0.57 for a=b=0.2 --
+    # see this task's fix report for the measured range). 0.05 sits with
+    # comfortable margin on both sides of that gap.
+    FLIP_ERROR_THRESHOLD_UV = 0.05
+    N_TRIALS = 300
+    # Generous headroom over the ~0.2% noise floor this exact sweep measured
+    # for the real fix (see the fix report's full table) -- and nowhere near
+    # round 2's 5-38% at its own bad angles, so this remains a meaningful
+    # bar, not a rubber stamp.
+    MAX_ACCEPTABLE_FLIP_RATE = 0.03
+
+    rng = np.random.default_rng(2026)
+    worst = (None, None, -1.0)
+    results = []
+    for theta in range(0, 91, 5):
+        for noise in (0.01, 0.02):
+            flips = 0
+            for _ in range(N_TRIALS):
+                true_c = true_corners(theta)
+                ref_true = relabel(true_c, int(rng.integers(0, 4)), bool(rng.integers(0, 2)))
+                cand_true = relabel(true_c, int(rng.integers(0, 4)), bool(rng.integers(0, 2)))
+                ref_noisy = ref_true + rng.normal(0.0, noise, ref_true.shape)
+                cand_noisy = cand_true + rng.normal(0.0, noise, cand_true.shape)
+                aligned = _align_polygon_like(ref_noisy, cand_noisy)
+                err = float(np.mean(np.linalg.norm(aligned - ref_true, axis=1)))
+                if err > FLIP_ERROR_THRESHOLD_UV:
+                    flips += 1
+            rate = flips / N_TRIALS
+            results.append((theta, noise, rate))
+            if rate > worst[2]:
+                worst = (theta, noise, rate)
+    worst_theta, worst_noise, worst_rate = worst
+    assert worst_rate <= MAX_ACCEPTABLE_FLIP_RATE, (
+        f"elevated flip rate {worst_rate:.1%} at theta={worst_theta} deg, "
+        f"noise={worst_noise} -- a degenerate rotation exists; full sweep: {results}")
+    print(f"[align sweep] 0-90 deg step 5, {N_TRIALS} trials/point x 2 noise levels: "
+          f"worst = theta={worst_theta} deg, noise={worst_noise}, flip_rate={worst_rate:.2%} "
+          "-- no elevated rotation found")
 
 
 def test_lock_adapts_identity_frame_requirement_when_measure_frames_is_lower():
@@ -2731,6 +2842,7 @@ if __name__ == "__main__":
     test_lock_survey_outline_history_reflects_independent_per_frame_surveys()
     test_lock_identity_gate_accepts_a_stationary_rectangle_under_real_depth_noise()
     test_lock_identity_gate_accepts_a_near_45_degree_centred_rectangle_under_noise()
+    test_align_polygon_like_has_no_degenerate_rotation_across_full_sweep()
     test_lock_adapts_identity_frame_requirement_when_measure_frames_is_lower()
     test_lock_never_vacuously_passes_identity_with_a_single_frame()
     test_lock_gate_event_carries_survey_and_provenance()

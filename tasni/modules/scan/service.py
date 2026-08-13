@@ -655,95 +655,11 @@ def _compact_identity_scfg(scfg) -> "tuple[object, str | None]":
         f"({nominal}); the identity check used {available} frame(s) instead.")
 
 
-#: Task 18 review round 2: the origin-distance start-corner rule below is
-#: unambiguous with a large margin EXCEPT near an in-plane rotation of
-#: 45/135/225/315 degrees for a rectangle centred in view, where two corners
-#: become nearly equidistant from the origin by construction (an exact
-#: algebraic tie for an exactly-centred, exactly-45-degree square) -- see
-#: ``_canonicalize_outline_uv``'s own docstring for the measured before/after
-#: numbers. Below this gap (normalized uv), the two smallest origin-distances
-#: are treated as "too close to trust" and the tie-break described there
-#: takes over instead. Comfortably above the ~0.001-0.03 uv corner-position
-#: noise measured at 0.5-2 mm depth noise (this and the original Critical 1
-#: regression test), and comfortably inside the window where origin-distance
-#: is genuinely near-degenerate: a numeric sweep (0-45 degrees in 1-degree
-#: steps, three aspect ratios -- 1:1, 1.36:1, 1.67:1) shows the gap crosses
-#: below 0.05 only within roughly 3-6 degrees of a 45-degree multiple
-#: (e.g. square: 0.073 at 40 degrees, 0.044 at 42, 0.000 at 45), and is back
-#: above 0.15 by 10 degrees away (e.g. square: 0.145 at 35 degrees) -- so this
-#: fallback engages only in the narrow band where it is actually needed.
-_CANONICALIZE_TIE_EPS_UV = 0.05
-
-
-def _canonicalize_outline_uv(outline_uv) -> list:
-    """Canonicalize a 4-corner outline's corner order for CROSS-FRAME comparison
-    (Task 18 review, Critical 1; tie-break hardened in review round 2).
-
-    ``_oriented_rectangle`` (``plane.py``) fits each frame's rectangle
-    independently via its own min-area-rectangle search, so the SAME physical
-    rectangle can legitimately come back with a different STARTING corner
-    and/or winding direction from one frame to the next once real depth noise
-    perturbs which axis the fit calls "first" -- measured directly: at 1.0 mm
-    of synthetic depth noise (within the D435i's real ~0.5-2 mm RMS band at
-    400-500 mm), a frame's corners came back as an exact cyclic rotation of a
-    noise-free reference frame's, reading as 0.8455 normalized-uv "drift" by
-    naive corner-for-corner (by-index) comparison against a 0.04 tolerance --
-    while the best relabelling of the SAME two outlines drifts only 0.0012.
-    ``rectangle_identity_consistent`` compares corner-for-corner BY INDEX, so
-    without this, a rectangle that has not moved at all can spuriously fail
-    the identity gate on ordinary sensor noise (see ``test_scan_job.py``'s
-    dedicated noisy-frame regression test for the full before/after numbers).
-
-    Normalizes winding via the shoelace signed area (reversing to make it
-    consistently non-negative). The start corner is then the one nearest the
-    image origin (0, 0) -- EXCEPT when the two smallest origin-distances are
-    within ``_CANONICALIZE_TIE_EPS_UV`` of each other, which happens near an
-    in-plane rotation of 45 degrees for a rectangle centred in view (two
-    corners become nearly equidistant from the origin by construction; review
-    round 2 measured an EXACT tie for a perfectly centred, perfectly
-    45-degree square, and a near-tie -- 0.0026-0.0137 normalized-uv gap, well
-    inside real sensor-noise range -- empirically on this project's own
-    rendering + fitting pipeline at 43.6-43.7 degrees, the pipeline's actual
-    crossing point once its own small fitting asymmetries are accounted for).
-    In that regime the start corner is instead the LEXICOGRAPHICALLY smallest
-    (u, then v) -- chosen because it is providably non-degenerate exactly
-    where origin-distance is degenerate: for any rectangle with half-extents
-    a, b > 0 at rotation theta, the four corners' u-coordinates (relative to
-    centroid) are +-(a*cos(theta)+b*sin(theta)) and +-(a*cos(theta)-b*sin(theta));
-    the minimum of the four is UNIQUE for every theta except theta = 0/90/180/
-    270 degrees (where a*cos(theta) or b*sin(theta) is exactly 0) -- i.e.
-    lexicographic order's own degenerate angles are a full 45 degrees away
-    from origin-distance's, so the two criteria's fragile zones never
-    coincide. (Verified both algebraically and with a numeric sweep; at
-    theta=45 degrees exactly the lexicographic gap is close to the
-    rectangle's own scale, not a near-tie.) At theta = 0/90/180/270 degrees
-    themselves origin-distance is fully unambiguous (its own gap is at its
-    MAXIMUM there), so this fallback is never actually exercised at those
-    angles -- the two rules' blind spots are complementary, not shared.
-
-    Two representations of the same physical rectangle that differ only in
-    starting corner and/or winding map to the IDENTICAL canonical form.
-    """
-    uv = np.asarray(outline_uv, dtype=float).reshape(-1, 2)
-    if len(uv) < 3:
-        return uv.tolist()
-    signed_area = 0.5 * np.sum(
-        uv[:, 0] * np.roll(uv[:, 1], -1) - np.roll(uv[:, 0], -1) * uv[:, 1])
-    if signed_area < 0:
-        uv = uv[::-1]
-    dist = np.linalg.norm(uv, axis=1)
-    order = np.argsort(dist)
-    if len(dist) >= 2 and (dist[order[1]] - dist[order[0]]) < _CANONICALIZE_TIE_EPS_UV:
-        start = int(min(range(len(uv)), key=lambda i: (uv[i, 0], uv[i, 1])))
-    else:
-        start = int(order[0])
-    return np.roll(uv, -start, axis=0).tolist()
-
-
 def _survey_outline_history(raw_frames, K, scfg) -> list:
     """Independently survey each RAW (pre-fusion) depth frame from this lock's
-    acquisition and collect its CANONICALIZED rectangle outline, for classify_
-    compact's §6 rectangle-identity gate (Task 18).
+    acquisition and collect its rectangle outline, ALIGNED to a common
+    reference, for classify_compact's §6 rectangle-identity gate (Task 18;
+    reframed in review round 3 -- see below).
 
     ``_authoritative_acquisition`` median-fuses ``scfg.surface_measure_frames``
     raw depth frames into ONE depth image before the single ``survey_surface``
@@ -751,31 +667,76 @@ def _survey_outline_history(raw_frames, K, scfg) -> list:
     carries no frame-to-frame evidence at all. This reruns ``survey_surface``
     on each raw frame independently -- real per-frame RANSAC plane fits, NOT
     the fused outline repeated -- so a genuinely unstable rectangle can be told
-    apart from a stable one. Each outline is passed through
-    ``_canonicalize_outline_uv`` before being appended (Critical 1) so ordinary
-    per-frame corner-order/winding drift from the independent fits does not
-    read as rectangle movement.
+    apart from a stable one.
 
-    MEASURED cost (1280x720, this machine): ~0.35 s per ``survey_surface`` pass,
-    so ~1.75 s total for the default 5 raw frames -- plus a further ~450 ms for
-    ``_work_boundary``'s SAM pass when the configured engine tries it. Paid
-    ONLY here, i.e. only on the compact (non-crop, fully-framed) lock path --
-    never on a crop/force_crop lock, and short-circuited entirely when the
-    survey did not detect a surface at all (see ``lock_scan_surface``).
+    Cross-frame correspondence, not per-frame canonicalization (round 3):
+    ``_oriented_rectangle`` (``plane.py``) fits each frame's rectangle
+    independently via its own min-area-rectangle search, with no controlled
+    starting corner or winding direction -- rounds 1 and 2 both tried to fix
+    that by picking a canonical "first corner" from properties of a SINGLE
+    outline in isolation (nearest the image origin; lexicographic order as a
+    tie-break). Both attempts DID fix their own reported case, but a square
+    has 4-fold rotational symmetry, so ANY purely-geometric per-frame rule has
+    SOME orientation where two candidate corners are that rule's own near-tie
+    -- round 1 was degenerate near 45 degrees; round 2's added tie-break
+    MOVED the singularity to ~37-41 degrees instead (measured: single-frame
+    wrong-correspondence rate up to ~38% there at 0.01-0.02 normalized-uv
+    noise, worse than round 1's own ~45-degree band). No per-frame labelling
+    rule closes this -- it can only relocate it.
+
+    What the identity gate actually needs is not "the same absolute label
+    every frame" but "is this the same physical rectangle as the others" --
+    a CORRESPONDENCE question, not a labelling one, and answering it directly
+    has no orientation-dependent singularity: the first successfully-surveyed
+    raw frame's outline becomes the reference (used as-is, whatever ordering
+    ``_oriented_rectangle`` happened to give it); every subsequent frame's
+    outline is aligned to that SAME reference via ``_align_polygon_like``
+    (already written and reviewed for the live-preview rectangle stabiliser,
+    ``_rectangles_consistent``) before being appended -- it tries all 4 cyclic
+    rotations of both the candidate and its reversal and keeps whichever
+    minimizes mean corner distance to the reference, so it subsumes winding
+    normalization for free and degrades continuously with noise (no
+    threshold, no step function, nothing to be "near" a boundary of).
+    Verified with a Monte Carlo sweep across the full 0-90 degree rotation
+    range (both square and oblong aspect ratios) at 0.01/0.02 normalized-uv
+    noise: worst-case wrong-correspondence rate <1% (noise floor), flat
+    across every orientation tested, against round 1's ~55% and round 2's
+    ~40% at their own worst angles under the same methodology -- see
+    ``test_scan_job.py``'s dedicated regression test
+    and this task's fix report for the full sweep table.
+
+    MEASURED cost (1280x720, this machine): ~0.35 s per ``survey_surface``
+    pass, so ~1.75 s total for the default 5 raw frames -- plus a further
+    ~450 ms for ``_work_boundary``'s SAM pass when the configured engine
+    tries it. Paid ONLY here, i.e. only on the compact (non-crop,
+    fully-framed) lock path -- never on a crop/force_crop lock, and
+    short-circuited entirely when the survey did not detect a surface at all
+    (see ``lock_scan_surface``).
 
     A raw frame that fails to detect a plane on its own contributes nothing to
     the history (skipped, not padded with a placeholder) -- that omission is
     itself real evidence of instability, and padding it would manufacture
-    agreement that was never measured.
+    agreement that was never measured. (If the very first raw frame is the
+    one that fails, the next successfully-surveyed frame simply becomes the
+    reference instead -- there is nothing special about physical frame order,
+    only about being first among the frames that actually produced a usable
+    outline.)
     """
     th = _survey_thresholds(scfg)
-    history = []
+    history: list = []
+    reference: np.ndarray | None = None
     for fr in raw_frames:
         if fr.depth is None:
             continue
         m = survey_surface(fr.depth, K, th, depth_scale=scfg.depth_scale)
-        if m.outline_uv:
-            history.append(_canonicalize_outline_uv(m.outline_uv))
+        if not m.outline_uv:
+            continue
+        outline = np.asarray(m.outline_uv, dtype=float)
+        if reference is None:
+            reference = outline
+        else:
+            outline = _align_polygon_like(reference, outline)
+        history.append(outline.tolist())
     return history
 
 
