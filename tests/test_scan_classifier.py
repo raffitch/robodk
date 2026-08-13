@@ -67,3 +67,41 @@ def test_coverage_gate_deferred_when_none_but_enforced_when_given():
     low = classify_compact(_Survey(), _GOOD_UV, _BOUNDARY, ScanConfig(),
                            predicted_coverage=0.5, outline_history=_history())
     assert low.coverage_ok is False and low.eligible is False
+
+
+# --- Task 18 review, Important 3: tilt_deg is None (not absent) on an
+# undetected survey -- getattr(survey, "tilt_deg", 90.0)'s default only fires
+# when the attribute is MISSING, never when it exists and is None, so an
+# undetected survey (survey_surface's own _not_detected() always sets
+# tilt_deg=None) used to crash float(None) here before "no surface detected"
+# was ever reached.
+
+class _UndetectedSurvey:
+    detected = False
+    fully_framed = False
+    tilt_deg = None
+
+
+class _LevelSurvey:
+    detected = True
+    fully_framed = True
+    tilt_deg = 0.0            # perfectly fronto-parallel -- falsy, not "unknown"
+
+
+def test_tilt_deg_none_fails_tilt_gate_without_crashing():
+    r = classify_compact(_UndetectedSurvey(), None, None, ScanConfig(), outline_history=[])
+    assert r.eligible is False
+    assert r.tilt_ok is False
+    assert any("no surface detected" in reason for reason in r.reasons)
+    print("[tilt None] undetected survey -> tilt_ok False, no crash:", r.reasons)
+
+
+def test_tilt_deg_zero_is_not_mistaken_for_unmeasured():
+    """A perfectly level plane reads tilt_deg=0.0 -- falsy in Python, so a naive
+    `getattr(...) or 90.0` fallback (rejected in review) would wrongly treat it
+    as "unknown" and fail tilt_ok. The real fix must tell "attribute is None"
+    apart from "attribute is 0.0"."""
+    r = classify_compact(_LevelSurvey(), _GOOD_UV, _BOUNDARY, ScanConfig(),
+                         outline_history=_history())
+    assert r.tilt_ok is True, r
+    print("[tilt zero] tilt_deg=0.0 (level) -> tilt_ok True, not misread as unmeasured")

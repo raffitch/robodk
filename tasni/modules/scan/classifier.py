@@ -69,7 +69,15 @@ def classify_compact(survey, raw_corners_uv, boundary, scfg, *,
     if not centered_ok:
         reasons.append("rectangle is not sufficiently centered")
 
-    tilt_ok = float(getattr(survey, "tilt_deg", 90.0)) <= float(scfg.survey_max_tilt_deg)
+    # Task 18 review, Important 3: getattr's default only fires when the
+    # attribute is MISSING, never when it exists and is None -- and an
+    # undetected survey (survey_surface's _not_detected()) always sets
+    # tilt_deg=None, not "absent". `getattr(..., 90.0) or 90.0` was considered
+    # and rejected: tilt_deg=0.0 (a perfectly level plane) is falsy, so `or`
+    # would wrongly re-map a genuinely good tilt to the "unknown" sentinel and
+    # fail tilt_ok. Read explicitly and treat only None as "not measured".
+    tilt_deg = getattr(survey, "tilt_deg", None)
+    tilt_ok = tilt_deg is not None and float(tilt_deg) <= float(scfg.survey_max_tilt_deg)
     if not tilt_ok:
         reasons.append("plane tilt exceeds the survey tolerance")
 

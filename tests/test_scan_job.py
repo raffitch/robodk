@@ -66,7 +66,7 @@ def _look_at(cam_pos, target):
     return Rt_to_T(np.column_stack([x, y, z]), cam_pos)
 
 
-def _render(T_base_cam, table_half_mm=None):
+def _render(T_base_cam, table_half_mm=None, noise_mm=0.0, rng=None):
     fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
     us, vs = np.meshgrid(np.arange(W), np.arange(H))
     dirs_cam = np.stack([(us - cx) / fx, (vs - cy) / fy, np.ones_like(us, float)], -1)
@@ -79,6 +79,15 @@ def _render(T_base_cam, table_half_mm=None):
     half_mm = TABLE_HALF_MM if table_half_mm is None else table_half_mm
     valid = ((np.abs(P[..., 0]) <= half_mm) & (np.abs(P[..., 1]) <= half_mm)
              & (s > 0) & np.isfinite(s))
+    if noise_mm > 0:
+        # Task 18 review, Critical 1: REAL per-pixel depth noise (Gaussian,
+        # independently drawn per call when the caller passes a shared `rng`
+        # across several _render() calls in one lock -- i.e. genuinely
+        # different per-frame noise, not the same noise repeated), rounded to
+        # whole mm like a real integer-mm depth stream. Only perturbs where
+        # `valid` was already True -- noise never creates or removes coverage.
+        r = rng if rng is not None else np.random.default_rng()
+        s = np.where(valid, np.clip(np.round(s + r.normal(0.0, noise_mm, s.shape)), 1.0, None), s)
     depth = np.where(valid, s, 0).astype(np.uint16)
     # Task 18: color must genuinely distinguish the table from its surroundings so
     # a REAL segmentation boundary engine (color_work_boundary / sam_work_boundary,
@@ -529,6 +538,156 @@ def _patch_classify_compact(fake):
     return orig
 
 
+def test_lock_real_guard_band_rejection_at_close_standoff():
+    """Task 18 review, Important 4: every other rejection test in this section
+    monkeypatches classify_compact with a canned CompactEligibility, so none of
+    them prove the real gate MATHS actually reach the lock -- only that the
+    lock branches correctly on whatever classify_compact returns. This is the
+    one real (non-monkeypatched) guard-band failure in the suite: a genuinely
+    closer standoff whose raw rectangle measurably leaves compact_guard_uv's
+    margin (fully framed, comfortably inside the distance/angle bands, nothing
+    else wrong) -- confirmed directly against the real production pipeline
+    (survey_surface + classify_compact) before writing this test:
+    v-range 0.0375..0.9625 against the 0.04 guard band, i.e. genuinely just
+    outside it, not a synthetic/canned violation.
+
+    (The original 420 mm scene this plan's own review used to find Critical 2
+    no longer reproduces a guard failure once Critical 2's own fix -- lowering
+    compact_guard_uv 0.06 -> 0.04 -- is applied: 420 mm's v-range 0.0583..0.9417
+    clears 0.04 comfortably. 400 mm is the closest-available equivalent scene
+    against the FIXED config, verified the same way.)
+    """
+    services, state = _build_fakes()
+    state["cam"] = _look_at((0, 0, 400), (0, 0, 0))
+    locked = scan_service.lock_scan_surface(services)
+    assert locked.gate_payload["ok"] is True, locked.gate_payload   # distance/angle/framed all fine
+    elig = locked.gate_payload["compact_eligibility"]
+    assert elig["guard_ok"] is False, elig
+    assert elig["eligible"] is False, elig
+    assert locked.survey_record is None
+    assert "survey" not in locked.gate_payload
+    assert "boundary_provenance" not in locked.gate_payload
+    # Critical 2c: the published warning is actionable, not just a bare "leaves
+    # the guard region" -- it names the fix and roughly how much.
+    assert any("guard region" in w and "back off" in w and "mm" in w
+              for w in locked.gate_payload["warnings"]), locked.gate_payload
+    assert locked.lock_token != ""
+    print("[compact eligibility] real 400 mm guard-band violation -> rejected with an actionable hint:",
+          [w for w in locked.gate_payload["warnings"] if "guard region" in w][0])
+
+
+def test_lock_never_classifies_the_fabricated_reticle_square_when_not_fully_framed():
+    """Task 18 review, Important 5: once survey.fully_framed is False,
+    survey_surface has already REPLACED corners_cam_mm/outline_uv with a
+    generic reticle square (not a measured boundary) -- see survey.py's own
+    comment. The compact branch is reachable in exactly that state (detected,
+    not fully framed, but NOT overrunning enough to trip the auto-crop 0.95
+    valid_frac threshold -- a realistic "table runs off one edge" scene): a
+    huge table with the camera aimed near one edge, so part of the frame is
+    genuinely open space, not a full overrun. Before this fix, classify_compact
+    would have been asked to judge the fabricated square, trivially satisfying
+    gates a real unmeasured edge says nothing about (e.g. "centered") and
+    misreporting why the lock refused. Confirmed first against the real
+    pipeline: this exact scene gives valid_frac=0.787 (< 0.95, so NOT
+    crop_mode) with detected=True, fully_framed=False.
+
+    final_gates["framed"] (pre-existing, untouched by Task 18) still forces
+    gate_payload["ok"]=False here, so the lock still raises -- but the
+    published gate JobEvent (what a live HUD actually sees, one tick BEFORE
+    the raise) must not carry a fabricated per-gate classification.
+    """
+    services, state = _build_fakes()
+    global TABLE_HALF_MM
+    saved = TABLE_HALF_MM
+    TABLE_HALF_MM = 1000.0
+    events = []
+    services.bus = SimpleNamespace(publish=lambda e: events.append(e))
+    try:
+        state["cam"] = _look_at((900, 0, 440), (900, 0, 0))
+        try:
+            scan_service.lock_scan_surface(services)
+            raise AssertionError("expected the not-fully-framed lock to refuse (framed gate)")
+        except RuntimeError:
+            pass
+    finally:
+        TABLE_HALF_MM = saved
+    gate_events = [e for e in events if e.type == "gate"]
+    assert gate_events, "expected the gate event to still be published before the raise"
+    payload = gate_events[-1].payload
+    assert payload["surface_mode"] == "full", payload   # not auto-crop -- valid_frac < 0.95
+    assert "compact_eligibility" not in payload, payload
+    assert "survey" not in payload and "boundary_provenance" not in payload
+    assert any("not fully framed" in w for w in payload.get("warnings", [])), payload
+    print("[compact eligibility] not-fully-framed partial overrun -> "
+          "no fabricated classification, honest warning instead")
+
+
+def _patch_sam_work_boundary(fake):
+    orig = scan_service.sam_work_boundary
+    scan_service.sam_work_boundary = fake
+    return orig
+
+
+def test_lock_falls_back_to_color_when_sam_abstains():
+    """Task 18 review, Important 6: production's default boundary_engine is
+    "sam_then_color" (these tests otherwise force "color" for determinism/speed
+    -- see _build_fakes's own comment), but lock_scan_surface's compact branch
+    never invoked ANY boundary engine before this task, so the SAM-first
+    dispatch was untested on the lock's actual critical path. If SAM abstains
+    (returns None -- a real, common outcome: low confidence, an unfamiliar
+    scene, weights not loaded), sam_then_color's OWN contract is to fall back
+    to colour, not to treat the abstention as an overrun. Proven end to end
+    through the real (non-monkeypatched) _work_boundary dispatch: only
+    sam_work_boundary is forced to abstain here; the fixture's real two-tone
+    colour frame lets the REAL color_work_boundary fallback actually succeed.
+    """
+    services, _state = _build_fakes()
+    services.config.scan.boundary_engine = "sam_then_color"
+    orig = _patch_sam_work_boundary(lambda *a, **k: None)
+    try:
+        locked = scan_service.lock_scan_surface(services)
+    finally:
+        scan_service.sam_work_boundary = orig
+    elig = locked.gate_payload["compact_eligibility"]
+    assert elig["boundary_ok"] is True, elig
+    assert elig["eligible"] is True, elig
+    assert locked.survey_record is not None
+    assert locked.survey_record.mode == MODE_COMPACT
+    print("[compact eligibility] SAM abstains -> falls back to color -> still MODE_COMPACT")
+
+
+def test_lock_rejects_when_every_boundary_engine_abstains():
+    """Task 18 review, Important 6 (the failure half): when EVERY configured
+    boundary engine abstains (SAM low-confidence AND colour low-contrast --
+    both real, independently-documented failure modes elsewhere in this
+    module), _work_boundary correctly returns None and classify_compact's
+    boundary_ok reads False -- proven through the real dispatch, not assumed.
+    This is the "a SAM abstention silently gives boundary_ok=False" case the
+    review named: confirmed here it produces the SAME honest no-record/warning
+    shape as every other §6 rejection, not a crash or a silent false-accept.
+    """
+    services, _state = _build_fakes()
+    services.config.scan.boundary_engine = "sam_then_color"
+    orig_sam = _patch_sam_work_boundary(lambda *a, **k: None)
+    orig_color = scan_service.color_work_boundary
+    scan_service.color_work_boundary = lambda *a, **k: None
+    try:
+        locked = scan_service.lock_scan_surface(services)
+    finally:
+        scan_service.sam_work_boundary = orig_sam
+        scan_service.color_work_boundary = orig_color
+    elig = locked.gate_payload["compact_eligibility"]
+    assert elig["boundary_ok"] is False, elig
+    assert elig["eligible"] is False, elig
+    assert locked.survey_record is None
+    assert "survey" not in locked.gate_payload
+    assert "boundary_provenance" not in locked.gate_payload
+    assert any("boundaries not confirmed" in w for w in locked.gate_payload["warnings"]), \
+        locked.gate_payload
+    assert locked.lock_token != ""
+    print("[compact eligibility] SAM + color both abstain -> honest rejection, no record")
+
+
 def test_lock_wires_classify_compact_and_rejects_when_ineligible():
     """The core Task 18 behaviour: when classify_compact reports the surface
     ineligible, lock_scan_surface must follow the EXACT same honest-provenance
@@ -585,7 +744,12 @@ def test_lock_reports_the_failing_gate_for_each_of_the_five_conditions():
         assert locked.survey_record is None, failing_field
         assert "survey" not in locked.gate_payload, failing_field
         assert "boundary_provenance" not in locked.gate_payload, failing_field
-        assert reason in locked.gate_payload["warnings"], (failing_field, locked.gate_payload)
+        # substring, not equality: the guard-region reason is enriched with an
+        # actionable backoff hint at the call site (Task 18 review, Critical 2c)
+        # before it is published as a warning -- classify_compact's own reason
+        # text (asserted verbatim in test_scan_classifier.py) is still a prefix.
+        assert any(reason in w for w in locked.gate_payload["warnings"]), \
+            (failing_field, locked.gate_payload)
         assert locked.gate_payload["compact_eligibility"][failing_field] is False, failing_field
         assert locked.lock_token != "", failing_field
     print("[compact eligibility] each of the 5 §6 gates independently blocks the compact label")
@@ -634,6 +798,41 @@ def test_lock_survey_outline_history_reflects_independent_per_frame_surveys():
     assert locked.gate_payload["ok"] is True, locked.gate_payload   # the lock itself still succeeds
     assert locked.lock_token != ""
     print("[compact eligibility] genuinely differing raw frames -> identity gate correctly rejects")
+
+
+def test_lock_identity_gate_accepts_a_stationary_rectangle_under_real_depth_noise():
+    """Task 18 review, Critical 1: each raw frame's outline comes from an
+    INDEPENDENT _oriented_rectangle fit (plane.py), so real per-frame depth
+    noise can shift which corner that fit calls "first" -- a cyclic rotation
+    -- even though the physical rectangle never moved.
+    rectangle_identity_consistent compares corner-for-corner BY INDEX, so
+    without canonicalizing each outline first, a genuinely stationary
+    rectangle can spuriously FAIL the identity gate on ordinary sensor noise
+    (measured directly on this exact fixture: 1.0 mm of per-pixel Gaussian
+    depth noise -- squarely inside the D435i's real ~0.5-2 mm RMS band at
+    400-500 mm standoff -- produced a 0.8455 normalized-uv "drift" by naive
+    by-index comparison against the 0.04 tolerance, purely from corner
+    reordering; canonicalizing first drops that to ~0.001, matching the best
+    possible corner relabelling). Complements the test above: that one proves
+    a REAL difference is still caught; this one proves REAL noise without a
+    real difference is not spuriously rejected. Both directions matter."""
+    services, state = _build_fakes()
+    cam = services.camera
+    rng = np.random.default_rng(7)   # one shared RNG -> genuinely different noise per frame
+
+    def noisy_grab(with_depth=False, timeout=None, color_only=False):
+        cam.grabs += 1
+        return _render(state["cam"], noise_mm=1.0, rng=rng)
+    cam.grab = noisy_grab
+
+    locked = scan_service.lock_scan_surface(services)
+    elig = locked.gate_payload["compact_eligibility"]
+    assert elig["identity_ok"] is True, elig
+    assert elig["eligible"] is True, elig
+    assert locked.survey_record is not None
+    assert locked.survey_record.mode == MODE_COMPACT
+    print("[compact eligibility] 1.0 mm real per-frame depth noise -> "
+          "identity gate still accepts a stationary rectangle")
 
 
 def test_lock_adapts_identity_frame_requirement_when_measure_frames_is_lower():
@@ -2451,9 +2650,14 @@ if __name__ == "__main__":
     test_lock_builds_locked_workframe_survey_compact()
     test_lock_crop_is_user_specified_with_declared_size()
     test_lock_auto_crop_overrun_builds_no_survey_record_but_warns()
+    test_lock_real_guard_band_rejection_at_close_standoff()
+    test_lock_never_classifies_the_fabricated_reticle_square_when_not_fully_framed()
+    test_lock_falls_back_to_color_when_sam_abstains()
+    test_lock_rejects_when_every_boundary_engine_abstains()
     test_lock_wires_classify_compact_and_rejects_when_ineligible()
     test_lock_reports_the_failing_gate_for_each_of_the_five_conditions()
     test_lock_survey_outline_history_reflects_independent_per_frame_surveys()
+    test_lock_identity_gate_accepts_a_stationary_rectangle_under_real_depth_noise()
     test_lock_adapts_identity_frame_requirement_when_measure_frames_is_lower()
     test_lock_never_vacuously_passes_identity_with_a_single_frame()
     test_lock_gate_event_carries_survey_and_provenance()

@@ -461,24 +461,64 @@ def lock_scan_surface(services, *, force_crop: bool = False,
         # record, no boundary_provenance, a warning naming which condition(s)
         # failed -- never a raise, so the lock still completes and issues a
         # lock_token either way.
-        classify_scfg, identity_note = _compact_identity_scfg(scfg)
-        if identity_note:
-            gate_payload.setdefault("warnings", []).append(identity_note)
-        outline_history = _survey_outline_history(raw_frames, K, scfg)
-        boundary = _work_boundary(scfg, frame.color)
-        eligibility = classify_compact(
-            _classify_compact_survey(survey), survey.outline_uv, boundary,
-            classify_scfg, outline_history=outline_history)
-        gate_payload["compact_eligibility"] = eligibility.to_dict()
-        if eligibility.eligible:
-            mode = MODE_COMPACT
-            plane_rms = _plane_rms_mm(depth, K)
-            record = _survey_record_from_lock(
-                survey, seed_T, snapshot, services.config.camera,
-                mode=mode, n_frames=n_frames, measurement_ts=frame.timestamp,
-                valid_frac=gate_payload.get("valid_frac", 0.0), plane_rms_mm=plane_rms)
-        else:
+        if not survey.detected:
+            # Task 18 review, Minor: ``detected`` alone already decides
+            # ineligibility (classify_compact adds "no surface detected" and
+            # every other gate reads not-ok against None/empty inputs too), so
+            # skip the two expensive calls below (~1.75 s of RANSAC across
+            # surface_measure_frames raw frames, plus a real segmentation pass)
+            # and reach the identical conclusion for free.
+            eligibility = classify_compact(survey, None, None, scfg, outline_history=[])
+            gate_payload["compact_eligibility"] = eligibility.to_dict()
             gate_payload.setdefault("warnings", []).extend(eligibility.reasons)
+        elif not survey.fully_framed:
+            # Task 18 review, Important 5: once fully_framed is False,
+            # survey_surface has already REPLACED corners_cam_mm/outline_uv with
+            # a generic reticle square centred on the reticle (see its own
+            # comment) -- not a measured boundary. classify_compact must never
+            # judge that fabricated square: it would trivially satisfy gates a
+            # genuinely unmeasured edge says nothing about (e.g. "centered"),
+            # misreporting WHY the lock isn't ready. Chose this over passing
+            # "the measured corners instead" because survey_surface's returned
+            # SurveyMeasurement does not retain the pre-substitution corners at
+            # all (recomputing them here would duplicate survey_surface's own
+            # RANSAC + oriented-rectangle logic at the call site) -- same honest
+            # shape as the auto-overrun branch below: warn, no record, no
+            # compact_eligibility key (nothing was actually classified).
+            gate_payload.setdefault("warnings", []).append(
+                "the surface is not fully framed, so its boundary is unmeasured — "
+                "reframe it fully in view, declare a region, or run a "
+                "multi-position survey before relying on this lock's geometry.")
+        else:
+            classify_scfg, identity_note = _compact_identity_scfg(scfg)
+            if identity_note:
+                gate_payload.setdefault("warnings", []).append(identity_note)
+            outline_history = _survey_outline_history(raw_frames, K, scfg)
+            boundary = _work_boundary(scfg, frame.color)
+            eligibility = classify_compact(
+                survey, survey.outline_uv, boundary, classify_scfg,
+                outline_history=outline_history)
+            gate_payload["compact_eligibility"] = eligibility.to_dict()
+            if eligibility.eligible:
+                mode = MODE_COMPACT
+                plane_rms = _plane_rms_mm(depth, K)
+                record = _survey_record_from_lock(
+                    survey, seed_T, snapshot, services.config.camera,
+                    mode=mode, n_frames=n_frames, measurement_ts=frame.timestamp,
+                    valid_frac=gate_payload.get("valid_frac", 0.0), plane_rms_mm=plane_rms)
+            else:
+                # Task 18 review, Critical 2c: the guard-band reason alone gave
+                # no direction -- enrich just that one warning line with an
+                # actionable backoff hint (classify_compact's own `reasons`
+                # tuple, already unit-tested verbatim in test_scan_classifier.py,
+                # is left untouched; the enrichment happens only in what this
+                # lock publishes).
+                warnings = gate_payload.setdefault("warnings", [])
+                for reason in eligibility.reasons:
+                    if not eligibility.guard_ok and "guard region" in reason:
+                        reason = reason + " — " + _guard_violation_backoff_hint(
+                            survey.outline_uv, scfg.compact_guard_uv, reading.distance_mm)
+                    warnings.append(reason)
     else:
         gate_payload.setdefault("warnings", []).append(
             "the surface overruns the camera view, so its boundary is unverified — "
@@ -577,31 +617,6 @@ def _survey_thresholds(scfg) -> SurveyThresholds:
     )
 
 
-def _classify_compact_survey(survey):
-    """Guard a real latent bug in ``classify_compact`` (reviewed, not to be
-    modified -- see its own module docstring) without touching it: it reads
-    tilt via ``getattr(survey, "tilt_deg", 90.0)``, but Python's ``getattr``
-    default only fires when the ATTRIBUTE IS MISSING, not when it exists and is
-    ``None`` -- and ``survey_surface`` sets ``tilt_deg=None`` (not "absent")
-    whenever ``detected`` is False (see ``survey._not_detected``). Calling
-    ``classify_compact`` on an undetected survey (a real path: e.g.
-    ``generate_scan_targets`` locks while the camera is aimed too far away) hits
-    ``float(None)`` and raises ``TypeError`` before its own "no surface
-    detected" reason is ever added -- turning a graceful rejection into a crash.
-
-    classify_compact's own module docstring says it "relies only on duck-typed
-    .detected and .tilt_deg from the survey object", so the caller owns
-    constructing a well-formed pair -- this substitutes the SAME 90.0 sentinel
-    classify_compact's own (currently-dead) getattr default already signals is
-    the intended "undetected/unknown tilt" value, without editing classifier.py.
-    Detected surveys are passed through unchanged (real code path, not this
-    shim) since survey_surface never leaves ``tilt_deg`` None when detected.
-    """
-    if getattr(survey, "tilt_deg", None) is None:
-        return SimpleNamespace(detected=bool(getattr(survey, "detected", False)), tilt_deg=90.0)
-    return survey
-
-
 def _compact_identity_scfg(scfg) -> "tuple[object, str | None]":
     """Adapt classify_compact's rectangle-identity frame requirement (spec §6) to
     what a single lock's acquisition can actually supply (Task 18).
@@ -640,10 +655,46 @@ def _compact_identity_scfg(scfg) -> "tuple[object, str | None]":
         f"({nominal}); the identity check used {available} frame(s) instead.")
 
 
+def _canonicalize_outline_uv(outline_uv) -> list:
+    """Canonicalize a 4-corner outline's corner order for CROSS-FRAME comparison
+    (Task 18 review, Critical 1).
+
+    ``_oriented_rectangle`` (``plane.py``) fits each frame's rectangle
+    independently via its own min-area-rectangle search, so the SAME physical
+    rectangle can legitimately come back with a different STARTING corner
+    and/or winding direction from one frame to the next once real depth noise
+    perturbs which axis the fit calls "first" -- measured directly: at 1.0 mm
+    of synthetic depth noise (within the D435i's real ~0.5-2 mm RMS band at
+    400-500 mm), a frame's corners came back as an exact cyclic rotation of a
+    noise-free reference frame's, reading as 0.8455 normalized-uv "drift" by
+    naive corner-for-corner (by-index) comparison against a 0.04 tolerance --
+    while the best relabelling of the SAME two outlines drifts only 0.0012.
+    ``rectangle_identity_consistent`` compares corner-for-corner BY INDEX, so
+    without this, a rectangle that has not moved at all can spuriously fail
+    the identity gate on ordinary sensor noise (see ``test_scan_job.py``'s
+    dedicated noisy-frame regression test for the full before/after numbers).
+
+    Normalizes winding via the shoelace signed area (reversing to make it
+    consistently non-negative), then rotates so the corner nearest the image
+    origin (0, 0) -- a fixed, frame-independent reference point -- is index 0.
+    Two representations of the same physical rectangle that differ only in
+    starting corner and/or winding map to the IDENTICAL canonical form.
+    """
+    uv = np.asarray(outline_uv, dtype=float).reshape(-1, 2)
+    if len(uv) < 3:
+        return uv.tolist()
+    signed_area = 0.5 * np.sum(
+        uv[:, 0] * np.roll(uv[:, 1], -1) - np.roll(uv[:, 0], -1) * uv[:, 1])
+    if signed_area < 0:
+        uv = uv[::-1]
+    start = int(np.argmin(np.linalg.norm(uv, axis=1)))
+    return np.roll(uv, -start, axis=0).tolist()
+
+
 def _survey_outline_history(raw_frames, K, scfg) -> list:
     """Independently survey each RAW (pre-fusion) depth frame from this lock's
-    acquisition and collect its rectangle outline, for classify_compact's §6
-    rectangle-identity gate (Task 18).
+    acquisition and collect its CANONICALIZED rectangle outline, for classify_
+    compact's §6 rectangle-identity gate (Task 18).
 
     ``_authoritative_acquisition`` median-fuses ``scfg.surface_measure_frames``
     raw depth frames into ONE depth image before the single ``survey_surface``
@@ -651,10 +702,17 @@ def _survey_outline_history(raw_frames, K, scfg) -> list:
     carries no frame-to-frame evidence at all. This reruns ``survey_surface``
     on each raw frame independently -- real per-frame RANSAC plane fits, NOT
     the fused outline repeated -- so a genuinely unstable rectangle can be told
-    apart from a stable one. Cost: up to ``len(raw_frames)`` (default 5) extra
-    ``survey_surface`` passes beyond the one already done on the fused frame --
-    paid ONLY here, i.e. only on the compact (non-crop) lock path, never on a
-    crop/force_crop lock (which never calls classify_compact at all).
+    apart from a stable one. Each outline is passed through
+    ``_canonicalize_outline_uv`` before being appended (Critical 1) so ordinary
+    per-frame corner-order/winding drift from the independent fits does not
+    read as rectangle movement.
+
+    MEASURED cost (1280x720, this machine): ~0.35 s per ``survey_surface`` pass,
+    so ~1.75 s total for the default 5 raw frames -- plus a further ~450 ms for
+    ``_work_boundary``'s SAM pass when the configured engine tries it. Paid
+    ONLY here, i.e. only on the compact (non-crop, fully-framed) lock path --
+    never on a crop/force_crop lock, and short-circuited entirely when the
+    survey did not detect a surface at all (see ``lock_scan_surface``).
 
     A raw frame that fails to detect a plane on its own contributes nothing to
     the history (skipped, not padded with a placeholder) -- that omission is
@@ -668,8 +726,35 @@ def _survey_outline_history(raw_frames, K, scfg) -> list:
             continue
         m = survey_surface(fr.depth, K, th, depth_scale=scfg.depth_scale)
         if m.outline_uv:
-            history.append(m.outline_uv)
+            history.append(_canonicalize_outline_uv(m.outline_uv))
     return history
+
+
+def _guard_violation_backoff_hint(raw_corners_uv, guard: float, standoff_mm) -> str:
+    """Turn a failed ``compact_guard_uv`` check into an ACTIONABLE hint (Task 18
+    review, Critical 2c) instead of a bare "leaves the guard region" with no
+    direction: roughly how much farther to back the camera off.
+
+    Backing off (increasing standoff) shrinks a FIXED real-world rectangle's
+    projected uv-distance-from-centre by the same factor, to first order
+    (pinhole projection: apparent size is inversely proportional to standoff).
+    The corner presently deepest into the guard band sets the required scale:
+    if it sits at normalized distance ``d`` from image centre but the guard
+    band only allows up to ``0.5 - guard``, standoff must grow by roughly
+    ``d / (0.5 - guard)`` to bring it back inside.
+    """
+    generic = "back off (increase standoff) to bring the boundary further inside the frame"
+    if raw_corners_uv is None or standoff_mm is None:
+        return generic
+    uv = np.asarray(raw_corners_uv, dtype=float).reshape(-1, 2)
+    d = float(np.max(np.abs(uv - 0.5)))
+    allowed = 0.5 - float(guard)
+    if d <= 0.0 or allowed <= 0.0 or d <= allowed:
+        return generic
+    scale = d / allowed
+    extra_mm = float(standoff_mm) * (scale - 1.0)
+    return (f"back off (increase standoff) by roughly {extra_mm:.0f} mm "
+            f"(~{(scale - 1.0) * 100:.0f}% farther) so the boundary clears the guard margin")
 
 
 def _backproject_depth(depth: np.ndarray, K: np.ndarray, *,

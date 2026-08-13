@@ -493,7 +493,15 @@ class ScanConfig(_Model):
     #                                        frame => the object is bounded in view (draw
     #                                        the rectangle), not an overrun (generic square)
     # Compact-eligibility classifier (two-path plan §6)
-    compact_guard_uv: float = 0.06        # raw corners must sit this far inside the frame
+    # Task 18 review, Critical 2: must satisfy frame_margin >= 1/(1 - 2*compact_guard_uv)
+    # (see tests/test_scan_config.py's dedicated invariant test for the derivation) or
+    # every framed-limited compact lock taken at the system's own recommended standoff
+    # fails guard_ok regardless of aim. At frame_margin=1.12 the per-side margin the
+    # planner leaves is (1 - 1/1.12)/2 = 0.0536 -- 0.06 violated it (needed <= 0.0536);
+    # 0.04 leaves real slack (required frame_margin drops to 1/(1-0.08) = 1.0870, well
+    # under the actual 1.12) without touching frame_margin, which was tuned separately
+    # (see its own comment) for a different problem.
+    compact_guard_uv: float = 0.04        # raw corners must sit this far inside the frame
     compact_center_tol_uv: float = 0.15   # outline centroid distance from image center
     compact_identity_frames: int = 5      # consecutive frames the rectangle must agree
     compact_identity_tol_uv: float = 0.04 # max corner drift across those frames
