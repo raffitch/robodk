@@ -88,6 +88,25 @@ DEFAULT_BUDGET = dict(
 # tests/test_characterize.py (Task 16 review, Finding 3).
 # --------------------------------------------------------------------------
 
+# A full-res D435i frame backprojects to ~920k points, and plane_metrics RANSACs
+# each capture 1000 times over ALL of them -- ~49 s per capture, ~4 min per stop,
+# ~37 min of compute across a 9-stop sweep, with the operator standing at the cell
+# the whole time. A dominant plane filling the frame is estimated just as well from
+# a uniform subsample: RANSAC's inlier ratio is unchanged (it is a proportion, not
+# a count), and the SVD refine that sets the final normal still sees tens of
+# thousands of points. Deterministic stride, so a re-run reproduces exactly.
+PLANE_FIT_MAX_POINTS = 60_000
+
+
+def _subsample_for_plane_fit(pts: np.ndarray,
+                             max_points: int = PLANE_FIT_MAX_POINTS) -> np.ndarray:
+    """Uniformly thin ``pts`` to at most ``max_points`` (deterministic stride)."""
+    n = len(pts)
+    if n <= max_points:
+        return pts
+    return pts[::int(np.ceil(n / max_points))]
+
+
 def _backproject_valid_mm(depth, K, depth_scale: float = 1000.0) -> np.ndarray:
     """Every valid (>0) depth pixel, backprojected to camera-frame millimetres.
 
@@ -175,7 +194,7 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
         frame = camera.grab(with_depth=True, timeout=timeout)
         if frame.depth is None:
             continue
-        pts = _backproject_valid_mm(frame.depth, K, depth_scale)
+        pts = _subsample_for_plane_fit(_backproject_valid_mm(frame.depth, K, depth_scale))
         if len(pts):
             plane_sets.append(pts)
             # What standoff this capture ACTUALLY happened at, measured rather than
