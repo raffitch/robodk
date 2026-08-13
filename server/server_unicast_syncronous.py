@@ -3,6 +3,7 @@ import struct
 import subprocess
 import threading
 import json
+import os
 import time
 from collections import deque
 import pyrealsense2 as rs
@@ -623,23 +624,57 @@ width = 1280;
 height = 720;
 
 
+# Depth acquisition tuning. Overridable per-cell via the service environment so a
+# change can be trialled without editing code: RS_VISUAL_PRESET (rs400 enum ordinal
+# -- 3 high_accuracy, 4 high_density, 5 medium_density) and RS_LASER_POWER (mW-ish,
+# 0..360 on a D435i).
+#
+# Measured on the cell 2026-08-13, against the printed ChArUco ruler on an A3 panel
+# 630 mm above the floor: valid depth stopped ~20 mm short of the panel's top and
+# bottom edges (left/right were within 0.3-2.7 mm). The stereo matcher needs
+# texture, and the IR projector is what supplies it on blank surfaces -- it was
+# running at the 150 default, only 42% of this device's 360 maximum. More projected
+# texture is the most direct lever on edge coverage, so that is the default now.
+RS_VISUAL_PRESET = int(os.environ.get('RS_VISUAL_PRESET', '4'))   # high_density
+RS_LASER_POWER = float(os.environ.get('RS_LASER_POWER', '300'))
+
+
 def set_high_accuracy_preset(profile):
-    """Apply the D4xx High Accuracy preset when the connected sensor supports it."""
+    """Configure the depth sensor's preset + laser power, and LOG WHAT STUCK.
+
+    The previous version resolved the preset via
+    ``getattr(rs, 'rs400_visual_preset', object)`` and, on builds where that enum is
+    not exposed (this Jetson's pyrealsense2 among them), silently fell through to a
+    bare 3. It then announced "High Accuracy" without ever reading the value back --
+    and the device in fact sat at 0 (Custom) for over a month while the docs claimed
+    otherwise. Every option is now read back after writing, so the log states the
+    achieved configuration rather than the attempted one.
+
+    The preset default is HIGH DENSITY, not High Accuracy: High Accuracy raises the
+    confidence threshold, returning fewer but surer points, which is the wrong trade
+    when the measured failure is missing coverage at surface edges.
+    """
     try:
-        device = profile.get_device()
-        sensor = device.first_depth_sensor()
-        if sensor.supports(rs.option.visual_preset):
-            preset = getattr(
-                getattr(rs, 'rs400_visual_preset', object),
-                'high_accuracy',
-                3,
-            )
-            sensor.set_option(rs.option.visual_preset, float(int(preset)))
-            print("RealSense visual preset: High Accuracy")
+        sensor = profile.get_device().first_depth_sensor()
     except Exception as e:
-        # Preset support varies by firmware/model. Keep serving frames, but make the
-        # capture quality state visible in the service log.
-        print(f"WARNING: could not set High Accuracy visual preset: {e}")
+        print(f"WARNING: no depth sensor to configure: {e}")
+        return
+    for name, option, value in (
+            ('visual_preset', getattr(rs.option, 'visual_preset', None), float(RS_VISUAL_PRESET)),
+            ('laser_power', getattr(rs.option, 'laser_power', None), RS_LASER_POWER),
+            ('emitter_enabled', getattr(rs.option, 'emitter_enabled', None), 1.0)):
+        if option is None or not sensor.supports(option):
+            print(f"RealSense: {name} unsupported on this device/build — skipped")
+            continue
+        try:
+            rng = sensor.get_option_range(option)
+            clamped = min(max(value, rng.min), rng.max)
+            sensor.set_option(option, clamped)
+            print(f"RealSense: {name} -> requested {value:g}, set {clamped:g}, "
+                  f"device reports {sensor.get_option(option):g} "
+                  f"(range {rng.min:g}..{rng.max:g})")
+        except Exception as e:
+            print(f"WARNING: could not set {name}={value:g}: {e}")
 
 
 def openPipeline():
