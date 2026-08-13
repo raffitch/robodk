@@ -197,6 +197,24 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
     return summarize_distance_trial(distance_mm, plane_sets, length_samples, coverage_frac)
 
 
+def _prompt(message: str) -> None:
+    """``input()`` with an actionable message when there is no interactive stdin.
+
+    This sweep is operator-driven step-and-measure: it MUST be able to block while
+    you jog the robot. Run through a wrapper that closes stdin (Claude Code's ``!``
+    prefix, a CI step, a piped/redirected shell) and the first prompt raises a bare
+    EOFError traceback that says nothing about the real problem.
+    """
+    try:
+        input(message)
+    except EOFError:
+        print("\n\nerror: no interactive terminal (stdin is closed), so this sweep "
+              "cannot prompt you to jog between captures.\n"
+              "Run it directly in a PowerShell/terminal window rather than through a "
+              "wrapper that redirects stdin.")
+        raise SystemExit(2)
+
+
 def _format_trial(label: str, trial) -> str:
     # Ambiguity resolution #5 (inherited from characterize.py's own docstring
     # caveat): never print height_repeat_mm without normal_repeat_deg next to
@@ -381,8 +399,8 @@ def main(argv=None) -> None:
         trials = []
         camera_T_per_distance: list = []
         for d in distances:
-            input(f"\n>> Jog the camera to a {d:.0f} mm standoff, fronto-parallel over the "
-                 f"ChArUco board. Press Enter when steady...")
+            _prompt(f"\n>> Jog the camera to a {d:.0f} mm standoff, fronto-parallel over the "
+                   f"ChArUco board. Press Enter when steady...")
             trial = capture_distance_trial(camera, board, cfg, d, args.frames,
                                            timeout=cfg.camera.timeout_s)
             trials.append(trial)
@@ -409,9 +427,9 @@ def main(argv=None) -> None:
         # Taken at d* so distance is held constant and tilt is the only variable.
         incidence: list = []
         for tilt in tilts:
-            input(f"\n>> Incidence check: tilt the board/camera to ~{tilt:.0f} deg at "
-                 f"~{oblique_distance:.0f} mm standoff — tolerances must not be validated "
-                 "only at normal incidence. Press Enter when steady...")
+            _prompt(f"\n>> Incidence check: tilt the board/camera to ~{tilt:.0f} deg at "
+                   f"~{oblique_distance:.0f} mm standoff — tolerances must not be validated "
+                   "only at normal incidence. Press Enter when steady...")
             trial = capture_distance_trial(camera, board, cfg, oblique_distance, args.frames,
                                            timeout=cfg.camera.timeout_s)
             passed = choose_dstar([trial], **budget) is not None
