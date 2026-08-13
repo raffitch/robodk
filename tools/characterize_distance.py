@@ -172,7 +172,7 @@ def _reject_off_board_points(pts: np.ndarray, *, band_mm: float = 25.0, k_sigma:
 
 
 def _backproject_valid_mm(depth, K, depth_scale: float = 1000.0,
-                          mask: "np.ndarray | None" = None) -> np.ndarray:
+                          mask: "np.ndarray | None" = None, dist=None) -> np.ndarray:
     """Every valid (>0) depth pixel, backprojected to camera-frame millimetres.
 
     Mirrors modules/scan/service.py's own ``_backproject_depth`` convention:
@@ -192,14 +192,40 @@ def _backproject_valid_mm(depth, K, depth_scale: float = 1000.0,
     if mask is not None:
         valid &= np.asarray(mask, dtype=bool)
     ys, xs = np.nonzero(valid)
+    if dist is not None and len(ys):
+        # Matters for a TILTED capture: with the plane fronto-parallel a lateral
+        # x/y error leaves z unchanged, so the residual is blind to it, but once the
+        # plane is inclined that same error maps straight into the residual.
+        z_mm = d[ys, xs] / float(depth_scale) * 1000.0
+        xy = _undistort_uv(np.column_stack([xs, ys]).astype(np.float64), K, dist)
+        return np.column_stack([xy[:, 0] * z_mm, xy[:, 1] * z_mm, z_mm])
     if len(ys) == 0:
         return np.zeros((0, 3), dtype=float)
     z_mm = d[ys, xs] / float(depth_scale) * 1000.0
     return np.column_stack([(xs - cx) / fx * z_mm, (ys - cy) / fy * z_mm, z_mm])
 
 
+def _undistort_uv(uv, K, dist) -> np.ndarray:
+    """Pixel(s) -> NORMALISED, undistorted camera coordinates (x/z, y/z).
+
+    Backprojecting with the plain pinhole formula ``(u - cx) / fx`` assumes a
+    distortion-free lens. This D435i's measured RGB coefficients are k1=0.115,
+    k2=-0.239, which displaces a point at r/f = 0.46 (a board corner when the board
+    fills the frame) by ~1.4% — 3.9 mm across a 288 mm board diagonal. That is
+    almost exactly the length error the first cell sweep reported at close range,
+    and it shrank with distance precisely because the board moved toward the
+    principal point where distortion vanishes.
+    """
+    import cv2
+
+    pts = np.asarray(uv, dtype=np.float64).reshape(-1, 1, 2)
+    out = cv2.undistortPoints(pts, np.asarray(K, dtype=np.float64),
+                              np.asarray(dist, dtype=np.float64).ravel())
+    return out.reshape(-1, 2)
+
+
 def _corner_point_mm(depth, K, u: float, v: float, depth_scale: float = 1000.0,
-                     window: int = 2) -> "np.ndarray | None":
+                     window: int = 2, dist=None) -> "np.ndarray | None":
     """Backproject one ChArUco corner pixel to camera-frame mm, using the
     median valid depth in a small window around it (robust to a single noisy
     pixel landing exactly on a corner)."""
@@ -212,6 +238,9 @@ def _corner_point_mm(depth, K, u: float, v: float, depth_scale: float = 1000.0,
     if valid.size == 0:
         return None
     z_mm = float(np.median(valid)) / float(depth_scale) * 1000.0
+    if dist is not None:
+        x, y = _undistort_uv([[float(u), float(v)]], K, dist)[0]
+        return np.array([x * z_mm, y * z_mm, z_mm])
     fx, fy = float(K[0, 0]), float(K[1, 1])
     cx, cy = float(K[0, 2]), float(K[1, 2])
     return np.array([(float(u) - cx) / fx * z_mm, (float(v) - cy) / fy * z_mm, z_mm])
@@ -286,7 +315,8 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
 
         mask = _board_region_mask(np.asarray(frame.depth).shape, corners.reshape(-1, 2))
         pts = _subsample_for_plane_fit(
-            _backproject_valid_mm(frame.depth, K, depth_scale, mask=mask))
+            _backproject_valid_mm(frame.depth, K, depth_scale, mask=mask,
+                                  dist=cfg.camera.dist))
         pts, n_rejected = _reject_off_board_points(pts)
         rejected_fracs.append(n_rejected / max(n_rejected + len(pts), 1))
         if len(pts) >= 3:
@@ -299,8 +329,10 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
 
         px_by_id = {cid: corners[i, 0] for i, cid in enumerate(ids_flat)}
         if id_a in px_by_id and id_b in px_by_id:
-            pa = _corner_point_mm(frame.depth, K, *px_by_id[id_a], depth_scale)
-            pb = _corner_point_mm(frame.depth, K, *px_by_id[id_b], depth_scale)
+            pa = _corner_point_mm(frame.depth, K, *px_by_id[id_a], depth_scale,
+                                  dist=cfg.camera.dist)
+            pb = _corner_point_mm(frame.depth, K, *px_by_id[id_b], depth_scale,
+                                  dist=cfg.camera.dist)
             if pa is not None and pb is not None:
                 length_samples.append((pa.reshape(1, 3), pb.reshape(1, 3), true_mm))
 
