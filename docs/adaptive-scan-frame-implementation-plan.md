@@ -56,6 +56,22 @@ Rules:
 - No claim of sub-millimetre or other production accuracy is allowed until the real
   D435i/KUKA distance characterization and known-rectangle trials pass.
 
+## Status (2026-08-13)
+
+**Milestone A (Tasks 1-5) is implemented.** Backend Tasks 1-4 landed in `b534b80`;
+see that commit message for what each task actually changed. Known gaps:
+
+- The full `pytest` suite has not been run end-to-end since the change; focused
+  suites (survey contract, plane, five-position, reconstruct, and the new
+  scope/frame-only tests) are green.
+- Milestone A's hardware exit test (one known A4 rectangle + one known large
+  rectangle, inserted with no dense tour) is **still pending on the real cell**.
+- The downstream process tolerance that Task 11 gate 1 allocates from is still
+  undefined, and Task 5's exit test needs it.
+
+Tasks 6-9 remain deliberately unstarted: they depend on distance characterization
+data that does not exist yet (see the delivery sequence at the end).
+
 ## Milestones
 
 - **Milestone A - Correct frame-only workflow:** Tasks 1-5. Delivers the user's core

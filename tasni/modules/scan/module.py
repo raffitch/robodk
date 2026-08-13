@@ -169,15 +169,17 @@ class ScanModule(WorkflowModule):
             raise HTTPException(409, "a job is already running")
         goal, scope = self._resolve_goal_scope(body)
         force_crop = scope == SCOPE_DECLARED_REGION
-        # Changing goal or scope invalidates anything prepared/planned under the old
-        # intent (plan Task 2); a fresh lock also mints a fresh, fingerprint-prefixed
-        # token, so targets generated earlier can no longer pass run()'s guard.
-        self._prepared_result = None
         try:
             self._locked_surface = lock_scan_surface(
                 services, force_crop=force_crop, user_region_mm=self._user_region_mm,
                 workflow_goal=goal, surface_scope=scope)
             self._current_lock_token = self._locked_surface.lock_token
+            # A NEW measurement supersedes anything prepared from the old one (plan
+            # Task 2). Cleared only on success: a lock that failed changed nothing,
+            # and must not destroy a good prepared frame the operator can still
+            # insert. The fresh fingerprint-prefixed token separately invalidates any
+            # targets generated under the previous goal/scope.
+            self._prepared_result = None
             gate = self._locked_surface.gate_payload
             crop = gate.get("crop_size_mm")
             extent = gate.get("extent_mm")
@@ -309,6 +311,10 @@ class ScanModule(WorkflowModule):
                 self._targets_token = result_dict.get("lock_token") or ""
             self._locked_surface = None
             return result_dict
+        except LargeSurfaceRequired as e:
+            # Must stay structured here too (it subclasses RuntimeError, so the
+            # generic handler below would flatten it into an opaque 400).
+            raise HTTPException(409, e.payload)
         except (RuntimeError, ValueError, KeyError) as e:
             raise HTTPException(400, str(e))
         except Exception as e:
