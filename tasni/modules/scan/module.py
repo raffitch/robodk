@@ -27,6 +27,7 @@ from .service import (annotate_pose_liveness, camera_pose_moved, ScanCaptureJob,
                       ScanParams, ScanResult, five_position_capture, generate_scan_targets,
                       insert_scan, live_scan_telemetry_payload, LockedScanSurface,
                       lock_scan_surface, stabilize_live_scan_payload)
+from .live_diag import LiveLatencyProbe
 from .survey_contract import camera_calibration_id, refresh_robot_state
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -520,6 +521,10 @@ class ScanModule(WorkflowModule):
             anchor_pose_T = None
             last_driver_check = 0.0
             driver_ok = False
+            # Defect 2 instrumentation: one line every live_latency_log_s telling a
+            # host RoboDK stall apart from a slow Jetson telemetry cadence, a clock-
+            # skewed staleness drop, or the hold logic. See live_diag.py.
+            probe = LiveLatencyProbe(log.info, period_s=sc.live_latency_log_s)
 
             def _publish_boundary(cb):
                 # The one boundary contract the HUD consumes (identical for every engine).
@@ -540,6 +545,7 @@ class ScanModule(WorkflowModule):
             def analyze(frame):
                 nonlocal last_ideal_mm, last_metrics, anchor_pose_T
                 nonlocal last_driver_check, driver_ok
+                probe.note_iteration()
                 if self._live_refresh.is_set():
                     # Operator pressed Refresh: re-read at the current pose. Drop the
                     # hold (last_metrics) and the pose anchor (anchor_pose_T) so the next
@@ -579,8 +585,10 @@ class ScanModule(WorkflowModule):
                             cb = None
                         if cb is not None:
                             _publish_boundary(cb)
+                raw_telemetry = getattr(frame, "telemetry", None)
+                probe.note_telemetry(raw_telemetry)
                 metrics = live_scan_telemetry_payload(
-                    getattr(frame, "telemetry", None), sc,
+                    raw_telemetry, sc,
                     previous_ideal_mm=last_ideal_mm,
                     camera_cfg=c.camera)
                 if metrics:
@@ -591,7 +599,8 @@ class ScanModule(WorkflowModule):
                     # RealSense plane-fit noise. Re-anchor the moment the arm moves.
                     pose_T = None
                     try:
-                        pose_T = services.rdk.camera_pose_T()
+                        with probe.timing("pose"):
+                            pose_T = services.rdk.camera_pose_T()
                     except Exception:
                         pose_T = None
                     # Driver-connected status is a cheap RoboDK round trip but not
@@ -603,7 +612,8 @@ class ScanModule(WorkflowModule):
                     if now - last_driver_check >= 2.0:
                         last_driver_check = now
                         try:
-                            driver_ok = bool(services.rdk.robot_connected()[0])
+                            with probe.timing("driver"):
+                                driver_ok = bool(services.rdk.robot_connected()[0])
                         except Exception:
                             driver_ok = False
                     moved = camera_pose_moved(
@@ -631,6 +641,9 @@ class ScanModule(WorkflowModule):
                     # stays None and crop correctly falls back to the work-close standoff.
                     if metrics.get("surface_mode") == "full":
                         last_ideal_mm = metrics.get("ideal_distance_mm", last_ideal_mm)
+                probe.note_result(metrics,
+                                  telemetry_present=raw_telemetry is not None)
+                probe.flush_if_due()
                 return (jpeg.tobytes() if ok else b""), metrics
 
             # Use the exact same proven color transport as Calibration. Scan depth is

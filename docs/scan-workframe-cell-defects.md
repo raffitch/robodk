@@ -51,44 +51,79 @@ list-shaped fakes hide the same class of bug everywhere. A targeted sweep of
 
 ---
 
-## Defect 2 — live target readout lags ~10 s behind the robot — NOT STARTED
+## Defect 2 — live target readout lags ~10 s behind the robot — INSTRUMENTED, NOT DIAGNOSED
 
 **Symptom.** Jogging toward the indicated Z target (300 mm), the on-screen feedback took
 about ten seconds to reflect the new position. Aiming is impractical at that latency.
 
-**Leading hypothesis (must be verified, not assumed).** Task 7 added a driver-liveness
-probe into the live preview loop:
+**Status.** The instrumentation described under *How to diagnose* is now implemented and on
+by default. **No cause is established yet** — the next cell run produces the measurement that
+picks between the candidates below. Do not fix before reading it.
 
-- `tasni/modules/scan/module.py` ~line 603-606, inside `live_start`'s loop:
-  `driver_ok = bool(services.rdk.robot_connected()[0])`, refreshed every 2 s
-  (`last_driver_check`).
-- `RdkIO.robot_connected()` (`tasni/core/rdk_io.py:165`) makes a **synchronous RoboDK API
-  round-trip** (`ConnectedState()`).
+### What a code read established (no hardware needed)
 
-If that RPC blocks while RoboDK is busy driving/monitoring a real KUKA, it stalls the whole
-preview loop every 2 seconds. That would be a regression introduced by this work, not a
-pre-existing condition.
+These are facts about the data path, and they reshape the candidate list:
 
-`services.rdk.camera_pose_T()` is called **per frame** in the same loop (~line 594) and is
-likewise a synchronous RoboDK RPC — that one predates this work, but under a live driver it
-may now be far more expensive than it was in simulation, so it belongs in the same
-measurement.
+1. **Telemetry rides a second, independent socket.** `MODE TELEMETRY` is served by
+   `stream_telemetry` (`server/server_unicast_syncronous.py:572`) and consumed host-side by
+   `_TelemetryReader` (`tasni/core/camera.py:305`) on its **own background thread** that keeps
+   only `self._latest`. It is **latest-wins**, so telemetry can never queue up stale behind a
+   slow consumer. A Jetson bottleneck can only present as a *low update rate*, never as a
+   backlog of old payloads.
+2. **Video also cannot backlog.** `stream.read(drain=True)` (`camera.py:361`) skips every
+   buffered frame and returns the newest (64-frame safety cap). So a slow `analyze()` yields
+   *low FPS with fresh frames*, not delayed frames.
+3. **Consequence — a host stall and a slow Jetson produce the same visible symptom by
+   different routes.** `analyze()` samples `telemetry_reader.latest()` once per iteration, so
+   if the loop iterates every 10 s the readout updates every 10 s even though the telemetry
+   itself is current. Both candidates stay live; only measurement separates them.
+4. **The staleness check is a cross-machine wall-clock subtraction.**
+   `live_scan_telemetry_payload` drops telemetry when `time.time() - stamp > 2.0`
+   (`service.py:1309`), where `stamp` is `time.time()` **on the Jetson**
+   (`server_unicast_syncronous.py:274`). A Jetson Nano has no RTC battery. If its clock runs
+   more than 2 s *behind* the host, every payload is discarded, `metrics` comes back `{}`,
+   and — because `LivePreview._loop` only publishes a gate `if metrics` (`livepreview.py:139`)
+   — **the HUD stops updating entirely while the video keeps streaming**. This candidate was
+   not on the original list and costs nothing to measure.
+5. **Telemetry is computed inline on the Jetson's frame feeder**
+   (`server_unicast_syncronous.py:844-920`), nominally every `SCAN_TELEMETRY_PERIOD_S = 1.0`.
+   It is not on a separate thread there, so a slow plane-fit/trim/grid pass throttles the
+   video feeder too.
 
-**Other candidates to eliminate before settling on a cause:**
-- The payload hold/freeze in `stabilize_live_scan_payload` (`service.py`). Release needs
-  `live_hold_release_frames` consecutive *moving* frames; if the driver is not mirroring,
-  release depends entirely on the vision escape thresholds
-  `live_hold_vision_distance_mm` (12 mm) / `live_hold_vision_tilt_deg` (10°). At 6 fps this
-  should be sub-second, so it is unlikely to explain 10 s on its own — but it could compound
-  a stall.
-- The 2-second staleness drop in `live_scan_telemetry_payload`.
-- Jetson-side telemetry rate: the server computes a plane fit, rectangle, density trim and a
-  180×180 coverage grid per telemetry frame. If the Jetson is the bottleneck, the fix is not
-  in the host — **report it and stop rather than editing `server/`**.
+### Candidates and their signatures
 
-**How to diagnose.** Instrument the live loop: time each RoboDK call and the end-to-end
-publish interval, and log them. That distinguishes "host RPC stall" from "Jetson telemetry
-rate" from "freeze logic" in one run. Do not guess between them.
+| Candidate | Signature in the log line |
+|---|---|
+| Host RoboDK RPC stall (`camera_pose_T`, `robot_connected`) | `pose`/`driver` p50 or max high **and** `loop` interval high |
+| Jetson telemetry cadence | `loop` and RPCs normal, `telemetry` rate far below 1 Hz |
+| Clock skew tripping the 2 s drop | `dropped` climbing, `age` far from 0 (negative = Jetson ahead) |
+| Hold/freeze logic | `held` ≈ frame count while the arm is being jogged |
+
+Corrections to the original analysis, worth keeping straight:
+
+- `camera_pose_T()` is **not** called per video frame. Both RoboDK calls sit inside
+  `if metrics:` (`module.py:594`), and `live_scan_telemetry_payload` returns `{}` for frames
+  with no fresh telemetry, so they fire at roughly the ~1 Hz telemetry cadence.
+- Both calls are **more expensive than one RPC each**: every `RdkIO` helper re-resolves the
+  robot via `self.rdk.Item(...)` first (`rdk_io.py:69`), making `camera_pose_T()` three
+  round-trips (Item + `Pose` + `PoseTool`) and `robot_connected()` two.
+- "At 6 fps this should be sub-second" was wrong arithmetic: `live_hold_release_frames=2`
+  counts **telemetry** frames at ~1 Hz, so the release debounce is worth ~2-3 s, not
+  sub-second. The conclusion (can't explain 10 s alone, could compound) still holds.
+- Even a perfectly healthy loop refreshes the Z readout at only ~1 Hz. Judge any fix against
+  that ceiling, not against video framerate.
+
+**How to diagnose.** Start the scan live preview on the cell, jog the arm toward the Z
+target, and read the `live-latency` lines from the app console (`tasni.scan`, INFO):
+
+```
+live-latency 5.0s: 30 frames (6.0 fps) | loop p50/max 165/180 ms | driver p50/max 2/40 ms |
+pose p50/max 3/12 ms | telemetry 5 upd (1.00 Hz) age p50 120 ms | dropped 0 held 25 no-tel 0
+```
+
+Match it against the signature table. Implementation: `tasni/modules/scan/live_diag.py`
+(`LiveLatencyProbe`), wired into `live_start`'s `analyze()`; cadence/off-switch is
+`scan.live_latency_log_s` (default 5.0, `0` disables recording and logging entirely).
 
 **Constraint on the fix.** If the answer is to move the RoboDK probes off the hot path
 (background thread, longer cache, non-blocking probe), **preserve the behaviour Task 7 added**:
@@ -96,11 +131,14 @@ rate" from "freeze logic" in one run. Do not guess between them.
 Do not fix the latency by deleting the liveness signal — that signal exists because
 pose-derived X/Y readouts are otherwise presented as real-time when they are not.
 
+If the Jetson is the proven bottleneck, the fix is not in the host — **report it and stop
+rather than editing `server/`**.
+
 ---
 
 ## Standing constraints for either fix
 
-- `py -3.10 -m pytest -q` from the repo root must stay green (412 now, 11 pre-existing
+- `py -3.10 -m pytest -q` from the repo root must stay green (426 now, 11 pre-existing
   deprecation warnings expected). `cd tasni\webui; npm run build` must stay clean if the
   frontend is touched.
 - Tests must run without hardware.

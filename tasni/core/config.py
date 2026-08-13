@@ -576,6 +576,12 @@ class ScanConfig(_Model):
     # release debounce) caused the jitter; distance is clean so its escape stays tight.
     live_hold_vision_distance_mm: float = 12.0
     live_hold_vision_tilt_deg: float = 10.0
+    # Live-loop latency instrumentation (Defect 2): seconds between one-line
+    # summaries of loop interval, RoboDK RPC cost, Jetson telemetry cadence/age and
+    # hold/drop counts, logged at INFO. On by default because the readout-lag defect
+    # is only reproducible on the real cell, so the measurement has to already be
+    # running when someone next drives it. 0 disables (no recording, no logging).
+    live_latency_log_s: float = 5.0
     # When the surface overruns the view (edges not fully framed) its real edges are
     # untrustworthy, so we stop fitting the board and project a GENERIC fixed work
     # square on the plane, centred on the camera reticle (the aim point). This is its
