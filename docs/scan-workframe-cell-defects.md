@@ -122,6 +122,36 @@ baseline. If a fix is wanted server-side, the honest one is to refuse or queue a
 client rather than silently degrading both, and per the standing constraints that needs the
 Jetson proven as the cause first.
 
+### Cell finding 2026-08-13 (later): SINGLE-client video path measured — the numbers
+
+The characterize tool's aiming window (one client, NO RoboDK calls in its loop) was
+also reported laggy, which rules contention out as the root cause. Measured from the
+host, one client at a time:
+
+| Stream mode | fps at host | KB/frame | staleness (p50) | limiter |
+|---|---|---|---|---|
+| full depth+color | **0.52** | 660 | **≥ 1.8 s** | payload size over Wi-Fi |
+| jpeg color-only q60 | 8.3 | 61 | 156 ms | **Nano CPU JPEG encoder** (server emits every 166 ms; link keeps pace) |
+| jpeg color-only q30 | 16.2 | 43 | 31 ms | — |
+| h264 4000 kbps | **24.9** | — | **31 ms** | — (hardware NVENC) |
+
+Host-side ChArUco detection is 16 ms/frame — never the bottleneck.
+
+Consequences:
+
+- **Anything pulling full depth+color frames is ~2 s stale by transport alone.**
+  That is the scan CAPTURE path and any depth interleave — not the Tasni scan
+  preview, which already streams h264 + Jetson-side telemetry (`preview_codec:
+  h264`, PyAV present on the host).
+- The characterize aiming window used jpeg q60 (8 fps); switched to h264 with a
+  jpeg-q35 fallback.
+- Since Tasni's VIDEO transport is h264/25 fps, Defect 2's remaining suspects are
+  the ~1 Hz telemetry cadence, the hold/freeze logic, RoboDK RPC stalls, and clock
+  skew — i.e. the ORIGINAL candidate table below, minus video transport. The
+  `live-latency` log lines remain the missing measurement.
+- Wi-Fi in the cell is variable (the arm is a large moving reflector between the
+  Jetson and the AP); a measurement taken at a quiet moment is a lower bound.
+
 ### Candidates and their signatures
 
 | Candidate | Signature in the log line |

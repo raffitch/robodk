@@ -500,28 +500,36 @@ def _aim_prompt(camera, board, cfg, message: str, id_a: int, id_b: int,
 
     print(message)
     print("   (aiming window open — SPACE/ENTER to capture, q to abort)")
-    try:
-        with camera.stream(color_only=True, quality=60,
-                           timeout=cfg.camera.timeout_s) as stream:
-            win = "characterize — aim the board, SPACE to capture"
-            while True:
-                frame = stream.read(drain=True)
-                img, _ready = _aim_overlay(np.ascontiguousarray(frame.color), board,
-                                           id_a, id_b, total_corners)
-                cv2.imshow(win, img)
-                key = cv2.waitKey(30) & 0xFF
-                if key in (32, 13, 10):                   # SPACE / ENTER
-                    break
-                if key in (ord("q"), 27):                 # q / ESC
-                    cv2.destroyWindow(win)
-                    raise SystemExit("aborted at the aiming step")
-            cv2.destroyWindow(win)
-            cv2.waitKey(1)
-    except SystemExit:
-        raise
-    except Exception as e:
-        print(f"   (no aiming preview: {e} — falling back to the text prompt)")
-        _prompt("   Press Enter when steady...")
+    # h264 first: the Nano's HARDWARE encoder. Measured on this cell's Wi-Fi:
+    # 24.9 fps / 31 ms p50, versus 8.3 fps / 156 ms for jpeg q60 — the q60 limiter is
+    # the Nano's CPU JPEG encoder, not the link (q60 uses only ~4 Mbit/s and arrival
+    # keeps pace with production). jpeg q35 is the fallback for a host without PyAV
+    # or a server predating h264; the text prompt remains the fallback of last resort.
+    for codec_kwargs in ({"codec": "h264", "bitrate": 4000},
+                         {"color_only": True, "quality": 35}):
+        try:
+            with camera.stream(timeout=cfg.camera.timeout_s, **codec_kwargs) as stream:
+                win = "characterize — aim the board, SPACE to capture"
+                while True:
+                    frame = stream.read(drain=True)
+                    img, _ready = _aim_overlay(np.ascontiguousarray(frame.color), board,
+                                               id_a, id_b, total_corners)
+                    cv2.imshow(win, img)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (32, 13, 10):               # SPACE / ENTER
+                        break
+                    if key in (ord("q"), 27):             # q / ESC
+                        cv2.destroyWindow(win)
+                        raise SystemExit("aborted at the aiming step")
+                cv2.destroyWindow(win)
+                cv2.waitKey(1)
+            return
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"   ({codec_kwargs} preview failed: {e} — trying the next option)")
+    print("   (no aiming preview available — falling back to the text prompt)")
+    _prompt("   Press Enter when steady...")
 
 
 def _prompt(message: str) -> None:
