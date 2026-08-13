@@ -14,7 +14,8 @@ full-resolution surface scan.
 - A dense mesh remains optional. When requested, standoff, footprints, view count, and
   route are chosen from resolution/uncertainty and coverage constraints rather than
   fixed pose counts.
-- "Entire platform" can never silently fall back to the configured 600 x 600 mm crop.
+- "Entire platform" can never silently fall back to the configured generic work crop
+  (`scan.work_crop_mm`, currently 1000 x 1000 mm).
 
 This plan builds on the completed two-path workframe survey. It does not replace
 `LockedWorkframeSurvey`, the five-position acquisition, collision screening, dry tour,
@@ -81,7 +82,12 @@ insert must not choose one silently.
 
 - origin = ordered corner `C1`, nearest the robot base;
 - +Z = up-oriented surface normal;
-- +X = the selected rectangle edge according to the existing long-edge convention;
+- +X = the **longer of the two rectangle edges meeting `C1`** — the deployed
+  `plane.py` rule, NOT the global long edge that
+  `survey_contract.frame_from_rectangle` currently uses. The two rules coincide for
+  clean rectangles but diverge on near-squares, so the unified implementation must
+  state this rule explicitly and keep the existing deterministic near-square
+  tie-break (the historical bug source — see commits `4a437db`, `f24d7fa`);
 - +Y = right-handed;
 - center is stored separately as `center_base` and
   `rectangle_center_frame_mm`.
@@ -102,7 +108,8 @@ insert must not choose one silently.
 2. Use it when building a locked survey and when fitting a post-scan plane.
 3. Delete duplicated origin/axis construction.
 4. Add regression tests proving compact, five-position, reference, and fused-scan
-   paths return the same frame for identical corners.
+   paths return the same frame for identical corners — including a near-square
+   rectangle that exercises the `C1` long-edge tie-break.
 5. Add a migration note: this aligns the previously unused survey-frame field with
    existing inserted behavior; it does not move frames inserted by past runs.
 
@@ -157,6 +164,11 @@ request compatibility.
 1. When `surface_scope == entire_platform`, accept a compact lock only if the existing
    compact classifier confirms four physical boundaries, guard margin, centering,
    tilt, multi-frame identity, and required frame confidence.
+   The colour/density boundary evidence the compact classifier already consumes is
+   the **authoritative** boundary source for this gate; the SAM live boundary
+   (`boundary_engine=sam_then_color`) remains advisory/display-only. Promoting SAM
+   to a gating signal, if ever desired, is a separate deliberate change with its own
+   validation, not a side effect of this task.
 2. If the surface overruns the view, return a structured `large_surface_required`
    response instead of creating the generic crop.
 3. Present one primary action: **Survey full platform - center + four corners**.
@@ -165,9 +177,9 @@ request compatibility.
    provenance.
 5. Remove wording that calls an overrun crop the full surface.
 
-**Acceptance:** A simulated 2 x 1 m overrun can never reach Insert through a 600 x 600
-mm auto crop in entire-platform mode. The same crop remains available when the user
-explicitly selects declared-region scope.
+**Acceptance:** A simulated 2 x 1 m overrun can never reach Insert through the generic
+`work_crop_mm` auto crop (currently 1000 x 1000 mm) in entire-platform mode. The same
+crop remains available when the user explicitly selects declared-region scope.
 
 ---
 
@@ -443,7 +455,10 @@ table height, partial occlusion, and worst planned incidence angle.
 **Release gates:**
 
 1. Define the downstream process tolerance and allocate at most one third to workframe
-   measurement.
+   measurement. This number is a process decision only the user can supply — it cannot
+   be derived from code. Record it **before Milestone A hardware validation**, since
+   the Task 5 exit test already compares against "the agreed tolerance budget"; do not
+   leave it to be discovered at release time.
 2. Frame-only A4 and large-table trials pass that budget repeatedly.
 3. Full scans demonstrate required actual fill and weakest-edge support.
 4. Collision and dry-tour behavior is verified on the real station.
