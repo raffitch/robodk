@@ -972,7 +972,10 @@ export default function Scan() {
     : gate?.surface_mode === "crop"
       ? "Platform overruns the view — its full boundary cannot be measured from here; survey it from five positions"
     : gate?.fully_framed === false
-      ? "Full surface detected — move toward the recommended distance to include every edge"
+      // Until the surface has been fully framed once, the RANGE target falls back
+      // to accurate_min (closest) — which for a not-yet-framed platform points the
+      // WRONG WAY. Framing comes first; the fit-based target latches after it.
+      ? "Surface detected but its edges leave the view — move BACK until the whole platform fits; the distance target applies after it is fully framed"
     : gate?.fully_framed === true && gate.extent_mm
       ? `Full surface ${Math.round(gate.extent_mm[0])} × ${Math.round(gate.extent_mm[1])} mm`
       : "Aim the center reticle at the intended work surface";
