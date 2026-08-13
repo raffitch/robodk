@@ -24,6 +24,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from types import SimpleNamespace
 
 import cv2
@@ -35,6 +36,16 @@ from ...core.events import JobEvent
 from ...core.jobrunner import JobContext
 from ...core.logging import get_logger, new_run_dir
 from ...core.rdk_io import RdkIO
+# tools/ is a scripts dir, not part of the installed `tasni*` package (see
+# pyproject.toml), but Task 16's characterization store + reader legitimately
+# live there (CLI conventions, not a library). Both this app (run via `py -3.10
+# -m tasni` from the repo root, see start.ps1) and the test suite (`py -3.10 -m
+# pytest` from the repo root) run with the repo root on sys.path, so this
+# import resolves in both; it would need `tools` packaged/installed to survive
+# a real distribution of `tasni` — acceptable for this dev-only cell app today,
+# flagged here for anyone hardening the layering later.
+from tools.characterize_distance import OUTPUT_DIR as CHARACTERIZATION_DIR
+from tools.characterize_distance import latest_characterization
 # Reuse calibration's shared orchestration helpers (one implementation).
 from ..calibration.poses import (frame_aim_offsets, generate_calibration_poses,
                                   projected_corner_coverage, select_diverse,
@@ -447,12 +458,46 @@ def lock_scan_surface(services, *, force_crop: bool = False,
             "declare a region (crop mode) or run a multi-position survey before "
             "relying on this lock's geometry.")
 
+    # Calibration-age gate (Task 16, spec §10): a distance-characterization sweep
+    # (tools/characterize_distance.py) is what actually validates the measurement
+    # chain's error budget at the working standoff -- without one on file (or once
+    # it goes stale) this lock's plane/rectangle has no verified accuracy behind
+    # it. Checked here regardless of which branch above ran: staleness is a
+    # camera/measurement-chain concern, orthogonal to the boundary-provenance
+    # warning (a surface can be perfectly framed with a stale characterization, or
+    # vice versa). Same "append to warnings, unless hard-fail" convention as the
+    # boundary-overrun warning above; the actual raise (when hard-fail is on) is
+    # deferred past the telemetry publish below, mirroring the "gate not ok" raise
+    # at the end of this function -- so the operator's HUD still sees the gate/
+    # frame events before the lock is refused, instead of failing silently.
+    characterization = latest_characterization(CHARACTERIZATION_DIR)
+    stale = characterization is None
+    if not stale:
+        try:
+            measured_at = datetime.fromisoformat(str(characterization.get("date")))
+            age_days = (datetime.now() - measured_at).total_seconds() / 86400.0
+            stale = age_days > float(scfg.calibration_max_age_days)
+        except (TypeError, ValueError):
+            stale = True    # an unparsable date is untrustworthy -- treat as stale
+    calibration_hard_fail = False
+    if stale:
+        if scfg.calibration_expiry_hard_fail:
+            calibration_hard_fail = True
+        else:
+            gate_payload.setdefault("warnings", []).append(
+                "calibration verification missing or expired")
+    elif record is not None and characterization.get("dstar_mm") is not None:
+        record.quality["dstar_mm"] = float(characterization["dstar_mm"])
+
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:
         services.bus.publish(JobEvent("frame", {
             "jpeg_b64": base64.b64encode(jpeg.tobytes()).decode("ascii")}))
     services.bus.publish(JobEvent("gate", {
         **gate_payload, "live": False, "measure_frames": n_frames}))
+
+    if calibration_hard_fail:
+        raise RuntimeError("calibration verification missing or expired")
 
     if not gate_payload["ok"]:
         bad = [name for name, good in final_gates.items() if not good]

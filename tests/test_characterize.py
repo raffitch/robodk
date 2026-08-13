@@ -1,10 +1,17 @@
+import json
+import sys
+from pathlib import Path
+
 import numpy as np
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tasni.core.characterize import (
     choose_dstar, known_length_error_mm, plane_metrics, summarize_distance_trial,
 )
 from tasni.modules.scan.plane import fit_plane
+from tools.characterize_distance import latest_characterization
 
 
 def _plane_set(z=400.0, sigma=0.3, n=500, seed=0):
@@ -320,3 +327,37 @@ def test_plane_metrics_all_nan_capture_raises():
     all_nan = np.full((50, 3), np.nan)
     with pytest.raises(ValueError):
         plane_metrics([all_nan])
+
+
+# --- Task 16: latest_characterization (the pure, headlessly-importable half of
+# tools/characterize_distance.py -- everything touching the camera/robot lives
+# behind main(), so this is testable with no hardware at all).
+
+def test_latest_characterization_reads_newest(tmp_path):
+    """The exact contract Task 16 is built to (spec §5/§10): given the
+    characterization directory, return the newest dated file's contents by
+    filename (YYYYMMDD sorts lexicographically), or None when there is none."""
+    assert latest_characterization(tmp_path) is None
+    (tmp_path / "characterization-20260101.json").write_text(json.dumps({"dstar_mm": 400}))
+    (tmp_path / "characterization-20260812.json").write_text(json.dumps({"dstar_mm": 350}))
+    assert latest_characterization(tmp_path)["dstar_mm"] == 350
+
+
+def test_latest_characterization_missing_directory_returns_none(tmp_path):
+    """The lock-side gate (modules/scan/service.py) calls this on every surface
+    lock, before any characterization has ever been run on a fresh machine --
+    a missing directory must read as "no characterization on file", not raise."""
+    assert latest_characterization(tmp_path / "does_not_exist_yet") is None
+
+
+def test_latest_characterization_skips_malformed_file(tmp_path):
+    """Ambiguity resolution #1: a malformed/unreadable JSON file in the
+    directory must not crash the caller. Here it is also the NEWEST file by
+    name, so this pins the documented behaviour -- skip it and fall through to
+    the next-newest readable file -- rather than raising or silently stopping
+    at the corrupted file and reporting None."""
+    (tmp_path / "characterization-20260101.json").write_text(
+        json.dumps({"dstar_mm": 111}))
+    (tmp_path / "characterization-20260810.json").write_text("{not valid json")
+    result = latest_characterization(tmp_path)
+    assert result is not None and result["dstar_mm"] == 111

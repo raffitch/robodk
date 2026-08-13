@@ -17,6 +17,10 @@ __pycache__/
 runs/
 tasni.config.json
 
+# distance-characterization sweeps (tools/characterize_distance.py) — dated,
+# machine-specific measurement data, not source.
+characterization/
+
 # RoboDK temp
 *.rdk.bak
 

@@ -657,6 +657,16 @@ class ScanConfig(_Model):
     collision_self_pairs: bool = True
     collision_skip_wrist_links: int = 2
 
+    # -- distance characterization (spec §5/§10, Phase 0) -------------------
+    # tools/characterize_distance.py sweeps candidate camera standoffs over a
+    # known ChArUco board and stores a dated verdict (characterization/*.json).
+    # lock_scan_surface reads it back and warns (or refuses) when it is missing
+    # or stale -- "characterization that isn't a button will not be re-run", so
+    # this makes staleness visible on every lock instead of silently trusting
+    # measurement-chain accuracy nobody re-verified.
+    calibration_max_age_days: float = 30.0    # characterization older than this -> warn/refuse
+    calibration_expiry_hard_fail: bool = False  # True: refuse the lock instead of warning
+
 
 class ExtrusionConfig(_Model):
     """Cylinder-test defaults and verified extrusion-cell integration data.

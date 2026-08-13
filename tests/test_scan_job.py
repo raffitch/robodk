@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -479,6 +480,77 @@ def test_lock_gate_event_carries_survey_and_provenance():
     assert payload["survey"]["mode"] == MODE_COMPACT
     print("[gate event] carries survey + boundary_provenance:",
           payload["boundary_provenance"])
+
+
+# --- Task 16: calibration-age gate ---------------------------------------------
+#
+# lock_scan_surface reads tools.characterize_distance.latest_characterization
+# (imported into scan_service's own namespace) after building the survey record,
+# and warns (or hard-fails) when the on-file characterization is missing/stale.
+# Patched the same way this file already patches survey_surface/color_work_
+# boundary/extract_corner_evidence elsewhere (manual save/restore, not the
+# pytest `monkeypatch` fixture) -- this module doubles as a standalone script
+# (see the __main__ block), so every test here must run without fixtures.
+
+def _patch_latest_characterization(fake):
+    orig = scan_service.latest_characterization
+    scan_service.latest_characterization = fake
+    return orig
+
+
+def test_lock_warns_when_characterization_missing():
+    services, _state = _build_fakes()
+    orig = _patch_latest_characterization(lambda root: None)
+    try:
+        locked = scan_service.lock_scan_surface(services)
+    finally:
+        scan_service.latest_characterization = orig
+    assert "calibration verification missing or expired" in locked.gate_payload.get("warnings", [])
+    print("[characterization gate] missing on-file characterization -> warning appended")
+
+
+def test_lock_warns_when_characterization_stale():
+    services, _state = _build_fakes()
+    stale_date = (datetime.now() - timedelta(days=100)).isoformat()
+    orig = _patch_latest_characterization(
+        lambda root: {"date": stale_date, "dstar_mm": 400.0})
+    try:
+        locked = scan_service.lock_scan_surface(services)
+    finally:
+        scan_service.latest_characterization = orig
+    assert "calibration verification missing or expired" in locked.gate_payload.get("warnings", [])
+    print("[characterization gate] 100-day-old characterization (> 30 day default) -> warning")
+
+
+def test_lock_records_dstar_into_survey_quality_when_fresh():
+    services, _state = _build_fakes()
+    fresh_date = datetime.now().isoformat()
+    orig = _patch_latest_characterization(
+        lambda root: {"date": fresh_date, "dstar_mm": 417.5})
+    try:
+        locked = scan_service.lock_scan_surface(services)
+    finally:
+        scan_service.latest_characterization = orig
+    assert not locked.gate_payload.get("warnings")
+    assert locked.survey_record is not None
+    assert locked.survey_record.quality.get("dstar_mm") == pytest.approx(417.5)
+    print("[characterization gate] fresh characterization -> no warning; "
+          "dstar_mm recorded into the survey record's quality dict")
+
+
+def test_lock_hard_fails_when_characterization_missing_and_hard_fail_enabled():
+    services, _state = _build_fakes()
+    services.config.scan.calibration_expiry_hard_fail = True
+    orig = _patch_latest_characterization(lambda root: None)
+    try:
+        try:
+            scan_service.lock_scan_surface(services)
+            raise AssertionError("expected the missing characterization to hard-fail the lock")
+        except RuntimeError as e:
+            assert "calibration verification missing or expired" in str(e), e
+    finally:
+        scan_service.latest_characterization = orig
+    print("[characterization gate] calibration_expiry_hard_fail=True -> RuntimeError, lock refused")
 
 
 def test_surface_region_route_updates_lock_dimensions():
@@ -2134,6 +2206,10 @@ if __name__ == "__main__":
     test_lock_crop_is_user_specified_with_declared_size()
     test_lock_auto_crop_overrun_builds_no_survey_record_but_warns()
     test_lock_gate_event_carries_survey_and_provenance()
+    test_lock_warns_when_characterization_missing()
+    test_lock_warns_when_characterization_stale()
+    test_lock_records_dstar_into_survey_quality_when_fresh()
+    test_lock_hard_fails_when_characterization_missing_and_hard_fail_enabled()
     test_surface_region_route_updates_lock_dimensions()
     test_targets_report_surface_coverage_from_footprint()
     test_save_views_persists_per_pose_frames()
