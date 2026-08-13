@@ -132,6 +132,34 @@ def _board_region_mask(shape, corners_px, *, margin_px: float = 6.0) -> np.ndarr
     return mask.astype(bool)
 
 
+def _reject_off_board_points(pts: np.ndarray, *, band_mm: float = 25.0):
+    """Drop points too far from the board's own plane to be board. Returns
+    ``(kept, n_rejected)``.
+
+    Even inside the detected ChArUco hull the RealSense returns a small fraction of
+    spurious depths (stereo mismatches, alignment edge artifacts). They are rare,
+    but ``plane_metrics`` computes its residual over EVERY point it is handed, so a
+    couple of percent of pixels sitting ~0.5 m off the board dominates the result:
+    the live cell reported 40 mm RMS on a sheet of paper that is flat to well under
+    a millimetre.
+
+    The band is deliberately loose (25 mm, versus real board flatness under ~5 mm):
+    the job here is to exclude what physically cannot be the board, not to flatter
+    the noise measurement. It is tilt-safe because the reference is the fitted
+    plane, which follows the board's tilt, not a fixed depth. Non-finite points
+    fail the comparison and are therefore rejected AND COUNTED, so contamination is
+    reported rather than silently laundered.
+    """
+    from tasni.modules.scan.plane import fit_plane
+
+    p = np.asarray(pts, dtype=float).reshape(-1, 3)
+    if len(p) < 3:
+        return p, 0
+    n, c, _mask = fit_plane(p, distance=6.0)
+    keep = np.abs((p - c) @ n) <= float(band_mm)      # NaN -> False -> rejected
+    return p[keep], int((~keep).sum())
+
+
 def _backproject_valid_mm(depth, K, depth_scale: float = 1000.0,
                           mask: "np.ndarray | None" = None) -> np.ndarray:
     """Every valid (>0) depth pixel, backprojected to camera-frame millimetres.
@@ -225,6 +253,7 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
     length_samples: list[tuple] = []
     coverage_samples: list[float] = []
     standoff_samples: list[float] = []
+    rejected_fracs: list[float] = []
 
     detected_any = False
     for _ in range(max(1, int(n_frames))):
@@ -247,6 +276,8 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
         mask = _board_region_mask(np.asarray(frame.depth).shape, corners.reshape(-1, 2))
         pts = _subsample_for_plane_fit(
             _backproject_valid_mm(frame.depth, K, depth_scale, mask=mask))
+        pts, n_rejected = _reject_off_board_points(pts)
+        rejected_fracs.append(n_rejected / max(n_rejected + len(pts), 1))
         if len(pts) >= 3:
             plane_sets.append(pts)
             # What standoff this capture ACTUALLY happened at, measured rather than
@@ -280,6 +311,13 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
               "the whole board is in frame and repeat this stop.")
     coverage_frac = float(np.mean(coverage_samples)) if coverage_samples else 0.0
     measured_mm = float(np.median(standoff_samples)) if standoff_samples else float(distance_mm)
+    bad = float(np.mean(rejected_fracs)) if rejected_fracs else 0.0
+    if bad > 0.10:
+        # Not fatal, but it IS the headline fact about this capture: a tenth of the
+        # board returning nonsense depth says more about the distance than any
+        # residual computed from what is left.
+        print(f"   !! {bad:.0%} of board pixels were off-plane garbage (excluded). "
+              "Depth quality is poor here — treat this distance with suspicion.")
     trial = summarize_distance_trial(measured_mm, plane_sets, length_samples, coverage_frac)
     return trial, _measured_tilt_deg(plane_sets)
 
