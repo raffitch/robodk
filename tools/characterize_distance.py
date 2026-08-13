@@ -422,6 +422,95 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
     return trial, _measured_tilt_deg(plane_sets)
 
 
+def _aim_overlay(img, board, id_a: int, id_b: int, total_corners: int):
+    """Draw the aiming HUD on a preview frame. Returns ``(img, ready)``.
+
+    Pure drawing over an already-grabbed colour frame, so the capture logic and the
+    preview agree by construction: it reports the SAME things the capture will
+    measure — how much of the board is detected, and whether the two opposite
+    reference corners are both visible (without them the known-length sample is
+    absent and the whole stop is void).
+    """
+    import cv2
+
+    h, w = img.shape[:2]
+    cx, cy = w // 2, h // 2
+    cv2.drawMarker(img, (cx, cy), (0, 255, 255), cv2.MARKER_CROSS, 28, 1)
+
+    found = board.detect_points(img, min_corners=1)
+    coverage, have_ref, centre = 0.0, False, None
+    if found is not None:
+        corners, ids, _obj = found
+        ids_flat = [int(v) for v in ids.flatten().tolist()]
+        coverage = len(ids_flat) / float(total_corners)
+        have_ref = id_a in ids_flat and id_b in ids_flat
+        pts = corners.reshape(-1, 2).astype(np.int32)
+        hull = cv2.convexHull(pts)
+        cv2.polylines(img, [hull], True, (0, 255, 0) if have_ref else (0, 165, 255), 2)
+        for p in pts:
+            cv2.circle(img, tuple(p), 2, (0, 255, 0), -1)
+        centre = tuple(int(v) for v in pts.mean(axis=0))
+        cv2.drawMarker(img, centre, (255, 0, 255), cv2.MARKER_TILTED_CROSS, 20, 2)
+        cv2.line(img, (cx, cy), centre, (255, 0, 255), 1)
+
+    ready = bool(found is not None and have_ref and coverage >= 0.99)
+    off = None if centre is None else np.hypot(centre[0] - cx, centre[1] - cy)
+    lines = [
+        f"corners {coverage:.0%}" + ("" if found is not None else "  (BOARD NOT DETECTED)"),
+        ("reference corners VISIBLE" if have_ref else
+         "reference corners MISSING - this capture would be void"),
+        "centred" if off is None else f"off-centre {off:.0f} px",
+        "SPACE/ENTER = capture    q = abort",
+    ]
+    for i, text in enumerate(lines):
+        colour = (0, 255, 0) if ready or i == 3 else (0, 165, 255)
+        cv2.putText(img, text, (12, 28 + 26 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                    (0, 0, 0), 4, cv2.LINE_AA)
+        cv2.putText(img, text, (12, 28 + 26 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                    colour, 1, cv2.LINE_AA)
+    return img, ready
+
+
+def _aim_prompt(camera, board, cfg, message: str, id_a: int, id_b: int,
+                total_corners: int) -> None:
+    """Live colour preview with the aiming HUD; blocks until SPACE/ENTER.
+
+    Exists because the sweep needs sole use of a UNICAST camera, so the operator
+    cannot keep the Tasni preview open to aim with — without this they are jogging
+    blind. Colour-only streaming (no depth payload) keeps it realtime: a full
+    depth+colour grab is ~5 s over this Wi-Fi link, which would be useless for aiming.
+
+    Falls back to the plain text prompt if no GUI/stream is available, so nothing
+    here can block a headless run.
+    """
+    import cv2
+
+    print(message)
+    print("   (aiming window open — SPACE/ENTER to capture, q to abort)")
+    try:
+        with camera.stream(color_only=True, quality=60,
+                           timeout=cfg.camera.timeout_s) as stream:
+            win = "characterize — aim the board, SPACE to capture"
+            while True:
+                frame = stream.read(drain=True)
+                img, _ready = _aim_overlay(np.ascontiguousarray(frame.color), board,
+                                           id_a, id_b, total_corners)
+                cv2.imshow(win, img)
+                key = cv2.waitKey(30) & 0xFF
+                if key in (32, 13, 10):                   # SPACE / ENTER
+                    break
+                if key in (ord("q"), 27):                 # q / ESC
+                    cv2.destroyWindow(win)
+                    raise SystemExit("aborted at the aiming step")
+            cv2.destroyWindow(win)
+            cv2.waitKey(1)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"   (no aiming preview: {e} — falling back to the text prompt)")
+        _prompt("   Press Enter when steady...")
+
+
 def _prompt(message: str) -> None:
     """``input()`` with an actionable message when there is no interactive stdin.
 
@@ -572,6 +661,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
                    help="comma-separated incidence angles (deg) to sweep at d*, e.g. "
                         "0,10,20,30. Yields the permitted incidence-angle RANGE; without "
                         "it only the single --tilt sanity check is taken")
+    p.add_argument("--no-preview", action="store_true",
+                   help="skip the live aiming window and just prompt on the console")
     p.add_argument("--discovery", action="store_true",
                    help="first run on a new cell: accept every trial (no budget gating) "
                         "and report the achieved envelope to derive a real budget from. "
@@ -625,6 +716,16 @@ def main(argv=None) -> None:
             max_length_spread_mm=args.max_length_spread,
             min_coverage_frac=args.min_coverage)
 
+    _id_a, _id_b, _true_mm = _reference_corner_pair(board)
+    _total_corners = len(board.all_obj_points)
+
+    def aim(message: str) -> None:
+        """Prompt, with a live aiming window unless --no-preview."""
+        if args.no_preview:
+            _prompt(message + " Press Enter when steady...")
+        else:
+            _aim_prompt(camera, board, cfg, message, _id_a, _id_b, _total_corners)
+
     print(f"=== Distance characterization: {distances} mm, {args.frames} frames each ===")
     print(f"Board: {cfg.board.dictionary} {cfg.board.squares_x}x{cfg.board.squares_y} "
          f"@ {cfg.board.square_size_mm:.1f} mm squares")
@@ -655,8 +756,8 @@ def main(argv=None) -> None:
         trials = []
         camera_T_per_distance: list = []
         for d in distances:
-            _prompt(f"\n>> Jog the camera to a {d:.0f} mm standoff, fronto-parallel over the "
-                   f"ChArUco board. Press Enter when steady...")
+            aim(f"\n>> Jog the camera to a {d:.0f} mm standoff, fronto-parallel over the "
+                f"ChArUco board.")
             trial, tilt_now = capture_distance_trial(
                 camera, board, cfg, d, args.frames, timeout=cfg.camera.timeout_s,
                 frame_interval_s=args.frame_interval)
@@ -697,9 +798,9 @@ def main(argv=None) -> None:
         # Taken at d* so distance is held constant and tilt is the only variable.
         incidence: list = []
         for tilt in tilts:
-            _prompt(f"\n>> Incidence check: tilt the board/camera to ~{tilt:.0f} deg at "
-                   f"~{oblique_distance:.0f} mm standoff — tolerances must not be validated "
-                   "only at normal incidence. Press Enter when steady...")
+            aim(f"\n>> Incidence check: tilt the board/camera to ~{tilt:.0f} deg at "
+                f"~{oblique_distance:.0f} mm standoff — tolerances must not be validated "
+                "only at normal incidence.")
             trial, measured_tilt = capture_distance_trial(
                 camera, board, cfg, oblique_distance, args.frames,
                 timeout=cfg.camera.timeout_s, frame_interval_s=args.frame_interval)
