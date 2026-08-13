@@ -323,6 +323,8 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
     coverage_samples: list[float] = []
     standoff_samples: list[float] = []
     rejected_fracs: list[float] = []
+    pair_a: list[np.ndarray] = []
+    pair_b: list[np.ndarray] = []
 
     detected_any = False
     window_t0 = time.monotonic()
@@ -380,7 +382,14 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
                 pb = _corner_point_mm(frame.depth, K, *px_by_id[id_b], depth_scale,
                                       dist=cfg.camera.dist)
             if pa is not None and pb is not None:
-                length_samples.append((pa.reshape(1, 3), pb.reshape(1, 3), true_mm))
+                # ACCUMULATE across frames into one sample. Emitting one sample per
+                # frame made length_spread_mm structurally zero: it is the std of the
+                # pair distances WITHIN a sample, and a sample holding a single pair
+                # has no spread by definition. That is why the metric read exactly
+                # 0.000 at every stop of every sweep -- it was never measuring the
+                # camera, and no amount of frame spacing could have changed it.
+                pair_a.append(pa)
+                pair_b.append(pb)
 
     if not plane_sets:
         why = ("the board was never detected" if not detected_any else
@@ -390,6 +399,12 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
             "metrics must be measured on the board, so this distance cannot be "
             "characterized. Move closer, improve lighting, or drop this distance.")
 
+    if pair_a:
+        # One sample holding EVERY frame's pair: length_err_mm is then the bias of
+        # their mean against the true length, and length_spread_mm their genuine
+        # frame-to-frame repeatability — which is what both metrics always claimed.
+        length_samples = [(np.asarray(pair_a).reshape(-1, 3),
+                           np.asarray(pair_b).reshape(-1, 3), true_mm)]
     if not length_samples:
         # summarize_distance_trial folds an empty list into length_err_mm = NaN, and
         # choose_dstar rejects any non-finite metric -- so this trial is already
@@ -409,16 +424,14 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
               "Depth quality is poor here — treat this distance with suspicion.")
     trial = summarize_distance_trial(measured_mm, plane_sets, length_samples, coverage_frac)
     window_s = time.monotonic() - window_t0
-    if len(plane_sets) > 1 and (trial.height_repeat_mm < 0.01
-                                or (length_samples and trial.length_spread_mm == 0.0)):
+    if len(pair_a) > 1 and trial.length_spread_mm == 0.0:
         # Degenerate repeatability is not a good result, it is an ABSENT one. Say so
         # here rather than let a 0.000 mm spread be read as astonishing precision and
         # copied into a budget nothing can ever fail.
-        print(f"   !! repeatability is degenerate over this {window_s:.1f} s window "
-              f"(height_repeat {trial.height_repeat_mm:.3f} mm, length_spread "
-              f"{trial.length_spread_mm:.3f} mm) — the Jetson's shared temporal filter "
-              "has converged, so these frames are not independent samples. Treat the "
-              "repeatability figures as UNMEASURED; do not set a budget from them.")
+        print(f"   !! {len(pair_a)} length samples over a {window_s:.1f} s window all "
+              "measured IDENTICALLY (spread 0.000 mm). With independent frames that is "
+              "not plausible — suspect the depth stream is repeating (a converged "
+              "temporal filter, or a stalled feed). Treat repeatability as UNMEASURED.")
     return trial, _measured_tilt_deg(plane_sets)
 
 
