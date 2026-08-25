@@ -195,3 +195,23 @@ def inspection_plan(recipe, setup, *, K: np.ndarray, size_px: tuple[int, int],
         "ok": bool(framing["fits"]),
         "warnings": list(framing["warnings"]),
     }
+
+
+def order_candidates_seed_first(candidates: list[dict], seed: dict | None) -> list[dict]:
+    """Move the candidate matching ``seed``'s (tilt, azimuth, roll) to the front.
+
+    Rejections are usually constant across layers (straight-down collides with
+    the same fixture at every height), so the previous layer's winner is by far
+    the most likely first pass — trying it first collapses the per-layer search
+    to one collision-validated attempt. Validation still gates every layer;
+    only the search ORDER changes. Absent/unknown seeds return the list as-is.
+    """
+    if not seed:
+        return candidates
+    key = (float(seed.get("tilt_deg", 0.0)), float(seed.get("azimuth_deg", 0.0)),
+           float(seed.get("roll_deg", 0.0)))
+    for index, candidate in enumerate(candidates):
+        if (float(candidate["tilt_deg"]), float(candidate["azimuth_deg"]),
+                float(candidate["roll_deg"])) == key:
+            return [candidate] + candidates[:index] + candidates[index + 1:]
+    return candidates

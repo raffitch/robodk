@@ -475,3 +475,15 @@ def test_api_reset_invalidates_generated_coordinates_without_a_station():
     stale = client.post("/api/modules/extrusion/preflight",
                         json={"fingerprint": plan["fingerprint"]})
     assert stale.status_code == 409
+
+
+def test_seed_first_reordering_moves_last_winner_to_front():
+    from tasni.modules.extrusion.inspection import order_candidates_seed_first
+    candidates = [{"tilt_deg": 0.0, "azimuth_deg": 0.0, "roll_deg": r}
+                  for r in (0.0, 90.0, 180.0)]
+    seed = {"tilt_deg": 0.0, "azimuth_deg": 0.0, "roll_deg": 90.0}
+    out = order_candidates_seed_first(candidates, seed)
+    assert [c["roll_deg"] for c in out] == [90.0, 0.0, 180.0]
+    assert order_candidates_seed_first(candidates, None) == candidates
+    unknown = {"tilt_deg": 5.0, "azimuth_deg": 0.0, "roll_deg": 45.0}
+    assert order_candidates_seed_first(candidates, unknown) == candidates

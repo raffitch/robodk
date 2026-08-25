@@ -18,7 +18,8 @@ from ...core.rdk_io import RdkIO
 from ..calibration.service import _camera_hold, ensure_real_robot_link
 from .archive import ExtrusionArchive
 from .inspection import (aim_point_mm, cylinder_diameter_mm, framing_standoff,
-                         inspection_plan, pose_candidates)
+                         inspection_plan, order_candidates_seed_first,
+                         pose_candidates)
 from .models import CylinderPlan, CylinderRecipe, CylinderSetup, LayerManifest
 from .processing import process_observation
 from .surface import surface_check
@@ -147,7 +148,8 @@ def _require_program_valid(report: dict, layer_index: int) -> None:
 
 
 def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
-                           inspection_name: str, config, camera) -> dict:
+                           inspection_name: str, config, camera,
+                           seed_pose: dict | None = None) -> dict:
     """Create the inspection program for one layer and return its validation.
 
     Manual mode moves to the taught target, exactly as before. Automatic mode
@@ -184,7 +186,9 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
     aim = aim_point_mm(plan.recipe, plan.setup, layer.layer_index)
     target_name = inspection_name + "_Target"
     rejected: list[dict] = []
-    for candidate in pose_candidates(aim, framing["standoff_mm"], config):
+    candidates = order_candidates_seed_first(
+        pose_candidates(aim, framing["standoff_mm"], config), seed_pose)
+    for candidate in candidates:
         descriptor = {k: v for k, v in candidate.items() if k != "T"}
         made = rdk.create_inspection_target(
             name=target_name, T=candidate["T"],
@@ -252,6 +256,7 @@ class CylinderDryRunJob:
             mock_artifacts.extend((mock_on, mock_off))
             ctx.log("DRY_RUN: SIMULATE mode; physical valve/rate outputs blocked")
             total = len(self.plan.layers)
+            last_inspection_pose: dict | None = None
             for index, layer in enumerate(self.plan.layers, start=1):
                 ctx.check_cancel()
                 ctx.progress(index, total, f"dry-running layer {layer.layer_index}")
@@ -285,7 +290,10 @@ class CylinderDryRunJob:
                 inspection_name = name + "_Inspect"
                 inspect = _build_inspection_move(
                     rdk, self.plan, layer, inspection_name=inspection_name,
-                    config=ecfg, camera=self.services.config.camera)
+                    config=ecfg, camera=self.services.config.camera,
+                    seed_pose=last_inspection_pose)
+                if inspect["pose"]:
+                    last_inspection_pose = inspect["pose"]
                 path_artifacts.extend(inspect["artifacts"])
                 inspection_validation = inspect["validation"]
                 current_program = inspection_name
@@ -414,6 +422,7 @@ class CylinderPrintJob:
         try:
             valve_off("job startup before motion", required=True)
             total = len(self.plan.layers)
+            last_inspection_pose: dict | None = None
             with _camera_hold(services, "extrusion-run"):
                 for index, layer in enumerate(self.plan.layers, start=1):
                     ctx.check_cancel()
@@ -455,7 +464,10 @@ class CylinderPrintJob:
                     inspection_name = name + "_Inspect"
                     inspect = _build_inspection_move(
                         rdk, self.plan, layer, inspection_name=inspection_name,
-                        config=ecfg, camera=services.config.camera)
+                        config=ecfg, camera=services.config.camera,
+                        seed_pose=last_inspection_pose)
+                    if inspect["pose"]:
+                        last_inspection_pose = inspect["pose"]
                     artifacts.extend(inspect["artifacts"])
                     inspection_validation = inspect["validation"]
                     current_program = inspection_name

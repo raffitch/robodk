@@ -306,3 +306,20 @@ def test_live_print_archives_the_derived_viewpoint_it_actually_measured_from(
     assert provenance["inspection_pose"]["standoff_mm"] == 300.0
     assert provenance["inspection_pose"]["aim_mm"][2] == 6.0     # top of layer 1
     assert provenance["inspection_pose"]["tilt_deg"] == 0.0
+
+
+def test_auto_inspection_reuses_the_previous_layers_winner(tmp_path, monkeypatch):
+    """Review finding: the candidate sweep restarted at straight-down every
+    layer, re-paying a collision-ON program Update per rejected candidate per
+    layer. The previous layer's validated winner is tried first now."""
+    svc, rdk, camera = services(tmp_path)
+    monkeypatch.setattr(service_mod, "new_run_dir",
+                        lambda module, stamp: _mkdir(tmp_path / module / stamp))
+    rdk.bad_inspections = 1        # layer 1: straight-down fails validation once
+    output = CylinderDryRunJob(svc, plan(layers=2, auto_inspection=True))(Ctx())
+    first = output["layers"][0]["inspection_pose"]
+    second = output["layers"][1]["inspection_pose"]
+    assert first["roll_deg"] != 0.0          # layer 1 fell through to a roll
+    assert (second["tilt_deg"], second["azimuth_deg"], second["roll_deg"]) == \
+        (first["tilt_deg"], first["azimuth_deg"], first["roll_deg"])
+    assert second["rejected"] == []          # no wasted candidates on layer 2
