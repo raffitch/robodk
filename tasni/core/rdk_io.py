@@ -61,6 +61,11 @@ class RdkIO:
         # generated targets would be flange poses (the camera offset dropped). With
         # this every IK/pose query is anchored to the real camera TCP.
         self._tool_pose: np.ndarray | None = None
+        # Pose of the ACTIVE reference frame w.r.t. the robot base, cached at
+        # tool/frame activation. None = the active frame IS the base. SolveIK's
+        # pose math is client-side against the robot base and ignores the
+        # station's active frame, so _solve_ik multiplies this in first.
+        self._frame_wrt_base_T: np.ndarray | None = None
 
     @property
     def rdk(self):
@@ -86,6 +91,7 @@ class RdkIO:
         robot = self.robot()
         robot.setPoseTool(tool)
         self._frame = None
+        self._frame_wrt_base_T = None
         if frame_of_target:
             target = self.rdk.Item(frame_of_target, robolink.ITEM_TYPE_TARGET)
             if target.Valid():
@@ -93,6 +99,7 @@ class RdkIO:
                 if frame.Valid() and frame.Type() == robolink.ITEM_TYPE_FRAME:
                     robot.setPoseFrame(frame)
                     self._frame = frame
+                    self._frame_wrt_base_T = self._frame_pose_wrt_base(frame)
         self._tool_pose = pose_to_T(tool.PoseTool())
         return self._tool_pose
 
@@ -114,8 +121,10 @@ class RdkIO:
         if base.Valid() and base.Type() == robolink.ITEM_TYPE_FRAME:
             robot.setPoseFrame(base)
             self._frame = base
+            self._frame_wrt_base_T = None   # the active frame IS the base
         else:
             self._frame = None      # AddTarget(None) / Pose() then use the base frame
+            self._frame_wrt_base_T = None
         self._tool_pose = pose_to_T(tool.PoseTool())
         return self._tool_pose
 
@@ -211,11 +220,15 @@ class RdkIO:
     def _solve_ik(self, T: np.ndarray, seed=None):
         """Raw ``SolveIK`` for a pose, with the camera tool passed **explicitly**.
 
-        ``T`` is the pose of the camera (the last-activated tool's TCP) in the active
-        reference frame; passing the tool mount (``_tool_pose``) as SolveIK's ``tool``
+        ``T`` is the pose of the camera (the last-activated tool's TCP) in the
+        **active reference frame**; it is converted to robot-base coordinates here
+        (``_frame_wrt_base_T``) because SolveIK's client-side math is base-frame-only.
+        Passing the tool mount (``_tool_pose``) as SolveIK's ``tool``
         argument makes the result place the CAMERA — not the flange — at ``T``,
         independent of whatever tool RoboDK thinks is active. ``seed`` (joints_approx)
         pins a deterministic IK branch. May raise; callers wrap as needed."""
+        if self._frame_wrt_base_T is not None:
+            T = self._frame_wrt_base_T @ np.asarray(T, dtype=float)
         robot = self.robot()
         pose = T_to_pose(T)
         tool = T_to_pose(self._tool_pose) if self._tool_pose is not None else None
@@ -1065,7 +1078,19 @@ class RdkIO:
         robot.setPoseFrame(frame)
         self._tool_pose = pose_to_T(tool.PoseTool())
         self._frame = frame
+        self._frame_wrt_base_T = self._frame_pose_wrt_base(frame)
         return self._tool_pose
+
+    def _frame_pose_wrt_base(self, frame) -> np.ndarray:
+        """Pose of ``frame`` w.r.t. the robot's base frame, via station-absolute
+        poses — correct wherever either sits in the station tree."""
+        import robolink
+
+        base = self.robot().Parent()
+        base_T = (pose_to_T(base.PoseAbs())
+                  if base.Valid() and base.Type() == robolink.ITEM_TYPE_FRAME
+                  else np.eye(4))
+        return invert_T(base_T) @ pose_to_T(frame.PoseAbs())
 
     def current_tcp_xyzrpw(self, tool_name: str, frame_name: str) -> list[float]:
         """Read the selected tool TCP pose in the selected frame without motion."""
