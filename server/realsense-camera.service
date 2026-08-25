@@ -14,6 +14,21 @@ Type=simple
 # without relying on the login session. Matches the prior root-cron precedent.
 WorkingDirectory=/home/jetson/robodk/server
 
+# Depth acquisition, declared EXPLICITLY rather than left to chance.
+#
+# RealSense option state lives on the DEVICE and survives a service restart, so
+# "leave alone" preserves whatever the last process wrote — which is how the
+# camera ended up running at 300 mW after an earlier build defaulted it there,
+# while the 2026-08-13 depth characterization had been measured at 150. Pinning
+# the value here makes the running configuration match the dated envelope on
+# every start, and makes any future change a reviewable one-line diff instead of
+# invisible device state.
+#
+# To trial a different power, change this line, run
+# `python tools/jetson_deploy.py bootstrap`, and re-measure the envelope with
+# tools/characterize_distance.py before trusting the new accuracy numbers.
+Environment=RS_LASER_POWER=150
+
 # Cooling fan -> 100% for sustained scanning (was done via sudo in the old shortcut)
 ExecStartPre=-/bin/sh -c 'echo 255 > /sys/devices/pwm-fan/target_pwm'
 
