@@ -73,7 +73,10 @@ def _build_fakes():
             # no locked joints from the sweep -> generation must back-fill joints
             # via solve_joints_for_pose so every target is still joint-locked.
             # **kw absorbs obstacle_pairs/baseline_relative/path_samples.
-            return [True] * len(poses), False, [None] * len(poses)
+            out = [True] * len(poses), False, [None] * len(poses)
+            if kw.get("return_details"):
+                return (*out, {"poses": []})
+            return out
         def solve_joints_for_pose(self, T, seed=None):
             return ("joints", float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
         def ensure_mounted_tool_collision_pairs(self, skip_trailing=2):
@@ -277,7 +280,10 @@ def test_generate_drops_colliding_poses():
         m = [True] * len(poses)
         for i in range(0, len(poses), 4):
             m[i] = False
-        return m, True, [None] * len(poses)
+        out = m, True, [None] * len(poses)
+        if kw.get("return_details"):
+            return (*out, {"poses": []})
+        return out
     rdk.screen_collisions = mask
 
     gen = service_mod.generate_calibration_targets(services)
@@ -325,7 +331,10 @@ def test_generate_refuses_when_tooling_collides():
     def mask(poses, *, guard_skip=None, **kw):   # only 2 free -> below MIN_TRAIN_VIEWS
         m = [False] * len(poses)
         m[0] = m[1] = True
-        return m, True, [None] * len(poses)
+        out = m, True, [None] * len(poses)
+        if kw.get("return_details"):
+            return (*out, {"poses": []})
+        return out
     rdk.screen_collisions = mask
 
     msg = ""
@@ -346,7 +355,10 @@ def test_generate_refuses_when_all_poses_collide():
     services, rdk, _X, _state = _build_fakes()
 
     def mask(poses, *, guard_skip=None, **kw):
-        return [False] * len(poses), True, [None] * len(poses)
+        out = [False] * len(poses), True, [None] * len(poses)
+        if kw.get("return_details"):
+            return (*out, {"poses": []})
+        return out
     rdk.screen_collisions = mask
 
     msg = ""

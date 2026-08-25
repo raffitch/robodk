@@ -3,6 +3,7 @@ import struct
 import subprocess
 import threading
 import json
+import os
 import time
 from collections import deque
 import pyrealsense2 as rs
@@ -14,6 +15,7 @@ import scan_overlay  # pure-numpy live-rectangle trim + colour edge cross-check
 
 port = 1024
 SCAN_COLOR_JPEG_QUALITY = 100
+SCAN_TELEMETRY_PERIOD_S = 1.0
 
 _telemetry_cond = threading.Condition()
 _telemetry_seq = 0
@@ -453,6 +455,14 @@ def scan_plane_telemetry(depth, intrinsics, depth_unit_mm=1.0,
                 pc + thi1 * ax1 + thi2 * ax2,
                 pc + tlo1 * ax1 + thi2 * ax2,
             ]
+            # The trimmed corners in the COLOR-camera frame (mm), so the workstation
+            # can re-project them through its RealSense calibration and draw the LIVE
+            # overlay as the same density/colour-trimmed box the lock/insert uses.
+            # (rectangle_corners_color_mm carries the RAW corners for the framing test.)
+            trimmed_corners_color = (
+                np.asarray(overlay_transform_points(np.asarray(trimmed_corners, float)),
+                           dtype=float)
+                if overlay_transform_points is not None else None)
             if overlay_project is not None:
                 tpc = np.asarray([overlay_project(p) for p in trimmed_corners], float)
             elif overlay_project_points is not None:
@@ -530,6 +540,9 @@ def scan_plane_telemetry(depth, intrinsics, depth_unit_mm=1.0,
                                       else [float(tlen1), float(tlen2)]),
                 "rectangle_corners_color_mm": (
                     corners_color.tolist() if corners_color is not None else None),
+                "trimmed_corners_color_mm": (
+                    trimmed_corners_color.tolist()
+                    if trimmed_corners_color is not None else None),
                 # Operator overlay: the generic reticle-centred work square when the
                 # surface overruns the view (edges off-frame), else the density/colour-
                 # trimmed board box (hugs the surface). Falls back to the raw outline
@@ -611,23 +624,112 @@ width = 1280;
 height = 720;
 
 
-def set_high_accuracy_preset(profile):
-    """Apply the D4xx High Accuracy preset when the connected sensor supports it."""
+# Depth acquisition tuning. Overridable per-cell via the service environment so a
+# change can be trialled without editing code: RS_VISUAL_PRESET (rs400 enum ordinal
+# -- 3 high_accuracy, 4 high_density, 5 medium_density) and RS_LASER_POWER (mW-ish,
+# 0..360 on a D435i).
+#
+# Measured on the cell 2026-08-13, against the printed ChArUco ruler on an A3 panel
+# 630 mm above the floor: valid depth stopped ~20 mm short of the panel's top and
+# bottom edges (left/right were within 0.3-2.7 mm). The stereo matcher needs
+# texture, and the IR projector is what supplies it on blank surfaces -- it was
+# running at the 150 default, only 42% of this device's 360 maximum.
+# Both knobs are deliberately LEFT ALONE by default (-1 = don't touch). Today's
+# distance characterization was measured under the preset the device is actually
+# running, so silently changing it would invalidate that dated record; and High
+# Accuracy in particular is the wrong direction here (it raises the confidence
+# threshold, returning fewer but surer points, when the measured defect is missing
+# coverage). Set RS_VISUAL_PRESET=4 to trial high_density as a SEPARATE experiment,
+# with its own before/after measurement.
+def _env_number(name: str, default: float) -> float:
+    """A numeric env override, or ``default`` when unset OR unparsable. A
+    typo'd value must never take the service down: the unit is Restart=always
+    with no start limit, so an import-time ValueError becomes an infinite
+    crash-loop with the camera dark for every module."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
     try:
-        device = profile.get_device()
-        sensor = device.first_depth_sensor()
-        if sensor.supports(rs.option.visual_preset):
-            preset = getattr(
-                getattr(rs, 'rs400_visual_preset', object),
-                'high_accuracy',
-                3,
-            )
-            sensor.set_option(rs.option.visual_preset, float(int(preset)))
-            print("RealSense visual preset: High Accuracy")
+        return float(raw)
+    except ValueError:
+        print(f"WARNING: {name}={raw!r} is not a number — using {default:g}",
+              flush=True)
+        return float(default)
+
+
+RS_VISUAL_PRESET = int(_env_number('RS_VISUAL_PRESET', -1))
+# -1 = leave the device's current laser power alone. The 2026-08-13 depth
+# characterization was measured at the device's 150; a silent default of 300
+# doubled projector power on every restart and invalidated that dated envelope
+# (the same invariant that keeps RS_VISUAL_PRESET at leave-alone). Trial higher
+# power as an explicit experiment with its own before/after measurement.
+RS_LASER_POWER = _env_number('RS_LASER_POWER', -1.0)
+
+
+def set_high_accuracy_preset(profile):
+    """Configure the depth sensor's preset + laser power, and LOG WHAT STUCK.
+
+    The previous version resolved the preset via
+    ``getattr(rs, 'rs400_visual_preset', object)`` and, on builds where that enum is
+    not exposed (this Jetson's pyrealsense2 among them), silently fell through to a
+    bare 3. It then announced "High Accuracy" without ever reading the value back --
+    and the device in fact sat at 0 (Custom) for over a month while the docs claimed
+    otherwise. Every option is now read back after writing, so the log states the
+    achieved configuration rather than the attempted one.
+
+    Both the preset and the laser power default to LEAVE-ALONE (-1): the dated
+    depth characterization was measured under whatever the device is actually
+    running, so changing either silently on every restart would invalidate that
+    record. Set RS_VISUAL_PRESET / RS_LASER_POWER to trial a change as an
+    explicit experiment with its own before/after measurement. (High Accuracy in
+    particular is the wrong direction for edge coverage: it raises the confidence
+    threshold, returning fewer but surer points, when the measured defect is
+    MISSING coverage at surface edges.)
+    """
+    try:
+        sensor = profile.get_device().first_depth_sensor()
     except Exception as e:
-        # Preset support varies by firmware/model. Keep serving frames, but make the
-        # capture quality state visible in the service log.
-        print(f"WARNING: could not set High Accuracy visual preset: {e}")
+        print(f"WARNING: no depth sensor to configure: {e}", flush=True)
+        return
+    wanted = [
+        # Every client of this server shares one pipeline, so enabling the
+        # emitter here covers scan, calibration, extrusion/cylinder measuring
+        # and the live preview alike — there is no per-feature IR state to
+        # keep in sync, and nothing anywhere turns it back off.
+        ('emitter_enabled', getattr(rs.option, 'emitter_enabled', None), 1.0)]
+    if RS_LASER_POWER >= 0:
+        wanted.insert(0, ('laser_power', getattr(rs.option, 'laser_power', None),
+                          RS_LASER_POWER))
+    else:
+        try:
+            cur = sensor.get_option(rs.option.laser_power)
+            print(f"RealSense: laser_power left as-is at {cur:g} "
+                  "(set RS_LASER_POWER to change it)", flush=True)
+        except Exception:
+            pass
+    if RS_VISUAL_PRESET >= 0:
+        wanted.insert(0, ('visual_preset', getattr(rs.option, 'visual_preset', None),
+                          float(RS_VISUAL_PRESET)))
+    else:
+        try:
+            cur = sensor.get_option(rs.option.visual_preset)
+            print(f"RealSense: visual_preset left as-is at {cur:g} "
+                  "(set RS_VISUAL_PRESET to change it)", flush=True)
+        except Exception:
+            pass
+    for name, option, value in wanted:
+        if option is None or not sensor.supports(option):
+            print(f"RealSense: {name} unsupported on this device/build — skipped", flush=True)
+            continue
+        try:
+            rng = sensor.get_option_range(option)
+            clamped = min(max(value, rng.min), rng.max)
+            sensor.set_option(option, clamped)
+            print(f"RealSense: {name} -> requested {value:g}, set {clamped:g}, "
+                  f"device reports {sensor.get_option(option):g} "
+                  f"(range {rng.min:g}..{rng.max:g})", flush=True)
+        except Exception as e:
+            print(f"WARNING: could not set {name}={value:g}: {e}", flush=True)
 
 
 def openPipeline():
@@ -829,7 +931,7 @@ def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
                 color = frames.get_color_frame()
                 if not color:
                     continue
-                if scan_telemetry and time.monotonic() - last_telemetry >= 0.40:
+                if scan_telemetry and time.monotonic() - last_telemetry >= SCAN_TELEMETRY_PERIOD_S:
                     depth = frames.get_depth_frame()
                     if depth:
                         try:
@@ -854,8 +956,8 @@ def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
                                 return rs.rs2_project_point_to_pixel(
                                     color_intr, color_point)
 
-                            def overlay_project_points(points):
-                                cp = np.asarray(points, float) @ R_dc.T + t_dc_mm
+                            def project_color_points(points_color):
+                                cp = np.asarray(points_color, float)
                                 zc = cp[:, 2]
                                 return np.column_stack([
                                     cp[:, 0] * float(color_intr.fx) / zc
@@ -864,8 +966,27 @@ def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
                                     + float(color_intr.ppy),
                                 ])
 
+                            valid_vertices = depth_vertices_mm.reshape(-1, 3)
+                            valid_vertices = valid_vertices[
+                                np.isfinite(valid_vertices).all(axis=1)
+                                & (valid_vertices[:, 2] > 0)]
+                            if len(valid_vertices):
+                                sample = valid_vertices[::max(1, len(valid_vertices) // 8)][:8]
+                                sdk_px = np.asarray([overlay_project(p) for p in sample], float)
+                                cand_a = project_color_points(sample @ R_dc.T + t_dc_mm)
+                                cand_b = project_color_points(sample @ R_dc + t_dc_mm)
+                                R_vec = R_dc.T if (
+                                    np.nanmean(np.linalg.norm(cand_a - sdk_px, axis=1))
+                                    <= np.nanmean(np.linalg.norm(cand_b - sdk_px, axis=1))
+                                ) else R_dc
+                            else:
+                                R_vec = R_dc.T
+
+                            def overlay_project_points(points):
+                                return project_color_points(np.asarray(points, float) @ R_vec + t_dc_mm)
+
                             def overlay_transform_points(points):
-                                return np.asarray(points, float) @ R_dc.T + t_dc_mm
+                                return np.asarray(points, float) @ R_vec + t_dc_mm
 
                             def depth_deproject_points(pixels, depths_mm):
                                 uv = np.rint(np.asarray(pixels, float)).astype(int)

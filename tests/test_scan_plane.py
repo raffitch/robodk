@@ -15,7 +15,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tasni.modules.scan.plane import bounded_work_plane, work_plane_from_points  # noqa: E402
+from tasni.modules.scan.plane import (  # noqa: E402
+    bounded_work_plane, reticle_plane_square, work_plane_from_points)
 
 
 def _rect_grid(xr, yr, nx=50, ny=40, z_noise=0.0, seed=0):
@@ -101,6 +102,63 @@ def test_sparse_edge_noise_does_not_make_diagonal_frame():
     print("[robust footprint] sparse fringe retained an axis-aligned frame")
 
 
+def test_density_trim_hugs_dense_board_not_halo():
+    """A sparse coplanar halo just past the real edge must NOT inflate the rectangle.
+    The board is 400 mm on its long axis; a sparse band of points extends ~30 mm
+    past the +x edge — too many for the 0.5% quantile to remove, but far less dense
+    than the board. The per-edge density trim should pull the long edge back to ~400,
+    not the ~430 over-run the quantile-only box produced."""
+    board = _rect_grid((200.0, 600.0), (100.0, 400.0), nx=80, ny=60, z_noise=0.2)
+    # Sparse halo: 6 columns x 8 rows over (600..630) x (100..400) => ~1.0% of points,
+    # ~8 per x-bin vs ~60 on the board, so it is a clear sub-threshold fringe.
+    ghx, ghy = np.meshgrid(np.linspace(600.0, 630.0, 6), np.linspace(100.0, 400.0, 8))
+    halo = np.column_stack([ghx.ravel(), ghy.ravel(), np.zeros(ghx.size)])
+    wp = work_plane_from_points(np.vstack([board, halo]),
+                                distance=3.0, min_inlier_frac=0.5)
+    assert abs(wp.size[0] - 400) < 18, wp.size  # hugs the board, not 400+30 over-run
+    print("[density trim] long edge", round(wp.size[0], 1),
+          "mm (board 400 + 30 mm halo)")
+
+
+def test_density_trim_keeps_uniform_board():
+    """A uniformly dense board (no halo) is preserved: the trim must not eat a real,
+    fully-sampled edge — only a genuine density cliff is trimmed."""
+    pts = _rect_grid((0.0, 500.0), (0.0, 350.0), nx=90, ny=70, z_noise=0.2)
+    wp = work_plane_from_points(pts, distance=3.0, min_inlier_frac=0.5)
+    assert abs(wp.size[0] - 500) < 12 and abs(wp.size[1] - 350) < 12, wp.size
+    print("[density trim] uniform board preserved", tuple(round(s, 1) for s in wp.size))
+
+
+def test_reticle_square_centered_on_optical_axis():
+    """A generic work square on a frontal plane is centred where the +Z optical axis
+    (the reticle) pierces it — independent of the in-plane centroid offset — with the
+    requested size and screen-aligned (first axis ~ camera +X)."""
+    normal = np.array([0.0, 0.0, -1.0])                  # frontal, faces the camera
+    centroid = np.array([80.0, -40.0, 500.0])            # offset in-plane
+    corners, u, v, reticle = reticle_plane_square(normal, centroid, (1000.0, 1000.0))
+    assert np.allclose(corners.mean(axis=0), [0.0, 0.0, 500.0], atol=1e-6), corners.mean(0)
+    assert np.allclose(reticle, [0.0, 0.0, 500.0], atol=1e-6), reticle
+    edges = np.linalg.norm(np.roll(corners, -1, axis=0) - corners, axis=1)
+    assert np.allclose(edges, 1000.0, atol=1e-6), edges
+    assert abs(float(u @ [1, 0, 0])) > 0.999, u          # screen-stable axis
+    assert abs(float(u @ normal)) < 1e-9 and abs(float(v @ normal)) < 1e-9  # in-plane
+    print("[reticle square] centred on the optical axis, 1000 mm, screen-aligned")
+
+
+def test_reticle_square_lies_on_tilted_plane():
+    """On a tilted plane every corner is exactly on the plane, the centre is on the
+    optical axis, and the side lengths match the requested (sx, sy)."""
+    a = np.deg2rad(20.0)
+    normal = np.array([np.sin(a), 0.0, -np.cos(a)])      # tilted about Y, faces camera
+    centroid = np.array([0.0, 25.0, 600.0])
+    corners, u, v, reticle = reticle_plane_square(normal, centroid, (800.0, 600.0))
+    assert np.allclose((corners - centroid) @ normal, 0.0, atol=1e-6)  # all on the plane
+    assert abs(reticle[0]) < 1e-9 and abs(reticle[1]) < 1e-9 and reticle[2] > 0
+    e = np.linalg.norm(np.roll(corners, -1, axis=0) - corners, axis=1)
+    assert np.allclose(np.sort(e), [600, 600, 800, 800], atol=1e-6), e
+    print("[reticle square] lies on a 20° plane, 800×600, centred on the axis")
+
+
 def test_large_surface_can_be_bounded_around_camera_aim():
     surface = _rect_grid((-1000.0, 1000.0), (-800.0, 800.0), nx=80, ny=60)
     wp = work_plane_from_points(surface, distance=2.0, min_inlier_frac=0.8)
@@ -116,5 +174,9 @@ if __name__ == "__main__":
     test_tilted_plane_normal_recovered()
     test_no_dominant_plane_raises()
     test_sparse_edge_noise_does_not_make_diagonal_frame()
+    test_density_trim_hugs_dense_board_not_halo()
+    test_density_trim_keeps_uniform_board()
+    test_reticle_square_centered_on_optical_axis()
+    test_reticle_square_lies_on_tilted_plane()
     test_large_surface_can_be_bounded_around_camera_aim()
     print("\nplane.py convention + fit tests passed.")

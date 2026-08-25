@@ -46,6 +46,10 @@ class BoardSelectBody(BaseModel):
     page: Literal["A4", "A3", "Letter"]
 
 
+class CollisionIgnoreBody(BaseModel):
+    pair: str
+
+
 class CalibrationModule(WorkflowModule):
     id = "calibration"
     title = "Calibration"
@@ -115,7 +119,29 @@ class CalibrationModule(WorkflowModule):
                 return services.rdk.collision_status(
                     ensure_pairs=cc.collision_self_pairs,
                     skip_trailing=cc.collision_skip_wrist_links,
-                    ignore_objects=cc.collision_ignore_objects)
+                    ignore_objects=cc.collision_ignore_objects,
+                    ignore_pairs=cc.collision_ignore_pairs)
+            except Exception as e:
+                raise HTTPException(503, f"RoboDK unavailable: {e}")
+
+        @router.post("/collision/ignore")
+        def collision_ignore(body: CollisionIgnoreBody) -> dict:
+            """Persist an exact collision-pair ignore from the Tasni UI."""
+            pair = body.pair.strip()
+            if not pair or "↔" not in pair:
+                raise HTTPException(400, "invalid collision pair")
+            cc = services.config.calibration
+            if pair not in cc.collision_ignore_pairs:
+                cc.collision_ignore_pairs.append(pair)
+                from ...core.config import save_overrides
+                save_overrides({"calibration": {
+                    "collision_ignore_pairs": cc.collision_ignore_pairs}})
+            try:
+                return services.rdk.collision_status(
+                    ensure_pairs=cc.collision_self_pairs,
+                    skip_trailing=cc.collision_skip_wrist_links,
+                    ignore_objects=cc.collision_ignore_objects,
+                    ignore_pairs=cc.collision_ignore_pairs)
             except Exception as e:
                 raise HTTPException(503, f"RoboDK unavailable: {e}")
 

@@ -26,6 +26,11 @@ h264 = ["av"]                  # PyAV (bundles ffmpeg) — `pip install av`
 # Imported lazily in tasni/modules/scan/reconstruct.py, so the package still
 # imports without it — only a scan Run needs it. `pip install -e .[scan]`.
 scan = ["open3d"]              # Open3D — TSDF integrate + marching-cubes + RANSAC plane
+# Learned (SAM) live work-boundary for low-contrast scenes (module #2). Host-side ONNX
+# inference (the Jetson never runs SAM). Imported lazily in scan/sam_boundary.py, so the
+# package imports without it and the classical colour engine still works. Weights are NOT
+# shipped in the repo — fetch with `tools/download_sam.py`. `pip install -e .[sam]`.
+sam = ["onnxruntime"]          # ONNXRuntime (CPU) — EdgeSAM / MobileSAM encoder+decoder
 
 [project.scripts]
 tasni = "tasni.__main__:main"

@@ -1,6 +1,6 @@
 #!/bin/bash
-# jetson-autopull.sh — keep the Jetson's monorepo clone in lock-step with
-# origin/main and restart the camera server when its code changes.
+# jetson-autopull.sh — keep the Jetson's monorepo clone in lock-step with its
+# checked-out origin branch and restart the camera server when its code changes.
 #
 # Run by jetson-autopull.timer every couple of minutes. Design goals:
 #   * Cheap no-op when there's nothing new (a quiet fetch + a SHA compare).
@@ -20,11 +20,14 @@ UNIT=realsense-camera
 GIT() { runuser -l jetson -c "cd '$REPO' && $1"; }
 
 GIT "git fetch --quiet origin" || exit 0
-GIT "git checkout --quiet main" 2>/dev/null || \
-    GIT "git checkout --quiet -B main --track origin/main" || exit 0
+BRANCH=$(GIT "git rev-parse --abbrev-ref HEAD" 2>/dev/null) || BRANCH=main
+[ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ] && BRANCH=main
+GIT "git rev-parse --verify --quiet origin/$BRANCH" >/dev/null || BRANCH=main
+GIT "git checkout --quiet '$BRANCH'" 2>/dev/null || \
+    GIT "git checkout --quiet -B '$BRANCH' --track 'origin/$BRANCH'" || exit 0
 
 LOCAL=$(GIT "git rev-parse HEAD" 2>/dev/null) || exit 0
-REMOTE=$(GIT "git rev-parse origin/main" 2>/dev/null) || exit 0
+REMOTE=$(GIT "git rev-parse 'origin/$BRANCH'" 2>/dev/null) || exit 0
 [ -z "$REMOTE" ] && exit 0
 [ "$LOCAL" = "$REMOTE" ] && exit 0      # already up to date — nothing to do
 

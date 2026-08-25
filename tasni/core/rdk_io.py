@@ -61,6 +61,11 @@ class RdkIO:
         # generated targets would be flange poses (the camera offset dropped). With
         # this every IK/pose query is anchored to the real camera TCP.
         self._tool_pose: np.ndarray | None = None
+        # Pose of the ACTIVE reference frame w.r.t. the robot base, cached at
+        # tool/frame activation. None = the active frame IS the base. SolveIK's
+        # pose math is client-side against the robot base and ignores the
+        # station's active frame, so _solve_ik multiplies this in first.
+        self._frame_wrt_base_T: np.ndarray | None = None
 
     @property
     def rdk(self):
@@ -86,6 +91,7 @@ class RdkIO:
         robot = self.robot()
         robot.setPoseTool(tool)
         self._frame = None
+        self._frame_wrt_base_T = None
         if frame_of_target:
             target = self.rdk.Item(frame_of_target, robolink.ITEM_TYPE_TARGET)
             if target.Valid():
@@ -93,6 +99,7 @@ class RdkIO:
                 if frame.Valid() and frame.Type() == robolink.ITEM_TYPE_FRAME:
                     robot.setPoseFrame(frame)
                     self._frame = frame
+                    self._frame_wrt_base_T = self._frame_pose_wrt_base(frame)
         self._tool_pose = pose_to_T(tool.PoseTool())
         return self._tool_pose
 
@@ -114,8 +121,10 @@ class RdkIO:
         if base.Valid() and base.Type() == robolink.ITEM_TYPE_FRAME:
             robot.setPoseFrame(base)
             self._frame = base
+            self._frame_wrt_base_T = None   # the active frame IS the base
         else:
             self._frame = None      # AddTarget(None) / Pose() then use the base frame
+            self._frame_wrt_base_T = None
         self._tool_pose = pose_to_T(tool.PoseTool())
         return self._tool_pose
 
@@ -211,11 +220,15 @@ class RdkIO:
     def _solve_ik(self, T: np.ndarray, seed=None):
         """Raw ``SolveIK`` for a pose, with the camera tool passed **explicitly**.
 
-        ``T`` is the pose of the camera (the last-activated tool's TCP) in the active
-        reference frame; passing the tool mount (``_tool_pose``) as SolveIK's ``tool``
+        ``T`` is the pose of the camera (the last-activated tool's TCP) in the
+        **active reference frame**; it is converted to robot-base coordinates here
+        (``_frame_wrt_base_T``) because SolveIK's client-side math is base-frame-only.
+        Passing the tool mount (``_tool_pose``) as SolveIK's ``tool``
         argument makes the result place the CAMERA — not the flange — at ``T``,
         independent of whatever tool RoboDK thinks is active. ``seed`` (joints_approx)
         pins a deterministic IK branch. May raise; callers wrap as needed."""
+        if self._frame_wrt_base_T is not None:
+            T = self._frame_wrt_base_T @ np.asarray(T, dtype=float)
         robot = self.robot()
         pose = T_to_pose(T)
         tool = T_to_pose(self._tool_pose) if self._tool_pose is not None else None
@@ -566,6 +579,68 @@ class RdkIO:
         return {"objects": [ob.Name() for ob in objects],
                 "pairs_disabled": disabled, "pairs_failed": failed}
 
+    @staticmethod
+    def _parse_pair_endpoint(text: str) -> tuple[str, int]:
+        """Parse ``Name[:Lid]`` as displayed by :meth:`collision_pairs`."""
+        s = str(text).strip()
+        if ":L" in s:
+            name, lid = s.rsplit(":L", 1)
+            try:
+                return name.strip(), int(lid)
+            except ValueError:
+                return s, 0
+        return s, 0
+
+    def _item_by_name_any_type(self, name: str):
+        """Best-effort RoboDK item lookup by name, independent of item type."""
+        try:
+            return self.rdk.Item(name)
+        except Exception:
+            return None
+
+    def disable_collision_pair_strings(self, pairs: list[str] | None) -> dict:
+        """Disable exact pair strings such as ``A:L1 ↔ B``.
+
+        These strings are what the UI shows from RoboDK's current collision report.
+        Applying them after collision checking is enabled lets an operator suppress
+        station-model false positives without opening RoboDK's Collision Map.
+        """
+        import robolink
+
+        disabled = failed = 0
+        applied: list[str] = []
+        for pair in pairs or []:
+            text = str(pair).strip()
+            if not text or "↔" not in text:
+                continue
+            left, right = [p.strip() for p in text.split("↔", 1)]
+            n1, id1 = self._parse_pair_endpoint(left)
+            n2, id2 = self._parse_pair_endpoint(right)
+            it1, it2 = self._item_by_name_any_type(n1), self._item_by_name_any_type(n2)
+            try:
+                if it1 is None or it2 is None or not it1.Valid() or not it2.Valid():
+                    failed += 1
+                    continue
+            except Exception:
+                failed += 1
+                continue
+            ok = False
+            # Try both orders. RoboDK usually accepts either, but this makes link IDs
+            # robust when the pair was reported opposite to our lookup order.
+            for a, b, aid, bid in ((it1, it2, id1, id2), (it2, it1, id2, id1)):
+                try:
+                    r = self.rdk.setCollisionActivePair(
+                        robolink.COLLISION_OFF, a, b, aid, bid)
+                    ok = ok or int(r) == 1
+                except Exception:
+                    pass
+            if ok:
+                disabled += 1
+                applied.append(text)
+            else:
+                failed += 1
+        return {"pairs": applied, "pairs_disabled": disabled, "pairs_failed": failed}
+
     # Joint step (deg) MoveJ_Test interpolates at while checking the approach — fine
     # enough to catch a thin self-collision, coarse enough to stay quick on the big
     # station. The destination config is always checked regardless of this.
@@ -624,7 +699,7 @@ class RdkIO:
         new = keys - (baseline or set())
         return bool(new), self._format_pair_keys(new)
 
-    def path_new_collisions(self, j1, j2, baseline, samples: int = 6):
+    def path_new_collision_details(self, j1, j2, baseline, samples: int = 6):
         """Does interpolating the joint move ``j1 -> j2`` introduce a colliding pair
         not present in ``baseline``? Samples the path (endpoints + interior points),
         reading the canonical pair-set at each. Returns ``True`` (a new collision
@@ -640,7 +715,7 @@ class RdkIO:
         try:
             b = np.asarray(j2.list(), dtype=float).ravel()
         except Exception:
-            return None
+            return None, []
         a = None
         if j1 is not None:
             try:
@@ -658,19 +733,27 @@ class RdkIO:
             try:
                 robot.setJoints(robomath.Mat([float(x) for x in cfg]))
             except Exception:
-                return None
+                return None, []
             keys = self.collision_pair_keys()
             if keys is None:
-                return None
-            if keys - base:
-                return True
-        return False
+                return None, []
+            new = keys - base
+            if new:
+                return True, self._format_pair_keys(new)
+        return False, []
+
+    def path_new_collisions(self, j1, j2, baseline, samples: int = 6):
+        """Backward-compatible bool-only wrapper for swept new-collision checks."""
+        collides, _pairs = self.path_new_collision_details(j1, j2, baseline, samples)
+        return collides
 
     def screen_collisions(self, poses: list[np.ndarray], *,
                           guard_skip: int | None = None, obstacle_pairs: bool = False,
                           ignore_objects: list[str] | None = None,
-                          baseline_relative: bool = True, path_samples: int = 6
-                          ) -> tuple[list[bool], bool, list]:
+                          ignore_pairs: list[str] | None = None,
+                          baseline_relative: bool = True, path_samples: int = 6,
+                          return_details: bool = False
+                          ):
         """Test each TCP pose for collisions **in simulation** and record the exact
         joint configuration used.
 
@@ -719,6 +802,8 @@ class RdkIO:
             self.ensure_obstacle_collision_pairs(ignore_objects)
         if on and ignore_objects:
             self.disable_object_collision_pairs(ignore_objects)
+        ignored_pairs = (self.disable_collision_pair_strings(ignore_pairs)
+                         if on and ignore_pairs else None)
         # Record the baseline collision pair-set at the SAFE seed config (the pose the
         # operator aimed from), so the constant modelling artifacts are subtracted out.
         baseline = set()
@@ -731,10 +816,12 @@ class RdkIO:
             baseline = bk if bk is not None else set()
         mask: list[bool] = []
         joints: list = []
+        details: list[dict] = []
         try:
-            for T in poses:
+            for idx, T in enumerate(poses):
                 sol = None
                 collides: bool | None = None
+                pairs: list[str] = []
                 try:
                     # Anchor every solve to the seed config so the chosen IK branch is
                     # deterministic, and pass the camera tool EXPLICITLY so the joints
@@ -744,7 +831,7 @@ class RdkIO:
                     sol = self._ik_to_joints(ik, seed_joints)
                     if sol is not None and on:
                         if baseline_relative:
-                            collides = self.path_new_collisions(
+                            collides, pairs = self.path_new_collision_details(
                                 seed_joints, sol, baseline, path_samples)
                         else:
                             j1 = seed_joints if seed_joints is not None else sol
@@ -752,10 +839,17 @@ class RdkIO:
                             collides = int(ncol) > 0
                             if not collides:
                                 collides = bool(self.collisions())
+                            if collides:
+                                pairs = self.collision_pairs(limit=20)
                 except Exception:
                     sol, collides = sol, None
                 joints.append(sol)
                 mask.append(True if collides is None else not collides)
+                details.append({
+                    "index": idx,
+                    "collides": collides,
+                    "pairs": pairs,
+                })
         finally:
             if seed_joints is not None:
                 try:
@@ -764,11 +858,18 @@ class RdkIO:
                     pass
             self.set_run_mode_raw(prior_mode)
             self.set_collision_checking(False)   # don't leave the station heavy
+        if return_details:
+            return mask, on, joints, {
+                "baseline_pairs": self._format_pair_keys(baseline),
+                "ignored_pairs": ignored_pairs or {"pairs": [], "pairs_disabled": 0, "pairs_failed": 0},
+                "poses": details,
+            }
         return mask, on, joints
 
     def collision_status(self, *, ensure_pairs: bool = False,
                          skip_trailing: int = 2,
-                         ignore_objects: list[str] | None = None) -> dict:
+                         ignore_objects: list[str] | None = None,
+                         ignore_pairs: list[str] | None = None) -> dict:
         """Best-effort snapshot of RoboDK collision checking at the **current** pose
         — no motion. Briefly enables checking to force a recompute, reads the count,
         then **disables it again** (so it doesn't slow every later call). Returns
@@ -786,8 +887,10 @@ class RdkIO:
                  if on and ensure_pairs else None)
         ignored = (self.disable_object_collision_pairs(ignore_objects)
                    if on and ignore_objects else None)
+        ignored_pairs = (self.disable_collision_pair_strings(ignore_pairs)
+                         if on and ignore_pairs else None)
         n = self.collisions() if on else None
-        pairs = self.collision_pairs() if n else []
+        pairs = self.collision_pairs(limit=50) if n else []
         self.set_collision_checking(False)
         out = {"available": n is not None, "count": n}
         if pairs:
@@ -797,6 +900,9 @@ class RdkIO:
             out["guarded_pairs"] = guard["pairs_enabled"]
         if ignored is not None:
             out["ignored_objects"] = ignored["objects"]
+        if ignored_pairs is not None:
+            out["ignored_pairs"] = ignored_pairs["pairs"]
+            out["ignored_pair_count"] = ignored_pairs["pairs_disabled"]
         return out
 
     def collisions(self) -> int | None:
@@ -919,7 +1025,407 @@ class RdkIO:
         import robolink
 
         items = self.rdk.ItemList(robolink.ITEM_TYPE_TOOL)
-        return [i.Name() for i in items]
+        return sorted(i.Name() for i in items)
+
+    def list_frames(self) -> list[str]:
+        """Sorted reference-frame names available for a fabrication plan."""
+        import robolink
+
+        return sorted(i.Name() for i in self.rdk.ItemList(robolink.ITEM_TYPE_FRAME))
+
+    def list_programs(self) -> list[str]:
+        """Sorted standard-program names (Python macros excluded)."""
+        import robolink
+
+        return sorted(i.Name() for i in self.rdk.ItemList(robolink.ITEM_TYPE_PROGRAM))
+
+    def program_instructions(self, name: str) -> list[str]:
+        """Human-readable instruction texts for a standard program."""
+        import robolink
+
+        program = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+        if not program.Valid():
+            return []
+        return [str(program.Instruction(index)[0])
+                for index in range(program.InstructionCount())]
+
+    def item_exists_as(self, name: str, kind: str) -> bool:
+        """Exact-type existence check used for untrusted UI selections."""
+        import robolink
+
+        types = {
+            "tool": robolink.ITEM_TYPE_TOOL,
+            "frame": robolink.ITEM_TYPE_FRAME,
+            "target": robolink.ITEM_TYPE_TARGET,
+            "program": robolink.ITEM_TYPE_PROGRAM,
+        }
+        if kind not in types or not name:
+            return False
+        return bool(self.rdk.Item(name, types[kind]).Valid())
+
+    def use_named_tool_frame(self, tool_name: str, frame_name: str) -> np.ndarray:
+        """Activate exact selected TOOL and FRAME items; return flange->TCP."""
+        import robolink
+
+        tool = self.rdk.Item(tool_name, robolink.ITEM_TYPE_TOOL)
+        frame = self.rdk.Item(frame_name, robolink.ITEM_TYPE_FRAME)
+        if not tool.Valid():
+            raise RuntimeError(f"tool {tool_name!r} not found")
+        if not frame.Valid():
+            raise RuntimeError(f"frame {frame_name!r} not found")
+        robot = self.robot()
+        robot.setPoseTool(tool)
+        robot.setPoseFrame(frame)
+        self._tool_pose = pose_to_T(tool.PoseTool())
+        self._frame = frame
+        self._frame_wrt_base_T = self._frame_pose_wrt_base(frame)
+        return self._tool_pose
+
+    def _frame_pose_wrt_base(self, frame) -> np.ndarray:
+        """Pose of ``frame`` w.r.t. the robot's base frame, via station-absolute
+        poses — correct wherever either sits in the station tree."""
+        import robolink
+
+        base = self.robot().Parent()
+        base_T = (pose_to_T(base.PoseAbs())
+                  if base.Valid() and base.Type() == robolink.ITEM_TYPE_FRAME
+                  else np.eye(4))
+        return invert_T(base_T) @ pose_to_T(frame.PoseAbs())
+
+    def current_tcp_xyzrpw(self, tool_name: str, frame_name: str) -> list[float]:
+        """Read the selected tool TCP pose in the selected frame without motion."""
+        import robodk.robomath as robomath
+
+        self.use_named_tool_frame(tool_name, frame_name)
+        return [float(value) for value in
+                robomath.pose_2_xyzrpw(T_to_pose(self.tcp_pose_T()))]
+
+    def extrusion_reachability_report(
+            self, *, points_xyz: np.ndarray, orientation_rpy_deg,
+            print_tool: str, work_frame: str, maximum_samples: int = 24) -> dict:
+        """Sample exact fixed-orientation path poses with IK, without robot motion.
+
+        This is an early placement check, not a replacement for Curve Follow
+        generation or the collision-enabled complete program dry run.
+        """
+        pts = np.asarray(points_xyz, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 3 or not len(pts):
+            raise ValueError("reachability path must be an Nx3 array")
+        if not np.isfinite(pts).all():
+            raise ValueError("reachability path contains non-finite coordinates")
+        self.use_named_tool_frame(print_tool, work_frame)
+        robot = self.robot()
+        seed = robot.Joints()
+        orientation = self.xyzrpy_pose_T([0.0, 0.0, 0.0], orientation_rpy_deg)
+        count = min(max(1, int(maximum_samples)), len(pts))
+        indices = sorted(set(int(round(v)) for v in
+                             np.linspace(0, len(pts) - 1, count)))
+        samples: list[dict] = []
+        for index in indices:
+            target = orientation.copy()
+            target[:3, 3] = pts[index]
+            try:
+                joints = self._ik_to_joints(self._solve_ik(target, seed), seed)
+                if joints is None:
+                    joints = self._ik_to_joints(self._solve_ik(target), seed)
+            except Exception:
+                joints = None
+            reachable = joints is not None
+            samples.append({
+                "point_index": index,
+                "xyz_mm": [float(v) for v in pts[index]],
+                "reachable": reachable,
+            })
+            if reachable:
+                seed = joints
+        failed = [sample for sample in samples if not sample["reachable"]]
+        return {
+            "all_reachable": not failed,
+            "sample_count": len(samples),
+            "reachable_count": len(samples) - len(failed),
+            "first_unreachable": failed[0] if failed else None,
+            "frame": work_frame,
+            "tool": print_tool,
+            "orientation_rpy_deg": [float(v) for v in orientation_rpy_deg],
+            "note": ("Sampled poses have IK solutions; full curve/collision dry run is still required."
+                     if not failed else
+                     "At least one sampled path pose has no IK solution."),
+        }
+
+    @staticmethod
+    def xyzrpy_pose_T(xyz_mm, rpy_deg) -> np.ndarray:
+        """Build a RoboDK-convention XYZ+RPW pose as a numpy transform."""
+        import robodk.robomath as robomath
+
+        xyz = [float(v) for v in xyz_mm]
+        rpy = [float(v) for v in rpy_deg]
+        return pose_to_T(robomath.xyzrpw_2_pose(xyz + rpy))
+
+    def ensure_mock_valve_programs(self, prefix: str = "TasniDry") -> tuple[str, str]:
+        """Create comment-only dry-run valve programs (never touch I/O)."""
+        import robolink
+
+        names = (f"{prefix}AirOn", f"{prefix}AirOff")
+        for name, state in zip(names, ("ON", "OFF")):
+            old = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+            if old.Valid():
+                old.Delete()
+            prog = self.rdk.AddProgram(name, self.robot())
+            prog.RunInstruction(
+                f"DRY_RUN mock valve {state}; physical outputs blocked",
+                robolink.INSTRUCTION_COMMENT)
+        return names
+
+    def create_extrusion_layer_program(
+            self, *, name: str, points_xyz: np.ndarray, orientation_rpy_deg,
+            print_tool: str, work_frame: str, speed_mm_s: float,
+            travel_speed_mm_s: float, rounding_mm: float,
+            approach_clearance_mm: float, retreat_clearance_mm: float,
+            air_on_program: str, air_off_program: str) -> dict:
+        """Build a disposable native RoboDK Curve Follow Project for one layer.
+
+        Dense samples live inside one curve object (XYZ+IJK), not as station
+        targets. RoboDK owns interpolation, approach/retract, preferred orientation,
+        process/rapid speeds, blending, and path-boundary program events.
+        """
+        import robolink
+
+        pts = np.asarray(points_xyz, dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 3:
+            raise ValueError("extrusion path must be a finite Nx3 array")
+        if not np.isfinite(pts).all():
+            raise ValueError("extrusion path contains non-finite coordinates")
+        required = ((print_tool, "tool"), (work_frame, "frame"),
+                    (air_on_program, "program"), (air_off_program, "program"))
+        missing = [f"{kind} {value!r}" for value, kind in required
+                   if not self.item_exists_as(value, kind)]
+        if missing:
+            raise RuntimeError("missing station item(s): " + ", ".join(missing))
+
+        robot = self.robot()
+        frame = self.rdk.Item(work_frame, robolink.ITEM_TYPE_FRAME)
+        print_tcp = self.rdk.Item(print_tool, robolink.ITEM_TYPE_TOOL)
+        curve_name = name + "_Curve"
+        project_name = name + "_Settings"
+        for item_name, item_type in ((name, robolink.ITEM_TYPE_PROGRAM),
+                                     (project_name, robolink.ITEM_TYPE_MACHINING),
+                                     (curve_name, robolink.ITEM_TYPE_OBJECT)):
+            old = self.rdk.Item(item_name, item_type)
+            if old.Valid():
+                old.Delete()
+
+        orientation = self.xyzrpy_pose_T([0.0, 0.0, 0.0], orientation_rpy_deg)
+        normal = orientation[:3, 2]
+        curve_vertices = np.column_stack(
+            (pts, np.repeat(normal.reshape(1, 3), len(pts), axis=0)))
+        curve = self.rdk.AddCurve(
+            curve_vertices.tolist(), projection_type=robolink.PROJECTION_NONE)
+        if not curve.Valid():
+            raise RuntimeError("RoboDK could not create the extrusion curve")
+        curve.setName(curve_name)
+        # setParent keeps the object's identity pose, so XYZ/IJK remain local to
+        # the selected work frame instead of station/world coordinates.
+        curve.setParent(frame)
+        curve.setValue("Display", "LINEW=4 COLOR=#FF39D0BD")
+
+        project = self.rdk.AddMachiningProject(project_name, robot)
+        if not project.Valid():
+            curve.Delete()
+            raise RuntimeError("RoboDK could not create the Curve Follow Project")
+        project.setPoseFrame(frame)
+        project.setPoseTool(print_tcp)
+        project.setPose(T_to_pose(orientation))
+        project.setJoints(robot.Joints())
+        program, setup_status = project.setMachiningParameters(part=curve)
+        if not program.Valid() or setup_status < 0:
+            bounds_min = pts.min(axis=0)
+            bounds_max = pts.max(axis=0)
+            raise RuntimeError(
+                "RoboDK found no feasible start/path for the Curve Follow Project "
+                f"(status {setup_status}). Frame={work_frame!r}, tool={print_tool!r}, "
+                f"XYZ bounds=[{bounds_min[0]:.1f}..{bounds_max[0]:.1f}, "
+                f"{bounds_min[1]:.1f}..{bounds_max[1]:.1f}, "
+                f"{bounds_min[2]:.1f}..{bounds_max[2]:.1f}] mm, "
+                f"XYZRPW={[float(v) for v in orientation_rpy_deg]}. "
+                f"The failed artifacts {curve_name!r} and {project_name!r} were kept "
+                "for inspection; Reset removes them. Jog the selected TCP to the intended "
+                "path start and seed the coordinates again.")
+        program.setName(name)
+        project.setParam("Machining", {
+            "Algorithm": 0,
+            "ApproachRetractAll": 1,
+            "AutoUpdate": 0,
+            "AvoidCollisions": 0,
+            "FollowAngleOn": 0,
+            "FollowRealignOn": 0,
+            "FollowStepOn": 0,
+            "JoinCurvesTol": 0.1,
+            "PointApproach": float(approach_clearance_mm),
+            "RapidApproachRetract": 1,
+            "RotZ_Range": 0,
+            "SpeedOperation": float(speed_mm_s),
+            "SpeedRapid": float(travel_speed_mm_s),
+            "VisibleNormals": 1,
+        })
+        project.setParam("ProgEvents", {
+            "CallPathStart": air_on_program,
+            "CallPathStartOn": 1,
+            "CallPathFinish": air_off_program,
+            "CallPathFinishOn": 1,
+            "RapidSpeed": float(travel_speed_mm_s),
+            "Rounding": float(rounding_mm),
+            "RoundingOn": 1 if rounding_mm > 0 else 0,
+        })
+        project.setParam("Approach", f"NTS {float(approach_clearance_mm):.6f} 0 0")
+        project.setParam("Retract", f"NTS {float(retreat_clearance_mm):.6f} 0 0")
+        project.setParam("UpdatePath")
+        generation = project.Update(robolink.COLLISION_OFF)
+        if float(generation[3]) < 0:
+            raise RuntimeError(
+                "RoboDK Curve Follow Project generation failed: "
+                + str(generation[4] or "unspecified path problem")
+                + f". Failed artifacts {curve_name!r}, {project_name!r}, and any "
+                  f"linked {name!r} program were kept; "
+                  "Reset removes them.")
+        program = project.getLink(robolink.ITEM_TYPE_PROGRAM)
+        if not program.Valid():
+            raise RuntimeError(
+                "Curve Follow Project has no linked generated program. "
+                f"Failed artifacts {curve_name!r} and {project_name!r} were kept; "
+                "Reset removes them.")
+        program.setName(name)
+        # Curve normals constrain tool Z and the project optimizes the redundant
+        # rotation about it. This workflow exposes an exact fixed XYZRPW instead,
+        # so pin every generated motion pose to that requested rotation. Positions,
+        # interpolation, approach/retract, speeds, and events remain project-owned.
+        for index in range(program.InstructionCount()):
+            (instruction_name, instruction_type, move_type, _is_joint_target,
+             target_pose, joints) = program.Instruction(index)
+            if instruction_type != robolink.INS_TYPE_MOVE:
+                continue
+            target_T = pose_to_T(target_pose)
+            target_T[:3, :3] = orientation[:3, :3]
+            program.setInstruction(
+                index, instruction_name, instruction_type, move_type,
+                False, T_to_pose(target_T), joints)
+        artifacts = [curve_name, project_name, name]
+        return {
+            "program": name, "curve": curve_name, "project": project_name,
+            "artifacts": artifacts, "targets": [], "point_count": len(pts),
+            "setup_status": float(setup_status),
+            "project_generation_percent": float(generation[3]) * 100.0,
+        }
+
+    def cleanup_extrusion_artifacts(self, prefix: str = "TasniCylinder_") -> list[str]:
+        """Delete stale generated programs/projects/curves owned by this module."""
+        import robolink
+
+        removed: list[str] = []
+        for item_type in (robolink.ITEM_TYPE_PROGRAM, robolink.ITEM_TYPE_MACHINING,
+                          robolink.ITEM_TYPE_TARGET, robolink.ITEM_TYPE_OBJECT):
+            for item in list(self.rdk.ItemList(item_type)):
+                item_name = item.Name()
+                if item_name.startswith(prefix) and item.Valid():
+                    item.Delete()
+                    removed.append(item_name)
+        return removed
+
+    def create_inspection_target(self, *, name: str, T: np.ndarray,
+                                 inspection_tool: str, work_frame: str) -> dict:
+        """Create a derived inspection target at camera pose ``T`` (work frame).
+
+        ``T`` places the **camera** — the inspection tool's TCP — not the flange:
+        :meth:`solve_joints_for_pose` passes the tool mount to ``SolveIK``
+        explicitly, so the joints put the lens at the requested viewpoint. The
+        target is stored as a **joint** target locked to that solution, so the
+        configuration RoboDK then collision-validates is the one actually visited
+        (a cartesian target can be reached in a different, colliding IK branch).
+
+        Returns ``{"created": False, "reason": ...}`` rather than raising when the
+        pose has no IK solution: the caller is walking an ordered candidate list
+        and an unreachable viewpoint is an expected outcome, not a fault.
+        """
+        import robolink
+
+        self.use_named_tool_frame(inspection_tool, work_frame)
+        old = self.rdk.Item(name, robolink.ITEM_TYPE_TARGET)
+        if old.Valid():
+            old.Delete()
+        joints = self.solve_joints_for_pose(T, self.robot().Joints())
+        if joints is None:
+            return {"created": False, "target": name,
+                    "reason": "no IK solution places the camera at this viewpoint"}
+        self.add_target(name, np.asarray(T, dtype=float), joints)
+        return {"created": True, "target": name, "reason": ""}
+
+    def create_inspection_program(self, *, name: str, inspection_tool: str,
+                                  inspection_target: str, speed_mm_s: float) -> dict:
+        """Create the post-OFF inspection move as its own auditable program."""
+        import robolink
+
+        required = ((inspection_tool, "tool"), (inspection_target, "target"))
+        missing = [f"{kind} {value!r}" for value, kind in required
+                   if not self.item_exists_as(value, kind)]
+        if missing:
+            raise RuntimeError("missing station item(s): " + ", ".join(missing))
+        robot = self.robot()
+        tool = self.rdk.Item(inspection_tool, robolink.ITEM_TYPE_TOOL)
+        target = self.rdk.Item(inspection_target, robolink.ITEM_TYPE_TARGET)
+        old = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+        if old.Valid():
+            old.Delete()
+        program = self.rdk.AddProgram(name, robot)
+        parent = target.Parent()
+        if parent.Valid() and parent.Type() == robolink.ITEM_TYPE_FRAME:
+            program.setPoseFrame(parent)
+        program.setPoseTool(tool)
+        program.setSpeed(float(speed_mm_s))
+        program.MoveJ(target)
+        return {"program": name, "targets": [], "inspection_target": inspection_target}
+
+    def update_program(self, name: str, *, collisions: bool = True) -> dict:
+        """RoboDK program validation (instructions, time, distance, % feasible)."""
+        import robolink
+
+        program = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+        if not program.Valid():
+            raise RuntimeError(f"program {name!r} not found")
+        result = program.Update(robolink.COLLISION_ON if collisions else robolink.COLLISION_OFF)
+        return {"instructions_ok": int(result[0]), "time_s": float(result[1]),
+                "distance_mm": float(result[2]), "percent_ok": float(result[3]) * 100.0,
+                "problems": str(result[4] or "")}
+
+    def start_program(self, name: str, *, real_robot: bool) -> int:
+        """Start a named program with an explicit simulator/robot run type."""
+        import robolink
+
+        program = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+        if not program.Valid():
+            raise RuntimeError(f"program {name!r} not found")
+        program.setRunType(robolink.PROGRAM_RUN_ON_ROBOT if real_robot
+                           else robolink.PROGRAM_RUN_ON_SIMULATOR)
+        return int(program.RunCode())
+
+    def program_busy(self, name: str) -> bool:
+        import robolink
+
+        return bool(self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM).Busy())
+
+    def stop_program(self, name: str) -> None:
+        import robolink
+
+        program = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+        if program.Valid():
+            program.Stop()
+
+    def run_station_program(self, name: str, *, real_robot: bool) -> None:
+        """Run a station program to completion with explicit run type."""
+        started = self.start_program(name, real_robot=real_robot)
+        if started < 0:
+            raise RuntimeError(f"program {name!r} could not start")
+        while self.program_busy(name):
+            import time
+            time.sleep(0.05)
 
     def set_tool_pose(self, tool_name: str, T: np.ndarray) -> None:
         import robolink

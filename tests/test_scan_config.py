@@ -32,9 +32,20 @@ def test_defaults_present_and_sane():
     for k in ("pose_count", "cone_half_angle_deg", "roll_max_deg",
               "distance_jitter", "look_distance_mm"):
         assert hasattr(s, k)
-    assert s.collision_filter_hard_fail is False
+    # §10: a soft collision bypass is not appropriate for a production target
+    # set, so scan defaults to the STRICT collision gate (unlike calibration's
+    # collision_filter_hard_fail, which stays soft — this is scan-only).
+    assert s.collision_filter_hard_fail is True
     print("[defaults] scan present; prefix", s.target_prefix,
           "voxel", s.voxel_size_m, "ideal", s.ideal_distance_mm)
+
+
+def test_collision_hard_fail_is_default():
+    """Dedicated regression for the Task 8 default flip: a fresh ScanConfig()
+    must refuse (not silently bypass) a noisy collision map unless the operator
+    explicitly opts back into the soft path."""
+    assert ScanConfig().collision_filter_hard_fail is True
+    print("[defaults] scan collision_filter_hard_fail defaults to True (hard fail)")
 
 
 def test_json_override_merges_only_targeted_fields():
@@ -51,6 +62,43 @@ def test_json_override_merges_only_targeted_fields():
     print("[merge] scan overrides applied; rest defaulted")
 
 
+def test_compact_guard_uv_is_satisfiable_at_the_recommended_standoff():
+    """Task 18 review, Critical 2: planner.py's plan_scan frames the surface at
+    a standoff where it spans dim/frame_margin of each image axis (the fit-to-
+    frame standoff times frame_margin's comfortable border), leaving a PER-SIDE
+    normalized margin of (1 - 1/frame_margin) / 2 -- split between the two
+    edges. classify_compact's compact_guard_uv gate then demands every raw
+    corner sit at least compact_guard_uv inside the frame on EVERY side. If
+    compact_guard_uv exceeds that per-side margin, EVERY framed-limited compact
+    lock taken at the system's own recommended ideal_distance_mm fails
+    guard_ok -- not because the operator aimed badly, but because the two
+    constants are mutually unsatisfiable. And silently: the distance/framed
+    lamps still read green, nothing tells the operator to back off.
+
+    Required invariant, derived directly from that per-side margin:
+
+        (1 - 1/frame_margin) / 2 >= compact_guard_uv
+        1 - 1/frame_margin       >= 2 * compact_guard_uv
+        1/frame_margin           <= 1 - 2 * compact_guard_uv
+        frame_margin              >= 1 / (1 - 2 * compact_guard_uv)
+
+    Asserted directly from the CONFIG DEFAULTS (not a synthetic scene) so a
+    future change to either constant fails this test loudly instead of
+    silently making every compact lock unsatisfiable -- which is exactly what
+    happened: compact_guard_uv was 0.06 against frame_margin's 1.12, requiring
+    frame_margin >= 1 / (1 - 0.12) = 1.13636..., and 1.12 < 1.13636 -- failed
+    by ~1.5% of a percentage point on every single surface.
+    """
+    s = ScanConfig()
+    required_frame_margin = 1.0 / (1.0 - 2.0 * s.compact_guard_uv)
+    assert s.frame_margin >= required_frame_margin, (
+        f"frame_margin={s.frame_margin} must be >= {required_frame_margin:.6f} "
+        f"(1 / (1 - 2*compact_guard_uv), compact_guard_uv={s.compact_guard_uv}) "
+        "or every framed-limited compact lock at the recommended standoff fails guard_ok")
+    print(f"[guard invariant] frame_margin={s.frame_margin} >= required "
+          f"{required_frame_margin:.4f} (compact_guard_uv={s.compact_guard_uv})")
+
+
 def test_unknown_scan_key_rejected():
     with tempfile.TemporaryDirectory() as t:
         p = Path(t) / "tasni.config.json"
@@ -65,6 +113,8 @@ def test_unknown_scan_key_rejected():
 
 if __name__ == "__main__":
     test_defaults_present_and_sane()
+    test_collision_hard_fail_is_default()
     test_json_override_merges_only_targeted_fields()
+    test_compact_guard_uv_is_satisfiable_at_the_recommended_standoff()
     test_unknown_scan_key_rejected()
     print("\nScanConfig tests passed.")

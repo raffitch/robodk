@@ -1,6 +1,7 @@
 import type { ComponentType } from "react";
 import Calibration from "../pages/Calibration";
 import Scan from "../pages/Scan";
+import Extrusion from "../pages/Extrusion";
 
 // Frontend half of the module system: map a backend module id (from
 // /api/modules) to the React page that drives it. Adding a workflow = a backend
@@ -9,4 +10,5 @@ import Scan from "../pages/Scan";
 export const MODULE_PAGES: Record<string, ComponentType> = {
   calibration: Calibration,
   scan: Scan,
+  extrusion: Extrusion,
 };

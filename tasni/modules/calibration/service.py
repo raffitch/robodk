@@ -425,18 +425,21 @@ def generate_calibration_targets(services) -> dict:
     col_checked = False
     collision_filter_bypassed = False   # retained for the API/UI shape; never set now
     reach_joints: list = [None] * n_reach
+    pair_examples: list[str] = []
     if ccfg.collision_filter:
         # Baseline-relative screen: drops only poses that introduce a NEW collision
         # beyond the constant ones present at the safe seed (robot-base↔pedestal, each
         # tool↔its wrist, a parked axis↔wall). Obstacle pairs enabled so a tool
         # entering the board pedestal is seen; the path is swept so a mid-move bump is
         # too. A genuinely-colliding pose is ALWAYS dropped — never shipped.
-        mask, col_checked, jts = rdk.screen_collisions(
+        mask, col_checked, jts, col_details = rdk.screen_collisions(
             [T for _, T in reachable], guard_skip=guard_skip,
             obstacle_pairs=ccfg.collision_obstacle_pairs,
             ignore_objects=ccfg.collision_ignore_objects,
+            ignore_pairs=ccfg.collision_ignore_pairs,
             baseline_relative=ccfg.collision_baseline_relative,
-            path_samples=ccfg.collision_path_samples)
+            path_samples=ccfg.collision_path_samples,
+            return_details=True)
         kept = [k for k in range(n_reach) if mask[k]]
         if col_checked:
             n_collide = n_reach - len(kept)
@@ -446,6 +449,20 @@ def generate_calibration_targets(services) -> dict:
             f"collision screen: checking {'ACTIVE' if col_checked else 'unavailable'}; "
             f"swept {n_reach} reachable pose(s), {n_collide} introduced a new "
             f"collision and were dropped"}))
+        if col_checked and n_collide:
+            for d in col_details.get("poses", []):
+                if d.get("collides") and d.get("pairs"):
+                    for p in d["pairs"]:
+                        if p not in pair_examples:
+                            pair_examples.append(p)
+                        if len(pair_examples) >= 8:
+                            break
+                if len(pair_examples) >= 8:
+                    break
+            if pair_examples:
+                services.bus.publish(JobEvent("log", {"message":
+                    "collision pairs causing dropped targets: "
+                    + "; ".join(pair_examples)}))
         if not col_checked:
             # The station/build can't evaluate collisions (no collision map). Nothing
             # was dropped — proceed with reachable poses (inspect + dry-run), unless a
@@ -606,6 +623,7 @@ def generate_calibration_targets(services) -> dict:
             "gate": reading.to_dict(),
             "candidates_reachable": n_reach, "candidates_total": len(candidates),
             "collisions_checked": col_checked, "candidates_collided": n_collide,
+            "collision_pairs": pair_examples,
             "collision_filter_enabled": ccfg.collision_filter,
             "collision_filter_bypassed": collision_filter_bypassed,
             "visibility_checked": vis_checked,

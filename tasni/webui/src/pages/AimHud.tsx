@@ -33,6 +33,12 @@ export interface GateReading {
   tilt_b_deg?: number | null;
   tilt_c_deg?: number | null;
   live?: boolean;
+  // True only when RoboDK's driver is connected AND actively mirroring the physical
+  // arm's pose right now. When false, the X/Y jog guidance below (move_cam[0:2],
+  // JogBar) was computed from a stale/model pose — real, but not real-time — and the
+  // HUD must say so instead of presenting it as live. Absent on older payloads, which
+  // means "assume live" (identical to `true`) so nothing degrades by default.
+  pose_live?: boolean;
   error?: string;
   // Survey fields (full-frame surface measurement — scan module only)
   fully_framed?: boolean | null;
@@ -46,6 +52,16 @@ export interface GateReading {
   crop_size_mm?: [number, number] | null;        // bounded region for an oversized plane
   surface_mode?: "full" | "crop" | null;
   measurement_ts?: number | null;
+  rect_stable_frames?: number;
+  center_latched?: boolean;
+  // Locked-gate provenance (workframe survey, scan module only): how the locked
+  // outline_uv boundary was established. Absent when the surface auto-overran the
+  // camera view without an explicit operator region declaration — in that case the
+  // backend instead appends to `warnings` and the UI must not show a provenance
+  // chip (there is nothing honest to claim).
+  boundary_provenance?: string;
+  survey?: Record<string, unknown>;
+  warnings?: string[];
 }
 
 const W = 1280, H = 720, CX = W / 2, CY = H / 2;
@@ -54,53 +70,18 @@ const DIM = "rgba(125,235,160,.55)", INK = "rgba(6,11,8,.64)";
 const MONO = "ui-monospace, Consolas, monospace";
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const r = (n: number) => Math.round(n);
+const spreadSample = <T,>(items: T[], max: number) => {
+  if (items.length <= max) return items;
+  const out: T[] = [];
+  const step = (items.length - 1) / (max - 1);
+  for (let i = 0; i < max; i++) out.push(items[Math.round(i * step)]);
+  return out;
+};
 
-function projectivePoint(
-  quad: Array<[number, number]>, x: number, y: number,
-): [number, number] {
-  const [p0, p1, p2, p3] = quad;
-  const dx1 = p1[0] - p2[0], dx2 = p3[0] - p2[0];
-  const dy1 = p1[1] - p2[1], dy2 = p3[1] - p2[1];
-  const dx3 = p0[0] - p1[0] + p2[0] - p3[0];
-  const dy3 = p0[1] - p1[1] + p2[1] - p3[1];
-  const det = dx1 * dy2 - dx2 * dy1;
-  if (Math.abs(det) < 1e-12 || (Math.abs(dx3) < 1e-12 && Math.abs(dy3) < 1e-12)) {
-    return [
-      p0[0] + x * (p1[0] - p0[0]) + y * (p3[0] - p0[0]),
-      p0[1] + x * (p1[1] - p0[1]) + y * (p3[1] - p0[1]),
-    ];
-  }
-  const g = (dx3 * dy2 - dx2 * dy3) / det;
-  const h = (dx1 * dy3 - dx3 * dy1) / det;
-  const a = p1[0] - p0[0] + g * p1[0];
-  const b = p3[0] - p0[0] + h * p3[0];
-  const d = p1[1] - p0[1] + g * p1[1];
-  const e = p3[1] - p0[1] + h * p3[1];
-  const den = g * x + h * y + 1;
-  return [(a * x + b * y + p0[0]) / den, (d * x + e * y + p0[1]) / den];
-}
-
-function cropQuad(
-  source: Array<[number, number]>,
-  crop: [number, number],
-  rectangleSize: [number, number],
-): Array<[number, number]> {
-  const edge0IsLong = rectangleSize[0] >= rectangleSize[1];
-  const crop0 = edge0IsLong ? crop[0] : crop[1];
-  const crop1 = edge0IsLong ? crop[1] : crop[0];
-  const sx = Math.min(1, crop0 / Math.max(rectangleSize[0], 1e-9));
-  const sy = Math.min(1, crop1 / Math.max(rectangleSize[1], 1e-9));
-  const x0 = (1 - sx) / 2, x1 = 1 - x0;
-  const y0 = (1 - sy) / 2, y1 = 1 - y0;
-  return [
-    projectivePoint(source, x0, y0),
-    projectivePoint(source, x1, y0),
-    projectivePoint(source, x1, y1),
-    projectivePoint(source, x0, y1),
-  ];
-}
-
-function Hud({ gate, mode = "scan" }: { gate: GateReading | null; mode?: "calibration" | "scan" }) {
+function Hud({ gate, mode = "scan", coverageDots = null, liveBoundary = null }:
+  { gate: GateReading | null; mode?: "calibration" | "scan";
+    coverageDots?: Array<[number, number]> | null;
+    liveBoundary?: { outline: Array<[number, number]>; overruns: boolean } | null }) {
   const detected = !!gate?.detected;
   const locked = !!gate?.ok;
   const main = locked ? OK : detected ? WARN : BAD;
@@ -113,7 +94,7 @@ function Hud({ gate, mode = "scan" }: { gate: GateReading | null; mode?: "calibr
     && !!gate.gates.detected && !!gate.gates.distance && !!gate.gates.angle
     && !!gate.gates.center && !!gate.gates.coverage;
   const status = gate?.error ? "NO SIGNAL"
-    : waitingForScanCheck ? "DEPTH STARTING"
+    : waitingForScanCheck ? "AIMING"
     : calibrationGeometryReady && !gate?.gates?.stable ? "HOLD STEADY"
     : locked ? (mode === "scan" ? "IN RANGE" : "● LOCK")
     : detected ? "AIMING" : "SEARCHING";
@@ -139,42 +120,64 @@ function Hud({ gate, mode = "scan" }: { gate: GateReading | null; mode?: "calibr
       </g>
 
       {/* detected-surface dots over the RGB — where depth actually landed on the plane.
-          Sparse gaps here are real coverage holes (e.g. an unseen far edge). Drawn
-          behind the outline/grid; capped defensively so the SVG stays light. */}
-      {mode === "scan" && gate?.points_uv && gate.points_uv.length > 0 && (
-        <g fill="#ff453a" opacity={0.62}>
-          {gate.points_uv.slice(0, 800).map(([u, v], i) => (
-            <circle key={i} cx={u * W} cy={v * H} r={2.4} />
-          ))}
-        </g>
-      )}
+          Prefer the accumulated coverage (union of the last N frames) so per-frame
+          RealSense dropouts fill in and a remaining gap is a TRUE hole; fall back to
+          the single live frame. Capped defensively so the SVG stays light. */}
+      {mode === "scan" && (() => {
+        const dots = (coverageDots && coverageDots.length)
+          ? coverageDots : gate?.points_uv;
+        if (!dots || dots.length === 0) return null;
+        const renderDots = spreadSample(dots, 2400);
+        return (
+          <g fill="#ff453a" opacity={0.6}>
+            {renderDots.map(([u, v], i) => (
+              <circle key={i} cx={u * W} cy={v * H} r={2.1} />
+            ))}
+          </g>
+        );
+      })()}
 
-      {/* survey surface overlay (outline + metric grid) — behind all other HUD elements */}
-      {mode === "scan" && gate?.outline_uv && gate.outline_uv.length >= 3 && (() => {
-        const source = gate.outline_uv!;
-        const selected = gate.fully_framed === false && gate.crop_size_mm
-          && gate.rectangle_size_mm && source.length === 4
-          ? cropQuad(source, gate.crop_size_mm, gate.rectangle_size_mm)
-          : source;
-        const pts = source.map(([u, v]) =>
+      {/* survey surface overlay (work region + metric grid) — behind all other HUD
+          elements. outline_uv IS the final work region already: the generic reticle-
+          centred square when the surface overruns the view, else the trimmed board
+          rectangle. Drawn directly (no client-side cropping). visible_outline_uv is
+          the raw depth silhouette, kept dashed as a diagnostic. */}
+      {mode === "scan" && (() => {
+        // The blue work rectangle. Prefer the LIVE COLOR boundary (segmented from the
+        // color frame at video rate — reliable + real-time); fall back to the depth-
+        // fitted outline (locked snapshot, or when color abstains on a low-contrast
+        // scene). The depth silhouette + metric grid are depth diagnostics, shown only
+        // with the depth box. Once a locked (live: false) gate has arrived, the color
+        // boundary must never win even if the parent hasn't cleared its liveBoundary
+        // prop yet — the lock WS event can land before the /surface/lock HTTP response
+        // resolves (which is what the parent gates liveBoundary on), so without this
+        // check there is a narrow window where a stale color rectangle would render
+        // over the just-locked authoritative outline_uv.
+        const usingColor = !!(liveBoundary && liveBoundary.outline.length >= 3
+          && gate?.live !== false);
+        const region = usingColor ? liveBoundary!.outline
+          : (gate?.outline_uv && gate.outline_uv.length >= 3 ? gate.outline_uv : null);
+        if (!region) return null;
+        const regionPts = region.map(([u, v]) =>
           `${(u * W).toFixed(1)},${(v * H).toFixed(1)}`).join(" ");
-        const selectedPts = selected.map(([u, v]) =>
-          `${(u * W).toFixed(1)},${(v * H).toFixed(1)}`).join(" ");
-        const visiblePts = gate.visible_outline_uv?.map(([u, v]) =>
-          `${(u * W).toFixed(1)},${(v * H).toFixed(1)}`).join(" ");
-        const col = gate.fully_framed == null ? DIM
+        const visiblePts = (!usingColor && gate?.visible_outline_uv)
+          ? gate.visible_outline_uv.map(([u, v]) =>
+              `${(u * W).toFixed(1)},${(v * H).toFixed(1)}`).join(" ") : null;
+        const col = gate?.fully_framed == null ? DIM
           : gate.fully_framed ? OK : WARN;
+        // A color boundary that overruns the view -> dashed (its rectangle is the frame,
+        // not the true object extent) so the operator knows to back off / re-centre.
+        const dash = usingColor && liveBoundary!.overruns ? "10 8" : undefined;
         return (
           <>
             {visiblePts && (
               <polygon points={visiblePts} fill="none" stroke={DIM} strokeWidth={1.5}
                        strokeDasharray="4 7" opacity={0.45} />
             )}
-            <polygon points={pts} fill="none" stroke={col} strokeWidth={2.5}
-                     strokeDasharray="10 6" opacity={0.8} />
-            <polygon points={selectedPts} fill="rgba(53,194,255,.16)"
-                     stroke="#35c2ff" strokeWidth={4} opacity={0.95} />
-            {gate.grid_uv && gate.grid_uv.map(([[u1, v1], [u2, v2]], i) => (
+            <polygon points={regionPts} fill="rgba(53,194,255,.16)"
+                     stroke="#35c2ff" strokeWidth={4} strokeDasharray={dash}
+                     opacity={0.95} />
+            {!usingColor && gate?.grid_uv && gate.grid_uv.map(([[u1, v1], [u2, v2]], i) => (
               <line key={i} x1={u1 * W} y1={v1 * H} x2={u2 * W} y2={v2 * H}
                     stroke={col} strokeWidth={1} opacity={0.35} />
             ))}
@@ -200,10 +203,10 @@ function Hud({ gate, mode = "scan" }: { gate: GateReading | null; mode?: "calibr
       {/* readouts */}
       {waitingForScanCheck && (
         <>
-          <PendingReadout y={104} label="RANGE" text="WAITING FOR DEPTH" />
-          <PendingReadout y={200} label="TILT" text="WAITING FOR DEPTH" />
-          <PendingReadout y={296} label="LEVEL" text="WAITING FOR DEPTH" tall />
-          <PendingReadout y={440} label="FRAMED" text="FINAL SNAPSHOT" />
+          <PendingReadout y={104} label="RANGE" text="WAITING FOR SURFACE" />
+          <PendingReadout y={200} label="TILT" text="WAITING FOR SURFACE" />
+          <PendingReadout y={296} label="LEVEL" text="WAITING FOR SURFACE" tall />
+          <PendingReadout y={440} label="FRAMED" text="WAITING FOR SURFACE" />
         </>
       )}
       {detected && gate && (
@@ -244,24 +247,53 @@ function Hud({ gate, mode = "scan" }: { gate: GateReading | null; mode?: "calibr
         <text x={48} y={120} fontSize={28} fill={BAD}>{gate.error}</text>
       )}
 
-      {/* jog guidance (camera/TOOL frame) */}
+      {/* jog guidance (camera/TOOL frame). X/Y (and this readout) are only as fresh as
+          RoboDK's mirrored pose: when the driver isn't connected/monitoring
+          (pose_live === false) the arm can move without this reading changing, so we
+          degrade to the same "not real-time" visual language as the other pending
+          readouts instead of presenting stale numbers as live. `pose_live` absent or
+          `true` renders exactly as before. */}
       {detected && gate?.move_cam && (
-        <JogBar move={gate.move_cam} ctol={gate.center_tol_mm ?? 40}
-                dtol={gate.distance_tol_mm ?? 80} />
+        gate.pose_live === false ? (
+          <>
+            <PendingReadout x={40} y={H - 116} width={W - 80} height={96}
+              label="JOG — TOOL frame" text="DRIVER NOT MONITORING — X/Y NOT LIVE" />
+            <PoseModelChip x={40} y={H - 164} />
+          </>
+        ) : (
+          <JogBar move={gate.move_cam} ctol={gate.center_tol_mm ?? 40}
+                  dtol={gate.distance_tol_mm ?? 80} />
+        )
       )}
     </svg>
   );
 }
 
-function PendingReadout({ y, label, text, tall = false }:
-  { y: number; label: string; text: string; tall?: boolean }) {
+function PendingReadout({ y, label, text, tall = false, x = 26, width = 384, height }:
+  { y: number; label: string; text: string; tall?: boolean;
+    x?: number; width?: number; height?: number }) {
+  const h = height ?? (tall ? 132 : 84);
   return (
     <g>
-      <rect x={26} y={y} width={384} height={tall ? 132 : 84} rx={10} fill={INK} />
-      <text x={44} y={y + 30} fontSize={23} fill={DIM}>{label}</text>
-      <text x={44} y={y + 70} fontSize={27} fontWeight={700} fill={DIM}>
+      <rect x={x} y={y} width={width} height={h} rx={10} fill={INK} />
+      <text x={x + 18} y={y + 30} fontSize={23} fill={DIM}>{label}</text>
+      <text x={x + 18} y={y + 70} fontSize={27} fontWeight={700} fill={DIM}>
         {text}
       </text>
+    </g>
+  );
+}
+
+function PoseModelChip({ x, y }: { x: number; y: number }) {
+  // Amber "not real-time" badge for the pose-derived readouts (see `pose_live` on
+  // GateReading). A native <title> gives it a hover tooltip without any extra UI.
+  const label = "POSE: MODEL";
+  const w = 196;
+  return (
+    <g>
+      <title>driver not monitoring — X/Y guidance is not real-time</title>
+      <rect x={x} y={y} width={w} height={34} rx={8} fill={INK} stroke={WARN} strokeWidth={2} />
+      <text x={x + 14} y={y + 23} fontSize={18} fontWeight={800} fill={WARN}>{label}</text>
     </g>
   );
 }
@@ -367,7 +399,9 @@ function JogBar({ move, ctol, dtol }:
 
 // -- error boundary: never let a bad frame blank the page; self-heal next frame.
 export default class AimHud extends Component<
-  { gate: GateReading | null; mode?: "calibration" | "scan" },
+  { gate: GateReading | null; mode?: "calibration" | "scan";
+    coverageDots?: Array<[number, number]> | null;
+    liveBoundary?: { outline: Array<[number, number]>; overruns: boolean } | null },
   { err: boolean }
 > {
   state = { err: false };
@@ -377,6 +411,8 @@ export default class AimHud extends Component<
   }
   render(): ReactNode {
     if (this.state.err) return null;
-    return <Hud gate={this.props.gate} mode={this.props.mode} />;
+    return <Hud gate={this.props.gate} mode={this.props.mode}
+                coverageDots={this.props.coverageDots}
+                liveBoundary={this.props.liveBoundary} />;
   }
 }

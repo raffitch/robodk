@@ -299,6 +299,11 @@ class CalibrationConfig(_Model):
     # Station objects excluded from calibration collision checking. WallAll is a
     # visual envelope in this cell, not a physical obstacle the robot can hit.
     collision_ignore_objects: list[str] = ["WallAll"]
+    # Exact collision pairs the operator has marked as modelling artifacts from the
+    # Tasni UI. Format matches RdkIO.collision_pairs(), e.g.
+    # "WallAll ↔ KUKA KR150 R2700:L2". These are disabled after RoboDK rebuilds the
+    # collision map, so Recheck/Create targets do not require closing the app.
+    collision_ignore_pairs: list[str] = []
     # Baseline-relative screening: a real cell reports many CONSTANT collisions even
     # at the safe pose the operator aimed from — the robot base overlapping a
     # pedestal, each flange tool touching the wrist it is bolted to, a parked
@@ -358,9 +363,17 @@ class ScanConfig(_Model):
     # The operator jogs the camera to look down at the surface from a neutral
     # standoff; these bands decide when the HUD lamps go green (all green ->
     # Create targets). Distance is the median depth of a central image patch.
-    ideal_distance_mm: float = 500.0    # target camera<->surface standoff
-    distance_tol_mm: float = 150.0      # +/- band around ideal_distance_mm
-    max_tilt_deg: float = 35.0          # surface normal may be this far off the optical axis
+    ideal_distance_mm: float = 500.0    # fallback camera<->surface standoff
+    # Widened 50 -> 150 on 2026-08-13, justified by that day's cell characterization:
+    # plane RMS varies only ~0.93-1.12 mm across a +-150 mm window around a typical
+    # ideal standoff, so a +-50 mm gate was enforcing a precision that buys nothing
+    # measurable while making a hand-jogged robot painful to aim and — the reason it
+    # surfaced — making it IMPOSSIBLE to trade frame-fill for edge-measurement margin.
+    # At the 412 mm ideal for an A3 the old band topped out at 462 mm, where the sheet
+    # still fills 88% of the frame height. Framing itself is gated separately (FRAMED /
+    # the compact guard band), so this only relaxes the standoff, never the geometry.
+    distance_tol_mm: float = 150.0       # +/- band around the live planned standoff
+    max_tilt_deg: float = 6.0           # surface normal must be close to fronto-parallel
     center_patch_frac: float = 0.25     # central image fraction sampled for depth/normal
     min_valid_depth_frac: float = 0.5   # >= this fraction of the patch must have valid depth
 
@@ -385,10 +398,45 @@ class ScanConfig(_Model):
     # timeout for a depth-bearing grab must be generous or poses fail/skip. Color-only
     # grabs/streaming keep the shorter ``camera.timeout_s``.
     grab_timeout_s: float = 25.0
+    surface_measure_frames: int = 5      # depth frames fused for one frozen surface measurement
     # HUD jog hints are in the camera optical frame (X right, Y down, Z forward).
     jog_invert_x: bool = False
     jog_invert_y: bool = False
     jog_invert_z: bool = False
+
+    # -- live COLOR work boundary (host-side, every video frame) --------------
+    # RealSense depth is noisy on low-texture objects, so the depth-fitted rectangle
+    # flickers + lags (1 Hz telemetry + the anti-jitter freeze). The object's outline is
+    # crisp in the COLOR frame the host already decodes at video rate, so we segment it
+    # there (reticle-seeded, classical CV) and draw THAT as the live blue rectangle — it
+    # tracks the object in real time, independent of depth. A visual aid only; the
+    # authoritative 3D work rectangle is still measured from depth at Lock.
+    color_boundary_enabled: bool = True
+    color_boundary_min_color_dist: float = 14.0  # min Lab object<->table colour distance to trust
+    # Hybrid work-surface extent (cell evidence 2026-08-13): the plane comes from
+    # depth, the EDGES from vision, because stereo depth stops ~20 mm short at the
+    # rim of a raised object (no texture to match across a 630 mm cliff) while the
+    # colour image sees that rim crisply. Vision is corroborated against the depth
+    # extent before it is trusted, and the check is DIRECTIONAL because depth can
+    # only ever under-reach:
+    boundary_trust_envelope_mm: float = 60.0  # vision may exceed depth by at most this
+    boundary_shrink_tol_mm: float = 5.0       # ...and may fall short of it by at most this
+    boundary_center_tol_mm: float = 30.0      # ...and its centre may shift laterally by at most this
+    color_boundary_seg_width: int = 480          # downscale width for the segmentation (speed)
+
+    # -- learned (SAM) work boundary for low-contrast scenes -------------------
+    # The classical colour layer abstains on genuinely low-contrast scenes (measured: a
+    # green mat on a gray table is ~5 Lab units apart, so no threshold isolates it). A
+    # point-prompted model (EdgeSAM/MobileSAM ONNX, host-side) segments by object-ness and
+    # nails those. Runs in a background thread so the ~450 ms/frame inference never hitches
+    # the video. Weights are NOT vendored — fetch with `tools/download_sam.py` (see
+    # models/README.md). LICENSE: EdgeSAM = S-Lab non-commercial; MobileSAM = Apache-2.0.
+    boundary_engine: str = "sam_then_color"   # "color" | "sam" | "sam_then_color" (SAM, colour fallback)
+    sam_model_dir: str = "models"             # dir holding the encoder/decoder ONNX
+    sam_encoder_file: str = "edge_sam_encoder.onnx"
+    sam_decoder_file: str = "edge_sam_decoder.onnx"
+    sam_min_score: float = 0.80               # abstain below this IoU/stability score
+    sam_max_fill_frac: float = 0.92           # a mask filling more than this is untrusted (overrun/fail)
 
     # -- pose generation (reuses the calibration cone+roll generator) -------
     # Orbit the gated standoff seed in a cone so the surface stays in view, with
@@ -404,27 +452,166 @@ class ScanConfig(_Model):
     # Old knobs (cone_half_angle_deg, pose_count, voxel_size_m) remain as fallbacks.
     accurate_min_mm: float = 300.0       # near edge of D435i accurate depth band
     accurate_max_mm: float = 800.0       # far edge; beyond -> reference mode (no tour/mesh)
-    frame_margin: float = 1.3            # surface must fit FOV with this margin
+    frame_margin: float = 1.12           # frame the surface with a comfortable border.
+    # The recommended aiming standoff is frame_margin * the fit-to-frame standoff, so it
+    # must leave enough border that the object stays INSIDE the view at the target — at
+    # 1.05 the aim point sat right on the full/crop boundary, so moving to it tipped the
+    # object into overrun and the target collapsed to accurate_min. 1.12 keeps ~12%
+    # border (the object corner at ~0.446 of the half-frame vs the 0.48 crop line) so
+    # "distance-green" and "framed-green" hold at the same pose. Still closer = better
+    # depth resolution, so keep it modest.
     survey_max_tilt_deg: float = 6.0     # survey squareness gate (tighter than max_tilt_deg)
     center_tol_mm: float = 30.0          # finite-platform centroid offset allowed
     edge_align_tol_deg: float = 5.0      # finite-platform edge yaw allowed
-    voxel_k: float = 0.008               # voxel_size_m = standoff_mm * voxel_k, clamped
-    voxel_min_m: float = 0.002           # finest voxel (small / close surfaces)
-    voxel_max_m: float = 0.006           # coarsest voxel
+    voxel_k: float = 0.003               # voxel_size_m = standoff_mm * voxel_k, clamped
+    voxel_min_m: float = 0.001           # finest voxel (small / close surfaces)
+    voxel_max_m: float = 0.002           # coarsest voxel
     surface_type: str = "flat"           # "flat" | "raised" → cone/count preset
     flat_cone_deg: float = 18.0          # cone half-angle for flat surfaces
-    flat_views: int = 8                  # view count for flat surfaces
+    flat_views: int = 12                 # view count for flat surfaces
     raised_cone_deg: float = 38.0        # cone half-angle for raised objects
     raised_views: int = 13               # view count for raised objects
+    boundary_views: int = 4              # extra edge/oblique views when the platform is fully framed
+    boundary_cone_extra_deg: float = 8.0 # widen framed scans a little for boundary evidence
+    boundary_aim_edge_fraction: float = 0.30  # 3x3 frame aim grid inset for boundary-biased views
     min_surface_coverage: float = 0.85   # warn if the chosen views tile < this fraction
                                          # of the surface footprint grid (a missed region)
+    surface_coverage_hard_fail: bool = True  # refuse target sets that cannot tile the surface
     grid_target_px: int = 64             # desired on-screen grid cell (px) for live overlay
+    live_aim_smoothing_alpha: float = 0.35  # EMA for live HUD numbers/rectangle; lock remains raw
+    live_aim_reset_distance_mm: float = 120.0  # reset smoothing when the camera truly moved
+    live_aim_reset_center_mm: float = 80.0
+    live_aim_reset_outline_uv: float = 0.20
+    live_aim_distance_hysteresis_mm: float = 20.0
+    live_aim_center_hysteresis_mm: float = 80.0
+    live_aim_angle_hysteresis_deg: float = 1.0
+    live_aim_edge_hysteresis_deg: float = 10.0
+    edge_gate_min_aspect: float = 1.80  # below this yaw edge is advisory; it is too ambiguous for lock
+    live_rect_latch_frames: int = 3      # stable full-rectangle frames before X/Y is treated as locked
+    live_rect_latch_outline_uv: float = 0.04  # max mean normalized corner motion for a static rectangle
+    # Robot-pose HOLD: while the arm is parked, every pose-derived HUD readout
+    # (X/Y/Z + tilt A/B/C + the rectangle) must stay constant — per-frame RealSense
+    # plane-fit noise otherwise makes a still robot look like it is jittering. The
+    # live gate holds the previous reading until the camera pose moves beyond these
+    # tolerances (RoboDK mirrors the physical arm, so this is the true motion signal).
+    # These sit just above the live-driver's parked position-stream dither (the model
+    # pose mirrors the arm, so it never reads perfectly still) yet well below a real
+    # jog; combined with the release debounce below, a parked arm stays frozen.
+    live_hold_pose_trans_mm: float = 1.2   # camera translation that releases the hold
+    live_hold_pose_rot_deg: float = 0.3    # camera rotation that releases the hold
+    live_hold_settle_frames: int = 5       # still frames to average into the rectangle
+    #                                        before the hold ENGAGES (avoids freezing a
+    #                                        half-settled fit right after a move)
+    live_hold_release_frames: int = 2      # consecutive "moved" frames before the hold
+    #                                        RELEASES — without this a single noisy frame
+    #                                        drops the freeze, re-latches a fresh noisy
+    #                                        sample, and the readout visibly jumps
+    live_frame_margin_uv: float = 0.02     # fitted-rectangle corners this far inside the
+    #                                        frame => the object is bounded in view (draw
+    #                                        the rectangle), not an overrun (generic square)
+    # Compact-eligibility classifier (two-path plan §6)
+    # Task 18 review, Critical 2: must satisfy frame_margin >= 1/(1 - 2*compact_guard_uv)
+    # (see tests/test_scan_config.py's dedicated invariant test for the derivation) or
+    # every framed-limited compact lock taken at the system's own recommended standoff
+    # fails guard_ok regardless of aim. At frame_margin=1.12 the per-side margin the
+    # planner leaves is (1 - 1/1.12)/2 = 0.0536 -- 0.06 violated it (needed <= 0.0536);
+    # 0.04 leaves real slack (required frame_margin drops to 1/(1-0.08) = 1.0870, well
+    # under the actual 1.12) without touching frame_margin, which was tuned separately
+    # (see its own comment) for a different problem.
+    compact_guard_uv: float = 0.04        # raw corners must sit this far inside the frame
+    compact_center_tol_uv: float = 0.15   # outline centroid distance from image center
+    compact_identity_frames: int = 5      # consecutive frames the rectangle must agree
+    compact_identity_tol_uv: float = 0.04 # max corner drift across those frames
+
+    # -- five-position survey: center + four-corner (two-path plan §7) ------
+    # Used when the platform is too large to fit in one camera view: the
+    # operator drives to the centre, then each of the four corners in turn.
+    survey_capture_max_age_s: float = 10.0   # a capture must be used within this long
+    survey_coplanar_warn_mm: float = 3.0     # worst per-position plane RMS -> flag "non_flat"
+    survey_coplanar_reject_mm: float = 8.0   # worst per-position plane RMS -> refuse the survey
+    survey_edge_band_mm: float = 25.0        # perpendicular band (mm) around each corner-to-
+                                              # corner segment a candidate edge point must fall in
+    survey_rect_discrepancy_mm: float = 6.0  # unconstrained-vs-constrained corner gate. NOTE:
+                                              # this only detects ANGULAR cross-capture
+                                              # inconsistency, never a pure translational
+                                              # registration error -- see rect_fit.py docstring.
+    survey_corner_agreement_mm: float = 8.0  # surveyed-corner-vs-fitted-rectangle gate; THIS is
+                                              # the one that catches translational registration
+                                              # error (rect_fit.RectangleSolution.corner_agreement_mm)
+    survey_min_edge_points: int = 20         # min pooled points per edge after band filtering
+    # Per-capture PLANE-INLIER band (mm, camera frame) for the coplanarity check's raw
+    # input (Task 13 review Finding 1): a corner capture aims at a table corner, so a
+    # large fraction of the frame legitimately looks past the table's two edges at
+    # background (floor, fixtures) far off the work plane. fit_global_plane re-derives
+    # its OWN plane via an internal RANSAC over whatever points it is given -- with a
+    # majority-background frame that RANSAC locks onto the BACKGROUND, and the reported
+    # per-set RMS is really the minority table points' residual against that WRONG
+    # plane: measured 384 mm on a synthetic table with a floor 750 mm below (73.75%
+    # floor), against the 8 mm reject gate above -- every real corner capture would
+    # fail as "not coplanar." This band re-selects inliers around the plane
+    # survey_surface already fit (an independent detector, via its own RANSAC) for
+    # that exact frame -- matches its own default RANSAC inlier distance
+    # (survey.SurveyThresholds.ransac_distance_mm) so "inlier" means the same thing in
+    # both places -- removing the background BEFORE fit_global_plane's internal RANSAC
+    # ever sees it, so it has nothing left to lock onto but the table.
+    survey_plane_inlier_band_mm: float = 6.0
+    # Minimum fraction of the FULL FRAME that must be on the work plane for a CORNER
+    # step (Task 13 review, remedy ii): purity alone (see _deproject_plane_points_mm)
+    # cannot catch "genuinely too little table in view" -- a tiny-but-clean sliver
+    # against an empty background also reads ~100% pure. Centring the reticle exactly
+    # on a 90-degree corner caps real coverage at 25% of the frame (a geometric
+    # ceiling: the two near edges, each a straight line through image centre, always
+    # quarter a rectangular frame -- confirmed by ray-tracing all four corners of the
+    # test table; independent of table size or standoff). 0.10 admits normal aiming
+    # imprecision around that ceiling while still refusing a genuinely-too-small
+    # sliver (e.g. the reticle mostly missing the platform).
+    survey_corner_min_plane_coverage_frac: float = 0.10
+    # -- tiled close-range tour over a five-position-surveyed rectangle -----
+    # (Task 12) A platform too large for one camera view is measured by the
+    # five-position survey above, then TILED with overlapping close-range
+    # views (plan_rect_tour) instead of backing the camera off — backing off
+    # would frame the whole thing but destroy depth quality.
+    survey_tour_overlap: float = 0.30        # target overlap fraction between adjacent tiles
+    survey_tour_views_per_tile: int = 2      # captured views per tile (angle diversity for fusion)
+    # Post-review fix (Finding 2): the tile-completeness FRACTION gate alone
+    # tolerates one large CONTIGUOUS hole exactly as easily as the same count
+    # of misses scattered across the grid (measured: a 3x3 block, 9 of 64
+    # tiles, passes a 0.85 fraction gate at 0.859 while the true measured
+    # world-space coverage is only ~0.90-0.95 -- a single real, unscanned
+    # patch of the surface). Measured world-coverage loss per contiguous block
+    # size on the same 2000x1200 mm / 64-tile example: 1 tile ~0.4-0.6%, 2 in
+    # a line ~1.2-1.8%, 3 in a line ~1.9-2.8%, a 2x2 block ~3.6-4%, a 3x3 block
+    # ~9-10%. 2 keeps isolated single misses and short 2-tile runs (workspace-
+    # edge unreachability, essentially harmless) while refusing anything a 2x2
+    # block or larger -- comfortably below the ~9% loss of the reported case.
+    survey_tour_max_contiguous_empty_tiles: int = 2
+    # Vision safety net for the hold: the live rectangle is depth-derived, so it must
+    # still track a physical camera move even if RoboDK is not mirroring the arm. A
+    # standoff/tilt shift past these releases the hold regardless of the pose gate.
+    # Measured parked plane-fit noise at ~0.8 m is ~2 mm standoff / ~6° tilt peak-to-peak,
+    # so the tilt escape must sit ABOVE that floor or it trips on noise and (before the
+    # release debounce) caused the jitter; distance is clean so its escape stays tight.
+    live_hold_vision_distance_mm: float = 12.0
+    live_hold_vision_tilt_deg: float = 10.0
+    # Live-loop latency instrumentation (Defect 2): seconds between one-line
+    # summaries of loop interval, RoboDK RPC cost, Jetson telemetry cadence/age and
+    # hold/drop counts, logged at INFO. On by default because the readout-lag defect
+    # is only reproducible on the real cell, so the measurement has to already be
+    # running when someone next drives it. 0 disables (no recording, no logging).
+    live_latency_log_s: float = 5.0
+    # When the surface overruns the view (edges not fully framed) its real edges are
+    # untrustworthy, so we stop fitting the board and project a GENERIC fixed work
+    # square on the plane, centred on the camera reticle (the aim point). This is its
+    # size; the run crops to it around the aim (bounded_work_plane).
+    work_crop_mm: tuple[float, float] = (1000.0, 1000.0)
+    # Legacy adaptive-crop knobs (superseded by the fixed work_crop_mm above); kept so
+    # an existing tasni.config.json that still sets them loads without error.
     large_surface_crop_fraction: float = 0.75  # fraction of visible FOV used as work crop
     large_surface_crop_max_mm: float = 800.0   # cap either crop dimension
 
     # -- capture ------------------------------------------------------------
     settle_s: float = 0.4               # pause after MoveJ before grabbing
-    frames_per_pose: int = 1            # depth frames per pose (1 = single grab)
+    frames_per_pose: int = 3            # depth frames per pose, median-fused before TSDF
     # Diagnostics: persist each pose's color + 16-bit depth + camera pose under
     # <run>/views/ so a camera-perspective coverage overlay can be built later.
     # Off by default (~tens of MB/run); enable for a coverage-debugging scan.
@@ -439,18 +626,33 @@ class ScanConfig(_Model):
     # OFF until the burst-capable server is deployed: a pre-burst server would
     # mishandle the handshake, so the client probes for support and FALLS BACK to
     # per-pose grab if the server doesn't advertise it.
-    burst_capture: bool = False
+    burst_capture: bool = True
 
     # -- TSDF fusion (Open3D ScalableTSDFVolume) ----------------------------
     # Per-view RGBD is integrated with the camera pose as extrinsic; the volume is
     # a 3D weighted average -> denoised mesh. voxel_size drives resolution/cost.
-    voxel_size_m: float = 0.004         # 4 mm TSDF voxel
-    sdf_trunc_m: float = 0.02           # truncation distance (~5 voxels)
+    voxel_size_m: float = 0.0015        # 1.5 mm TSDF voxel fallback
+    sdf_trunc_m: float = 0.008          # truncation distance (~4-8 voxels)
     depth_scale: float = 1000.0         # RealSense depth units -> metres (uint16 mm)
     depth_min_m: float = 0.2            # ignore depth nearer than this
     depth_max_m: float = 1.5            # ignore depth farther than this (table standoff)
-    preview_max_points: int = 60000     # decimate the cloud before streaming to the viewer
-    surface_mesh_spacing_m: float = 0.005  # dense flat output mesh grid (5 mm)
+    preview_max_points: int = 300000    # decimate the cloud before streaming to the viewer
+    surface_mesh_spacing_m: float = 0.001  # dense flat output mesh grid (1 mm)
+    measured_mesh_plane_band_m: float = 0.012  # keep real mesh vertices this close to work plane
+    measured_mesh_rect_margin_m: float = 0.010  # allow slight TSDF edge overhang past rectangle
+    measured_mesh_support_tolerance_m: float = 0.008  # per-view depth agreement tolerance
+    measured_mesh_min_support_views: int = 2  # require repeated depth support for real mesh
+    measured_mesh_min_support_ratio: float = 0.35  # supported / observed view confidence
+    measured_mesh_min_normal_dot: float = 0.35  # reject near-vertical side walls/edge thickness
+    measured_mesh_keep_largest_component: bool = True  # drop disconnected TSDF islands
+    measured_mesh_project_to_plane: bool = True  # output top-surface mesh as a single plane
+    measured_mesh_neutral_color: bool = True  # do not show printed ChArUco/color texture
+    actual_coverage_bin_m: float = 0.004  # post-run occupancy cell for measured surface
+    actual_coverage_edge_band_m: float = 0.024  # edge band width for coverage warnings
+    min_actual_surface_points: int = 500  # reject fitted rectangles backed by too little real mesh
+    min_actual_fill_coverage: float = 0.20  # reject when measured support is too sparse overall
+    min_actual_edge_coverage: float = 0.60  # warn/reject below this weakest-edge fill
+    actual_coverage_hard_fail: bool = True  # do not offer Insert for unsupported fitted planes
 
     # -- region of interest: isolate the work surface (the "top layer") ----
     # Without this, fusing every view captures the whole room and RANSAC locks
@@ -474,13 +676,114 @@ class ScanConfig(_Model):
 
     # -- collision guard + dry tour (same semantics as calibration) --------
     collision_filter: bool = True
-    # Same soft default as calibration: if RoboDK's collision map reports so many
-    # collisions that target creation would fail (common with stale/oversized wall
-    # or fixture geometry), keep the reachable targets and make the operator inspect
-    # them / dry-run before moving the real robot. Set True for strict refusal.
-    collision_filter_hard_fail: bool = False
+    collision_ignore_pairs: list[str] = []
+    # UNLIKE calibration's soft default: a production target set that the robot is
+    # about to run gets a STRICT collision gate by default. If RoboDK's collision
+    # map reports so many collisions that target creation would otherwise fail
+    # (common with stale/oversized wall or fixture geometry), refuse outright
+    # rather than silently shipping a target set for the operator to inspect —
+    # a soft bypass is not appropriate here (spec §10). Set False to opt back
+    # into the soft/advisory path (e.g. for a deliberately inspected dry run).
+    collision_filter_hard_fail: bool = True
     collision_self_pairs: bool = True
     collision_skip_wrist_links: int = 2
+
+    # -- distance characterization (spec §5/§10, Phase 0) -------------------
+    # tools/characterize_distance.py sweeps candidate camera standoffs over a
+    # known ChArUco board and stores a dated verdict (characterization/*.json).
+    # lock_scan_surface reads it back and warns (or refuses) when it is missing
+    # or stale -- "characterization that isn't a button will not be re-run", so
+    # this makes staleness visible on every lock instead of silently trusting
+    # measurement-chain accuracy nobody re-verified.
+    calibration_max_age_days: float = 30.0    # characterization older than this -> warn/refuse
+    calibration_expiry_hard_fail: bool = False  # True: refuse the lock instead of warning
+
+
+class ExtrusionConfig(_Model):
+    """Cylinder-test defaults and verified extrusion-cell integration data.
+
+    Valve switching and extrusion rate are deliberately separate.  The two
+    digital outputs below were read from the legacy ``231006_RoboArchPaper.rdk``
+    AirOn/AirOff programs on 2026-08-12; hardware approval remains a distinct
+    interlock and defaults off.
+    """
+
+    radius_mm: float = Field(default=40.0, gt=0, le=500)
+    layer_count: int = Field(default=3, ge=1, le=100)
+    layer_height_mm: float = Field(default=5.0, gt=0, le=50)
+    bead_diameter_mm: float = Field(default=15.0, gt=0, le=50)
+    robot_speed_mm_s: float = Field(default=75.0, gt=0, le=1000)
+    travel_speed_mm_s: float = Field(default=200.0, gt=0, le=2000)
+    path_rounding_mm: float = Field(default=1.0, ge=0, le=100)
+    extrusion_rate_pct: float = Field(default=0.0, ge=0, le=100)
+    points_per_circle: int = Field(default=180, ge=24, le=4000)
+    correction_enabled: bool = False
+    correction_gain: float = Field(default=1.0, ge=0, le=2)
+    correction_smoothing_points: int = Field(default=9, ge=1, le=101)
+    correction_max_mm: float = Field(default=10.0, gt=0, le=100)
+
+    # Optional UI preferences only. Station items are discovered dynamically and
+    # the chosen names are embedded in every plan fingerprint; blank means the
+    # operator must select explicitly. Nothing here is a mandatory station name.
+    default_print_tool: str = ""
+    default_work_frame: str = ""
+    default_inspection_tool: str = ""
+    default_inspection_target: str = ""
+    center_x_mm: float = 0.0
+    center_y_mm: float = 0.0
+    build_plane_z_mm: float = 0.0
+    orientation_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    approach_clearance_mm: float = Field(default=40.0, gt=0, le=500)
+    retreat_clearance_mm: float = Field(default=60.0, gt=0, le=500)
+    settle_s: float = Field(default=1.0, ge=0, le=30)
+    grab_timeout_s: float = Field(default=15.0, gt=0, le=120)
+
+    # -- automatic inspection pose (tasni/modules/extrusion/inspection.py) ---
+    # The camera distance is derived from the cylinder's own diameter and the
+    # camera's intrinsics (pinhole fit-to-frame, same rule as the scan planner),
+    # then clamped into the D435i's accurate depth band. The band mirrors
+    # ScanConfig's but is deliberately a separate copy: inspecting a 90 mm wall at
+    # close range and surveying a table are different jobs, and tuning one must
+    # not silently move the other.
+    inspection_frame_margin: float = Field(default=1.15, ge=1.0, le=3.0)
+    inspection_min_mm: float = Field(default=300.0, gt=0, le=2000)
+    inspection_max_mm: float = Field(default=800.0, gt=0, le=3000)
+    # Candidate search order when the fronto-parallel pose cannot be reached.
+    # Roll first (free — the surface stays square to the sensor, only the wrist
+    # config changes), tilt last and small: the 2026-08-13 cell characterization
+    # measured incidence costing ~4x what distance costs.
+    inspection_roll_candidates_deg: list[float] = Field(
+        default_factory=lambda: [0.0, 180.0, 90.0, 270.0])
+    inspection_tilt_candidates_deg: list[float] = Field(
+        default_factory=lambda: [0.0, 10.0])
+    inspection_azimuth_candidates_deg: list[float] = Field(
+        default_factory=lambda: [0.0, 90.0, 180.0, 270.0])
+    air_on_program: str = "AirOn"
+    air_off_program: str = "AirOff"
+    valve_outputs: list[str] = Field(default_factory=lambda: ["IO_508", "IO_601"])
+    valve_active_value: int = 1
+    valve_inactive_value: int = 0
+    valve_mapping_source: str = "231006_RoboArchPaper.rdk"
+    valve_mapping_verified: bool = True
+    hardware_io_test_approved: bool = False
+
+    # Legacy single-frame processing defaults (metres where suffixed ``_m``).
+    plane_distance_threshold_m: float = Field(default=0.0025, gt=0)
+    voxel_size_m: float = Field(default=0.002, gt=0)
+    statistical_neighbors: int = Field(default=20, ge=3)
+    statistical_std_ratio: float = Field(default=2.0, gt=0)
+    radius_neighbors: int = Field(default=16, ge=2)
+    radius_m: float = Field(default=0.1, gt=0)
+    cluster_eps_m: float = Field(default=0.005, gt=0)
+    cluster_min_points: int = Field(default=10, ge=2)
+    upwards_normal_z: float = Field(default=0.92, ge=-1, le=1)
+    normal_cluster_eps_m: float = Field(default=0.02, gt=0)
+    branch_guard_max_attempts: int = Field(default=3, ge=1, le=20)
+    deposit_min_height_mm: float = Field(default=0.5, ge=0, le=100)
+    deposit_height_margin_mm: float = Field(default=15.0, gt=0, le=100)
+    radial_roi_margin_mm: float = Field(default=30.0, gt=0, le=200)
+    raster_mm_per_pixel: float = Field(default=1.0, gt=0, le=10)
+    measured_spline_points: int = Field(default=180, ge=24, le=4000)
 
 
 class WebConfig(_Model):
@@ -494,6 +797,7 @@ class AppConfig(_Model):
     robodk: RoboDKConfig = Field(default_factory=RoboDKConfig)
     calibration: CalibrationConfig = Field(default_factory=CalibrationConfig)
     scan: ScanConfig = Field(default_factory=ScanConfig)
+    extrusion: ExtrusionConfig = Field(default_factory=ExtrusionConfig)
     web: WebConfig = Field(default_factory=WebConfig)
 
 

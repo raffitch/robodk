@@ -32,7 +32,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ...core.geometry import Rt_to_T
+from ...core.geometry import invert_T, transform_points
+from .survey_contract import workframe_from_rectangle
 
 
 @dataclass
@@ -182,6 +183,44 @@ def _min_area_rectangle(pts2d: np.ndarray, *,
     return ux, uy, w, h, lox, loy
 
 
+def _density_extent_1d(values: np.ndarray, lo: float, hi: float, *,
+                       core_frac: float = 0.20, max_trim_frac: float = 0.15,
+                       min_bin_mm: float = 4.0, min_points: int = 60):
+    """Shrink a rectangle side's raw span ``[lo, hi]`` (1D positions along one axis,
+    mm) inward to where point density rises to ``core_frac`` of the body's typical
+    density.
+
+    A symmetric quantile trim cuts the same small fraction off every edge, so a
+    *sparse coplanar halo* just past the real board edge (flying TSDF pixels, depth
+    spill — more than the 0.5% the quantile removes) survives and inflates the box,
+    making it over-run the physical board. A real edge is a sharp density CLIFF: the
+    first populated bin sits right at the board, and the halo bins beyond it are far
+    below the body density, so thresholding at a fraction of the body keeps the board
+    and drops the halo. Guarded so it cannot eat a real, fully-sampled edge: each side
+    trims at most ``max_trim_frac`` of the span, and the whole step is skipped below
+    ``min_points`` (too few points to estimate density)."""
+    span = float(hi - lo)
+    n = int(np.size(values))
+    if span <= 0.0 or n < min_points:
+        return float(lo), float(hi)
+    n_bins = max(8, int(round(span / max(min_bin_mm, span / 80.0))))
+    counts, edges = np.histogram(values, bins=n_bins, range=(float(lo), float(hi)))
+    occupied = counts[counts > 0]
+    if len(occupied) == 0:
+        return float(lo), float(hi)
+    core = float(np.median(occupied))            # typical density of a populated bin
+    thresh = max(1.0, core_frac * core)          # a halo bin sits well below the body
+    above = np.where(counts >= thresh)[0]
+    if len(above) == 0:
+        return float(lo), float(hi)
+    new_lo = float(edges[int(above[0])])
+    new_hi = float(edges[int(above[-1]) + 1])
+    cap = max_trim_frac * span                   # never trim more than this per side
+    new_lo = min(new_lo, lo + cap)
+    new_hi = max(new_hi, hi - cap)
+    return new_lo, new_hi
+
+
 def _oriented_rectangle(points: np.ndarray, normal: np.ndarray, centroid: np.ndarray):
     """Minimum-area oriented rectangle of ``points`` projected onto the plane.
 
@@ -214,6 +253,18 @@ def _oriented_rectangle(points: np.ndarray, normal: np.ndarray, centroid: np.nda
     ax_a = u * ux[0] + v * ux[1]
     ax_b = u * uy[0] + v * uy[1]
 
+    # Refine the extent per edge: pull each side in to the density cliff, dropping a
+    # sparse coplanar halo just past the real board edge that the symmetric quantile
+    # trim above leaves in (which makes the box over-run the board). Orientation is
+    # already fixed by the min-area rectangle on the fringe-trimmed cloud; this only
+    # tightens how far each side reaches, and is guarded so it cannot eat a real edge.
+    pa = coords @ ux
+    pb = coords @ uy
+    lo_a, hi_a = _density_extent_1d(pa, lox, lox + w)
+    lo_b, hi_b = _density_extent_1d(pb, loy, loy + h)
+    lox, w = lo_a, hi_a - lo_a
+    loy, h = lo_b, hi_b - lo_b
+
     def to3d(coord2d: np.ndarray) -> np.ndarray:
         # coord2d is in the (u,v) plane basis -> back to 3D.
         return centroid + coord2d[0] * u + coord2d[1] * v
@@ -228,6 +279,20 @@ def _oriented_rectangle(points: np.ndarray, normal: np.ndarray, centroid: np.nda
     if w >= h:
         return corners, ax_a, ax_b, w, h
     return corners, ax_b, ax_a, h, w
+
+
+def rectangle_in_frame(frame_T: np.ndarray, corners: np.ndarray) -> np.ndarray:
+    """The rectangle corners re-expressed in the work frame (4x3, same units in/out).
+
+    ``frame_T`` is base->frame, so this applies its inverse. Consumers that place
+    work *on* the surface (the extrusion module centres its cylinder here) need the
+    rectangle in the frame they program in, not in the base frame. By construction
+    the result is axis-aligned with ~0 Z — frame X/Y run along the rectangle edges —
+    so the surface centre is a plain midpoint of the bounds. The frame origin is a
+    *corner*, so that centre is emphatically not (0, 0).
+    """
+    return transform_points(invert_T(np.asarray(frame_T, float)),
+                            np.asarray(corners, float).reshape(4, 3))
 
 
 def work_plane_from_points(points: np.ndarray, *, distance: float = 0.006,
@@ -249,23 +314,54 @@ def work_plane_from_points(points: np.ndarray, *, distance: float = 0.006,
     inl = pts[mask]
     corners, ax1, ax2, len1, len2 = _oriented_rectangle(inl, normal, centroid)
 
-    # Origin = the corner nearest the base origin (deterministic + repeatable).
-    o = int(np.argmin(np.linalg.norm(corners, axis=1)))
-    origin = corners[o]
-    nxt, prv = corners[(o + 1) % 4], corners[(o - 1) % 4]
-    edge_nxt, edge_prv = nxt - origin, prv - origin
-    # X = along the LONGER of the two edges meeting the origin corner.
-    x_raw = edge_nxt if np.linalg.norm(edge_nxt) >= np.linalg.norm(edge_prv) else edge_prv
-    z = normal / np.linalg.norm(normal)
-    x = x_raw - (x_raw @ z) * z            # re-orthogonalise against the plane normal
-    x = x / np.linalg.norm(x)
-    y = np.cross(z, x)                     # right-handed [x, y, z]
-    frame_T = Rt_to_T(np.column_stack([x, y, z]), origin)
+    # The one shared convention (origin = corner nearest base, +X = longer edge
+    # meeting it, +Z = up normal) -- see survey_contract.workframe_from_rectangle.
+    frame_T = workframe_from_rectangle(corners, normal)
+    z = frame_T[:3, 2]
 
     return WorkPlane(frame_T=frame_T, corners=corners,
                      size=(max(len1, len2), min(len1, len2)),
                      normal=z, centroid=centroid,
                      inlier_count=int(mask.sum()), inlier_frac=frac)
+
+
+def reticle_plane_square(normal: np.ndarray, centroid: np.ndarray,
+                         size: tuple[float, float],
+                         *, axis_hint: tuple[float, float, float] = (1.0, 0.0, 0.0)):
+    """Four corners of a ``size=(sx, sy)`` rectangle lying on the plane (``normal``
+    through ``centroid``), centred where the camera optical axis — the +Z ray through
+    the origin, i.e. the image reticle — pierces that plane.
+
+    Used when the surface OVERRUNS the view, so its real edges are not trustworthy:
+    instead of fitting (and over-running) the board, project a GENERIC work square of
+    a fixed size centred on where the operator is aiming. The first in-plane axis is
+    ``axis_hint`` (camera +X) projected onto the plane, so the square is screen-stable
+    (edges stay roughly horizontal/vertical) rather than chasing a noisy dominant
+    direction. Camera frame, same units as the inputs.
+
+    Returns ``(corners (4,3) cyclic, u, v, reticle (3,))``. Falls back to centring on
+    ``centroid`` if the plane is too edge-on to intersect the optical axis.
+    """
+    n = np.asarray(normal, float)
+    n = n / max(float(np.linalg.norm(n)), 1e-9)
+    c = np.asarray(centroid, float).reshape(3)
+    nz = float(n[2])
+    t = float(c @ n) / nz if abs(nz) > 1e-6 else 0.0
+    reticle = np.array([0.0, 0.0, t]) if t > 0.0 else c.copy()
+    hint = np.asarray(axis_hint, float)
+    if abs(float(hint @ n)) > 0.99 * max(float(np.linalg.norm(hint)), 1e-9):
+        hint = np.array([0.0, 1.0, 0.0])            # hint ~parallel to normal -> swap
+    u = hint - float(hint @ n) * n
+    u = u / max(float(np.linalg.norm(u)), 1e-9)
+    v = np.cross(n, u)
+    sx, sy = float(size[0]) / 2.0, float(size[1]) / 2.0
+    corners = np.array([
+        reticle - sx * u - sy * v,
+        reticle + sx * u - sy * v,
+        reticle + sx * u + sy * v,
+        reticle - sx * u + sy * v,
+    ])
+    return corners, u, v, reticle
 
 
 def bounded_work_plane(wp: WorkPlane, center: np.ndarray,
@@ -295,15 +391,7 @@ def bounded_work_plane(wp: WorkPlane, center: np.ndarray,
         c + hx * x + hy * y,
         c - hx * x + hy * y,
     ])
-    o = int(np.argmin(np.linalg.norm(corners, axis=1)))
-    origin = corners[o]
-    nxt, prv = corners[(o + 1) % 4], corners[(o - 1) % 4]
-    x_raw = (nxt - origin if np.linalg.norm(nxt - origin) >= np.linalg.norm(prv - origin)
-             else prv - origin)
-    x_axis = x_raw - float(x_raw @ z) * z
-    x_axis /= np.linalg.norm(x_axis)
-    y_axis = np.cross(z, x_axis)
-    frame_T = Rt_to_T(np.column_stack([x_axis, y_axis, z]), origin)
+    frame_T = workframe_from_rectangle(corners, z)
     return WorkPlane(
         frame_T=frame_T, corners=corners, size=(length, width),
         normal=z, centroid=c, inlier_count=wp.inlier_count,

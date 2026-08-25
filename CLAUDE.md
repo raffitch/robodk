@@ -8,6 +8,21 @@ Intel **RealSense** camera for ArUco-referenced **Open3D** 3D auto-scanning.
 The `.rdk` is binary, so its embedded Python cannot be edited directly. The two bridge
 scripts below extract that Python to `macros/*.py` (editable here) and push edits back in.
 
+## Working agreement: COMMIT + PUSH every change (so the user can see it)
+After finishing a change, **always `git commit` and `git push`** — do not leave work
+sitting uncommitted. The user reviews progress from the pushed history (and the Jetson
+deploys from it), so unpushed local commits are invisible to them. Concretely:
+- Commit + push the working branch (today: `calibration-improvements`).
+- If the change touches **`server/`**, push and deploy/restart the Jetson camera
+  service. The Jetson now follows the branch checked out in `/home/jetson/robodk`
+  (falling back to `main` only if that branch has no remote), and
+  `tools/jetson_deploy.py deploy` pulls the current local branch unless
+  `JETSON_BRANCH` is set.
+- Mention the pushed commit hashes and Jetson restart/deploy status in the summary.
+
+For fast orientation before opening long handoff docs, read
+**[docs/agent-debug-map.md](docs/agent-debug-map.md)**.
+
 ## The editing loop
 
 1. **Extract** embedded macros to `macros/*.py` (overwrites them from the station):
@@ -64,11 +79,12 @@ python tools/jetson_deploy.py deploy         # manual: git pull on Jetson + rest
 python tools/jetson_deploy.py setup-autopull # install the auto-pull timer (idempotent)
 python tools/jetson_deploy.py bootstrap      # (re)install service + auto-pull (idempotent)
 ```
-The Jetson clones THIS repo to `~/robodk` and tracks `main`. So: **one repo** — and it
-**auto-pulls `origin/main` every ~2 min** (systemd timer), restarting the camera only
-when `server/` changed and no client is mid-capture. So normally: **just push to `main`**
-and the Jetson deploys itself; `deploy` is only for an immediate push-and-restart. A
-feature branch reaches the Jetson only once merged to `main`. See
+The Jetson clones THIS repo to `~/robodk`. It follows the branch checked out there
+(currently `calibration-improvements`) and auto-pulls that branch every ~2 min
+(systemd timer), restarting the camera only when `server/` changed and no client is
+mid-capture. Use `python tools/jetson_deploy.py deploy` for an immediate pull and
+restart from the current local branch. See
+[docs/agent-debug-map.md](docs/agent-debug-map.md) and
 [docs/jetson-scanner.md](docs/jetson-scanner.md).
 
 ## North star (the actual goal)
@@ -139,6 +155,16 @@ you drive the real cell, not an empty station). Run it on Windows with
 - Then integrate the rest into the same app: scan (with **TSDF fusion** — biggest quality
   win), ArUco-to-plane, target generation. RealSense High-Accuracy preset + filter order
   live in `server/server_unicast_syncronous.py`. Tailscale (off-LAN) deferred.
+- ✅ **Two-path workframe survey implemented** (17-task plan, all merged to
+  `calibration-improvements`, 393 tests green): compact single-view lock, a guided
+  five-position (center + four corners) survey for platforms too large for one camera
+  view, and a relabeled user-specified-region fast path, all producing one immutable
+  `LockedWorkframeSurvey` contract. Design in
+  [docs/scan-workframe-two-path-plan.md](docs/scan-workframe-two-path-plan.md); build log
+  in [docs/scan-workframe-implementation-plan.md](docs/scan-workframe-implementation-plan.md).
+  Hardware validation (corner-aiming plane selection, survey-diagram chirality, `d*`
+  measurement) is still pending on the real cell — see that doc's Hardware validation
+  TODO section.
 
 ## Notes
 - Requires the `robodk` package (installed under Python 3.10) and RoboDK at `C:\RoboDK`.

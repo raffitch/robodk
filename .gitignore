@@ -17,5 +17,15 @@ __pycache__/
 runs/
 tasni.config.json
 
+# distance-characterization sweeps (tools/characterize_distance.py) — dated,
+# machine-specific measurement data, not source.
+characterization/
+
 # RoboDK temp
 *.rdk.bak
+
+# SAM model weights (host-side scan boundary). NOT vendored — keeps the clone + the
+# Jetson pull light, and avoids shipping non-commercial (EdgeSAM) weights in the repo.
+# Fetch with `tools/download_sam.py`. See models/README.md.
+models/*.onnx
+models/*.pt
