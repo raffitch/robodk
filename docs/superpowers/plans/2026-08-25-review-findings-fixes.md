@@ -58,7 +58,7 @@ The cylinder's "centred by construction" guarantee currently dies at the RoboDK 
 - Consumes: `RdkIO`, `pose_to_T`, `invert_T` (module-level in `rdk_io.py`).
 - Produces: `RdkIO._frame_wrt_base_T: np.ndarray | None` (None ⇒ active frame IS the base) and `RdkIO._frame_pose_wrt_base(frame) -> np.ndarray`. `_solve_ik`'s contract becomes what its docstring already claims: `T` is in the ACTIVE reference frame.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `tests/test_rdk_io_frames.py`:
 
@@ -170,12 +170,12 @@ def test_create_inspection_target_solves_in_base_but_stores_work_pose():
     np.testing.assert_allclose(solved[:3, 3], [800.0, -300.0, 300.0], atol=1e-9)
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `py -3.10 -m pytest tests/test_rdk_io_frames.py -q`
 Expected: 2 FAIL (`test_named_frame_pose…` and `test_create_inspection_target…` — the pose reaches SolveIK untranslated), 1 PASS (base-frame pass-through already works).
 
-- [ ] **Step 3: Implement the conversion**
+- [x] **Step 3: Implement the conversion**
 
 In `tasni/core/rdk_io.py` `__init__`, directly under the `self._tool_pose: np.ndarray | None = None` line (~63):
 
@@ -216,17 +216,17 @@ In `_solve_ik` (~219), first statement after the docstring:
 
 and amend its docstring's first sentence to: *"``T`` is the pose of the camera (the last-activated tool's TCP) in the **active reference frame**; it is converted to robot-base coordinates here (``_frame_wrt_base_T``) because SolveIK's client-side math is base-frame-only."*
 
-- [ ] **Step 4: Run the new tests**
+- [x] **Step 4: Run the new tests**
 
 Run: `py -3.10 -m pytest tests/test_rdk_io_frames.py -q`
 Expected: 3 passed.
 
-- [ ] **Step 5: Bounded regression sweep** (RdkIO consumers that build it with fakes)
+- [x] **Step 5: Bounded regression sweep** (RdkIO consumers that build it with fakes)
 
 Run: `py -3.10 -m pytest tests/test_collision_guard.py tests/test_pose_generation.py tests/test_extrusion_job.py -q`
 Expected: all pass (calibration/collision paths activate the base frame or never activate one — `_frame_wrt_base_T` stays None).
 
-- [ ] **Step 6: Commit + push**
+- [x] **Step 6: Commit + push**
 
 ```bash
 git add tasni/core/rdk_io.py tests/test_rdk_io_frames.py
@@ -249,7 +249,7 @@ git push
 - Consumes: existing locals `corners` (vision rectangle, mm), `n` (unit plane normal), `survey.corners_cam_mm`, `info` dict.
 - Produces: `ScanConfig.boundary_center_tol_mm: float = 30.0`; `info["center_offset_mm"]` (rounded float) on every corroboration that reaches the centroid check.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/test_scan_job.py` (it already imports `numpy as np` and `from tasni.modules.scan import service as scan_service`):
 
@@ -294,12 +294,12 @@ def test_vision_boundary_accepted_when_centred():
     assert info["center_offset_mm"] <= 6.0
 ```
 
-- [ ] **Step 2: Run to verify the reject case fails**
+- [x] **Step 2: Run to verify the reject case fails**
 
 Run: `py -3.10 -m pytest tests/test_scan_job.py -q -k "vision_boundary"`
 Expected: `rejected_when_laterally_shifted` FAILS (corners are returned today), `accepted_when_centred` FAILS on the missing `center_offset_mm` key.
 
-- [ ] **Step 3: Add the knob**
+- [x] **Step 3: Add the knob**
 
 `tasni/core/config.py`, directly under `boundary_shrink_tol_mm` (~423):
 
@@ -307,7 +307,7 @@ Expected: `rejected_when_laterally_shifted` FAILS (corners are returned today), 
     boundary_center_tol_mm: float = 30.0      # ...and its centre may shift laterally by at most this
 ```
 
-- [ ] **Step 4: Add the centroid gate**
+- [x] **Step 4: Add the centroid gate**
 
 In `_corners_from_boundary_on_plane`, after the per-axis length loop (the `for axis, (v, d) in enumerate(zip(vis, dep)):` block) and before `info["boundary_source"] = "vision"`:
 
@@ -332,12 +332,12 @@ In `_corners_from_boundary_on_plane`, after the per-axis length loop (the `for a
 
 Also append one sentence to the function docstring's corroboration paragraph: *"The centre is corroborated too (``boundary_center_tol_mm``): equal side lengths cannot see a lateral shift."*
 
-- [ ] **Step 5: Run the new tests + the file**
+- [x] **Step 5: Run the new tests + the file**
 
 Run: `py -3.10 -m pytest tests/test_scan_job.py -q`
 Expected: all pass.
 
-- [ ] **Step 6: Commit + push**
+- [x] **Step 6: Commit + push**
 
 ```bash
 git add tasni/core/config.py tasni/modules/scan/service.py tests/test_scan_job.py
@@ -359,7 +359,7 @@ At the hybrid-extent lock (`service.py` ~611) only `survey.corners_cam_mm` is re
 - Consumes: `dataclasses.replace` (already imported in `service.py`), `boundary_info["vision_extent_mm"]` — `[longer, shorter]`, the SAME convention as `SurveyMeasurement.extent_mm` ("(longer, shorter)", `survey.py:56`).
 - Produces: `_survey_with_vision_boundary(survey, vis_corners, info) -> survey` (module level in `service.py`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `tests/test_scan_job.py`:
 
@@ -385,12 +385,12 @@ def test_vision_boundary_updates_extent_for_the_planner():
     assert out2.extent_mm == (280.0, 200.0)
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `py -3.10 -m pytest tests/test_scan_job.py -q -k "updates_extent"`
 Expected: FAIL — `_survey_with_vision_boundary` does not exist.
 
-- [ ] **Step 3: Add the helper**
+- [x] **Step 3: Add the helper**
 
 In `service.py`, directly after `_corners_from_boundary_on_plane`:
 
@@ -409,7 +409,7 @@ def _survey_with_vision_boundary(survey, vis_corners, info):
     return replace(survey, corners_cam_mm=vis_corners, extent_mm=extent)
 ```
 
-- [ ] **Step 4: Use it at the lock**
+- [x] **Step 4: Use it at the lock**
 
 Replace the two lines at ~610–611:
 
@@ -429,12 +429,12 @@ with:
                         if survey.extent_mm is not None else None)
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `py -3.10 -m pytest tests/test_scan_job.py tests/test_scan_planner.py -q`
 Expected: all pass.
 
-- [ ] **Step 6: Commit + push**
+- [x] **Step 6: Commit + push**
 
 ```bash
 git add tasni/modules/scan/service.py tests/test_scan_job.py
@@ -448,9 +448,9 @@ git push
 
 This finding is already fully specced — with code, a currently-red test, and commit steps — as **Task 1 of `docs/superpowers/plans/2026-08-14-scan-chain-fixes.md`** ("Clamp the standoff accept window to the accurate band (A2)").
 
-- [ ] **Step 1: Open that plan and execute its Task 1, Steps 1–8, exactly as written** (helper `standoff_accept_window_mm`, both gate sites, the two tests, commit + push). Do not re-derive anything here.
+- [x] **Step 1: Open that plan and execute its Task 1, Steps 1–8, exactly as written** (helper `standoff_accept_window_mm`, both gate sites, the two tests, commit + push). Do not re-derive anything here.
 
-- [ ] **Step 2: Confirm the previously red test is green**
+- [x] **Step 2: Confirm the previously red test is green**
 
 Run: `py -3.10 -m pytest tests/test_scan_job.py -q -k "too_far or clamped_to_accurate"`
 Expected: 2 passed.
@@ -469,7 +469,7 @@ Expected: 2 passed.
 **Interfaces:**
 - Produces: `_plane_rms_mm(...) -> float | None`; `_finite_or_none(value) -> float | None` (module level in `service.py`); `CaptureRecord.plane_rms_mm: float | None`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/test_scan_job.py`:
 
@@ -488,12 +488,12 @@ def test_finite_or_none_guards_payload_metrics():
     assert scan_service._finite_or_none(None) is None
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `py -3.10 -m pytest tests/test_scan_job.py -q -k "never_nan or finite_or_none"`
 Expected: FAIL — `_plane_rms_mm` returns `nan` (`is None` fails); `_finite_or_none` does not exist.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `service.py` `_plane_rms_mm`: change the signature to `-> float | None`, replace all three `return float("nan")` with `return None`, and append to the docstring: *"Returns ``None`` (never NaN) when starved of samples or the fit fails — NaN would poison JSON on both client paths."*
 
@@ -519,12 +519,12 @@ In `survey_contract.py` line ~129, change `plane_rms_mm: float` to:
     plane_rms_mm: float | None   # None = too few valid samples to fit (never NaN — must stay JSON-safe)
 ```
 
-- [ ] **Step 4: Run the tests + bounded sweep**
+- [x] **Step 4: Run the tests + bounded sweep**
 
 Run: `py -3.10 -m pytest tests/test_scan_job.py tests/test_survey_contract.py tests/test_five_position.py -q`
 Expected: all pass (`five_position_capture` at `service.py:1333` also builds `CaptureRecord`s from `_plane_rms_mm` and now stores `None` cleanly).
 
-- [ ] **Step 5: Commit + push**
+- [x] **Step 5: Commit + push**
 
 ```bash
 git add tasni/modules/scan/service.py tasni/modules/scan/survey_contract.py tests/test_scan_job.py
@@ -545,7 +545,7 @@ Two defects at the same site. (a) `RS_VISUAL_PRESET`/`RS_LASER_POWER` are parsed
 **Interfaces:**
 - Produces: `_env_number(name: str, default: float) -> float` (module level, defined ABOVE the two parse lines); `RS_LASER_POWER` default `-1.0` (= leave alone).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `tests/test_server_env.py` (same import scaffolding as `tests/test_scan_telemetry_server.py`):
 
@@ -597,12 +597,12 @@ def test_laser_power_defaults_to_leave_alone():
     assert srv.RS_LASER_POWER == -1.0
 ```
 
-- [ ] **Step 2: Run to verify they fail**
+- [x] **Step 2: Run to verify they fail**
 
 Run: `py -3.10 -m pytest tests/test_server_env.py -q`
 Expected: `_env_number` AttributeError; the reload test raises ValueError; the default test sees 300.0.
 
-- [ ] **Step 3: Implement the parser + defaults**
+- [x] **Step 3: Implement the parser + defaults**
 
 In `server/server_unicast_syncronous.py`, replace lines ~645–646:
 
@@ -641,7 +641,7 @@ RS_LASER_POWER = _env_number('RS_LASER_POWER', -1.0)
 
 Also update the block comment above (~636–637): delete the two sentences claiming more projected texture "is the default now" (they described the 300 default) and leave the measurement description.
 
-- [ ] **Step 4: Gate the laser write like the preset write**
+- [x] **Step 4: Gate the laser write like the preset write**
 
 In `set_high_accuracy_preset`, replace the `wanted = [...]` assignment (~669–674) with:
 
@@ -666,12 +666,12 @@ In `set_high_accuracy_preset`, replace the `wanted = [...]` assignment (~669–6
 
 (The existing `RS_VISUAL_PRESET >= 0` block below it stays exactly as is.)
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `py -3.10 -m pytest tests/test_server_env.py tests/test_scan_telemetry_server.py -q`
 Expected: all pass.
 
-- [ ] **Step 6: Commit + push + deploy to the Jetson**
+- [x] **Step 6: Commit + push + deploy to the Jetson**
 
 ```bash
 git add server/server_unicast_syncronous.py tests/test_server_env.py
@@ -698,7 +698,7 @@ Expected in the logs after restart: `RealSense: laser_power left as-is at …` (
 - Produces: `order_candidates_seed_first(candidates: list[dict], seed: dict | None) -> list[dict]` in `inspection.py`; `_build_inspection_move(..., seed_pose: dict | None = None)`.
 - Consumes: the winner descriptor already returned as `inspect["pose"]` (contains `tilt_deg`/`azimuth_deg`/`roll_deg`).
 
-- [ ] **Step 1: Write the failing pure-helper test**
+- [x] **Step 1: Write the failing pure-helper test**
 
 Append to `tests/test_extrusion.py`:
 
@@ -715,7 +715,7 @@ def test_seed_first_reordering_moves_last_winner_to_front():
     assert order_candidates_seed_first(candidates, unknown) == candidates
 ```
 
-- [ ] **Step 2: Write the failing job-level test**
+- [x] **Step 2: Write the failing job-level test**
 
 Append to `tests/test_extrusion_job.py`:
 
@@ -737,12 +737,12 @@ def test_auto_inspection_reuses_the_previous_layers_winner(tmp_path, monkeypatch
     assert second["rejected"] == []          # no wasted candidates on layer 2
 ```
 
-- [ ] **Step 3: Run to verify both fail**
+- [x] **Step 3: Run to verify both fail**
 
 Run: `py -3.10 -m pytest tests/test_extrusion.py -q -k seed_first` and `py -3.10 -m pytest tests/test_extrusion_job.py -q -k reuses_the_previous`
 Expected: import error on `order_candidates_seed_first`; the job test fails on the pose-equality assert (layer 2 re-chooses straight-down today).
 
-- [ ] **Step 4: Implement the helper**
+- [x] **Step 4: Implement the helper**
 
 Append to `tasni/modules/extrusion/inspection.py`:
 
@@ -767,7 +767,7 @@ def order_candidates_seed_first(candidates: list[dict], seed: dict | None) -> li
     return candidates
 ```
 
-- [ ] **Step 5: Thread the seed through the service**
+- [x] **Step 5: Thread the seed through the service**
 
 In `tasni/modules/extrusion/service.py`:
 
@@ -788,12 +788,12 @@ In `tasni/modules/extrusion/service.py`:
                     last_inspection_pose = inspect["pose"]
 ```
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
 
 Run: `py -3.10 -m pytest tests/test_extrusion.py tests/test_extrusion_job.py -q`
 Expected: all pass (including the existing auto-inspection tests — layer 1 ordering is unchanged because the seed starts as None).
 
-- [ ] **Step 7: Commit + push**
+- [x] **Step 7: Commit + push**
 
 ```bash
 git add tasni/modules/extrusion/inspection.py tasni/modules/extrusion/service.py tests/test_extrusion.py tests/test_extrusion_job.py
@@ -809,3 +809,71 @@ git push
 - **Ordering:** Task 1 first (safety: a wrong-but-validated joint target on the real cell); Tasks 2–5 are host-only scan-lock correctness; Task 6 changes Jetson device behavior (laser back to the characterized 150) and must be deployed; Task 7 is efficiency-only.
 - **Interface consistency:** `_survey_with_vision_boundary`, `_finite_or_none`, `_env_number`, `order_candidates_seed_first`, `_frame_pose_wrt_base`/`_frame_wrt_base_T`, and `seed_pose` are each defined once and used with the same names/signatures in their tests and call sites.
 - **Deliberately out of scope:** the per-candidate `use_named_tool_frame`/`Joints()` hoist and target-rewrite refactor (noted in Task 7); the crop-path `extent_mm` (its planner branch uses `crop_size_mm`); the remaining 15 tasks of the 2026-08-14 audit plan.
+
+---
+
+## Execution log (2026-08-25) — all 7 tasks DONE, pushed to `calibration-improvements`
+
+| Task | Finding | Commit |
+|------|---------|--------|
+| 1 | IK solved in the work frame | `ec0b655` |
+| 2 | vision boundary centre uncorroborated | `9e073a1` |
+| 3 | hybrid lock dropped the vision extent | `df0ea97` |
+| 4 | standoff window unclamped (= audit A2) | `74bfbf8` |
+| 5 | `plane_rms_mm` NaN poisons JSON | `14ab296` |
+| 6+7 | Jetson env parsing / laser default | `e90fc7d` (deployed) |
+| 8 | inspection sweep restarts every layer | `dcd2d86` |
+
+### Deviations from the plan as written
+
+1. **Task 4 gates THREE sites, not two.** `stabilize_live_scan_payload`
+   (`service.py`, called from `module.py:725` *after* `live_scan_telemetry_payload`)
+   re-derived `gates["distance"]` from the symmetric tolerance and handed the clamp
+   straight back on the live path. The plan's test would have passed while production
+   stayed broken, because it calls the payload builder directly. It now reuses the
+   published `distance_window_mm`. Covered by
+   `test_stabilize_does_not_hand_back_the_unclamped_window` (verified genuinely red
+   against the pre-fix code).
+
+2. **Task 4 exempts reference mode on the FAR edge** (user-confirmed decision). A
+   literal clamp made `test_generate_reference_mode_for_oversized_framed_surface`
+   fail *by design*: reference mode triggers when `d_fit > accurate_max_mm` and the
+   planner pins its ideal AT `accurate_max_mm`, so a clamped top means the operator
+   can never stand far enough back to see the surface — `_reference_locate` would
+   have become dead code again, undoing `d4e56bd`. `standoff_accept_window_mm` now
+   takes `reference_mode`; the near edge clamps in every mode. `_planned_surface_
+   standoff_mm` became `_planned_surface_aim` returning `(standoff_mm, mode)`, and
+   the live gate detects the same condition from the *unclipped* framing distance.
+
+3. **Task 5 made one frontend change** the plan said would not be needed. Both
+   formatters were indeed already null-safe, but `SurveyReport.plane_rms_mm: number`
+   became an inaccurate type once the backend can send `null`, which would let a
+   future `.toFixed()` through the compiler. Widened to `number | null` (and `fmt`'s
+   parameter with it). `npm run build` clean.
+
+4. **Task 6: the Jetson device still READS 300 mW.** The deploy log shows
+   `RealSense: laser_power left as-is at 300 (set RS_LASER_POWER to change it)` —
+   the fix stops *future* silent changes, but the 300 written by earlier restarts
+   persists in the sensor across service restarts. The 2026-08-13 depth envelope was
+   measured at 150. **Open item:** decide whether to restore 150 explicitly
+   (`RS_LASER_POWER=150` once, or a camera power-cycle) or to re-measure the envelope
+   at 300 and re-date it. Until then the characterization and the running device
+   disagree.
+
+### Verification
+
+- 184 tests green across `test_rdk_io_frames`, `test_robot_link`, `test_collision_guard`,
+  `test_pose_generation`, `test_survey_contract`, `test_five_position`, `test_scan_planner`,
+  `test_scan_depth_gate`, `test_scan_overlay`, `test_scan_telemetry_server`,
+  `test_server_env`, `test_extrusion`, `test_extrusion_job`.
+- `tests/test_scan_job.py` 82 passed (run separately — ~190 s), including the
+  previously-red `test_generate_refuses_when_too_far`.
+- `npm run build` clean; Jetson service active + listening on 1024 after deploy.
+- Not run: the full pytest suite (user instruction — too slow).
+
+### Still open (not in this plan's scope)
+
+- Tasks 2–16 of `2026-08-14-scan-chain-fixes.md` (Task 1 executed from here).
+- All of this is bench-verified only; nothing here has been exercised on the real
+  KUKA. Task 1 in particular changes what the robot is commanded to do on the
+  extrusion inspection path and wants a dry tour before a live print.

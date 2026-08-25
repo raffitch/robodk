@@ -42,12 +42,12 @@
 **Interfaces:**
 - Produces: `standoff_accept_window_mm(ideal_mm: float, scfg) -> tuple[float, float]` in `tasni/modules/scan/service.py` (module level). Payload key `"distance_window_mm": [lo, hi]` added to both gate payloads (additive; no consumer changes).
 
-- [ ] **Step 1: Run the already-failing test to confirm the defect**
+- [x] **Step 1: Run the already-failing test to confirm the defect**
 
 Run: `py -3.10 -m pytest tests/test_scan_job.py::test_generate_refuses_when_too_far -q`
 Expected: FAIL (`expected refusal — surface out of the standoff band`). This is the red step: a 900 mm standoff passes because ideal clips to 800 and |900−800| ≤ 150.
 
-- [ ] **Step 2: Add the helper**
+- [x] **Step 2: Add the helper**
 
 In `service.py`, directly above `scan_gate_thresholds` (~line 723):
 
@@ -66,7 +66,7 @@ def standoff_accept_window_mm(ideal_mm: float, scfg) -> tuple[float, float]:
     return lo, hi
 ```
 
-- [ ] **Step 3: Use it in the lock gate**
+- [x] **Step 3: Use it in the lock gate**
 
 In `lock_scan_surface` (~line 462, right after `gate_payload["distance_tol_mm"] = ...`):
 
@@ -84,7 +84,7 @@ and change the `final_gates` distance entry (~line 467) from the `abs(...) <= to
         ),
 ```
 
-- [ ] **Step 4: Use it in the live gate**
+- [x] **Step 4: Use it in the live gate**
 
 In `live_scan_telemetry_payload`, after the `ideal_distance` value is FINAL (after the crop-hold / deadband logic, just before the `gates = {` dict ~line 1750):
 
@@ -95,7 +95,7 @@ In `live_scan_telemetry_payload`, after the `ideal_distance` value is FINAL (aft
 change `"distance": abs(distance - ideal_distance) <= th.distance_tol_mm,` to
 `"distance": lo_mm <= distance <= hi_mm,` and add `"distance_window_mm": [lo_mm, hi_mm],` next to `"distance_tol_mm"` in the returned dict.
 
-- [ ] **Step 5: Add the live-gate regression test**
+- [x] **Step 5: Add the live-gate regression test**
 
 Append to `tests/test_scan_job.py` (it already imports `scan_service`; use the same ScanConfig source as neighbouring live-payload tests — grep `live_scan_telemetry_payload(` in the file and mirror the fixture style):
 
@@ -117,17 +117,17 @@ def test_live_distance_gate_clamped_to_accurate_band():
     assert out2["gates"]["distance"] is True, out2
 ```
 
-- [ ] **Step 6: Run both tests**
+- [x] **Step 6: Run both tests**
 
 Run: `py -3.10 -m pytest tests/test_scan_job.py -q -k "too_far or clamped_to_accurate"`
 Expected: 2 passed.
 
-- [ ] **Step 7: Sanity-run the file's gate/lock tests**
+- [x] **Step 7: Sanity-run the file's gate/lock tests**
 
 Run: `py -3.10 -m pytest tests/test_scan_job.py -q`
 Expected: all pass (the file was 100% green before except `too_far`).
 
-- [ ] **Step 8: Commit + push**
+- [x] **Step 8: Commit + push**
 
 ```bash
 git add tasni/modules/scan/service.py tests/test_scan_job.py
@@ -136,6 +136,15 @@ git push
 ```
 
 ---
+
+> **DONE 2026-08-25 — commit `74bfbf8`** (executed from
+> `2026-08-25-review-findings-fixes.md` Task 4). Two deviations: the window is
+> also applied in `stabilize_live_scan_payload`, a THIRD gate site this task did
+> not name — it runs after `live_scan_telemetry_payload` on the live path and
+> re-derived the gate from the symmetric tolerance; and reference mode is exempt
+> on the far edge only (user-confirmed), because the planner pins its ideal AT
+> `accurate_max_mm`, so clamping the top made `_reference_locate` unreachable.
+> See that plan's execution log for detail.
 
 ### Task 2: Drop hole-filling from the capture filter chain (A4)
 
