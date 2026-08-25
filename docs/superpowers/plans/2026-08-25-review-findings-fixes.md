@@ -851,14 +851,20 @@ git push
    future `.toFixed()` through the compiler. Widened to `number | null` (and `fmt`'s
    parameter with it). `npm run build` clean.
 
-4. **Task 6: the Jetson device still READS 300 mW.** The deploy log shows
-   `RealSense: laser_power left as-is at 300 (set RS_LASER_POWER to change it)` —
-   the fix stops *future* silent changes, but the 300 written by earlier restarts
-   persists in the sensor across service restarts. The 2026-08-13 depth envelope was
-   measured at 150. **Open item:** decide whether to restore 150 explicitly
-   (`RS_LASER_POWER=150` once, or a camera power-cycle) or to re-measure the envelope
-   at 300 and re-date it. Until then the characterization and the running device
-   disagree.
+4. **Task 6 needed a follow-up: the device was still READING 300 mW.** Leave-alone
+   stopped *future* silent changes, but RealSense option state lives on the DEVICE and
+   survives a service restart, so the 300 an earlier build had written was still there
+   and leave-alone was faithfully preserving the wrong value
+   (`RealSense: laser_power left as-is at 300`). RESOLVED in `b697f3b`:
+   `Environment=RS_LASER_POWER=150` is now declared in
+   `server/realsense-camera.service`, so the running camera matches the 2026-08-13
+   envelope on every start and any future change is a reviewable one-line diff.
+   Verified by read-back on the cell:
+   `laser_power -> requested 150, set 150, device reports 150 (range 0..360)`.
+   Trade-off recorded in that commit: 300 was originally chosen for MORE IR texture on
+   blank surfaces (the lever on the ~20 mm of missing depth at panel edges), so 150 may
+   cost some edge coverage — raising it again is now an explicit experiment with its own
+   before/after measurement.
 
 ### Verification
 
