@@ -28,7 +28,7 @@ export interface SurveyState {
 // flattened alongside the lock's intent (plan Task 2/5).
 export interface SurveyReport {
   status: string;
-  plane_rms_mm: number;
+  plane_rms_mm: number | null;   // null = too few valid samples to fit (never NaN)
   plane_max_residual_mm: number;
   per_position_rms_mm: number[];
   edge_rms_mm: number[];
@@ -382,7 +382,9 @@ function SurveyDiagram({ state }: { state: SurveyState | null }) {
   );
 }
 
-function fmt(v: number, digits = 2) { return Number.isFinite(v) ? v.toFixed(digits) : "—"; }
+function fmt(v: number | null | undefined, digits = 2) {
+  return typeof v === "number" && Number.isFinite(v) ? v.toFixed(digits) : "—";
+}
 
 function QualityReport({ report, goal, onContinue }:
   { report: SurveyReport; goal: "frame_only" | "full_scan"; onContinue: () => void }) {

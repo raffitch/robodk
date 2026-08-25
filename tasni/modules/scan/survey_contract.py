@@ -126,7 +126,7 @@ class CaptureRecord:
     standoff_mm: float
     tilt_deg: float
     valid_frac: float
-    plane_rms_mm: float
+    plane_rms_mm: float | None   # None = too few valid samples to fit (never NaN — must stay JSON-safe)
     plane_normal_base: tuple[float, float, float]
     plane_point_base: tuple[float, float, float]
 

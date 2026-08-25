@@ -3261,3 +3261,17 @@ def test_stabilize_honours_a_published_reference_window():
     out = scan_service.stabilize_live_scan_payload(
         frame(900.0, True), frame(890.0, True), scfg, robot_static=False)
     assert out["gates"]["distance"] is True, out
+
+
+def test_plane_rms_none_when_starved_never_nan():
+    """Review finding: NaN here kills the /ws JSON on the client and 500s the
+    lock/insert responses (FastAPI renders with allow_nan=False)."""
+    K = np.array([[600.0, 0.0, 32.0], [0.0, 600.0, 32.0], [0.0, 0.0, 1.0]])
+    assert scan_service._plane_rms_mm(np.zeros((64, 64)), K) is None
+
+
+def test_finite_or_none_guards_payload_metrics():
+    assert scan_service._finite_or_none(float("nan")) is None
+    assert scan_service._finite_or_none(float("inf")) is None
+    assert scan_service._finite_or_none(1.25) == 1.25
+    assert scan_service._finite_or_none(None) is None

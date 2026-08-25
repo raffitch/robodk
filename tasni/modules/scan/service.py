@@ -206,7 +206,7 @@ def _large_surface_crop_mm(scfg, K, image_size, look_mm: float,
     return [float(scfg.work_crop_mm[0]), float(scfg.work_crop_mm[1])]
 
 
-def _plane_rms_mm(depth, K, *, stride: int = 8, outline_uv=None) -> float:
+def _plane_rms_mm(depth, K, *, stride: int = 8, outline_uv=None) -> float | None:
     """Plane-fit RMS (mm) of the SURVEYED surface, for the quality report.
 
     ``outline_uv`` (normalized image coords, the survey's own outline) restricts the
@@ -219,6 +219,9 @@ def _plane_rms_mm(depth, K, *, stride: int = 8, outline_uv=None) -> float:
     A loose 25 mm band still drops the few spurious stereo/alignment pixels inside
     the outline (physically not the surface) before the RMS, mirroring the
     characterization fix; genuine surface structure sits far below it.
+
+    Returns ``None`` (never NaN) when starved of samples or the fit fails — NaN
+    would poison JSON on both client paths.
     """
     d = np.asarray(depth, dtype=float)[::stride, ::stride]
     if outline_uv is not None and len(outline_uv) >= 3:
@@ -237,19 +240,30 @@ def _plane_rms_mm(depth, K, *, stride: int = 8, outline_uv=None) -> float:
         d = np.where(mask.astype(bool), d, 0.0)
     v, u = np.nonzero(d > 0)
     if len(v) < 50:
-        return float("nan")
+        return None
     z = d[v, u]
     fx, fy, cx, cy = K[0][0], K[1][1], K[0][2], K[1][2]
     pts = np.stack([(u * stride - cx) / fx * z, (v * stride - cy) / fy * z, z], axis=1)
     try:
         normal, centroid, _ = fit_plane(pts, distance=6.0)
     except Exception:
-        return float("nan")
+        return None
     res = (pts - centroid) @ np.asarray(normal, dtype=float)
     res = res[np.abs(res) <= 25.0]
     if len(res) < 50:
-        return float("nan")
+        return None
     return float(np.sqrt(np.mean(res ** 2)))
+
+
+def _finite_or_none(value) -> float | None:
+    """JSON-safe metric guard: NaN/inf must never reach a payload — the /ws
+    send_json path emits bare NaN (the browser's JSON.parse rejects the whole
+    event) and FastAPI's HTTP render raises (allow_nan=False -> a 500 on
+    lock/insert/finish)."""
+    if value is None:
+        return None
+    v = float(value)
+    return v if np.isfinite(v) else None
 
 
 def _survey_record_from_lock(survey, seed_T, snapshot, camera_cfg, *, mode, n_frames,
@@ -273,10 +287,10 @@ def _survey_record_from_lock(survey, seed_T, snapshot, camera_cfg, *, mode, n_fr
         measurement_ts=float(measurement_ts), captured_at=snapshot.fetched_at,
         n_frames=int(n_frames), standoff_mm=float(survey.standoff_mm),
         tilt_deg=float(survey.tilt_deg), valid_frac=float(valid_frac),
-        plane_rms_mm=float(plane_rms_mm),
+        plane_rms_mm=_finite_or_none(plane_rms_mm),
         plane_normal_base=tuple(normal_base), plane_point_base=tuple(centroid_base))
     quality = {
-        "plane_rms_mm": float(plane_rms_mm), "standoff_mm": float(survey.standoff_mm),
+        "plane_rms_mm": _finite_or_none(plane_rms_mm), "standoff_mm": float(survey.standoff_mm),
         "tilt_deg": float(survey.tilt_deg), "valid_frac": float(valid_frac),
         "measure_frames": int(n_frames),
     }
