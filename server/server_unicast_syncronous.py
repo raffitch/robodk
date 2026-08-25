@@ -633,17 +633,37 @@ height = 720;
 # 630 mm above the floor: valid depth stopped ~20 mm short of the panel's top and
 # bottom edges (left/right were within 0.3-2.7 mm). The stereo matcher needs
 # texture, and the IR projector is what supplies it on blank surfaces -- it was
-# running at the 150 default, only 42% of this device's 360 maximum. More projected
-# texture is the most direct lever on edge coverage, so that is the default now.
-# The preset is deliberately LEFT ALONE by default (-1 = don't touch). Today's
+# running at the 150 default, only 42% of this device's 360 maximum.
+# Both knobs are deliberately LEFT ALONE by default (-1 = don't touch). Today's
 # distance characterization was measured under the preset the device is actually
 # running, so silently changing it would invalidate that dated record; and High
 # Accuracy in particular is the wrong direction here (it raises the confidence
 # threshold, returning fewer but surer points, when the measured defect is missing
 # coverage). Set RS_VISUAL_PRESET=4 to trial high_density as a SEPARATE experiment,
 # with its own before/after measurement.
-RS_VISUAL_PRESET = int(os.environ.get('RS_VISUAL_PRESET', '-1'))
-RS_LASER_POWER = float(os.environ.get('RS_LASER_POWER', '300'))
+def _env_number(name: str, default: float) -> float:
+    """A numeric env override, or ``default`` when unset OR unparsable. A
+    typo'd value must never take the service down: the unit is Restart=always
+    with no start limit, so an import-time ValueError becomes an infinite
+    crash-loop with the camera dark for every module."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"WARNING: {name}={raw!r} is not a number — using {default:g}",
+              flush=True)
+        return float(default)
+
+
+RS_VISUAL_PRESET = int(_env_number('RS_VISUAL_PRESET', -1))
+# -1 = leave the device's current laser power alone. The 2026-08-13 depth
+# characterization was measured at the device's 150; a silent default of 300
+# doubled projector power on every restart and invalidated that dated envelope
+# (the same invariant that keeps RS_VISUAL_PRESET at leave-alone). Trial higher
+# power as an explicit experiment with its own before/after measurement.
+RS_LASER_POWER = _env_number('RS_LASER_POWER', -1.0)
 
 
 def set_high_accuracy_preset(profile):
@@ -657,21 +677,36 @@ def set_high_accuracy_preset(profile):
     otherwise. Every option is now read back after writing, so the log states the
     achieved configuration rather than the attempted one.
 
-    The preset default is HIGH DENSITY, not High Accuracy: High Accuracy raises the
-    confidence threshold, returning fewer but surer points, which is the wrong trade
-    when the measured failure is missing coverage at surface edges.
+    Both the preset and the laser power default to LEAVE-ALONE (-1): the dated
+    depth characterization was measured under whatever the device is actually
+    running, so changing either silently on every restart would invalidate that
+    record. Set RS_VISUAL_PRESET / RS_LASER_POWER to trial a change as an
+    explicit experiment with its own before/after measurement. (High Accuracy in
+    particular is the wrong direction for edge coverage: it raises the confidence
+    threshold, returning fewer but surer points, when the measured defect is
+    MISSING coverage at surface edges.)
     """
     try:
         sensor = profile.get_device().first_depth_sensor()
     except Exception as e:
         print(f"WARNING: no depth sensor to configure: {e}", flush=True)
         return
-    wanted = [('laser_power', getattr(rs.option, 'laser_power', None), RS_LASER_POWER),
-              # Every client of this server shares one pipeline, so enabling the
-              # emitter here covers scan, calibration, extrusion/cylinder measuring
-              # and the live preview alike — there is no per-feature IR state to
-              # keep in sync, and nothing anywhere turns it back off.
-              ('emitter_enabled', getattr(rs.option, 'emitter_enabled', None), 1.0)]
+    wanted = [
+        # Every client of this server shares one pipeline, so enabling the
+        # emitter here covers scan, calibration, extrusion/cylinder measuring
+        # and the live preview alike — there is no per-feature IR state to
+        # keep in sync, and nothing anywhere turns it back off.
+        ('emitter_enabled', getattr(rs.option, 'emitter_enabled', None), 1.0)]
+    if RS_LASER_POWER >= 0:
+        wanted.insert(0, ('laser_power', getattr(rs.option, 'laser_power', None),
+                          RS_LASER_POWER))
+    else:
+        try:
+            cur = sensor.get_option(rs.option.laser_power)
+            print(f"RealSense: laser_power left as-is at {cur:g} "
+                  "(set RS_LASER_POWER to change it)", flush=True)
+        except Exception:
+            pass
     if RS_VISUAL_PRESET >= 0:
         wanted.insert(0, ('visual_preset', getattr(rs.option, 'visual_preset', None),
                           float(RS_VISUAL_PRESET)))
