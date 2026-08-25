@@ -608,7 +608,11 @@ def lock_scan_surface(services, *, force_crop: bool = False,
                 vis_corners, boundary_info = _corners_from_boundary_on_plane(
                     (boundary or {}).get("polygon_uv"), survey, cfg.camera, scfg)
                 if vis_corners is not None:
-                    survey = replace(survey, corners_cam_mm=vis_corners)
+                    survey = _survey_with_vision_boundary(
+                        survey, vis_corners, boundary_info)
+                    gate_payload["extent_mm"] = (
+                        list(survey.extent_mm)
+                        if survey.extent_mm is not None else None)
                 elif boundary_info.get("reason"):
                     gate_payload.setdefault("warnings", []).append(
                         "work-surface edges measured from DEPTH, not vision: "
@@ -1172,6 +1176,20 @@ def _corners_from_boundary_on_plane(polygon_uv, survey, camera_cfg, scfg):
     info["boundary_source"] = "vision"
     info["gain_mm"] = [round(vis[0] - dep[0], 1), round(vis[1] - dep[1], 1)]
     return np.asarray(corners, dtype=float), info
+
+
+def _survey_with_vision_boundary(survey, vis_corners, info):
+    """Adopt the corroborated vision boundary onto the survey WHOLE: corners AND
+    extent together. plan_scan sizes the tour from ``survey.extent_mm`` while
+    the record/work frame derive from the corners — swapping only the corners
+    left the planner touring the ~20 mm/edge-smaller depth rectangle that the
+    hybrid extent exists to escape, and the gate payload contradicting the
+    record. ``vision_extent_mm`` is (longer, shorter), the same convention as
+    ``SurveyMeasurement.extent_mm``."""
+    vis_extent = info.get("vision_extent_mm")
+    extent = (tuple(float(v) for v in vis_extent)
+              if vis_extent is not None else survey.extent_mm)
+    return replace(survey, corners_cam_mm=vis_corners, extent_mm=extent)
 
 
 def _boundary_polygon_uv(scfg, color) -> "np.ndarray | None":

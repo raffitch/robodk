@@ -3157,3 +3157,24 @@ def test_vision_boundary_accepted_when_centred():
     assert corners is not None
     assert info["boundary_source"] == "vision"
     assert info["center_offset_mm"] <= 6.0
+
+
+def test_vision_boundary_updates_extent_for_the_planner():
+    """Review finding: only corners_cam_mm was replaced at the hybrid lock;
+    plan_scan reads survey.extent_mm, so the tour was sized from the smaller
+    depth rectangle and the gate payload contradicted the record."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class _S:
+        corners_cam_mm: object
+        extent_mm: object
+
+    survey = _S(corners_cam_mm=None, extent_mm=(280.0, 200.0))
+    corners = np.zeros((4, 3))
+    out = scan_service._survey_with_vision_boundary(
+        survey, corners, {"vision_extent_mm": [320.0, 240.0]})
+    assert out.extent_mm == (320.0, 240.0)
+    assert out.corners_cam_mm is corners
+    out2 = scan_service._survey_with_vision_boundary(survey, corners, {})
+    assert out2.extent_mm == (280.0, 200.0)
