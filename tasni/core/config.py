@@ -421,6 +421,7 @@ class ScanConfig(_Model):
     # only ever under-reach:
     boundary_trust_envelope_mm: float = 60.0  # vision may exceed depth by at most this
     boundary_shrink_tol_mm: float = 5.0       # ...and may fall short of it by at most this
+    boundary_center_tol_mm: float = 30.0      # ...and its centre may shift laterally by at most this
     color_boundary_seg_width: int = 480          # downscale width for the segmentation (speed)
 
     # -- learned (SAM) work boundary for low-contrast scenes -------------------

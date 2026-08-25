@@ -1090,7 +1090,9 @@ def _corners_from_boundary_on_plane(polygon_uv, survey, camera_cfg, scfg):
     vision edge INSIDE the depth reach means the segmentation grabbed something
     smaller than the surface (wrong object, shadow, glare) and is rejected; a
     vision edge implausibly far outside it (beyond ``boundary_trust_envelope_mm``)
-    means it bled onto the background and is likewise rejected.
+    means it bled onto the background and is likewise rejected. The centre is
+    corroborated too (``boundary_center_tol_mm``): equal side lengths cannot see
+    a lateral shift.
     """
     info: dict = {"boundary_source": "depth"}
     if polygon_uv is None or survey.normal_cam is None or survey.centroid_cam_mm is None:
@@ -1149,6 +1151,24 @@ def _corners_from_boundary_on_plane(polygon_uv, survey, camera_cfg, scfg):
                               f"extent on axis {axis} (limit {envelope:.0f}) — it "
                               "likely bled onto the background")
             return None, info
+
+    center_tol = float(getattr(scfg, "boundary_center_tol_mm", 30.0))
+    depth_corners = getattr(survey, "corners_cam_mm", None)
+    if depth_corners is not None:
+        # Lengths alone cannot see a lateral shift (gain a shadow band on one
+        # edge, lose a sliver on the opposite one: same extent, moved corners).
+        offset = (np.asarray(corners, dtype=float).mean(axis=0)
+                  - np.asarray(depth_corners, dtype=float).mean(axis=0))
+        offset -= float(offset @ n) * n          # in-plane component only
+        shift = float(np.linalg.norm(offset))
+        info["center_offset_mm"] = round(shift, 1)
+        if shift > center_tol:
+            info["reason"] = (
+                f"vision rectangle centre is {shift:.0f} mm from the depth "
+                f"rectangle centre (limit {center_tol:.0f}) — the segmentation "
+                "drifted sideways, not outward")
+            return None, info
+
     info["boundary_source"] = "vision"
     info["gain_mm"] = [round(vis[0] - dep[0], 1), round(vis[1] - dep[1], 1)]
     return np.asarray(corners, dtype=float), info

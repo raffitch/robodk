@@ -3117,3 +3117,43 @@ if __name__ == "__main__":
     test_survey_capture_restarts_live_preview_and_its_sam_worker_cleanly()
     test_poses_generate_rejects_out_of_range_overlap_with_400()
     print("\nScan job (gate -> generate -> run -> insert) tests passed.")
+
+
+def _corroboration_scene(shift_x_mm: float):
+    from types import SimpleNamespace
+    K = np.array([[600.0, 0.0, 640.0], [0.0, 600.0, 360.0], [0.0, 0.0, 1.0]])
+    camera_cfg = SimpleNamespace(K=K, dist=np.zeros(5), size=(1280, 720))
+    survey = SimpleNamespace(
+        normal_cam=np.array([0.0, 0.0, -1.0]),
+        centroid_cam_mm=np.array([0.0, 0.0, 500.0]),
+        extent_mm=(300.0, 200.0),
+        corners_cam_mm=np.array([[-150.0, -100.0, 500.0], [150.0, -100.0, 500.0],
+                                 [150.0, 100.0, 500.0], [-150.0, 100.0, 500.0]]))
+    xs = np.array([-150.0, 150.0, 150.0, -150.0]) + shift_x_mm
+    ys = np.array([-100.0, -100.0, 100.0, 100.0])
+    u = (xs / 500.0 * 600.0 + 640.0) / 1280.0
+    v = (ys / 500.0 * 600.0 + 360.0) / 720.0
+    return np.column_stack([u, v]), survey, camera_cfg
+
+
+def test_vision_boundary_rejected_when_laterally_shifted():
+    """Review finding: side lengths were the ONLY corroboration, so a shifted
+    segmentation (same extent, moved centre) replaced the work-frame corners
+    ~40 mm off under a green lock."""
+    from tasni.core.config import ScanConfig
+    polygon_uv, survey, camera_cfg = _corroboration_scene(shift_x_mm=40.0)
+    corners, info = scan_service._corners_from_boundary_on_plane(
+        polygon_uv, survey, camera_cfg, ScanConfig())
+    assert corners is None
+    assert "centre" in info["reason"]
+    assert info["boundary_source"] == "depth"
+
+
+def test_vision_boundary_accepted_when_centred():
+    from tasni.core.config import ScanConfig
+    polygon_uv, survey, camera_cfg = _corroboration_scene(shift_x_mm=5.0)
+    corners, info = scan_service._corners_from_boundary_on_plane(
+        polygon_uv, survey, camera_cfg, ScanConfig())
+    assert corners is not None
+    assert info["boundary_source"] == "vision"
+    assert info["center_offset_mm"] <= 6.0
