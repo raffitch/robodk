@@ -3178,3 +3178,86 @@ def test_vision_boundary_updates_extent_for_the_planner():
     assert out.corners_cam_mm is corners
     out2 = scan_service._survey_with_vision_boundary(survey, corners, {})
     assert out2.extent_mm == (280.0, 200.0)
+
+
+def test_live_distance_gate_clamped_to_accurate_band():
+    """Audit A2: a crop-latched ideal of 800 must not accept 930 mm just because
+    |930-800| <= distance_tol_mm — the window's top is accurate_max_mm."""
+    import time as _time
+    from tasni.core.config import ScanConfig
+    scfg = ScanConfig()
+    raw = {"detected": True, "distance_mm": 930.0, "tilt_deg": 1.0,
+           "valid_frac": 0.9, "surface_mode": "crop",
+           "_received_at": _time.time(), "timestamp": _time.time()}
+    out = scan_service.live_scan_telemetry_payload(raw, scfg, previous_ideal_mm=800.0)
+    assert out["ideal_distance_mm"] == 800.0
+    assert out["gates"]["distance"] is False, out
+    ok = dict(raw, distance_mm=780.0)
+    out2 = scan_service.live_scan_telemetry_payload(ok, scfg, previous_ideal_mm=800.0)
+    assert out2["gates"]["distance"] is True, out2
+
+
+def test_stabilize_does_not_hand_back_the_unclamped_window():
+    """stabilize_live_scan_payload re-gates distance AFTER the payload builder,
+    so it has to use the same clamped window (audit A2) — otherwise the live HUD
+    goes green past accurate_max_mm even though the builder said no."""
+    from tasni.core.config import ScanConfig
+    scfg = ScanConfig()
+
+    def frame(distance_mm, distance_gate):
+        return {"detected": True, "live": True, "surface_mode": "crop",
+                "distance_mm": distance_mm, "ideal_distance_mm": 800.0,
+                "tilt_deg": 1.0, "distance_tol_mm": scfg.distance_tol_mm,
+                "max_tilt_deg": scfg.max_tilt_deg,
+                "gates": {"detected": True, "distance": distance_gate,
+                          "angle": True}}
+
+    # Previous frame green at 900 mm (what the UNCLAMPED gate used to publish:
+    # |900-800| <= distance_tol_mm), so hysteresis widens the window. 930 mm is
+    # still far past accurate_max_mm and must NOT be re-gated green.
+    out = scan_service.stabilize_live_scan_payload(
+        frame(930.0, False), frame(900.0, True), scfg, robot_static=False)
+    assert out["gates"]["distance"] is False, out
+    assert out["distance_window_mm"][1] == scfg.accurate_max_mm
+    # ...and a reading inside the band still gates green through the same path.
+    ok = scan_service.stabilize_live_scan_payload(
+        frame(790.0, True), frame(780.0, True), scfg, robot_static=False)
+    assert ok["gates"]["distance"] is True, ok
+
+
+def test_standoff_window_exempts_reference_mode_far_edge_only():
+    """Reference mode exists for a surface too big to frame inside the accurate
+    band, and the planner pins its ideal AT accurate_max_mm — clamping the far
+    edge there would make the mode unreachable (it builds no mesh and runs no
+    tour, so standing past the band is the point). The NEAR edge still clamps:
+    below MinZ the camera returns nothing usable in any mode."""
+    from tasni.core.config import ScanConfig
+    scfg = ScanConfig()          # accurate band 300..800, tol 150
+    lo, hi = scan_service.standoff_accept_window_mm(800.0, scfg)
+    assert (lo, hi) == (650.0, 800.0)
+    lo_r, hi_r = scan_service.standoff_accept_window_mm(
+        800.0, scfg, reference_mode=True)
+    assert (lo_r, hi_r) == (650.0, 950.0)
+    # near edge clamped in BOTH modes
+    for ref in (False, True):
+        lo_n, _ = scan_service.standoff_accept_window_mm(350.0, scfg, reference_mode=ref)
+        assert lo_n == scfg.accurate_min_mm
+
+
+def test_stabilize_honours_a_published_reference_window():
+    """stabilize must reuse the window the payload builder published — only the
+    builder knows this surface is heading for reference mode."""
+    from tasni.core.config import ScanConfig
+    scfg = ScanConfig()
+
+    def frame(distance_mm, gate):
+        return {"detected": True, "live": True, "surface_mode": "full",
+                "distance_mm": distance_mm, "ideal_distance_mm": 800.0,
+                "tilt_deg": 1.0, "distance_tol_mm": scfg.distance_tol_mm,
+                "distance_window_mm": [650.0, 950.0],   # reference: far edge open
+                "max_tilt_deg": scfg.max_tilt_deg,
+                "gates": {"detected": True, "distance": gate, "angle": True}}
+
+    out = scan_service.stabilize_live_scan_payload(
+        frame(900.0, True), frame(890.0, True), scfg, robot_static=False)
+    assert out["gates"]["distance"] is True, out

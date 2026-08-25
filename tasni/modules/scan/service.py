@@ -323,25 +323,31 @@ def _aspect_ratio(values) -> float | None:
     return max(a, b) / lo
 
 
-def _planned_surface_standoff_mm(
+def _planned_surface_aim(
     scfg, K, image_size, reading, survey, full_frame_valid_frac: float | None = None
-) -> float:
-    """Best standoff for the measured surface, matching the target planner."""
+) -> tuple[float, str]:
+    """``(standoff_mm, mode)`` for the measured surface, matching the target planner.
+
+    ``mode`` is the planner's own ``"quality"``/``"reference"`` decision (or
+    ``"unknown"`` when no plan could be made). The distance gate needs it: a
+    reference-mode surface is by definition too big to frame inside the accurate
+    band, so the operator must stand PAST ``accurate_max_mm`` to see all of it —
+    see :func:`standoff_accept_window_mm`."""
     if survey is not None and getattr(survey, "detected", False):
         if (not getattr(survey, "fully_framed", False)
                 and full_frame_valid_frac is not None
                 and full_frame_valid_frac >= 0.95):
-            return float(scfg.accurate_min_mm)
+            return float(scfg.accurate_min_mm), "quality"
         try:
             plan = plan_scan(survey, K, image_size, scfg, cam_to_base_T=None)
-            return float(plan.standoff_mm)
+            return float(plan.standoff_mm), str(plan.mode)
         except Exception:
             pass
     if getattr(reading, "distance_mm", None) is not None:
         return float(np.clip(float(reading.distance_mm),
                              float(scfg.accurate_min_mm),
-                             float(scfg.accurate_max_mm)))
-    return float(scfg.ideal_distance_mm)
+                             float(scfg.accurate_max_mm))), "unknown"
+    return float(scfg.ideal_distance_mm), "unknown"
 
 
 def _authoritative_acquisition(services, *, owner: str):
@@ -457,16 +463,19 @@ def lock_scan_surface(services, *, force_crop: bool = False,
         })
     crop_mode = declared_region
     gate_payload = scan_gate_payload(reading, survey)
-    ideal_distance = _planned_surface_standoff_mm(
+    ideal_distance, planned_mode = _planned_surface_aim(
         scfg, K, cfg.camera.size, reading, survey, full_frame_valid_frac)
     gate_payload["ideal_distance_mm"] = ideal_distance
     gate_payload["distance_tol_mm"] = float(scfg.distance_tol_mm)
+    lo_mm, hi_mm = standoff_accept_window_mm(
+        ideal_distance, scfg, reference_mode=(planned_mode == "reference"))
+    gate_payload["distance_window_mm"] = [lo_mm, hi_mm]
     gate_payload["surface_mode"] = "crop" if crop_mode else "full"
     final_gates = {
         "detected": bool(reading.gates.get("detected")),
         "distance": (
             reading.distance_mm is not None
-            and abs(float(reading.distance_mm) - ideal_distance) <= float(scfg.distance_tol_mm)
+            and lo_mm <= float(reading.distance_mm) <= hi_mm
         ),
         "angle": bool(reading.gates.get("angle")),
     }
@@ -722,6 +731,32 @@ def lock_scan_surface(services, *, force_crop: bool = False,
         lock_token=(lock_fingerprint(workflow_goal, surface_scope, user_region_mm)
                     + "-" + uuid.uuid4().hex),
         workflow_goal=workflow_goal, surface_scope=surface_scope)
+
+
+def standoff_accept_window_mm(ideal_mm: float, scfg, *,
+                              reference_mode: bool = False) -> tuple[float, float]:
+    """Distance-gate accept window: ideal ± distance_tol_mm, CLAMPED to the
+    camera's accurate depth band (audit A2).
+
+    distance_tol_mm was widened 50 -> 150 on 2026-08-13 (plane RMS is flat
+    across ±150 mm), but the tolerance is applied around an ideal that is
+    itself clipped to [accurate_min_mm, accurate_max_mm] — without this clamp
+    the gate accepts 150..950 mm: past the characterized envelope on one end
+    and below the D435i's MinZ on the other.
+
+    ``reference_mode`` exempts the FAR edge only. Reference mode exists precisely
+    for a surface too big to frame inside the accurate band (``d_fit >
+    accurate_max_mm``), and the planner pins its ideal AT ``accurate_max_mm``, so
+    clamping the top would make the mode unreachable: the operator has to stand
+    at ``d_fit``, past the band, to see the whole surface. That is sound because
+    reference mode builds no fused mesh and runs no tour — it places a single
+    rough rectangle, already warning-flagged. The near edge is clamped in every
+    mode: below MinZ the camera returns nothing usable, whatever the mode."""
+    lo = max(float(ideal_mm) - float(scfg.distance_tol_mm), float(scfg.accurate_min_mm))
+    hi = float(ideal_mm) + float(scfg.distance_tol_mm)
+    if not reference_mode:
+        hi = min(hi, float(scfg.accurate_max_mm))
+    return lo, hi
 
 
 def scan_gate_thresholds(scfg) -> ScanGateThresholds:
@@ -1744,21 +1779,30 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
     # It is only trustworthy while the object is BOUNDED in view — once it overruns, the
     # rectangle/extent are clipped to the frame and the estimate is meaningless.
     framing_standoff = None
+    # The UNCLIPPED framing distance too: when it overshoots accurate_max_mm the
+    # surface cannot be framed inside the accurate band, which is exactly the
+    # planner's reference-mode condition (d_fit > accurate_max_mm). The distance
+    # gate must not clamp its far edge there or the operator can never stand far
+    # enough back to see the whole surface — see standoff_accept_window_mm.
+    framing_standoff_raw = None
     if fit_per_margin is not None:
-        framing_standoff = float(np.clip(
-            float(fit_per_margin) * float(scfg.frame_margin),
-            float(scfg.accurate_min_mm), float(scfg.accurate_max_mm)))
+        framing_standoff_raw = float(fit_per_margin) * float(scfg.frame_margin)
     elif extent is not None and camera_cfg is not None:
         try:
             sx, sy = [float(v) for v in extent]
             W, H = camera_cfg.size
             K = camera_cfg.K
-            framing_standoff = float(np.clip(
-                max(float(scfg.frame_margin) * sx * float(K[0, 0]) / float(W),
-                    float(scfg.frame_margin) * sy * float(K[1, 1]) / float(H)),
-                float(scfg.accurate_min_mm), float(scfg.accurate_max_mm)))
+            framing_standoff_raw = max(
+                float(scfg.frame_margin) * sx * float(K[0, 0]) / float(W),
+                float(scfg.frame_margin) * sy * float(K[1, 1]) / float(H))
         except Exception:
-            framing_standoff = None
+            framing_standoff_raw = None
+    if framing_standoff_raw is not None:
+        framing_standoff = float(np.clip(framing_standoff_raw,
+                                         float(scfg.accurate_min_mm),
+                                         float(scfg.accurate_max_mm)))
+    reference_standoff = (framing_standoff_raw is not None
+                          and framing_standoff_raw > float(scfg.accurate_max_mm))
 
     if surface_mode == "crop":
         # The surface overruns the view, so its live rectangle/extent are clipped to the
@@ -1785,9 +1829,11 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
         # Generic fixed work square (the surface overruns the view; its edges are not
         # trustworthy). Matches the host lock/run crop and the server's live overlay.
         crop_size = [float(scfg.work_crop_mm[0]), float(scfg.work_crop_mm[1])]
+    lo_mm, hi_mm = standoff_accept_window_mm(ideal_distance, scfg,
+                                             reference_mode=reference_standoff)
     gates = {
         "detected": True,
-        "distance": abs(distance - ideal_distance) <= th.distance_tol_mm,
+        "distance": lo_mm <= distance <= hi_mm,
         "angle": tilt <= th.max_tilt_deg,
     }
     center_cam = raw.get("surface_center_cam_mm")
@@ -1829,6 +1875,7 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
         "ok": all(bool(v) for v in ok_gates.values()),
         "ideal_distance_mm": ideal_distance,
         "distance_tol_mm": th.distance_tol_mm,
+        "distance_window_mm": [lo_mm, hi_mm],
         "max_tilt_deg": th.max_tilt_deg,
         "move_cam": [
             float(center_cam[0]) if finite_surface and center_cam is not None else 0.0,
@@ -2146,10 +2193,24 @@ def stabilize_live_scan_payload(current: dict, previous: dict | None, scfg,
     ideal = out.get("ideal_distance_mm")
     tilt = out.get("tilt_deg")
     if distance is not None and ideal is not None:
-        tol = float(out.get("distance_tol_mm", scfg.distance_tol_mm))
+        # Re-gate on the CLAMPED accept window (audit A2), not on a symmetric
+        # tolerance around the ideal: this runs after live_scan_telemetry_payload
+        # and would otherwise hand the clamp straight back. Hysteresis widens the
+        # window on both sides once the gate is already green, exactly as the
+        # symmetric tolerance used to.
+        # Prefer the window the payload builder published: only IT knows whether
+        # this surface is heading for reference mode (far edge unclamped). Falling
+        # back to a bare recompute here would silently re-clamp it.
+        window = out.get("distance_window_mm")
+        if window is not None:
+            lo_mm, hi_mm = float(window[0]), float(window[1])
+        else:
+            lo_mm, hi_mm = standoff_accept_window_mm(float(ideal), scfg)
+            out["distance_window_mm"] = [lo_mm, hi_mm]
         if prev_gates.get("distance"):
-            tol += float(getattr(scfg, "live_aim_distance_hysteresis_mm", 20.0))
-        gates["distance"] = abs(float(distance) - float(ideal)) <= tol
+            slack = float(getattr(scfg, "live_aim_distance_hysteresis_mm", 20.0))
+            lo_mm, hi_mm = lo_mm - slack, hi_mm + slack
+        gates["distance"] = lo_mm <= float(distance) <= hi_mm
     if tilt is not None:
         tol = float(out.get("max_tilt_deg", scfg.max_tilt_deg))
         if prev_gates.get("angle"):
