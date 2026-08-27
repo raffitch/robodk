@@ -283,10 +283,6 @@ class CylinderDryRunJob:
         current_program = None
         mock_artifacts: list[str] = []
         path_artifacts: list[str] = []
-        # Branch-locked waypoint targets are bulk, not evidence: they are removed
-        # even when a run fails, so a failure leaves only the curve, project and
-        # program to inspect instead of dozens of targets to hand-delete.
-        path_targets: list[str] = []
         completed = False
         reports: list[dict] = []
         valve_events: list[dict] = []
@@ -361,10 +357,8 @@ class CylinderDryRunJob:
                     air_on_program=mock_on, air_off_program=mock_off,
                     maximum_tool_axis_spin_deg=(
                         self.plan.setup.maximum_tool_axis_spin_deg),
-                    maximum_path_targets=ecfg.max_path_targets_per_layer,
                     check_cancel=ctx.check_cancel)
                 path_artifacts.extend(built["artifacts"])
-                path_targets.extend(built["targets"])
                 current_program = name
                 # Generation and Update are synchronous RoboDK calls. A cancel
                 # received during either call is acted on as soon as it returns,
@@ -466,7 +460,7 @@ class CylinderDryRunJob:
             except Exception:
                 pass
             try:
-                cleanup = (mock_artifacts + path_targets
+                cleanup = (mock_artifacts
                            + (path_artifacts if completed else []))
                 rdk.delete_items(list(dict.fromkeys(reversed(cleanup))))
             except Exception:
@@ -590,7 +584,6 @@ class CylinderPrintJob:
                         air_off_program=ecfg.air_off_program,
                         maximum_tool_axis_spin_deg=(
                             self.plan.setup.maximum_tool_axis_spin_deg),
-                        maximum_path_targets=ecfg.max_path_targets_per_layer,
                         check_cancel=ctx.check_cancel)
                     artifacts.extend(built["artifacts"])
                     # Never start real motion if cancellation arrived during a

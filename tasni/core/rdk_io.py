@@ -1354,22 +1354,6 @@ class RdkIO:
     WRIST_AXES = ((3, "axis 4"), (4, "axis 5"), (5, "axis 6"))
 
     @staticmethod
-    def _waypoint_indices(count: int, limit: int) -> list[int]:
-        """Evenly thin ``count`` path points to at most ``limit``, keeping the ends.
-
-        Each retained waypoint costs a station target and roughly ten RoboDK calls,
-        and the plan is generated far denser than the robot needs.
-        """
-        if count <= 0:
-            raise ValueError("the extrusion path has no points")
-        if limit <= 0 or count <= limit:
-            return list(range(count))
-        kept = {0, count - 1}
-        kept.update(int(round(value)) for value in np.linspace(0, count - 1, limit))
-        return sorted(kept)
-
-
-    @staticmethod
     def _joint_values(joints) -> list[float] | None:
         if joints is None:
             return None
@@ -1442,6 +1426,113 @@ class RdkIO:
         }
 
     @staticmethod
+    def _program_moves(program) -> list[tuple[int, np.ndarray]]:
+        """``(instruction index, 4x4 pose)`` for every move RoboDK generated."""
+        import robolink
+
+        moves = []
+        for index in range(program.InstructionCount()):
+            record = program.Instruction(index)
+            if record[1] != robolink.INS_TYPE_MOVE or record[4] is None:
+                continue
+            moves.append((index, pose_to_T(record[4])))
+        return moves
+
+    @classmethod
+    def _program_pose_report(cls, program, orientation_T: np.ndarray,
+                             tolerance_deg: float) -> dict:
+        """Reject a generated path whose ORIENTATION is not the commanded one.
+
+        The wrist-flip this module exists to prevent is not a mis-chosen IK
+        branch: RoboDK emits poses rotated ~180 degrees about the tool axis and
+        then flips axis 4 to reach them. Measuring the rotation of every move
+        against the commanded orientation catches that at the source, before the
+        joint-space check, and before anything is simulated or driven.
+        """
+        commanded = np.asarray(orientation_T, dtype=float)[:3, :3]
+        moves = cls._program_moves(program)
+        if not moves:
+            raise RuntimeError(
+                "RoboDK's generated program contains no movement instructions")
+        worst_index, worst_angle = moves[0][0], -1.0
+        for index, pose in moves:
+            relative = commanded.T @ pose[:3, :3]
+            cosine = max(-1.0, min(1.0, (float(np.trace(relative)) - 1.0) / 2.0))
+            angle = float(np.degrees(np.arccos(cosine)))
+            if angle > worst_angle:
+                worst_index, worst_angle = index, angle
+        if worst_angle > float(tolerance_deg):
+            raise RuntimeError(
+                f"RoboDK generated instruction {worst_index} rotated "
+                f"{worst_angle:.1f} deg away from the commanded orientation; the "
+                f"limit is {float(tolerance_deg):.1f} deg. The path-to-tool seed "
+                "did not reproduce the commanded rotation, so the path was "
+                "blocked before simulation or robot motion.")
+        return {"maximum_pose_error_deg": round(worst_angle, 3),
+                "move_count": len(moves)}
+
+    @classmethod
+    def _program_valve_report(cls, program, points: np.ndarray, normal: np.ndarray,
+                              air_on_program: str, air_off_program: str,
+                              tolerance_mm: float = 1.0) -> dict:
+        """Check WHERE RoboDK put the path-start/path-finish valve calls.
+
+        RoboDK owns this placement now, so it is verified rather than assumed.
+        Measured on the cell: the valve opens right after the nozzle descends to
+        the first path point and closes before the retract lifts it. Opening the
+        extruder while the nozzle is still at the approach standoff would dump
+        material 40 mm above the plane, so this is a safety gate, not a tidiness
+        one; the offsets are measured along the surface normal, not in Z, so a
+        tilted work frame is handled the same way.
+        """
+        points = np.asarray(points, dtype=float)
+        normal = np.asarray(normal, dtype=float)
+
+        def offset(pose) -> float:
+            nearest = points[int(np.argmin(np.linalg.norm(points - pose[:3, 3], axis=1)))]
+            return float(np.dot(pose[:3, 3] - nearest, normal))
+
+        moves = [(index, offset(pose)) for index, pose in cls._program_moves(program)]
+        found: dict[str, list[int]] = {air_on_program: [], air_off_program: []}
+        for index in range(program.InstructionCount()):
+            name = str(program.Instruction(index)[0])
+            if name in found:
+                found[name].append(index)
+        for name, hits in found.items():
+            if len(hits) != 1:
+                raise RuntimeError(
+                    f"the extruder valve program {name!r} appears {len(hits)} times "
+                    "in RoboDK's generated program; exactly one call is required. "
+                    "Check the project's ProgEvents CallPathStart/CallPathFinish.")
+        air_on, air_off = found[air_on_program][0], found[air_off_program][0]
+        if air_on > air_off:
+            raise RuntimeError(
+                f"the extruder valve opens at instruction {air_on}, after it closes "
+                f"at {air_off}")
+        before = [height for index, height in moves if index < air_on]
+        if not before or abs(before[-1]) > float(tolerance_mm):
+            height = before[-1] if before else float("nan")
+            raise RuntimeError(
+                f"the extruder valve opens at instruction {air_on}, where the nozzle "
+                f"is {height:.1f} mm off the path along the surface normal; it must "
+                "be down on the first path point. Extruding at the approach standoff "
+                "would dump material above the plane.")
+        while_open = [height for index, height in moves if air_on < index < air_off]
+        highest = max((abs(height) for height in while_open), default=0.0)
+        if highest > float(tolerance_mm):
+            raise RuntimeError(
+                f"the extruder valve stays open across a move {highest:.1f} mm off "
+                "the path along the surface normal; it must close before the nozzle "
+                "leaves the plane.")
+        after = [height for index, height in moves if index > air_off]
+        if not after or max(after) < float(tolerance_mm):
+            raise RuntimeError(
+                "RoboDK's generated program never retracts after the extruder valve "
+                "closes; the nozzle would be left down on the finished bead.")
+        return {"air_on_instruction": air_on, "air_off_instruction": air_off,
+                "retract_height_mm": round(max(after), 3)}
+
+    @staticmethod
     def xyzrpy_pose_T(xyz_mm, rpy_deg) -> np.ndarray:
         """Build a RoboDK-convention XYZ+RPW pose as a numpy transform."""
         import robodk.robomath as robomath
@@ -1472,12 +1563,20 @@ class RdkIO:
             approach_clearance_mm: float, retreat_clearance_mm: float,
             air_on_program: str, air_off_program: str,
             maximum_tool_axis_spin_deg: float = 90.0,
-            maximum_path_targets: int = 60, check_cancel=None) -> dict:
-        """Build a disposable native RoboDK Curve Follow Project for one layer.
+            maximum_pose_error_deg: float = 1.0, check_cancel=None) -> dict:
+        """Build a native RoboDK Curve Follow program for one layer.
 
         Dense samples live inside one curve object (XYZ+IJK), not as station
         targets. RoboDK owns interpolation, approach/retract, preferred orientation,
-        process/rapid speeds, blending, and path-boundary program events.
+        process/rapid speeds, blending, and path-boundary program events, and its
+        generated program is kept exactly as emitted -- ZERO station targets.
+
+        The path-to-tool seed is computed (``curve_follow_seed_T``) rather than
+        searched, then three gates verify what RoboDK actually produced: every
+        move must carry the commanded rotation to within
+        ``maximum_pose_error_deg``, the interpolated joint path must stay within
+        ``maximum_tool_axis_spin_deg`` of the start pose on axes 4/5/6, and the
+        extruder valve calls must sit where the nozzle is down on the path.
         """
         import robolink
 
@@ -1499,6 +1598,7 @@ class RdkIO:
         # Cache the exact selected TCP/frame for deterministic seeded IK below.
         self.use_named_tool_frame(print_tool, work_frame)
         start_joints = robot.Joints()
+        targets_before = self._target_count()
         curve_name = name + "_Curve"
         project_name = name + "_Settings"
         for item_name, item_type in ((name, robolink.ITEM_TYPE_PROGRAM),
@@ -1509,7 +1609,12 @@ class RdkIO:
                 old.Delete()
 
         orientation = self.xyzrpy_pose_T([0.0, 0.0, 0.0], orientation_rpy_deg)
-        normal = orientation[:3, 2]
+        # The curve normal is the SURFACE normal -- +Z of the work frame, in whose
+        # coordinates the curve is expressed. It used to be the commanded tool Z,
+        # which coincides with it only because LongCalibTool's Z happens to point
+        # up; for a tool mounted the usual way round that pointed approach and
+        # retract straight into the table.
+        normal = np.array([0.0, 0.0, 1.0])
         curve_vertices = np.column_stack(
             (pts, np.repeat(normal.reshape(1, 3), len(pts), axis=0)))
         curve = self.rdk.AddCurve(
@@ -1562,39 +1667,22 @@ class RdkIO:
         })
         project.setParam("Approach", f"NTS {float(approach_clearance_mm):.6f} 0 0")
         project.setParam("Retract", f"NTS {float(retreat_clearance_mm):.6f} 0 0")
-        # A Curve Follow Project aligns the tool to the curve's normal by its own
-        # convention (tool Z into the work, approach along +normal), so the
-        # path-to-tool pose decides whether the generated path lands on the
-        # operator's neutral wrist branch or 180 degrees from it. This cell's
-        # LongCalibTool carries its TCP Z back up the tool, opposite that
-        # convention, so the identity seed generates the flipped path (measured on
-        # the cell: axis 4 -179 deg from neutral) and the local-X-flipped seed is
-        # the physical one. Which seed is right is a property of the selected
-        # tool's mounting, so do not hard-code it: generate with each and keep the
-        # one whose interpolated joint path actually verifies against neutral.
-        # The curve normal stays unchanged so approach/retract remain on the safe
-        # +normal side of the surface.
-        flip_local_x = np.eye(4)
-        flip_local_x[1, 1] = -1.0
-        flip_local_x[2, 2] = -1.0
-        generation_orientations = (orientation, orientation @ flip_local_x)
-        setup_attempts: list[float] = []
-        program = None
-        setup_status = -1.0
-        for generation_orientation in generation_orientations:
-            project.setPose(T_to_pose(generation_orientation))
-            candidate, candidate_status = project.setMachiningParameters(part=curve)
-            setup_status = float(candidate_status)
-            setup_attempts.append(setup_status)
-            if candidate.Valid() and setup_status >= 0:
-                program = candidate
-                break
-        if program is None:
+        # A Curve Follow Project does not reproduce the roll of its path-to-tool
+        # seed -- it MIRRORS it (see ``curve_follow_seed_T``). This module used to
+        # try the commanded orientation, then ``orientation @ rotx(pi)``, and keep
+        # whichever generated FIRST; that second seed is what produced the
+        # ~180 degree tool-axis roll RoboDK then realised by turning axis 4. There
+        # is nothing to search: the required seed is computable, so compute it once
+        # and verify the result instead of guessing.
+        project.setPose(T_to_pose(curve_follow_seed_T(orientation)))
+        program, candidate_status = project.setMachiningParameters(part=curve)
+        setup_status = float(candidate_status)
+        if not (program.Valid() and setup_status >= 0):
             bounds_min = pts.min(axis=0)
             bounds_max = pts.max(axis=0)
             raise RuntimeError(
                 "RoboDK found no feasible start/path for the Curve Follow Project "
-                f"(statuses {setup_attempts}). Frame={work_frame!r}, tool={print_tool!r}, "
+                f"(status {setup_status}). Frame={work_frame!r}, tool={print_tool!r}, "
                 f"XYZ bounds=[{bounds_min[0]:.1f}..{bounds_max[0]:.1f}, "
                 f"{bounds_min[1]:.1f}..{bounds_max[1]:.1f}, "
                 f"{bounds_min[2]:.1f}..{bounds_max[2]:.1f}] mm, "
@@ -1603,107 +1691,56 @@ class RdkIO:
                 "for inspection; Reset removes them. Jog the selected TCP to the intended "
                 "path start and seed the coordinates again.")
         program.setName(name)
-        # The Curve Follow Project solves its own inverse kinematics and cannot be
-        # steered onto a wrist branch — preferred start joints, the machining
-        # params, the path-to-tool seed and hard joint limits were each measured to
-        # fail on this cell. ``setInstruction`` cannot pin joints either: a move
-        # instruction added through the API always defers to its TARGET item and
-        # reads back with the target's joints, on plain and machining-linked
-        # programs alike (``Item.MoveL``: "only target items supported, not
-        # poses"). So a branch-locked path REQUIRES one target per waypoint.
+        # RoboDK's own generated instructions ARE the layer: inline cartesian
+        # moves over one curve, no station targets. Nothing is deleted, nothing is
+        # appended, and the frame/tool/speed/rounding instructions the project
+        # emits are left exactly as generated. What used to force a rebuild was
+        # the seed above, not any limitation of the generated program.
         #
-        # The curve and project stay in the tree so the path remains visible and
-        # auditable, but the project's own solve is discarded rather than run: it
-        # is both slower and useless to solve a path we are about to replace.
-        for instruction_index in reversed(range(program.InstructionCount())):
-            program.InstructionDelete(instruction_index)
-        program.setPoseFrame(frame)
-        program.setPoseTool(print_tcp)
-        program.setRounding(float(rounding_mm))
-
-        # The plan's density is far finer than the robot needs: at 180 points on a
-        # 37.5 mm radius the waypoints sit ~1.3 mm apart. Decimating to ~60 leaves a
-        # chord error of ~0.05 mm — invisible against a 6 mm bead — and cuts the
-        # station targets (and the RPCs behind them) by two thirds.
-        indices = self._waypoint_indices(len(pts), maximum_path_targets)
-        prior_joints = start_joints
-        maximum_axis_4_seen = 0.0
-        maximum_axis_5_seen = 0.0
-        maximum_spin_seen = 0.0
-        target_names: list[str] = []
-
-        def locked_target(label: str, xyz) -> object:
-            nonlocal prior_joints
-            nonlocal maximum_axis_4_seen, maximum_axis_5_seen, maximum_spin_seen
-            if check_cancel is not None:
-                check_cancel()
-            target_T = orientation.copy()
-            target_T[:3, 3] = np.asarray(xyz, dtype=float)
-            solved = self.solve_joints_on_neutral_branch(
-                target_T, start_joints, prior_joints, maximum_tool_axis_spin_deg)
-            if solved is None:
-                raise RuntimeError(
-                    f"generated waypoint {label!r} has no IK solution on the neutral "
-                    "front/elbow/wrist branch within "
-                    f"±{float(maximum_tool_axis_spin_deg):.1f} deg of the start pose")
-            solved = self._nearest_equivalent_joints(solved, prior_joints)
-            deltas = [self._joint_delta_deg(solved, start_joints, axis=axis)
-                      for axis, _ in self.WRIST_AXES]
-            if any(delta is None or abs(delta) > float(maximum_tool_axis_spin_deg)
-                   for delta in deltas):
-                raise RuntimeError(
-                    f"generated waypoint {label!r} leaves the neutral wrist range "
-                    f"(axis 4/5/6 = {deltas} deg); limit is "
-                    f"±{float(maximum_tool_axis_spin_deg):.1f} deg")
-            maximum_axis_4_seen = max(maximum_axis_4_seen, abs(deltas[0]))
-            maximum_axis_5_seen = max(maximum_axis_5_seen, abs(deltas[1]))
-            maximum_spin_seen = max(maximum_spin_seen, abs(deltas[2]))
-            target_name = f"{name}_{label}"
-            target = self.add_target(target_name, target_T, solved)
-            target_names.append(target_name)
-            prior_joints = solved
-            return target
-
-        approach_target = locked_target(
-            "Approach", pts[indices[0]] + normal * float(approach_clearance_mm))
-        path_targets = [locked_target(f"P{position:04d}", pts[index])
-                        for position, index in enumerate(indices)]
-        retract_target = locked_target(
-            "Retract", pts[indices[-1]] + normal * float(retreat_clearance_mm))
-
-        program.setSpeed(float(travel_speed_mm_s))
-        program.MoveJ(approach_target)
-        program.MoveL(path_targets[0])
-        program.RunInstruction(air_on_program, robolink.INSTRUCTION_CALL_PROGRAM)
-        program.setSpeed(float(speed_mm_s))
-        for target in path_targets[1:]:
-            program.MoveL(target)
-        program.RunInstruction(air_off_program, robolink.INSTRUCTION_CALL_PROGRAM)
-        program.setSpeed(float(travel_speed_mm_s))
-        program.MoveL(retract_target)
+        # Everything below verifies that program rather than trusting it. Each
+        # gate blocks a failure that was actually observed on this cell.
         if check_cancel is not None:
             check_cancel()
+        poses = self._program_pose_report(program, orientation, maximum_pose_error_deg)
         trajectory = self._program_neutral_wrist_report(
             program, start_joints, maximum_tool_axis_spin_deg)
-        artifacts = [curve_name, project_name, name, *target_names]
+        valves = self._program_valve_report(
+            program, pts, normal, air_on_program, air_off_program)
+        created_targets = self._target_count() - targets_before
+        if created_targets:
+            raise RuntimeError(
+                f"generating the layer created {created_targets} station target(s); "
+                "the native Curve Follow program must own its poses inline")
         return {
             "program": name, "curve": curve_name, "project": project_name,
-            "artifacts": artifacts, "targets": target_names,
-            "point_count": len(pts), "waypoint_count": len(indices),
+            "artifacts": [curve_name, project_name, name], "targets": [],
+            "point_count": len(pts),
+            "instruction_count": int(program.InstructionCount()),
+            "move_count": poses["move_count"],
             "setup_status": float(setup_status),
-            "setup_attempts": setup_attempts,
+            "maximum_pose_error_deg": poses["maximum_pose_error_deg"],
+            "maximum_pose_error_limit_deg": float(maximum_pose_error_deg),
+            "air_on_instruction": valves["air_on_instruction"],
+            "air_off_instruction": valves["air_off_instruction"],
+            "retract_height_mm": valves["retract_height_mm"],
             "maximum_tool_axis_spin_deg": float(maximum_tool_axis_spin_deg),
-            "maximum_axis_4_rotation_seen_deg": max(
-                float(maximum_axis_4_seen),
-                trajectory["maximum_axis_4_rotation_seen_deg"]),
-            "maximum_axis_5_rotation_seen_deg": max(
-                float(maximum_axis_5_seen),
-                trajectory["maximum_axis_5_rotation_seen_deg"]),
-            "maximum_tool_axis_spin_seen_deg": max(
-                float(maximum_spin_seen),
-                trajectory["maximum_axis_6_rotation_seen_deg"]),
+            "maximum_axis_4_rotation_seen_deg":
+                trajectory["maximum_axis_4_rotation_seen_deg"],
+            "maximum_axis_5_rotation_seen_deg":
+                trajectory["maximum_axis_5_rotation_seen_deg"],
+            "maximum_tool_axis_spin_seen_deg":
+                trajectory["maximum_axis_6_rotation_seen_deg"],
             "joint_path_sample_count": trajectory["sample_count"],
         }
+
+    def _target_count(self) -> int:
+        """How many target items the station holds right now."""
+        import robolink
+
+        try:
+            return len(self.rdk.ItemList(robolink.ITEM_TYPE_TARGET))
+        except Exception:
+            return 0
 
     def cleanup_extrusion_artifacts(self, prefix: str = "TasniCylinder_") -> list[str]:
         """Delete stale generated programs/projects/curves owned by this module."""
