@@ -64,6 +64,27 @@ interface Status {
   quick_sim_live_approved: boolean; dry_run_passed: boolean;
   hardware_io_test_approved: boolean;
   live_print_enabled: boolean;
+  measure_session?: string | null;
+}
+
+// -- ring-stack measure-only experiment (no extrusion; camera move only) ----
+interface MeasureTake {
+  layer_index: number; take: number; layer_dir: string; valid: boolean; timestamp: string;
+  annotation: { introduced_offset_mm?: [number, number] | null; note?: string };
+  metrics: { mean_absolute_mm: number; rms_mm: number; maximum_mm: number;
+    center_offset_mm: [number, number]; center_offset_norm_mm: number; shape_rms_mm: number;
+    measured_radius_mm: number; path_completeness: number };
+  geometry: { height_mean_mm: number; height_min_mm: number; height_max_mm: number;
+    bead_width_mean_mm: number } | null;
+  timings_ms: { capture_ms: number; total_ms: number; acquisition_to_path_ms: number };
+}
+interface Characterization {
+  index: number; radius_mm: number; center_mm: [number, number]; bead_width_mm: number;
+  top_z_mean_mm: number; top_z_min_mm: number; top_z_max_mm: number;
+}
+interface MeasureSession {
+  trial_id: string; takes: Record<string, number>; records: MeasureTake[];
+  characterizations: Characterization[];
 }
 
 const recipeFields: Array<{ key: keyof Recipe; label: string; min: number; max: number; step: number; unit: string }> = [
@@ -202,6 +223,13 @@ export default function Extrusion() {
   const [liveCollisionCheck, setLiveCollisionCheck] = useState(true);
   const [surface, setSurface] = useState<ScanSurface | null>(null);
   const [inspection, setInspection] = useState<InspectionPreview | null>(null);
+  const [measureSession, setMeasureSession] = useState<MeasureSession | null>(null);
+  const [measureLayer, setMeasureLayer] = useState(1);
+  const [offsetX, setOffsetX] = useState(0);
+  const [offsetY, setOffsetY] = useState(0);
+  const [measureNote, setMeasureNote] = useState("");
+  const [confirmMotion, setConfirmMotion] = useState(false);
+  const [paper, setPaper] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
 
   const refreshStatus = useCallback(() => {
@@ -388,6 +416,65 @@ export default function Extrusion() {
           : `LIVE_PRINT started — collision checks ${liveCollisionCheck ? "ON" : "OFF by operator selection"}.`);
       refreshStatus();
     } catch (e: any) { setBusy(false); setMessage(e.message); }
+  };
+  // -- ring-stack measure-only experiment ------------------------------------
+  const refreshMeasure = useCallback(async () => {
+    try {
+      const data = await api.get<{ session: MeasureSession | null }>("/measure/session");
+      setMeasureSession(data.session);
+    } catch { /* module unavailable */ }
+  }, []);
+  useEffect(() => { refreshMeasure(); }, [refreshMeasure]);
+  // A take is only on disk once the job finishes, so re-read on every
+  // running -> idle edge rather than polling.
+  useEffect(() => { if (status && !status.running) refreshMeasure(); },
+            [status?.running, refreshMeasure]);
+  const newMeasureSession = async () => {
+    setBusy(true);
+    try {
+      const data = await api.post<{ session: MeasureSession }>("/measure/session/new", { note: measureNote });
+      setMeasureSession(data.session); setPaper(null);
+      setMessage(`New measure-only session ${data.session.trial_id}.`);
+    } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
+  };
+  const characterize = async () => {
+    setBusy(true);
+    try {
+      await api.post("/measure/characterize", { confirm_robot_motion: confirmMotion, collision_check_enabled: true });
+      setMessage("CHARACTERIZE started — the robot moves the camera over ring 1, measures it and returns.");
+      refreshStatus();
+    } catch (e: any) { setBusy(false); setMessage(e.message); }
+  };
+  const applyCharacterization = async () => {
+    setBusy(true);
+    try {
+      const next = await api.post<Plan>("/measure/apply-characterization");
+      setPlan(next); setRecipe(next.recipe); setSetup(next.setup);
+      setPreflight(null); setResult(null); setSelectedLayer(1);
+      setMessage(`Recipe and placement set from the measured ring: r ${next.recipe.radius_mm} mm, bead ${next.recipe.bead_diameter_mm} mm, layer ${next.recipe.layer_height_mm} mm.`);
+      refreshStatus();
+    } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
+  };
+  const measure = async () => {
+    if (!plan) return;
+    setBusy(true);
+    try {
+      const shifted = offsetX !== 0 || offsetY !== 0;
+      await api.post("/measure/layer", {
+        fingerprint: plan.fingerprint, layer_index: measureLayer,
+        annotation: { introduced_offset_mm: shifted ? [offsetX, offsetY] : null, note: measureNote },
+        confirm_robot_motion: confirmMotion, collision_check_enabled: true,
+      });
+      setMessage(`MEASURE layer ${measureLayer} started — camera move only; no extrusion, no valve.`);
+      refreshStatus();
+    } catch (e: any) { setBusy(false); setMessage(e.message); }
+  };
+  const showPaper = async () => {
+    if (!measureSession) return;
+    try {
+      const data = await api.get<{ markdown: string }>(`/trials/${measureSession.trial_id}/paper-summary`);
+      setPaper(data.markdown);
+    } catch (e: any) { setMessage(e.message); }
   };
   const cancel = async () => {
     setCancelling(true);
@@ -653,6 +740,58 @@ export default function Extrusion() {
         I confirm the selected tool/frame/orientation, cell clearance, material system, and live extrusion run.</label>
       <button className="live-print-btn" disabled={!plan || !status?.live_print_enabled || !confirmLive || busy || status?.running} onClick={() => startJob("print")}>Print & record — LIVE ROBOT · collisions {liveCollisionCheck ? "ON" : "OFF"}</button>
       <div className="log" ref={logRef}>{logs.length ? logs.map((line, i) => <div key={i} className={line.startsWith("ERROR") ? "err" : ""}>{line}</div>) : "Job timeline will appear here."}</div>
+    </div>
+
+    <div className="card">
+      <h2>Ring stack — measure only (no extrusion)</h2>
+      <p className="hint">Hand-placed dried rings. Each press moves ONLY the camera to the derived
+        inspection pose (collision-checked), takes one RGB-D frame, measures it and returns.
+        No layer program, no valve. Archived as <code>MEASURE_ONLY</code>, never counted as a print.</p>
+      <div className="btn-row">
+        <input placeholder="session / ring note" value={measureNote} onChange={(e) => setMeasureNote(e.target.value)} />
+        <button className="secondary" disabled={!plan || busy || status?.running} onClick={newMeasureSession}>New session</button>
+        <span className="hint">{measureSession ? `session ${measureSession.trial_id}` : "no session yet (one is created on first measure)"}</span>
+      </div>
+      <label><input type="checkbox" checked={confirmMotion} onChange={(e) => setConfirmMotion(e.target.checked)} />
+        I confirm the robot may move the camera to the inspection pose (hands clear of the cell).</label>
+      <div className="btn-row">
+        <button disabled={!plan || !connected || !confirmMotion || busy || status?.running} onClick={characterize}>Characterize ring 1 — ROBOT MOVES</button>
+        {measureSession?.characterizations?.length ? (() => {
+          const c = measureSession.characterizations[measureSession.characterizations.length - 1];
+          return <>
+            <span className="hint">measured: r {c.radius_mm.toFixed(1)} mm · bead {c.bead_width_mm.toFixed(1)} mm ·
+              height {c.top_z_min_mm.toFixed(1)}–{c.top_z_max_mm.toFixed(1)} (mean {c.top_z_mean_mm.toFixed(1)}) mm ·
+              centre ({c.center_mm[0].toFixed(1)}, {c.center_mm[1].toFixed(1)})</span>
+            <button className="secondary" disabled={busy || status?.running} onClick={applyCharacterization}>Apply to recipe &amp; placement</button>
+          </>;
+        })() : null}
+      </div>
+      <div className="btn-row">
+        <label>Layer <select value={measureLayer} onChange={(e) => setMeasureLayer(Number(e.target.value))}>
+          {(plan?.layers ?? []).map((l) => <option key={l.layer_index} value={l.layer_index}>{l.layer_index}</option>)}
+        </select></label>
+        <label>Introduced offset X <input type="number" step={1} value={offsetX} onChange={(e) => setOffsetX(Number(e.target.value))} /> mm</label>
+        <label>Y <input type="number" step={1} value={offsetY} onChange={(e) => setOffsetY(Number(e.target.value))} /> mm</label>
+        <button disabled={!plan || !connected || !confirmMotion || busy || status?.running} onClick={measure}>Measure layer {measureLayer} — ROBOT MOVES</button>
+        {(busy || status?.running) && <button className="secondary" onClick={cancel}>Cancel</button>}
+      </div>
+      {measureSession?.records?.length ? <table className="metrics">
+        <thead><tr><th>Layer</th><th>Take</th><th>Introduced</th><th>Offset dx/dy (|d|)</th><th>Mean |dev|</th><th>RMS</th><th>Max</th><th>Shape RMS</th><th>Height min/mean/max</th><th>Bead</th><th>Acq→path</th><th>Valid</th></tr></thead>
+        <tbody>{measureSession.records.map((r) => <tr key={`${r.layer_index}-${r.take}`}>
+          <td>{r.layer_index}</td><td>{r.take}</td>
+          <td>{r.annotation?.introduced_offset_mm ? `(${r.annotation.introduced_offset_mm.join(", ")}) mm` : "—"}</td>
+          <td className="num">{r.metrics.center_offset_mm[0].toFixed(1)} / {r.metrics.center_offset_mm[1].toFixed(1)} ({r.metrics.center_offset_norm_mm.toFixed(2)})</td>
+          <td className="num">{r.metrics.mean_absolute_mm.toFixed(2)}</td><td className="num">{r.metrics.rms_mm.toFixed(2)}</td>
+          <td className="num">{r.metrics.maximum_mm.toFixed(2)}</td><td className="num">{r.metrics.shape_rms_mm.toFixed(2)}</td>
+          <td className="num">{r.geometry ? `${r.geometry.height_min_mm.toFixed(1)} / ${r.geometry.height_mean_mm.toFixed(1)} / ${r.geometry.height_max_mm.toFixed(1)}` : "—"}</td>
+          <td className="num">{r.geometry ? r.geometry.bead_width_mean_mm.toFixed(1) : "—"}</td>
+          <td className="num">{Math.round(r.timings_ms.acquisition_to_path_ms)} ms</td>
+          <td><span className={`badge ${r.valid ? "good" : "bad"}`}>{r.valid ? "VALID" : "INVALID"}</span></td>
+        </tr>)}</tbody></table> : null}
+      <div className="btn-row">
+        <button className="secondary" disabled={!measureSession} onClick={showPaper}>Paper summary</button>
+      </div>
+      {paper && <pre className="log" style={{ whiteSpace: "pre-wrap" }}>{paper}</pre>}
     </div>
 
     {headlineMetrics.length > 0 && <div className="card"><h2>Measured layers</h2>
