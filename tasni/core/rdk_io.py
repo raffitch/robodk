@@ -25,6 +25,43 @@ def T_to_pose(T: np.ndarray):
     return robomath.Mat(np.asarray(T, dtype=float).tolist())
 
 
+# A Curve Follow Project does not reproduce the roll its path-to-tool pose is
+# seeded with -- it MIRRORS it. Measured on the cell (see
+# ``tools/probe_extrusion_branch.py``, probe R): a project seeded with
+# ``X @ rotx(pi) @ rotz(pi)`` generates the rotation ``Rz(180) @ S @ X @ S``
+# with ``S = diag(1, -1, 1)``. That map is an involution, so feeding it the
+# orientation we WANT yields the source that generates it.
+_CURVE_FOLLOW_MIRROR = np.diag([1.0, -1.0, 1.0, 1.0])
+
+
+def curve_follow_seed_T(orientation_T: np.ndarray) -> np.ndarray:
+    """The ``project.setPose`` seed that makes RoboDK generate ``orientation_T``.
+
+    Seeding the commanded orientation directly is wrong, and so is the
+    ``orientation @ rotx(pi)`` this module used to try first: RoboDK reflects the
+    seeded roll, so that seed only looks right when the commanded yaw happens to
+    sit near 90 degrees -- which is exactly where this cell's parked pose sits.
+    Measured error of that naive seed: 1.4 degrees at 90.7 degrees of yaw, but
+    91.4 degrees at 135.7, and 60.4 degrees once the orientation is also tilted.
+
+    Inverting the mirror in MATRIX form keeps it exact when the commanded
+    orientation is tilted off the surface normal; an equivalent inverse written
+    on RPW components would decompose into Euler angles and could gimbal. Both
+    forms measured 0.000 degrees of pose error across eight commanded
+    orientations (four yaws, pitch +/-10, pitch 10 + roll 5, yaw 30 + pitch 10 +
+    roll 5), so the matrix form is used and no tilt limit is needed.
+
+    Returns a pure rotation: a path-to-tool seed carries no translation.
+    """
+    import robodk.robomath as robomath
+
+    rotation = np.eye(4)
+    rotation[:3, :3] = np.asarray(orientation_T, dtype=float)[:3, :3]
+    unmirrored = (pose_to_T(robomath.rotz(np.pi)) @ _CURVE_FOLLOW_MIRROR
+                  @ rotation @ _CURVE_FOLLOW_MIRROR)
+    return unmirrored @ pose_to_T(robomath.rotx(np.pi) * robomath.rotz(np.pi))
+
+
 def link_real_robot(rdk: "RdkIO", cfg) -> dict | None:
     """Best-effort connect the physical robot per a ``RoboDKConfig`` and summarise
     the link for the ``/connect`` response + UI. Returns ``None`` when

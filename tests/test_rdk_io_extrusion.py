@@ -16,7 +16,7 @@ import robodk.robomath as robomath
 import robolink as rl
 
 from tasni.core.config import RoboDKConfig
-from tasni.core.rdk_io import RdkIO, pose_to_T
+from tasni.core.rdk_io import RdkIO, curve_follow_seed_T, pose_to_T
 
 NEUTRAL_BRANCH = [93.8, -67.8, 151.8, 5.1, -52.9, 0.1]   # measured on the cell
 
@@ -318,3 +318,80 @@ def test_a_hidden_interpolated_axis_5_flip_is_rejected():
 
     with pytest.raises(RuntimeError, match="turns axis 5.*blocked"):
         _build(_io(rdk), "TasniCylinder_QUICK_axis5_L001")
+
+
+# --- the path-to-tool seed ----------------------------------------------------
+#
+# RoboDK's Curve Follow Project does not reproduce the roll it is seeded with: it
+# MIRRORS it. Measured on the cell with tools/probe_extrusion_branch.py (probe R),
+# a project seeded with ``X . rotx(pi) . rotz(pi)`` generates the rotation
+# ``Rz(180) . S . X . S`` where ``S = diag(1, -1, 1)``. The model below is that
+# measurement, so these tests pin our inverse against RoboDK's real behaviour
+# rather than against itself.
+
+_MIRROR_S = np.diag([1.0, -1.0, 1.0, 1.0])
+_SEED_SUFFIX = pose_to_T(robomath.rotx(np.pi) * robomath.rotz(np.pi))
+
+
+def _robodk_generated_rotation(seed_T):
+    """What RoboDK emits when a Curve Follow Project is seeded with ``seed_T``."""
+    source = np.asarray(seed_T, float) @ np.linalg.inv(_SEED_SUFFIX)
+    return pose_to_T(robomath.rotz(np.pi)) @ _MIRROR_S @ source @ _MIRROR_S
+
+
+def _rotation_gap_deg(A, B):
+    R = np.asarray(A, float)[:3, :3].T @ np.asarray(B, float)[:3, :3]
+    return float(np.degrees(np.arccos(max(-1.0, min(1.0, (np.trace(R) - 1.0) / 2.0)))))
+
+
+# Yaw-only cases plus deliberately tilted ones: the tilted cases are what prove a
+# coordinate-free inverse is required. The naive seed scored 60.4 deg at the last.
+SEED_ORIENTATIONS = [
+    [0.0, 0.0, 0.0],
+    [-0.01, 0.05, 90.69],      # this cell's parked commanded orientation
+    [0.0, 0.0, 110.69],
+    [0.0, 0.0, 135.69],
+    [0.0, 10.0, 0.0],          # tilted off the surface normal
+    [0.0, -10.0, 0.0],
+    [5.0, 10.0, 0.0],
+    [5.0, 10.0, 30.0],
+]
+
+
+@pytest.mark.parametrize("rpy", SEED_ORIENTATIONS)
+def test_curve_follow_seed_makes_robodk_generate_the_commanded_rotation(rpy):
+    commanded = RdkIO.xyzrpy_pose_T([0.0, 0.0, 0.0], rpy)
+
+    generated = _robodk_generated_rotation(curve_follow_seed_T(commanded))
+
+    assert _rotation_gap_deg(commanded, generated) < 1e-6, (
+        f"seeding the commanded orientation {rpy} must generate it back")
+
+
+def test_curve_follow_seed_is_a_rotation_and_leaves_its_input_alone():
+    commanded = RdkIO.xyzrpy_pose_T([0.0, 0.0, 0.0], [5.0, 10.0, 30.0])
+    original = commanded.copy()
+
+    seed = curve_follow_seed_T(commanded)
+
+    assert np.allclose(commanded, original), "the caller's pose must not be mutated"
+    assert np.allclose(seed[:3, :3] @ seed[:3, :3].T, np.eye(3), atol=1e-9)
+    assert float(np.linalg.det(seed[:3, :3])) == pytest.approx(1.0)
+    assert np.allclose(seed[:3, 3], 0.0), "a path-to-tool seed carries no offset"
+
+
+def test_the_naive_seed_is_only_correct_near_ninety_degrees_of_yaw():
+    """Why the inverse exists at all: the old seed was a coincidence.
+
+    ``orientation @ rotx(pi) @ rotz(pi)`` scored 1.4 deg at this cell's ~90 deg
+    yaw and 91.4 deg at 135 deg yaw, measured on the cell.
+    """
+    near_ninety = RdkIO.xyzrpy_pose_T([0.0, 0.0, 0.0], [-0.01, 0.05, 90.69])
+    far_off = RdkIO.xyzrpy_pose_T([0.0, 0.0, 0.0], [0.0, 0.0, 135.69])
+
+    def naive_error(commanded):
+        return _rotation_gap_deg(
+            commanded, _robodk_generated_rotation(commanded @ _SEED_SUFFIX))
+
+    assert naive_error(near_ninety) == pytest.approx(1.37, abs=0.05)
+    assert naive_error(far_off) == pytest.approx(91.37, abs=0.05)
