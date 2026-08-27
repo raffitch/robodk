@@ -238,3 +238,129 @@ def test_archive_writes_a_characterization_directory(tmp_path):
     assert out.name == "characterize-01"
     for name in ("color.png", "depth.npy", "measured_path.json", "comparison.png", "report.json"):
         assert (out / name).is_file(), name
+
+
+# ------------------------------------------------- MEASURE_ONLY job (Task 8)
+
+from test_extrusion_job import Ctx, FakeCamera, FakeRdk, services  # noqa: F401
+from tasni.modules.extrusion import measure as measure_mod
+from tasni.modules.extrusion.measure import MeasureSession, RingMeasureJob
+from tasni.modules.extrusion.models import DeviationMetrics, RingGeometry
+from tasni.modules.extrusion.processing import ProcessingResult
+
+
+def fake_measure_processing(**kwargs):
+    layer = kwargs["layer"]
+    pts = np.array([[p.x_mm, p.y_mm, p.z_mm + 6.0] for p in layer.points])
+    metrics = DeviationMetrics(mean_absolute_mm=6.4, rms_mm=7.1, maximum_mm=10.0,
+                               measured_center_mm=(10.0, 0.0), measured_radius_mm=40.0,
+                               path_completeness=0.99, maximum_angular_gap_deg=5, valid=True,
+                               center_offset_mm=(10.0, 0.0), center_offset_norm_mm=10.0,
+                               shape_rms_mm=0.3, shape_max_mm=0.8)
+    geometry = RingGeometry(top_z_mean_mm=6, top_z_min_mm=5, top_z_max_mm=7, top_z_std_mm=0.5,
+                            height_mean_mm=6, height_min_mm=5, height_max_mm=7,
+                            height_reference="build_plane", bead_width_mean_mm=8,
+                            bead_width_min_mm=7, bead_width_max_mm=9, bead_width_bins=36)
+    image = np.zeros((12, 12), np.uint8)
+    fake_measure_processing.calls.append(kwargs)
+    return ProcessingResult(pts, None, metrics, image, image, np.zeros((12, 12, 3), np.uint8),
+                            {"counts": {"raw_depth_pixels": 256}, "timings_ms": {"total_ms": 10.0},
+                             "branch_guard_attempts": [{"attempt": 1}]},
+                            filtered_xyz=pts.copy(), geometry=geometry)
+
+
+fake_measure_processing.calls = []
+
+
+def measure_env(tmp_path, monkeypatch, *, hardware_approved=False):
+    svc, rdk, camera = services(tmp_path)
+    svc.config.extrusion.hardware_io_test_approved = hardware_approved
+    monkeypatch.setattr(measure_mod, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(measure_mod, "process_observation", fake_measure_processing)
+    monkeypatch.setattr(measure_mod, "_git_commit", lambda: "abc123")
+    monkeypatch.setattr(measure_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(measure_mod.runs, "read_active", lambda module: {"run_id": "cal-1"})
+    fake_measure_processing.calls.clear()
+    return svc, rdk, camera
+
+
+def auto_plan(layers=3):
+    recipe = CylinderRecipe(radius_mm=40, layer_count=layers, layer_height_mm=6,
+                            bead_diameter_mm=8, robot_speed_mm_s=75, extrusion_rate_pct=0,
+                            points_per_circle=24)
+    setup = CylinderSetup(print_tool="LongCalibTool", work_frame="Tasni Work Frame",
+                          inspection_tool="Realsense", inspection_auto=True,
+                          center_x_mm=200, center_y_mm=150)
+    return generate_cylinder_plan(recipe, setup)
+
+
+def test_measure_moves_only_the_camera_and_never_touches_the_valve(tmp_path, monkeypatch):
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch, hardware_approved=False)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan, note="rings")
+    out = RingMeasureJob(svc, plan, session, 1, annotation={"introduced_offset_mm": None},
+                         check_collisions=True)(Ctx())
+    kinds = [e[0] for e in rdk.events]
+    assert "station-program" not in kinds and "create" not in kinds     # no valve, no layer program
+    assert "create-target" in kinds and "create-inspection" in kinds
+    assert ("start", "TasniCylinder_MEASURE_%s_L001_Inspect" % plan.fingerprint[:10], True) in rdk.events
+    assert rdk.events[-1] == ("move-joints", "START")
+    assert any(name.endswith("_Inspect") for name in rdk.deleted)
+    assert camera.grabs == 2                                             # readiness + one measurement
+    assert out["kind"] == "ring_measure" and out["mode"] == "MEASURE_ONLY"
+    layer_dir = Path(out["layer_dir"])
+    assert layer_dir.name == "layer-001"
+    manifest = json.loads((layer_dir / "manifest.json").read_text())
+    assert manifest["mode"] == "MEASURE_ONLY" and manifest["take"] == 1
+    assert manifest["geometry"]["bead_width_mean_mm"] == 8
+    timings = manifest["processing"]["timings_ms"]
+    assert timings["capture_ms"] >= 0
+    assert timings["acquisition_to_path_ms"] == pytest.approx(timings["capture_ms"] + 10.0)
+    assert (layer_dir / "depth.npy").is_file() and (layer_dir / "color.png").is_file()
+
+
+def test_repeat_takes_and_the_floor_from_the_previous_layer(tmp_path, monkeypatch):
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    plan = auto_plan()
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, plan)
+    RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True)(Ctx())
+    second = RingMeasureJob(svc, plan, session, 1, annotation={"note": "re-placed"},
+                            check_collisions=True)(Ctx())
+    assert Path(second["layer_dir"]).name == "layer-001-take02"
+    assert fake_measure_processing.calls[-1].get("floor_profile") is None   # layer 1: build plane
+    third = RingMeasureJob(svc, plan, session, 2, annotation={"introduced_offset_mm": [10, 0]},
+                           check_collisions=True)(Ctx())
+    floor = fake_measure_processing.calls[-1]["floor_profile"]
+    assert floor is not None and np.asarray(floor).shape[1] == 3          # layer 2: ring 1's top
+    assert json.loads((Path(third["layer_dir"]) / "manifest.json").read_text())["annotation"] == {"introduced_offset_mm": [10, 0]}
+    # Session survives a restart.
+    reloaded = MeasureSession.load(root, session.trial_id)
+    assert reloaded.takes == {1: 2, 2: 1}
+    assert MeasureSession.latest(root).trial_id == session.trial_id
+    assert reloaded.last_pose is not None
+
+
+def test_measure_archives_the_raw_frame_when_processing_fails(tmp_path, monkeypatch):
+    svc, rdk, _ = measure_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(measure_mod, "process_observation",
+                        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("bad skeleton")))
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    with pytest.raises(RuntimeError, match="raw RGB-D archived"):
+        RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True)(Ctx())
+    layer = session.trial_dir / "layer-001"
+    assert (layer / "depth.npy").is_file() and "bad skeleton" in (layer / "report.json").read_text()
+    assert rdk.events[-1] == ("move-joints", "START")                     # still returns home
+
+
+def test_measure_blocks_before_motion_when_the_camera_is_offline(tmp_path, monkeypatch):
+    from tasni.core.camera import CameraError
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    def offline(**kwargs): raise CameraError("camera timeout (100.123.63.127:1024)")
+    camera.grab = offline
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    with pytest.raises(RuntimeError, match="camera is not ready"):
+        RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True)(Ctx())
+    assert rdk.events == []
