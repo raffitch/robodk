@@ -171,3 +171,30 @@ def test_bead_width_profile_on_an_ideal_annulus():
     w = bead_width_profile(pts, (0.0, 0.0), bins=36)
     assert w["bins_with_data"] == 36
     assert w["mean_mm"] == pytest.approx(8.0, abs=0.6)   # p97.5 - p2.5 of a uniform 8 mm band
+
+
+# ------------------------------------------------- characterize a ring (Task 6)
+
+from tasni.modules.extrusion.processing import characterize_ring
+
+
+def test_characterize_recovers_a_ring_the_recipe_got_wrong():
+    pytest.importorskip("open3d")
+    # The recipe/plan says 75 mm radius, 6 mm bead. The physical ring is 60 / 8,
+    # 6 mm tall, and sits 15 mm off the table centre.
+    plan = scene_plan(radius=75.0, bead=6.0, layer_height=5.0)
+    true_center = (CENTER[0] + 15.0, CENTER[1] - 10.0)
+    T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, 1), 300.0)
+    depth = syn.render_scene([syn.RingSpec(60.0, 8.0, true_center, height_fn=syn.flat(6.0))], T,
+                             plane_center_xy_mm=CENTER)
+    color = np.zeros((720, 1280, 3), np.uint8)
+    found = characterize_ring(color=color, depth=depth, T_work_camera=T, K=syn.K_720P,
+                              search_center_mm=CENTER, work_frame="Tasni Work Frame",
+                              config=ExtrusionConfig())
+    assert found.radius_mm == pytest.approx(60.0, abs=1.0)
+    assert found.center_mm[0] == pytest.approx(true_center[0], abs=1.0)
+    assert found.center_mm[1] == pytest.approx(true_center[1], abs=1.0)
+    assert found.bead_width_mm == pytest.approx(8.0, abs=2.0)
+    assert found.top_z_mean_mm == pytest.approx(6.0, abs=1.5)
+    assert found.report["coarse"]["radius_mm"] == pytest.approx(60.0, abs=3.0)
+    assert found.measured_xyz.shape[1] == 3

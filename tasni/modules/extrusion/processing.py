@@ -16,8 +16,10 @@ from scipy.interpolate import splprep, splev
 from scipy.spatial import cKDTree
 
 from ...core.geometry import transform_points
-from .comparison import compare_circle, corrected_circle
-from .models import CylinderPlan, DeviationMetrics, LayerPath, RingGeometry
+from .comparison import compare_circle, corrected_circle, fit_circle_xy
+from .models import (CylinderPlan, CylinderRecipe, CylinderSetup, DeviationMetrics,
+                     LayerPath, RingGeometry)
+from .toolpath import generate_cylinder_plan
 
 
 @dataclass
@@ -455,3 +457,90 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     return ProcessingResult(measured, corrected, metrics, final_mask,
                             final_skeleton * 255, overlay, report,
                             filtered_xyz=points.copy(), geometry=geometry)
+
+
+@dataclass
+class CharacterizationResult:
+    """What a physical ring actually IS, measured with no recipe assumption."""
+
+    radius_mm: float
+    center_mm: tuple[float, float]
+    bead_width_mm: float
+    bead_width_min_mm: float
+    bead_width_max_mm: float
+    top_z_mean_mm: float
+    top_z_min_mm: float
+    top_z_max_mm: float
+    measured_xyz: np.ndarray
+    segmentation: np.ndarray
+    skeleton: np.ndarray
+    comparison: np.ndarray
+    report: dict
+
+    def summary(self) -> dict:
+        return {k: getattr(self, k) for k in (
+            "radius_mm", "center_mm", "bead_width_mm", "bead_width_min_mm",
+            "bead_width_max_mm", "top_z_mean_mm", "top_z_min_mm", "top_z_max_mm")}
+
+
+def characterize_ring(*, color: np.ndarray, depth: np.ndarray, T_work_camera: np.ndarray,
+                      K: np.ndarray, search_center_mm, work_frame: str, config,
+                      inspection_tool: str = "Realsense",
+                      print_tool: str = "LongCalibTool") -> CharacterizationResult:
+    """Measure a ring with NO recipe assumption: coarse fit, then the normal pipeline.
+
+    Pass 1 takes everything above the build plane inside a search cylinder around
+    ``search_center_mm``, filters it like a deposit, and fits a circle to get a
+    coarse centre/radius/bead. Pass 2 hands those to ``process_observation`` as a
+    throwaway recipe so the refined centreline, radius and height profile come out
+    of the same code the layer measurements use -- one pipeline, one set of
+    numbers, no second implementation to keep honest.
+    """
+    started = time.perf_counter()
+    counts: dict[str, int] = {}
+    points, counts["raw_depth_pixels"] = depth_to_work_points(depth, K, T_work_camera)
+    center = np.asarray(search_center_mm, dtype=float)
+    min_z = max(config.deposit_min_height_mm, config.plane_distance_threshold_m * 1000.0)
+    radial = np.linalg.norm(points[:, :2] - center, axis=1)
+    roi = ((points[:, 2] >= min_z) & (points[:, 2] <= config.characterize_max_height_mm)
+           & (radial <= config.characterize_search_radius_mm))
+    points = points[roi]
+    counts["after_search_roi"] = len(points)
+    if len(points) < config.cluster_min_points:
+        raise RuntimeError("no deposited geometry inside the characterization search region")
+    deposit = _filter_deposit(points, config, counts)
+    coarse_center, coarse_radius = fit_circle_xy(deposit)
+    width = bead_width_profile(deposit, coarse_center, bins=config.bead_width_bins)
+    top = _top_surface(deposit, config, counts)
+    coarse_height = float(np.percentile(top[:, 2], 90))
+    coarse = {"center_mm": [float(coarse_center[0]), float(coarse_center[1])],
+              "radius_mm": float(coarse_radius), "bead_width_mm": width["mean_mm"],
+              "height_mm": coarse_height, "time_ms": (time.perf_counter() - started) * 1000}
+
+    recipe = CylinderRecipe(
+        radius_mm=float(np.clip(coarse_radius, 5.0, 500.0)), layer_count=1,
+        layer_height_mm=float(np.clip(coarse_height, 0.5, 50.0)),
+        bead_diameter_mm=float(np.clip(width["mean_mm"], 0.5, 50.0)),
+        robot_speed_mm_s=75.0, extrusion_rate_pct=0.0,
+        points_per_circle=config.measured_spline_points)
+    setup = CylinderSetup(
+        print_tool=print_tool, work_frame=work_frame, inspection_tool=inspection_tool,
+        inspection_auto=True, center_x_mm=float(coarse_center[0]),
+        center_y_mm=float(coarse_center[1]))
+    plan = generate_cylinder_plan(recipe, setup)
+    refined = process_observation(color=color, depth=depth, T_work_camera=T_work_camera,
+                                  K=K, plan=plan, layer=plan.layers[0], config=config)
+    geometry = refined.geometry
+    report = {**refined.report, "coarse": coarse, "counts_coarse": counts,
+              "kind": "characterization",
+              "total_ms": (time.perf_counter() - started) * 1000}
+    return CharacterizationResult(
+        radius_mm=refined.metrics.measured_radius_mm,
+        center_mm=refined.metrics.measured_center_mm,
+        bead_width_mm=geometry.bead_width_mean_mm,
+        bead_width_min_mm=geometry.bead_width_min_mm,
+        bead_width_max_mm=geometry.bead_width_max_mm,
+        top_z_mean_mm=geometry.top_z_mean_mm, top_z_min_mm=geometry.top_z_min_mm,
+        top_z_max_mm=geometry.top_z_max_mm, measured_xyz=refined.measured_xyz,
+        segmentation=refined.segmentation, skeleton=refined.skeleton,
+        comparison=refined.comparison, report=report)
