@@ -34,6 +34,12 @@ def compare_circle(measured_xyz, nominal_radius_mm: float, *,
     nominal_center = np.asarray(nominal_center_mm, dtype=float)
     radii = np.linalg.norm(pts[:, :2] - nominal_center, axis=1)
     deviation = radii - float(nominal_radius_mm)
+    # A bodily shift of the ring and a ring that is not round are different
+    # defects and the paper reports them separately: the offset is where the
+    # FITTED centre sits relative to nominal, the shape error is the radial
+    # scatter about that fitted circle (blind to the shift).
+    offset = center - nominal_center
+    shape = np.linalg.norm(pts[:, :2] - center, axis=1) - measured_radius
     angles = np.mod(np.arctan2(pts[:, 1] - center[1], pts[:, 0] - center[0]), 2 * math.pi)
     ordered = np.sort(np.unique(angles))
     gaps = np.diff(np.r_[ordered, ordered[0] + 2 * math.pi])
@@ -54,6 +60,10 @@ def compare_circle(measured_xyz, nominal_radius_mm: float, *,
         measured_radius_mm=measured_radius,
         path_completeness=completeness,
         maximum_angular_gap_deg=gap_deg,
+        center_offset_mm=(float(offset[0]), float(offset[1])),
+        center_offset_norm_mm=float(np.linalg.norm(offset)),
+        shape_rms_mm=float(np.sqrt(np.mean(shape * shape))),
+        shape_max_mm=float(np.max(np.abs(shape))),
         valid=not warnings,
         warnings=warnings,
     )

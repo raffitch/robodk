@@ -94,6 +94,14 @@ class DeviationMetrics(_Record):
     path_completeness: float
     maximum_angular_gap_deg: float
     valid: bool
+    # Fitted-circle centre minus the NOMINAL centre: the direct readout of a
+    # bodily displacement of the ring (the paper's introduced-offset check).
+    center_offset_mm: tuple[float, float] = (0.0, 0.0)
+    center_offset_norm_mm: float = 0.0
+    # Radial scatter about the FITTED circle: "ring is not round", separated
+    # from "ring placed wrong".
+    shape_rms_mm: float = 0.0
+    shape_max_mm: float = 0.0
     warnings: list[str] = Field(default_factory=list)
 
 
