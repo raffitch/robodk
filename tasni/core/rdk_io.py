@@ -1316,6 +1316,47 @@ class RdkIO:
     # sweep to follow the circle, so only these are held to the neutral window.
     WRIST_AXES = ((3, "axis 4"), (4, "axis 5"), (5, "axis 6"))
 
+    def _pin_program_to_neutral_branch(self, program, neutral_joints,
+                                       maximum_wrist_rotation_deg: float) -> dict:
+        """Rewrite each generated move as a joint move on the neutral wrist branch.
+
+        A Curve Follow Project chooses its own IK branch and cannot be steered onto
+        another one: preferred start joints, the path-to-tool seed and even hard
+        joint limits were all measured to fail on this cell (under limits it stops
+        generating rather than switching). Its Cartesian path is correct, though,
+        and a neutral-branch solution exists for every pose on it, so re-solve each
+        move and store those joints authoritatively.
+
+        ``is_joint_target`` MUST be True. Written as a Cartesian target — which is
+        what this module used to do — RoboDK keeps only the pose, re-solves at
+        playback and lands right back on the flipped branch; the generated program
+        then reads back with every move at ``jointTarget=0``.
+        """
+        import robolink
+
+        pinned = 0
+        previous = neutral_joints
+        for index in range(program.InstructionCount()):
+            (instruction_name, instruction_type, move_type, _is_joint_target,
+             pose, _joints) = program.Instruction(index)
+            if instruction_type != robolink.INS_TYPE_MOVE:
+                continue
+            solved = self.solve_joints_on_neutral_branch(
+                pose_to_T(pose), neutral_joints, previous,
+                maximum_wrist_rotation_deg)
+            if solved is None:
+                raise RuntimeError(
+                    f"generated move {index + 1} ({instruction_name!r}) has no IK "
+                    "solution on the neutral front/elbow/wrist branch within "
+                    f"±{float(maximum_wrist_rotation_deg):.1f} deg of the start pose")
+            program.setInstruction(index, instruction_name, instruction_type,
+                                   move_type, True, pose, solved)
+            previous = solved
+            pinned += 1
+        if not pinned:
+            raise RuntimeError("the generated program contains no move instructions")
+        return {"moves_pinned": pinned}
+
     def _clamp_wrist_joint_limits(self, neutral_joints,
                                   maximum_wrist_rotation_deg: float):
         """Bound axes 4 and 6 to the neutral window; return the limits to restore.
@@ -1627,16 +1668,23 @@ class RdkIO:
                     f"Failed artifacts {curve_name!r} and {project_name!r} were kept; "
                     "Reset removes them.")
             linked.setName(name)
+            return linked, float(generation[3])
+
+        def generate_pin_and_verify(path_to_tool):
+            """Generate, pin every move to the neutral branch, then verify."""
+            linked, ratio = generate_native_path(path_to_tool)
+            pinned = self._pin_program_to_neutral_branch(
+                linked, start_joints, maximum_tool_axis_spin_deg)
             report = self._program_neutral_wrist_report(
                 linked, start_joints, maximum_tool_axis_spin_deg)
-            return linked, float(generation[3]), report
+            return linked, ratio, {**report, **pinned}
 
         def first_verifying_seed():
             """Generate with each path-to-tool seed; keep the first that verifies."""
             failures = []
             for seed_index, path_to_tool in enumerate(generation_orientations):
                 try:
-                    return (seed_index, *generate_native_path(path_to_tool))
+                    return (seed_index, *generate_pin_and_verify(path_to_tool))
                 except RuntimeError as exc:
                     failures.append(f"path-to-tool seed {seed_index + 1}: {exc}")
             raise RuntimeError("; ".join(failures))
@@ -1676,6 +1724,7 @@ class RdkIO:
             "maximum_tool_axis_spin_deg": float(maximum_tool_axis_spin_deg),
             "wrist_limits_clamped": wrist_limits_clamped,
             "tool_path_flip_applied": bool(seed_index),
+            "moves_pinned_to_neutral_branch": trajectory["moves_pinned"],
             "maximum_axis_4_rotation_seen_deg":
                 trajectory["maximum_axis_4_rotation_seen_deg"],
             "maximum_axis_5_rotation_seen_deg":

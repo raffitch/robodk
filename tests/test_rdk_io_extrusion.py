@@ -71,8 +71,25 @@ def _joint_rows(**axis_rotations):
 class _Program(_Item):
     """A generated program whose interpolated path stays on the neutral branch."""
 
+    MOVES = 3
+
+    def __init__(self): self.written = []
+
     def setName(self, name): self.name = name
-    def InstructionCount(self): return 0
+    def InstructionCount(self): return self.MOVES + 1   # + one non-move instruction
+
+    def Instruction(self, index):
+        if index == 0:      # e.g. "Set speed" -- must be left alone
+            return ("Set speed (200)", rl.INS_TYPE_CHANGESPEED, 0, False,
+                    robomath.eye(4), robomath.Mat([0.0] * 6))
+        return (f"MoveL {index}", rl.INS_TYPE_MOVE, rl.MOVE_TYPE_LINEAR, False,
+                robomath.eye(4), robomath.Mat([0.0] * 6))
+
+    def setInstruction(self, index, name, instruction_type, move_type,
+                       is_joint_target, pose, joints):
+        self.written.append((index, bool(is_joint_target),
+                             [float(v) for v in joints.list()]))
+
     def InstructionListJoints(self, **kwargs): return _joint_rows()
 
 
@@ -91,7 +108,7 @@ class _Axis5FlipProgram(_Program):
 class _FlipOnFirstSeedProgram(_Program):
     """Flipped under the first path-to-tool seed, neutral under the second."""
 
-    def __init__(self): self.generations = 0
+    def __init__(self): super().__init__(); self.generations = 0
 
     def InstructionListJoints(self, **kwargs):
         self.generations += 1
@@ -101,7 +118,7 @@ class _FlipOnFirstSeedProgram(_Program):
 class _FlipUnlessClampedProgram(_Program):
     """Flips for as long as the robot's axis-4 travel can still reach the flip."""
 
-    def __init__(self, robot): self.robot = robot
+    def __init__(self, robot): super().__init__(); self.robot = robot
 
     def InstructionListJoints(self, **kwargs):
         reachable = self.robot.lower[3] <= -170.0
@@ -172,13 +189,22 @@ SQUARE_XYZ = np.array([[10.0, 0.0, 7.5], [0.0, 10.0, 7.5],
                        [-10.0, 0.0, 7.5], [10.0, 0.0, 7.5]])
 
 
-def _io(rdk):
-    """An RdkIO wired to the fakes, sharing ONE robot so limits can be asserted."""
+NEUTRAL_BRANCH = [93.8, -67.8, 151.8, 5.1, -52.9, 0.1]   # measured on the cell
+
+
+def _io(rdk, branch=NEUTRAL_BRANCH):
+    """An RdkIO wired to the fakes, sharing ONE robot so limits can be asserted.
+
+    ``branch=None`` models a pose with no neutral-branch solution.
+    """
     io = RdkIO(SimpleNamespace(rdk=rdk, config=RoboDKConfig()))
     robot = _Robot()
     io.robot = lambda: robot
     io.item_exists_as = lambda name, kind: True
     io.use_named_tool_frame = lambda tool, frame: np.eye(4)
+    io.solve_joints_on_neutral_branch = (
+        lambda T, neutral, previous=None, limit=90.0:
+        None if branch is None else robomath.Mat(list(branch)))
     io.test_robot = robot
     return io
 
@@ -243,7 +269,22 @@ def test_native_generation_emits_one_curve_and_no_station_targets():
     # The first seed verified, so nothing else had to be tried.
     assert result["tool_path_flip_applied"] is False
     assert result["wrist_limits_clamped"] is False
-    assert _io(rdk).test_robot.limit_calls == []
+
+    # Every MOVE is rewritten in place as a JOINT move carrying the neutral-branch
+    # solution. Stored Cartesian (is_joint_target False) RoboDK re-solves at
+    # playback and returns to the flipped branch -- that was the original defect.
+    written = rdk.project.program.written
+    assert result["moves_pinned_to_neutral_branch"] == _Program.MOVES
+    assert [index for index, _, _ in written] == [1, 2, 3], "index 0 is not a move"
+    assert all(is_joint_target for _, is_joint_target, _ in written)
+    assert all(joints == NEUTRAL_BRANCH for _, _, joints in written)
+
+
+def test_generation_fails_when_a_generated_move_has_no_neutral_solution():
+    rdk = _Rdk()
+
+    with pytest.raises(RuntimeError, match="no IK solution on the neutral"):
+        _build(_io(rdk, branch=None), "TasniCylinder_QUICK_unsolvable_L001")
 
 
 def test_curve_follow_retries_with_internal_flip_when_setup_is_rejected():
