@@ -1312,6 +1312,59 @@ class RdkIO:
         finally:
             self.restore_tool_and_frame(previous_tool, previous_frame)
 
+    def _clamp_wrist_joint_limits(self, neutral_joints,
+                                  maximum_wrist_rotation_deg: float):
+        """Bound axes 4 and 6 to the neutral window; return the limits to restore.
+
+        A Curve Follow Project solves its own path, so the only way to stop it
+        reaching the opposite wrist branch is to put that branch outside the
+        robot's declared travel for the duration of the generation. Returns the
+        original ``(lower, upper)`` lists for :meth:`_restore_joint_limits`, or
+        ``None`` when the station will not accept the clamp — in which case the
+        caller keeps the original failure rather than silently generating
+        unconstrained."""
+        import robodk.robomath as robomath
+
+        neutral = self._joint_values(neutral_joints)
+        if neutral is None or len(neutral) < 6:
+            return None
+        robot = self.robot()
+        try:
+            limits = robot.JointLimits()
+            lower = [float(v) for v in limits[0].list()]
+            upper = [float(v) for v in limits[1].list()]
+        except Exception:
+            return None
+        if len(lower) < 6 or len(upper) < 6:
+            return None
+        clamped_lower, clamped_upper = list(lower), list(upper)
+        window = abs(float(maximum_wrist_rotation_deg))
+        for axis in (3, 5):
+            clamped_lower[axis] = max(lower[axis], neutral[axis] - window)
+            clamped_upper[axis] = min(upper[axis], neutral[axis] + window)
+            if clamped_lower[axis] >= clamped_upper[axis]:
+                return None
+        try:
+            robot.setJointLimits(robomath.Mat(clamped_lower),
+                                 robomath.Mat(clamped_upper))
+        except Exception:
+            return None
+        return (lower, upper)
+
+    def _restore_joint_limits(self, limits) -> None:
+        """Put back limits saved by :meth:`_clamp_wrist_joint_limits`.
+
+        Never raises: this runs in a ``finally``, and leaving the robot's declared
+        travel clamped would quietly restrict every later motion in the station."""
+        import robodk.robomath as robomath
+
+        try:
+            lower, upper = limits
+            self.robot().setJointLimits(robomath.Mat(list(lower)),
+                                        robomath.Mat(list(upper)))
+        except Exception:
+            pass
+
     @staticmethod
     def _joint_values(joints) -> list[float] | None:
         if joints is None:
@@ -1544,104 +1597,75 @@ class RdkIO:
                 "for inspection; Reset removes them. Jog the selected TCP to the intended "
                 "path start and seed the coordinates again.")
         program.setName(name)
-        project.setParam("UpdatePath")
-        generation = project.Update(robolink.COLLISION_OFF)
-        if float(generation[3]) < 0:
-            raise RuntimeError(
-                "RoboDK Curve Follow Project generation failed: "
-                + str(generation[4] or "unspecified path problem")
-                + f". Failed artifacts {curve_name!r}, {project_name!r}, and any "
-                  f"linked {name!r} program were kept; "
-                  "Reset removes them.")
-        program = project.getLink(robolink.ITEM_TYPE_PROGRAM)
-        if not program.Valid():
-            raise RuntimeError(
-                "Curve Follow Project has no linked generated program. "
-                f"Failed artifacts {curve_name!r} and {project_name!r} were kept; "
-                "Reset removes them.")
-        program.setName(name)
-        # A Curve Follow program does not reliably retain joint vectors written
-        # through setInstruction: on this station the next read/playback silently
-        # re-solves the local-X fallback into the opposite axis-4 wrist branch.
-        # Rebuild the linked program from named joint targets instead. The curve and
-        # project remain visible/auditable, while every motion endpoint is now a real
-        # target locked to the selected neutral IK branch.
-        for instruction_index in reversed(range(program.InstructionCount())):
-            program.InstructionDelete(instruction_index)
-        program.setPoseFrame(frame)
-        program.setPoseTool(print_tcp)
-        program.setRounding(float(rounding_mm))
-        prior_joints = start_joints
-        maximum_axis_4_seen = 0.0
-        maximum_spin_seen = 0.0
-        target_names: list[str] = []
 
-        def locked_target(label: str, xyz) -> object:
-            nonlocal prior_joints, maximum_axis_4_seen, maximum_spin_seen
-            target_T = orientation.copy()
-            target_T[:3, 3] = np.asarray(xyz, dtype=float)
-            solved = self.solve_joints_on_neutral_branch(
-                target_T, start_joints, prior_joints,
-                maximum_tool_axis_spin_deg)
-            if solved is None:
+        def generate_native_path():
+            """Regenerate the project's own path and verify the wrist branch.
+
+            The Curve Follow Project keeps ownership of interpolation, approach and
+            retract, speeds and path events — one curve, no station targets. Raises
+            if generation fails or the joint path leaves the neutral wrist window.
+            """
+            project.setParam("UpdatePath")
+            generation = project.Update(robolink.COLLISION_OFF)
+            if float(generation[3]) < 0:
                 raise RuntimeError(
-                    f"generated target {label!r} has no IK solution on the neutral "
-                    "front/elbow/wrist branch within the axis-4/axis-6 rotation "
-                    "limit; artifacts were kept for inspection")
-            solved = self._nearest_equivalent_joints(solved, prior_joints)
-            axis_4 = self._joint_delta_deg(solved, start_joints, axis=3)
-            spin = self._joint_delta_deg(solved, start_joints, axis=5)
-            if (axis_4 is None or spin is None
-                    or abs(axis_4) > float(maximum_tool_axis_spin_deg)
-                    or abs(spin) > float(maximum_tool_axis_spin_deg)):
+                    "RoboDK Curve Follow Project generation failed: "
+                    + str(generation[4] or "unspecified path problem")
+                    + f". Failed artifacts {curve_name!r}, {project_name!r}, and any "
+                      f"linked {name!r} program were kept; "
+                      "Reset removes them.")
+            linked = project.getLink(robolink.ITEM_TYPE_PROGRAM)
+            if not linked.Valid():
                 raise RuntimeError(
-                    f"generated target {label!r} leaves the neutral wrist range "
-                    f"(axis 4={axis_4 if axis_4 is not None else 'unknown'} deg, "
-                    f"axis 6={spin if spin is not None else 'unknown'} deg); limit is "
-                    f"±{float(maximum_tool_axis_spin_deg):.1f} deg. "
-                    "Capture the current TCP orientation and regenerate the plan.")
-            maximum_axis_4_seen = max(maximum_axis_4_seen, abs(axis_4))
-            maximum_spin_seen = max(maximum_spin_seen, abs(spin))
-            target_name = f"{name}_{label}"
-            target = self.add_target(target_name, target_T, solved)
-            target_names.append(target_name)
-            prior_joints = solved
-            return target
+                    "Curve Follow Project has no linked generated program. "
+                    f"Failed artifacts {curve_name!r} and {project_name!r} were kept; "
+                    "Reset removes them.")
+            linked.setName(name)
+            report = self._program_neutral_wrist_report(
+                linked, start_joints, maximum_tool_axis_spin_deg)
+            return linked, float(generation[3]), report
 
-        approach_xyz = pts[0] + normal * float(approach_clearance_mm)
-        retract_xyz = pts[-1] + normal * float(retreat_clearance_mm)
-        approach_target = locked_target("Approach", approach_xyz)
-        path_targets = [locked_target(f"P{index:04d}", xyz)
-                        for index, xyz in enumerate(pts)]
-        retract_target = locked_target("Retract", retract_xyz)
-
-        program.setSpeed(float(travel_speed_mm_s))
-        program.MoveJ(approach_target)
-        program.MoveL(path_targets[0])
-        program.RunInstruction(air_on_program, robolink.INSTRUCTION_CALL_PROGRAM)
-        program.setSpeed(float(speed_mm_s))
-        for target in path_targets[1:]:
-            program.MoveL(target)
-        program.RunInstruction(air_off_program, robolink.INSTRUCTION_CALL_PROGRAM)
-        program.setSpeed(float(travel_speed_mm_s))
-        program.MoveL(retract_target)
-        trajectory = self._program_neutral_wrist_report(
-            program, start_joints, maximum_tool_axis_spin_deg)
-        artifacts = [curve_name, project_name, name, *target_names]
+        # Try the seeded, deterministic generation on its own first: the project is
+        # handed the neutral start joints and every orientation-search option is off,
+        # which should keep it on the operator's wrist branch. Only if the
+        # verification says otherwise do we take RoboDK's freedom to flip away, by
+        # bounding axes 4 and 6 to the neutral window and regenerating. This cell
+        # leaves both axes at +/-350 deg, which is exactly what puts the opposite
+        # branch within reach. The limits are always restored.
+        restore_limits = None
+        try:
+            try:
+                program, generation_ratio, trajectory = generate_native_path()
+                wrist_limits_clamped = False
+            except RuntimeError as unclamped_failure:
+                restore_limits = self._clamp_wrist_joint_limits(
+                    start_joints, maximum_tool_axis_spin_deg)
+                if restore_limits is None:
+                    raise
+                try:
+                    program, generation_ratio, trajectory = generate_native_path()
+                except RuntimeError as clamped_failure:
+                    raise RuntimeError(
+                        f"{clamped_failure} The unconstrained attempt ran first and "
+                        f"also failed: {unclamped_failure}") from clamped_failure
+                wrist_limits_clamped = True
+        finally:
+            if restore_limits is not None:
+                self._restore_joint_limits(restore_limits)
+        artifacts = [curve_name, project_name, name]
         return {
             "program": name, "curve": curve_name, "project": project_name,
-            "artifacts": artifacts, "targets": target_names, "point_count": len(pts),
+            "artifacts": artifacts, "targets": [], "point_count": len(pts),
             "setup_status": float(setup_status),
             "setup_attempts": setup_attempts,
             "maximum_tool_axis_spin_deg": float(maximum_tool_axis_spin_deg),
-            "maximum_axis_4_rotation_seen_deg": max(
-                float(maximum_axis_4_seen),
-                trajectory["maximum_axis_4_rotation_seen_deg"]),
-            "maximum_tool_axis_spin_seen_deg": max(
-                float(maximum_spin_seen),
-                trajectory["maximum_axis_6_rotation_seen_deg"]),
+            "wrist_limits_clamped": wrist_limits_clamped,
+            "maximum_axis_4_rotation_seen_deg":
+                trajectory["maximum_axis_4_rotation_seen_deg"],
+            "maximum_tool_axis_spin_seen_deg":
+                trajectory["maximum_axis_6_rotation_seen_deg"],
             "joint_path_sample_count": trajectory["sample_count"],
-            "project_generation_percent": float(generation[3]) * 100.0,
+            "project_generation_percent": generation_ratio * 100.0,
         }
 
     def cleanup_extrusion_artifacts(self, prefix: str = "TasniCylinder_") -> list[str]:

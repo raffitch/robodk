@@ -1,4 +1,12 @@
-"""Regression tests for native RoboDK Curve Follow project setup."""
+"""Regression tests for native RoboDK Curve Follow project setup.
+
+The Curve Follow Project owns the path: one curve object, no station targets. It
+also solves its own inverse kinematics, so the only lever that stops it choosing
+the opposite wrist branch is the robot's declared joint travel. Generation is
+therefore try-then-constrain: generate, verify the joint path against the
+operator's neutral wrist window, and only if that fails clamp axes 4/6 and
+regenerate. The clamp is always handed back.
+"""
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -10,6 +18,9 @@ import robolink as rl
 
 from tasni.core.config import RoboDKConfig
 from tasni.core.rdk_io import RdkIO, pose_to_T
+
+STOCK_LOWER = [-185.0, -140.0, -120.0, -350.0, -125.0, -350.0]
+STOCK_UPPER = [185.0, -5.0, 168.0, 350.0, 125.0, 350.0]
 
 
 class _Missing:
@@ -23,10 +34,23 @@ class _Item:
 
 
 class _Robot(_Item):
+    def __init__(self):
+        self._lower, self._upper = list(STOCK_LOWER), list(STOCK_UPPER)
+        self.limit_calls: list[tuple[list[float], list[float]]] = []
+
     def Joints(self): return robomath.Mat([0.0] * 6)
     def setPoseTool(self, tool): pass
     def setPoseFrame(self, frame): pass
     def Parent(self): return _Missing()
+
+    def JointLimits(self):
+        return (robomath.Mat(list(self._lower)), robomath.Mat(list(self._upper)), 0.0)
+
+    def setJointLimits(self, lower, upper):
+        low = [float(v) for v in lower.list()]
+        high = [float(v) for v in upper.list()]
+        self.limit_calls.append((low, high))
+        self._lower, self._upper = low, high
 
 
 class _Curve(_Item):
@@ -37,45 +61,33 @@ class _Curve(_Item):
 
 
 class _Program(_Item):
-    def __init__(self): self.moves = []
+    """A generated program whose interpolated path stays on the neutral branch."""
+
     def setName(self, name): self.name = name
     def InstructionCount(self): return 0
-    def InstructionDelete(self, index): pass
-    def setPoseFrame(self, frame): pass
-    def setPoseTool(self, tool): pass
-    def setRounding(self, rounding): pass
-    def setSpeed(self, speed): pass
-    def MoveJ(self, target): self.moves.append(("J", target))
-    def MoveL(self, target): self.moves.append(("L", target))
-    def RunInstruction(self, name, instruction_type): pass
     def InstructionListJoints(self, **kwargs):
         return "", robomath.Mat([[0.0] for _ in range(10)]), 1
 
 
-class _GeneratedProgram(_Program):
-    """A Curve Follow program that already holds the project's own instructions.
-
-    The real one does; those are what the neutral-branch rebuild has to discard.
-    """
-
-    def __init__(self, instruction_count: int = 2):
-        super().__init__()
-        self._instruction_count = instruction_count
-        self.deleted: list[int] = []
-
-    def InstructionCount(self): return self._instruction_count
-
-    def InstructionDelete(self, index):
-        self.deleted.append(index)
-        self._instruction_count = max(0, self._instruction_count - 1)
-
-
 class _InterpolatedFlipProgram(_Program):
-    """Endpoints stay neutral, but RoboDK interpolates through a wrist flip."""
+    """Always interpolates through a wrist flip, clamp or no clamp."""
 
     def InstructionListJoints(self, **kwargs):
         rows = [[0.0] for _ in range(10)]
         rows[3][0] = 170.0
+        return "", robomath.Mat(rows), 1
+
+
+class _FlipUntilClampedProgram(_Program):
+    """Flips on the first generation and is clean once the limits are clamped."""
+
+    def __init__(self): self.generations = 0
+
+    def InstructionListJoints(self, **kwargs):
+        self.generations += 1
+        rows = [[0.0] for _ in range(10)]
+        if self.generations == 1:
+            rows[3][0] = 170.0
         return "", robomath.Mat(rows), 1
 
 
@@ -134,39 +146,23 @@ class _Rdk:
         return self.project
 
     def AddTarget(self, name, frame, robot):
-        target = _Target(name)
+        target = SimpleNamespace(name=name)
         self.targets.append(target)
         return target
-
-
-class _Target(_Item):
-    def __init__(self, name):
-        self.name = name
-        self.joints = None
-        self.is_joint_target = False
-
-    def setPose(self, pose): self.pose = pose
-    def setAsJointTarget(self): self.is_joint_target = True
-    def setJoints(self, joints): self.joints = joints
 
 
 SQUARE_XYZ = np.array([[10.0, 0.0, 7.5], [0.0, 10.0, 7.5],
                        [-10.0, 0.0, 7.5], [10.0, 0.0, 7.5]])
 
 
-def _io(rdk, *, joints=None):
-    """An RdkIO wired to the fakes, with IK stubbed at the neutral-branch seam.
-
-    ``solve_joints_on_neutral_branch`` enumerates ``SolveIK_All`` and falls back to
-    ``solve_joints_for_pose``; the fake robot has no station behind it, so stubbing
-    that fallback is what gives these tests a deterministic solution to lock onto.
-    """
+def _io(rdk):
+    """An RdkIO wired to the fakes, sharing ONE robot so limits can be asserted."""
     io = RdkIO(SimpleNamespace(rdk=rdk, config=RoboDKConfig()))
-    io.robot = lambda: _Robot()
+    robot = _Robot()
+    io.robot = lambda: robot
     io.item_exists_as = lambda name, kind: True
     io.use_named_tool_frame = lambda tool, frame: np.eye(4)
-    io.solve_joints_for_pose = lambda T, seed=None: robomath.Mat(
-        list(joints if joints is not None else [0.0] * 6))
+    io.test_robot = robot
     return io
 
 
@@ -216,9 +212,25 @@ def test_exact_station_item_check_supports_collision_proxy_objects():
     assert io.item_exists_as("missing", "object") is False
 
 
-def test_curve_follow_retries_with_internal_flip_but_keeps_requested_output_pose():
+def test_native_generation_emits_one_curve_and_no_station_targets():
+    """The project owns the path: a target per point would litter the station."""
+    rdk = _Rdk()
+    name = "TasniCylinder_QUICK_native_L001"
+
+    result = _build(_io(rdk), name)
+
+    assert result["targets"] == []
+    assert rdk.targets == []
+    assert result["artifacts"] == [f"{name}_Curve", f"{name}_Settings", name]
+    assert result["point_count"] == len(SQUARE_XYZ)
+    # Nothing flipped, so the robot's declared travel was never touched.
+    assert result["wrist_limits_clamped"] is False
+
+
+def test_curve_follow_retries_with_internal_flip_when_setup_is_rejected():
     rdk = _Rdk()
     rdk.project = _Project(setup_statuses=[-5.0, 0.0])
+
     result = _build(_io(rdk), "TasniCylinder_DRY_retry_L001")
 
     generation_poses = [event[1] for event in rdk.project.events if event[0] == "pose"]
@@ -228,70 +240,54 @@ def test_curve_follow_retries_with_internal_flip_but_keeps_requested_output_pose
     np.testing.assert_allclose(fallback[:3, :3], np.diag([1.0, -1.0, -1.0]),
                                atol=1e-9)
     assert result["setup_attempts"] == [-5.0, 0.0]
-    # The internal flip is a generation seed only: the emitted targets still carry
-    # the requested orientation, so the printed rotation cannot change silently.
-    for target in rdk.targets:
-        np.testing.assert_allclose(pose_to_T(target.pose)[:3, :3], np.eye(3),
-                                   atol=1e-9)
 
 
-def test_curve_moves_are_rebuilt_as_neutral_branch_locked_joint_targets():
-    """The project's own motion is discarded for branch-locked joint targets.
-
-    A Curve Follow program does not retain joints written through setInstruction,
-    so every endpoint is re-emitted as a named joint target instead.
-    """
+def test_a_wrist_flip_clamps_axes_4_and_6_then_regenerates():
     rdk = _Rdk()
-    rdk.project.program = _GeneratedProgram(instruction_count=2)
-    name = "TasniCylinder_DRY_locked_L001"
+    rdk.project.program = _FlipUntilClampedProgram()
+    io = _io(rdk)
 
-    result = _build(_io(rdk, joints=[0.0, 0.0, 0.0, 0.0, 0.0, 45.0]), name,
+    result = _build(io, "TasniCylinder_QUICK_clamped_L001",
                     maximum_tool_axis_spin_deg=90.0)
 
-    program = rdk.project.program
-    # Highest index first: deleting low-to-high would renumber the rest.
-    assert program.deleted == [1, 0]
-    assert result["targets"] == [
-        f"{name}_Approach",
-        *(f"{name}_P{index:04d}" for index in range(len(SQUARE_XYZ))),
-        f"{name}_Retract"]
-    assert [target.name for target in rdk.targets] == result["targets"]
-    # Joint targets, not cartesian ones: RoboDK cannot re-solve another branch.
-    assert all(target.is_joint_target for target in rdk.targets)
-    assert all(RdkIO._joint_values(target.joints)[-1] == 45.0
-               for target in rdk.targets)
-    assert [move for move, _ in program.moves] == ["J"] + ["L"] * 5
-    assert [target.name for _, target in program.moves] == result["targets"]
-    assert result["maximum_tool_axis_spin_seen_deg"] == 45.0
-    assert result["maximum_axis_4_rotation_seen_deg"] == 0.0
-    # Every emitted target is disposable, so Reset can remove it.
-    assert result["artifacts"][-len(result["targets"]):] == result["targets"]
+    assert result["wrist_limits_clamped"] is True
+    assert result["targets"] == []
+    assert rdk.project.program.generations == 2, "it must regenerate once clamped"
+
+    clamped_lower, clamped_upper = io.test_robot.limit_calls[0]
+    # Axes 4 and 6 are pulled in to the neutral window (neutral is all-zero here)...
+    assert (clamped_lower[3], clamped_upper[3]) == (-90.0, 90.0)
+    assert (clamped_lower[5], clamped_upper[5]) == (-90.0, 90.0)
+    # ...and every other axis keeps the robot's real travel.
+    assert (clamped_lower[1], clamped_upper[1]) == (-140.0, -5.0)
+    # The clamp is temporary: the robot is handed back its declared travel.
+    assert io.test_robot.limit_calls[-1] == (STOCK_LOWER, STOCK_UPPER)
 
 
-def test_curve_generation_rejects_axis_6_spin_beyond_limit():
-    rdk = _Rdk()
-    io = _io(rdk, joints=[0.0, 0.0, 0.0, 0.0, 0.0, 120.0])
-
-    with pytest.raises(RuntimeError, match="neutral.*wrist|axis-4/axis-6"):
-        _build(io, "TasniCylinder_DRY_spin_L001", maximum_tool_axis_spin_deg=90.0)
-
-    assert rdk.project.program.moves == []
-
-
-def test_curve_generation_rejects_axis_4_rotation_beyond_limit():
-    rdk = _Rdk()
-    io = _io(rdk, joints=[0.0, 0.0, 0.0, 120.0, 0.0, 0.0])
-
-    with pytest.raises(RuntimeError, match="neutral.*wrist|axis 4"):
-        _build(io, "TasniCylinder_DRY_axis4", maximum_tool_axis_spin_deg=90.0)
-
-    assert rdk.project.program.moves == []
-
-
-def test_curve_generation_rejects_hidden_interpolated_axis_4_flip():
+def test_joint_limits_are_restored_when_the_clamped_regeneration_still_flips():
     rdk = _Rdk()
     rdk.project.program = _InterpolatedFlipProgram()
+    io = _io(rdk)
 
     with pytest.raises(RuntimeError, match="turns axis 4.*blocked"):
-        _build(_io(rdk), "TasniCylinder_DRY_interpolated_flip",
+        _build(io, "TasniCylinder_QUICK_stillflipped_L001",
                maximum_tool_axis_spin_deg=90.0)
+
+    # Clamped once, then restored -- a failed generation must not leave the robot
+    # with a narrowed axis 4/6 travel for every later motion in the station.
+    assert len(io.test_robot.limit_calls) == 2
+    assert io.test_robot.limit_calls[-1] == (STOCK_LOWER, STOCK_UPPER)
+
+
+def test_generation_fails_loudly_when_the_station_will_not_accept_a_clamp():
+    """No clamp available means the original wrist-flip failure must surface."""
+    rdk = _Rdk()
+    rdk.project.program = _InterpolatedFlipProgram()
+    io = _io(rdk)
+    io.robot().JointLimits = lambda: (_ for _ in ()).throw(RuntimeError("no limits"))
+
+    with pytest.raises(RuntimeError, match="turns axis 4.*blocked"):
+        _build(io, "TasniCylinder_QUICK_nolimits_L001",
+               maximum_tool_axis_spin_deg=90.0)
+
+    assert io.test_robot.limit_calls == []
