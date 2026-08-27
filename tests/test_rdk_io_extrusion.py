@@ -1,11 +1,11 @@
 """Regression tests for native RoboDK Curve Follow project setup.
 
 The Curve Follow Project owns the path: one curve object, no station targets. It
-also solves its own inverse kinematics, so the only lever that stops it choosing
-the opposite wrist branch is the robot's declared joint travel. Generation is
-therefore try-then-constrain: generate, verify the joint path against the
-operator's neutral wrist window, and only if that fails clamp axes 4/6 and
-regenerate. The clamp is always handed back.
+aligns the tool to the curve normal by its own convention, so the path-to-tool
+seed decides whether the generated path lands on the operator's neutral wrist
+branch or 180 degrees from it. Generation therefore tries each seed and keeps the
+one whose interpolated joint path verifies, falling back to clamping the wrist
+axes only as a last resort -- and always handing the robot's travel back.
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ class _Item:
 
 class _Robot(_Item):
     def __init__(self):
-        self._lower, self._upper = list(STOCK_LOWER), list(STOCK_UPPER)
+        self.lower, self.upper = list(STOCK_LOWER), list(STOCK_UPPER)
         self.limit_calls: list[tuple[list[float], list[float]]] = []
 
     def Joints(self): return robomath.Mat([0.0] * 6)
@@ -44,13 +44,13 @@ class _Robot(_Item):
     def Parent(self): return _Missing()
 
     def JointLimits(self):
-        return (robomath.Mat(list(self._lower)), robomath.Mat(list(self._upper)), 0.0)
+        return (robomath.Mat(list(self.lower)), robomath.Mat(list(self.upper)), 0.0)
 
     def setJointLimits(self, lower, upper):
         low = [float(v) for v in lower.list()]
         high = [float(v) for v in upper.list()]
         self.limit_calls.append((low, high))
-        self._lower, self._upper = low, high
+        self.lower, self.upper = low, high
 
 
 class _Curve(_Item):
@@ -60,35 +60,52 @@ class _Curve(_Item):
     def Delete(self): pass
 
 
+def _joint_rows(**axis_rotations):
+    """A one-sample interpolated joint path with the given axis deviations."""
+    rows = [[0.0] for _ in range(10)]
+    for axis, value in axis_rotations.items():
+        rows[int(axis)][0] = value
+    return "", robomath.Mat(rows), 1
+
+
 class _Program(_Item):
     """A generated program whose interpolated path stays on the neutral branch."""
 
     def setName(self, name): self.name = name
     def InstructionCount(self): return 0
-    def InstructionListJoints(self, **kwargs):
-        return "", robomath.Mat([[0.0] for _ in range(10)]), 1
+    def InstructionListJoints(self, **kwargs): return _joint_rows()
 
 
 class _InterpolatedFlipProgram(_Program):
-    """Always interpolates through a wrist flip, clamp or no clamp."""
+    """Always interpolates through an axis-4 flip, whatever is tried."""
 
-    def InstructionListJoints(self, **kwargs):
-        rows = [[0.0] for _ in range(10)]
-        rows[3][0] = 170.0
-        return "", robomath.Mat(rows), 1
+    def InstructionListJoints(self, **kwargs): return _joint_rows(**{"3": 170.0})
 
 
-class _FlipUntilClampedProgram(_Program):
-    """Flips on the first generation and is clean once the limits are clamped."""
+class _Axis5FlipProgram(_Program):
+    """Flips through axis 5 only -- the axis the guard used not to look at."""
+
+    def InstructionListJoints(self, **kwargs): return _joint_rows(**{"4": 150.0})
+
+
+class _FlipOnFirstSeedProgram(_Program):
+    """Flipped under the first path-to-tool seed, neutral under the second."""
 
     def __init__(self): self.generations = 0
 
     def InstructionListJoints(self, **kwargs):
         self.generations += 1
-        rows = [[0.0] for _ in range(10)]
-        if self.generations == 1:
-            rows[3][0] = 170.0
-        return "", robomath.Mat(rows), 1
+        return _joint_rows(**({"3": 170.0} if self.generations == 1 else {}))
+
+
+class _FlipUnlessClampedProgram(_Program):
+    """Flips for as long as the robot's axis-4 travel can still reach the flip."""
+
+    def __init__(self, robot): self.robot = robot
+
+    def InstructionListJoints(self, **kwargs):
+        reachable = self.robot.lower[3] <= -170.0
+        return _joint_rows(**({"3": 170.0} if reachable else {}))
 
 
 class _Project(_Item):
@@ -223,8 +240,10 @@ def test_native_generation_emits_one_curve_and_no_station_targets():
     assert rdk.targets == []
     assert result["artifacts"] == [f"{name}_Curve", f"{name}_Settings", name]
     assert result["point_count"] == len(SQUARE_XYZ)
-    # Nothing flipped, so the robot's declared travel was never touched.
+    # The first seed verified, so nothing else had to be tried.
+    assert result["tool_path_flip_applied"] is False
     assert result["wrist_limits_clamped"] is False
+    assert _io(rdk).test_robot.limit_calls == []
 
 
 def test_curve_follow_retries_with_internal_flip_when_setup_is_rejected():
@@ -242,21 +261,41 @@ def test_curve_follow_retries_with_internal_flip_when_setup_is_rejected():
     assert result["setup_attempts"] == [-5.0, 0.0]
 
 
-def test_a_wrist_flip_clamps_axes_4_and_6_then_regenerates():
+def test_a_flipped_first_seed_falls_through_to_the_flipped_path_to_tool_seed():
+    """The measured cell behaviour: the identity seed aims the tool 180 deg out."""
     rdk = _Rdk()
-    rdk.project.program = _FlipUntilClampedProgram()
+    rdk.project.program = _FlipOnFirstSeedProgram()
     io = _io(rdk)
+
+    result = _build(io, "TasniCylinder_QUICK_seed2_L001",
+                    maximum_tool_axis_spin_deg=90.0)
+
+    assert result["tool_path_flip_applied"] is True
+    assert rdk.project.program.generations == 2
+    # Seed selection is enough on its own; the wrist travel is never touched.
+    assert result["wrist_limits_clamped"] is False
+    assert io.test_robot.limit_calls == []
+    # The winning seed is the local-X flip of the requested orientation.
+    winning = pose_to_T([event[1] for event in rdk.project.events
+                         if event[0] == "pose"][-1])
+    np.testing.assert_allclose(winning[:3, :3], np.diag([1.0, -1.0, -1.0]),
+                               atol=1e-9)
+
+
+def test_clamping_wrist_travel_is_the_last_resort_after_both_seeds_flip():
+    rdk = _Rdk()
+    io = _io(rdk)
+    rdk.project.program = _FlipUnlessClampedProgram(io.test_robot)
 
     result = _build(io, "TasniCylinder_QUICK_clamped_L001",
                     maximum_tool_axis_spin_deg=90.0)
 
     assert result["wrist_limits_clamped"] is True
     assert result["targets"] == []
-    assert rdk.project.program.generations == 2, "it must regenerate once clamped"
-
     clamped_lower, clamped_upper = io.test_robot.limit_calls[0]
-    # Axes 4 and 6 are pulled in to the neutral window (neutral is all-zero here)...
+    # The wrist axes are pulled in to the neutral window (neutral is all-zero here)...
     assert (clamped_lower[3], clamped_upper[3]) == (-90.0, 90.0)
+    assert (clamped_lower[4], clamped_upper[4]) == (-90.0, 90.0)
     assert (clamped_lower[5], clamped_upper[5]) == (-90.0, 90.0)
     # ...and every other axis keeps the robot's real travel.
     assert (clamped_lower[1], clamped_upper[1]) == (-140.0, -5.0)
@@ -274,7 +313,7 @@ def test_joint_limits_are_restored_when_the_clamped_regeneration_still_flips():
                maximum_tool_axis_spin_deg=90.0)
 
     # Clamped once, then restored -- a failed generation must not leave the robot
-    # with a narrowed axis 4/6 travel for every later motion in the station.
+    # with narrowed wrist travel for every later motion in the station.
     assert len(io.test_robot.limit_calls) == 2
     assert io.test_robot.limit_calls[-1] == (STOCK_LOWER, STOCK_UPPER)
 
@@ -291,3 +330,14 @@ def test_generation_fails_loudly_when_the_station_will_not_accept_a_clamp():
                maximum_tool_axis_spin_deg=90.0)
 
     assert io.test_robot.limit_calls == []
+
+
+def test_an_axis_5_flip_is_rejected_too():
+    """Axis 5 was unbounded, so a flip realised through it passed unnoticed."""
+    rdk = _Rdk()
+    rdk.project.program = _Axis5FlipProgram()
+    io = _io(rdk)
+
+    with pytest.raises(RuntimeError, match="turns axis 5.*blocked"):
+        _build(io, "TasniCylinder_QUICK_axis5_L001",
+               maximum_tool_axis_spin_deg=90.0)

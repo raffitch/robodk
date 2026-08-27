@@ -1312,6 +1312,10 @@ class RdkIO:
         finally:
             self.restore_tool_and_frame(previous_tool, previous_frame)
 
+    # The three wrist axes a Curve Follow path can flip through. A1-A3 legitimately
+    # sweep to follow the circle, so only these are held to the neutral window.
+    WRIST_AXES = ((3, "axis 4"), (4, "axis 5"), (5, "axis 6"))
+
     def _clamp_wrist_joint_limits(self, neutral_joints,
                                   maximum_wrist_rotation_deg: float):
         """Bound axes 4 and 6 to the neutral window; return the limits to restore.
@@ -1339,7 +1343,7 @@ class RdkIO:
             return None
         clamped_lower, clamped_upper = list(lower), list(upper)
         window = abs(float(maximum_wrist_rotation_deg))
-        for axis in (3, 5):
+        for axis, _ in self.WRIST_AXES:
             clamped_lower[axis] = max(lower[axis], neutral[axis] - window)
             clamped_upper[axis] = min(upper[axis], neutral[axis] + window)
             if clamped_lower[axis] >= clamped_upper[axis]:
@@ -1416,28 +1420,25 @@ class RdkIO:
         samples = list(joint_list)
         if not samples:
             raise RuntimeError("RoboDK returned no joint samples for the generated path")
-        max_axis_4 = 0.0
-        max_axis_6 = 0.0
         limit = float(maximum_wrist_rotation_deg)
+        worst = {index: 0.0 for index, _ in cls.WRIST_AXES}
         for sample_index, sample in enumerate(samples):
             values = [float(v) for v in sample]
             if len(values) < 6:
                 raise RuntimeError("RoboDK returned an incomplete joint-path sample")
-            axis_4 = ((values[3] - neutral[3] + 180.0) % 360.0) - 180.0
-            axis_6 = ((values[5] - neutral[5] + 180.0) % 360.0) - 180.0
-            max_axis_4 = max(max_axis_4, abs(axis_4))
-            max_axis_6 = max(max_axis_6, abs(axis_6))
-            if abs(axis_4) > limit or abs(axis_6) > limit:
-                axis_name = "axis 4" if abs(axis_4) > limit else "axis 6"
-                rotation = axis_4 if axis_name == "axis 4" else axis_6
-                raise RuntimeError(
-                    f"generated path sample {sample_index + 1} turns {axis_name} "
-                    f"{rotation:.1f} deg from neutral; limit is ±{limit:.1f} deg. "
-                    "The wrist-flipped path was blocked before simulation or robot motion.")
+            for index, axis_name in cls.WRIST_AXES:
+                rotation = ((values[index] - neutral[index] + 180.0) % 360.0) - 180.0
+                worst[index] = max(worst[index], abs(rotation))
+                if abs(rotation) > limit:
+                    raise RuntimeError(
+                        f"generated path sample {sample_index + 1} turns {axis_name} "
+                        f"{rotation:.1f} deg from neutral; limit is ±{limit:.1f} deg. "
+                        "The wrist-flipped path was blocked before simulation or robot motion.")
         return {
             "sample_count": len(samples),
-            "maximum_axis_4_rotation_seen_deg": float(max_axis_4),
-            "maximum_axis_6_rotation_seen_deg": float(max_axis_6),
+            "maximum_axis_4_rotation_seen_deg": float(worst[3]),
+            "maximum_axis_5_rotation_seen_deg": float(worst[4]),
+            "maximum_axis_6_rotation_seen_deg": float(worst[5]),
         }
 
     @staticmethod
@@ -1560,14 +1561,18 @@ class RdkIO:
         })
         project.setParam("Approach", f"NTS {float(approach_clearance_mm):.6f} 0 0")
         project.setParam("Retract", f"NTS {float(retreat_clearance_mm):.6f} 0 0")
-        # RoboDK's Curve Follow initializer can reject an otherwise reachable fixed
-        # TCP pose depending on the selected tool's mounting transform. LongCalibTool
-        # is one such case: its identity path-to-tool seed returns -5, while the
-        # equivalent local-X-flipped seed produces the path. This pose is only an
-        # internal generation seed. Every generated motion is pinned back to the exact
-        # requested ``orientation`` below, then IK/collision validated, so the fallback
-        # cannot silently change the commanded print orientation. Keep the curve normal
-        # unchanged so approach/retract remain on the safe +normal side of the surface.
+        # A Curve Follow Project aligns the tool to the curve's normal by its own
+        # convention (tool Z into the work, approach along +normal), so the
+        # path-to-tool pose decides whether the generated path lands on the
+        # operator's neutral wrist branch or 180 degrees from it. This cell's
+        # LongCalibTool carries its TCP Z back up the tool, opposite that
+        # convention, so the identity seed generates the flipped path (measured on
+        # the cell: axis 4 -179 deg from neutral) and the local-X-flipped seed is
+        # the physical one. Which seed is right is a property of the selected
+        # tool's mounting, so do not hard-code it: generate with each and keep the
+        # one whose interpolated joint path actually verifies against neutral.
+        # The curve normal stays unchanged so approach/retract remain on the safe
+        # +normal side of the surface.
         flip_local_x = np.eye(4)
         flip_local_x[1, 1] = -1.0
         flip_local_x[2, 2] = -1.0
@@ -1598,13 +1603,14 @@ class RdkIO:
                 "path start and seed the coordinates again.")
         program.setName(name)
 
-        def generate_native_path():
+        def generate_native_path(path_to_tool):
             """Regenerate the project's own path and verify the wrist branch.
 
             The Curve Follow Project keeps ownership of interpolation, approach and
             retract, speeds and path events — one curve, no station targets. Raises
             if generation fails or the joint path leaves the neutral wrist window.
             """
+            project.setPose(T_to_pose(path_to_tool))
             project.setParam("UpdatePath")
             generation = project.Update(robolink.COLLISION_OFF)
             if float(generation[3]) < 0:
@@ -1625,17 +1631,25 @@ class RdkIO:
                 linked, start_joints, maximum_tool_axis_spin_deg)
             return linked, float(generation[3]), report
 
-        # Try the seeded, deterministic generation on its own first: the project is
-        # handed the neutral start joints and every orientation-search option is off,
-        # which should keep it on the operator's wrist branch. Only if the
-        # verification says otherwise do we take RoboDK's freedom to flip away, by
-        # bounding axes 4 and 6 to the neutral window and regenerating. This cell
-        # leaves both axes at +/-350 deg, which is exactly what puts the opposite
-        # branch within reach. The limits are always restored.
+        def first_verifying_seed():
+            """Generate with each path-to-tool seed; keep the first that verifies."""
+            failures = []
+            for seed_index, path_to_tool in enumerate(generation_orientations):
+                try:
+                    return (seed_index, *generate_native_path(path_to_tool))
+                except RuntimeError as exc:
+                    failures.append(f"path-to-tool seed {seed_index + 1}: {exc}")
+            raise RuntimeError("; ".join(failures))
+
+        # Seed selection alone should settle the branch. Clamping the wrist axes is
+        # only a last resort, and it cannot rescue a seed that aims the tool the
+        # wrong way round: forbidding the axis that reaches the flipped orientation
+        # just makes the path ungeneratable. Limits are always restored.
         restore_limits = None
         try:
             try:
-                program, generation_ratio, trajectory = generate_native_path()
+                (seed_index, program, generation_ratio,
+                 trajectory) = first_verifying_seed()
                 wrist_limits_clamped = False
             except RuntimeError as unclamped_failure:
                 restore_limits = self._clamp_wrist_joint_limits(
@@ -1643,10 +1657,11 @@ class RdkIO:
                 if restore_limits is None:
                     raise
                 try:
-                    program, generation_ratio, trajectory = generate_native_path()
+                    (seed_index, program, generation_ratio,
+                     trajectory) = first_verifying_seed()
                 except RuntimeError as clamped_failure:
                     raise RuntimeError(
-                        f"{clamped_failure} The unconstrained attempt ran first and "
+                        f"{clamped_failure}. The unconstrained attempts ran first and "
                         f"also failed: {unclamped_failure}") from clamped_failure
                 wrist_limits_clamped = True
         finally:
@@ -1660,8 +1675,11 @@ class RdkIO:
             "setup_attempts": setup_attempts,
             "maximum_tool_axis_spin_deg": float(maximum_tool_axis_spin_deg),
             "wrist_limits_clamped": wrist_limits_clamped,
+            "tool_path_flip_applied": bool(seed_index),
             "maximum_axis_4_rotation_seen_deg":
                 trajectory["maximum_axis_4_rotation_seen_deg"],
+            "maximum_axis_5_rotation_seen_deg":
+                trajectory["maximum_axis_5_rotation_seen_deg"],
             "maximum_tool_axis_spin_seen_deg":
                 trajectory["maximum_axis_6_rotation_seen_deg"],
             "joint_path_sample_count": trajectory["sample_count"],
