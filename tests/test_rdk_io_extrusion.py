@@ -279,7 +279,7 @@ def test_the_layer_creates_no_station_targets_at_all():
     result = _build(_io(rdk), "TasniCylinder_QUICK_native_L001")
 
     assert rdk.targets == [], "layer generation must not create targets"
-    assert result["targets"] == []
+    assert "targets" not in result, "no caller reads a target list any more"
     assert result["artifacts"] == ["TasniCylinder_QUICK_native_L001_Curve",
                                    "TasniCylinder_QUICK_native_L001_Settings",
                                    "TasniCylinder_QUICK_native_L001"]

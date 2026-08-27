@@ -1713,7 +1713,7 @@ class RdkIO:
                 "the native Curve Follow program must own its poses inline")
         return {
             "program": name, "curve": curve_name, "project": project_name,
-            "artifacts": [curve_name, project_name, name], "targets": [],
+            "artifacts": [curve_name, project_name, name],
             "point_count": len(pts),
             "instruction_count": int(program.InstructionCount()),
             "move_count": poses["move_count"],
