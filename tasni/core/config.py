@@ -737,12 +737,6 @@ class ExtrusionConfig(_Model):
     # generated curve uses fixed TCP orientation, but redundant IK/interpolation
     # branches can otherwise turn axis 4 or 6 by about 180 degrees.
     max_tool_axis_spin_deg: float = Field(default=90.0, gt=0, le=180)
-    # Each retained waypoint becomes one station target locked to the neutral IK
-    # branch — the only mechanism RoboDK's API offers for pinning a wrist
-    # configuration. The plan is generated far denser than the robot needs
-    # (180 points on a 37.5 mm radius is ~1.3 mm apart), so thin it: 60 waypoints
-    # leave a chord error near 0.05 mm against a 6 mm bead.
-    max_path_targets_per_layer: int = Field(default=60, ge=8, le=4000)
     approach_clearance_mm: float = Field(default=40.0, gt=0, le=500)
     retreat_clearance_mm: float = Field(default=60.0, gt=0, le=500)
     settle_s: float = Field(default=1.0, ge=0, le=30)

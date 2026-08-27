@@ -1,5 +1,52 @@
 # Extrusion cylinder: the axis-4 wrist flip — handoff
 
+## 2026-08-27 — RESOLVED
+
+Fixed on branch `extrusion-inline-program`. The layer is now ONE native Curve Follow
+program with **zero station targets**, on the parked wrist branch. Everything below
+this section is kept as the historical record, but **four of its conclusions are
+wrong** — read this first.
+
+**Root cause: the path-to-tool seed.** A Curve Follow Project does not reproduce the
+roll of its `project.setPose` seed — it MIRRORS it. Measured: a project seeded with
+`X · rotx(π) · rotz(π)` generates the rotation `Rz(180°) · S · X · S`, `S = diag(1,-1,1)`.
+That map is an involution, so `curve_follow_seed_T` feeds it the orientation we want
+and gets back the seed that produces it. Verified at eight commanded orientations
+(four yaws plus tilted ones): **0.000° pose error** at every one.
+
+**Corrections to the sections below:**
+
+1. **§5.1 is wrong** that the seed was tried and failed. Only TWO seeds were ever
+   tried — `orientation` and `orientation · rotx(π)` — and the loop kept whichever
+   GENERATED first, not whichever verified. The winner was the flipped one. The naive
+   `· rotx(π)` seed scores 1.4° at this cell's ~90.7° commanded yaw purely because the
+   mirror is near-identity there; at 135.7° yaw the same seed is **91.4° wrong**.
+2. **§6's recommended fix (a mirrored `TasniPrintTCP`) is a no-op.** `LongCalibTool`
+   and a tool rotated 180° about local X produce *bit-identical joints* for the
+   corresponding seed. The tool item never influenced the flip; only the seed did.
+   `LongCalibTool` was never modified.
+3. **§3 is only half right.** The generated tool AXIS is identical (`toolZ = [0,0,1]`
+   in both), but the emitted POSE is rotated 178.63° about that axis — so the pose
+   itself is wrong, not just the IK branch, and RoboDK realises that roll by flipping
+   axis 4 rather than axis 6. **§5.2's conclusion does not follow**: a one-target
+   neutral prefix cannot rescue a wrong pose (measured: still dA4 = 178.59°).
+4. **The `.src` import route is blocked, not merely untried.** `Robolink.AddFile` on a
+   `.src` opens a MODAL import dialog, so headless it never returns. Writing a `.src`
+   via `Item.MakeProgram` works (the post refuses `LIN` to a joint target).
+
+**What the fix does now:** curve normal = the SURFACE normal (frame +Z), not the
+commanded tool Z; one computed seed instead of a search; RoboDK's generated program
+kept exactly as emitted; then four gates — per-instruction pose error ≤ 1°, the
+interpolated wrist-flip sample check, valve-call placement (the extruder may not open
+at the approach standoff nor stay open while the nozzle lifts), and an unchanged
+station target count.
+
+All of it is reproducible with **`tools/probe_extrusion_branch.py`** (probes A, R, V,
+B, C) against a private headless licensed instance.
+
+---
+
+
 Written 2026-08-27 after a long unsuccessful session. Everything here was measured on
 the live cell, not inferred. **Read this before touching `create_extrusion_layer_program`.**
 
