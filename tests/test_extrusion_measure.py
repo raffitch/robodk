@@ -364,3 +364,43 @@ def test_measure_blocks_before_motion_when_the_camera_is_offline(tmp_path, monke
     with pytest.raises(RuntimeError, match="camera is not ready"):
         RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True)(Ctx())
     assert rdk.events == []
+
+
+# ---------------------------------------------- characterize job (Task 9)
+
+from tasni.modules.extrusion.measure import RingCharacterizeJob
+from tasni.modules.extrusion.processing import CharacterizationResult
+
+
+def fake_characterize(**kwargs):
+    fake_characterize.calls.append(kwargs)
+    image = np.zeros((12, 12), np.uint8)
+    return CharacterizationResult(
+        radius_mm=61.2, center_mm=(214.0, 141.0), bead_width_mm=8.3, bead_width_min_mm=7.0,
+        bead_width_max_mm=9.5, top_z_mean_mm=6.4, top_z_min_mm=5.1, top_z_max_mm=9.8,
+        measured_xyz=np.zeros((10, 3)), segmentation=image, skeleton=image,
+        comparison=np.zeros((12, 12, 3), np.uint8),
+        report={"coarse": {"radius_mm": 60.0}, "timings_ms": {"total_ms": 12.0}})
+
+
+fake_characterize.calls = []
+
+
+def test_characterize_job_measures_the_ring_and_stores_it_in_the_session(tmp_path, monkeypatch):
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(measure_mod, "characterize_ring", fake_characterize)
+    fake_characterize.calls.clear()
+    plan = auto_plan()
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, plan)
+    out = RingCharacterizeJob(svc, plan, session, check_collisions=True)(Ctx())
+    assert out["kind"] == "ring_characterize"
+    assert out["characterization"]["radius_mm"] == 61.2
+    assert fake_characterize.calls[-1]["search_center_mm"] == (200.0, 150.0)
+    assert fake_characterize.calls[-1]["work_frame"] == "Tasni Work Frame"
+    assert Path(out["capture_dir"]).name == "characterize-01"
+    assert (Path(out["capture_dir"]) / "depth.npy").is_file()
+    kinds = [e[0] for e in rdk.events]
+    assert "station-program" not in kinds and "create" not in kinds
+    assert rdk.events[-1] == ("move-joints", "START")
+    assert MeasureSession.load(root, session.trial_id).characterizations[-1]["radius_mm"] == 61.2

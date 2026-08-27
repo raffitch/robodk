@@ -329,3 +329,94 @@ class RingMeasureJob:
                 rdk.delete_items(list(dict.fromkeys(reversed(artifacts))))
             except Exception:
                 pass
+
+
+class RingCharacterizeJob:
+    """Measure ring 1 with no recipe assumption; the operator applies it to the recipe.
+
+    The recipe has to come from the physical ring -- the operator has dried
+    beads and no calipers -- so this runs before any measurement of a stack and
+    its result seeds radius, bead, layer height and the cylinder centre.
+    """
+
+    def __init__(self, services, plan: CylinderPlan, session: MeasureSession, *,
+                 check_collisions: bool = True):
+        self.services = services
+        self.plan = plan.model_copy(deep=True)
+        self.session = session
+        self.check_collisions = bool(check_collisions)
+        self.result: dict | None = None
+
+    def __call__(self, ctx: JobContext) -> dict:
+        services = self.services
+        rdk: RdkIO = services.rdk
+        ecfg = services.config.extrusion
+        layer = self.plan.layers[0]                      # aim at the first layer's top
+        inspection_name = _program_name(self.plan, 1, "CHARACTERIZE") + "_Inspect"
+        archive = ExtrusionArchive(REPO_ROOT / "runs" / "extrusion")
+        artifacts: list[str] = []
+        current_program: str | None = None
+        start_joints = _prepare_robot(services, ctx, self.plan, label="extrusion-characterize")
+        try:
+            with _camera_hold(services, "extrusion-characterize"):
+                ctx.progress(1, 3, "moving the camera over the ring")
+                current_program = inspection_name
+                captured = _inspect_and_capture(
+                    services, ctx, self.plan, layer, inspection_name=inspection_name,
+                    start_joints=start_joints, seed_pose=self.session.last_pose,
+                    collisions=self.check_collisions, artifacts=artifacts)
+                current_program = None
+                frame = captured["frame"]
+                ctx.progress(2, 3, "characterizing the ring")
+                found = characterize_ring(
+                    color=frame.color, depth=frame.depth,
+                    T_work_camera=captured["T_work_camera"], K=services.config.camera.K,
+                    search_center_mm=(float(self.plan.setup.center_x_mm),
+                                      float(self.plan.setup.center_y_mm)),
+                    work_frame=self.plan.setup.work_frame, config=ecfg,
+                    inspection_tool=self.plan.setup.inspection_tool,
+                    print_tool=self.plan.setup.print_tool)
+                index = len(self.session.characterizations) + 1
+                summary = {**found.summary(), "index": index, "timestamp": _utcnow(),
+                           "capture_ms": captured["capture_ms"],
+                           "inspection_pose": captured["inspect"]["pose"],
+                           "search_center_mm": [self.plan.setup.center_x_mm,
+                                                self.plan.setup.center_y_mm]}
+                capture_dir = archive.write_characterization(
+                    self.session.trial_id, index, color=frame.color, depth=frame.depth,
+                    measured_xyz=found.measured_xyz,
+                    derived_images={"segmentation.png": found.segmentation,
+                                    "skeleton.png": found.skeleton,
+                                    "comparison.png": found.comparison},
+                    report={**found.report, "summary": summary,
+                            "provenance": {**_provenance(services),
+                                           "T_work_camera": np.asarray(
+                                               captured["T_work_camera"], dtype=float).tolist()}})
+                summary["capture_dir"] = str(capture_dir)
+                self.session.characterizations.append(summary)
+                if captured["inspect"]["pose"]:
+                    self.session.last_pose = captured["inspect"]["pose"]
+                self.session.save()
+                ctx.log(f"ring: radius {found.radius_mm:.1f} mm, bead {found.bead_width_mm:.1f} mm, "
+                        f"height {found.top_z_min_mm:.1f}-{found.top_z_max_mm:.1f} mm "
+                        f"(mean {found.top_z_mean_mm:.1f}), centre "
+                        f"({found.center_mm[0]:.1f}, {found.center_mm[1]:.1f})")
+            ctx.progress(3, 3, "returning to the start pose")
+            self.result = {"kind": "ring_characterize", "mode": MODE,
+                           "trial_id": self.session.trial_id,
+                           "characterization": summary, "capture_dir": str(capture_dir)}
+            return self.result
+        finally:
+            if current_program:
+                try:
+                    rdk.stop_program(current_program)
+                except Exception:
+                    pass
+            try:
+                rdk.move_j_joints(start_joints)
+            except Exception:
+                pass
+            try:
+                rdk.delete_items(list(dict.fromkeys(reversed(artifacts))))
+            except Exception:
+                pass
