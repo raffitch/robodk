@@ -82,13 +82,19 @@ class _Program(_Item):
         if index == 0:      # e.g. "Set speed" -- must be left alone
             return ("Set speed (200)", rl.INS_TYPE_CHANGESPEED, 0, False,
                     robomath.eye(4), robomath.Mat([0.0] * 6))
+        # RoboDK generates the move with ITS OWN flipped tool rotation, at a
+        # position the project chose. Only the position may be kept.
+        generated = np.eye(4)
+        generated[:3, :3] = np.diag([1.0, -1.0, -1.0])
+        generated[:3, 3] = [10.0 * index, 20.0, 30.0]
         return (f"MoveL {index}", rl.INS_TYPE_MOVE, rl.MOVE_TYPE_LINEAR, False,
-                robomath.eye(4), robomath.Mat([0.0] * 6))
+                robomath.Mat(generated.tolist()), robomath.Mat([0.0] * 6))
 
     def setInstruction(self, index, name, instruction_type, move_type,
                        is_joint_target, pose, joints):
         self.written.append((index, bool(is_joint_target),
-                             [float(v) for v in joints.list()]))
+                             [float(v) for v in joints.list()],
+                             pose_to_T(pose)))
 
     def InstructionListJoints(self, **kwargs): return _joint_rows()
 
@@ -275,9 +281,16 @@ def test_native_generation_emits_one_curve_and_no_station_targets():
     # playback and returns to the flipped branch -- that was the original defect.
     written = rdk.project.program.written
     assert result["moves_pinned_to_neutral_branch"] == _Program.MOVES
-    assert [index for index, _, _ in written] == [1, 2, 3], "index 0 is not a move"
-    assert all(is_joint_target for _, is_joint_target, _ in written)
-    assert all(joints == NEUTRAL_BRANCH for _, _, joints in written)
+    assert [index for index, _, _, _ in written] == [1, 2, 3], "index 0 is not a move"
+    assert all(is_joint_target for _, is_joint_target, _, _ in written)
+    assert all(joints == NEUTRAL_BRANCH for _, _, joints, _ in written)
+
+    # The project keeps ownership of WHERE each move goes; only the rotation is
+    # replaced, because RoboDK generated it with its own flipped tool alignment.
+    for index, _, _, written_T in written:
+        np.testing.assert_allclose(written_T[:3, :3], np.eye(3), atol=1e-9)
+        np.testing.assert_allclose(written_T[:3, 3], [10.0 * index, 20.0, 30.0],
+                                   atol=1e-9)
 
 
 def test_generation_fails_when_a_generated_move_has_no_neutral_solution():

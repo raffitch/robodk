@@ -1316,7 +1316,7 @@ class RdkIO:
     # sweep to follow the circle, so only these are held to the neutral window.
     WRIST_AXES = ((3, "axis 4"), (4, "axis 5"), (5, "axis 6"))
 
-    def _pin_program_to_neutral_branch(self, program, neutral_joints,
+    def _pin_program_to_neutral_branch(self, program, neutral_joints, orientation,
                                        maximum_wrist_rotation_deg: float) -> dict:
         """Rewrite each generated move as a joint move on the neutral wrist branch.
 
@@ -1341,16 +1341,22 @@ class RdkIO:
              pose, _joints) = program.Instruction(index)
             if instruction_type != robolink.INS_TYPE_MOVE:
                 continue
+            # Keep the project's POSITION — it owns interpolation, approach and
+            # retract — but take the rotation from the requested orientation. The
+            # generated rotation is RoboDK's own flipped tool alignment, and a
+            # flipped-tool pose has no neutral-branch solution at all, so
+            # re-solving the pose exactly as generated fails on the first move.
+            target_T = pose_to_T(pose)
+            target_T[:3, :3] = orientation[:3, :3]
             solved = self.solve_joints_on_neutral_branch(
-                pose_to_T(pose), neutral_joints, previous,
-                maximum_wrist_rotation_deg)
+                target_T, neutral_joints, previous, maximum_wrist_rotation_deg)
             if solved is None:
                 raise RuntimeError(
                     f"generated move {index + 1} ({instruction_name!r}) has no IK "
                     "solution on the neutral front/elbow/wrist branch within "
                     f"±{float(maximum_wrist_rotation_deg):.1f} deg of the start pose")
             program.setInstruction(index, instruction_name, instruction_type,
-                                   move_type, True, pose, solved)
+                                   move_type, True, T_to_pose(target_T), solved)
             previous = solved
             pinned += 1
         if not pinned:
@@ -1674,7 +1680,7 @@ class RdkIO:
             """Generate, pin every move to the neutral branch, then verify."""
             linked, ratio = generate_native_path(path_to_tool)
             pinned = self._pin_program_to_neutral_branch(
-                linked, start_joints, maximum_tool_axis_spin_deg)
+                linked, start_joints, orientation, maximum_tool_axis_spin_deg)
             report = self._program_neutral_wrist_report(
                 linked, start_joints, maximum_tool_axis_spin_deg)
             return linked, ratio, {**report, **pinned}
