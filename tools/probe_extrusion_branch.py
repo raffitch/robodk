@@ -453,124 +453,171 @@ def probe_a(context) -> list:
 
 # --- PROBE R ------------------------------------------------------------------
 
-def probe_roll(context) -> list:
-    """Does the winning seed TRACK the commanded roll, or only mirror it?
+MIRROR_S = np.diag([1.0, -1.0, 1.0, 1.0])
 
-    At this cell's parked pose the commanded RPW yaw is ~90.69 deg, and the
-    generated one comes back as ~89.31 = 180 - 90.69.  Those two are 1.4 deg
-    apart *by coincidence of being near 90 deg*: if RoboDK is really reflecting
-    the seeded roll rather than reproducing it, the same seed rule would be
-    catastrophically wrong at any other orientation.  Re-run the winning seed
-    with the commanded orientation deliberately rolled about the tool axis and
-    watch whether the error stays small or grows as twice the offset.
+
+def seed_source_matrix(commanded: np.ndarray) -> np.ndarray:
+    """Invert, in matrix form, the mirror RoboDK imposes on the seeded roll.
+
+    Measured: seeding ``R_in . rotx(pi) . rotz(pi)`` makes RoboDK generate
+    ``R_out = Rz(180) . S . R_in . S`` with ``S = diag(1, -1, 1)``.  That map is
+    its own inverse, so feeding it the commanded orientation yields the source
+    whose generated result IS the commanded orientation.  Unlike the RPW form it
+    never decomposes into Euler angles, so it cannot pick up a gimbal artefact
+    when the commanded orientation is tilted off the surface normal.
     """
-    rdk, robot, frame = context["rdk"], context["robot"], context["frame"]
-    parked, points = context["parked"], context["points"]
+    return T_of(rm.rotz(math.pi)) @ MIRROR_S @ commanded @ MIRROR_S
+
+
+def seed_source_rpw(commanded: np.ndarray) -> np.ndarray:
+    """The same inverse expressed on RPW components: [r, p, w] -> [-r, p, 180-w]."""
+    r, p, w = rm.pose_2_xyzrpw(pose_of(commanded))[3:]
+    return T_of(rm.xyzrpw_2_pose([0.0, 0.0, 0.0, -r, p, 180.0 - w]))
+
+
+def seed_from_source(seed_source: np.ndarray) -> np.ndarray:
+    return seed_source @ T_of(rm.rotx(math.pi)) @ T_of(rm.rotz(math.pi))
+
+
+def generate_native_program(context, base: str, tool, commanded: np.ndarray,
+                            seed: np.ndarray):
+    """Build curve + Curve Follow Project exactly as production does and return
+    ``(program, status)`` keeping RoboDK's own generated instructions."""
+    rdk, frame, parked = context["rdk"], context["frame"], context["parked"]
+    points = context["points"]
+    for suffix in ("", "_Curve", "_Settings"):
+        drop(rdk, base + suffix)
+    surface_normal = np.array([0.0, 0.0, 1.0])      # +Z of the work frame
+    vertices = np.column_stack(
+        (points, np.repeat(surface_normal.reshape(1, 3), len(points), axis=0)))
+    curve = rdk.AddCurve(vertices.tolist(), projection_type=robolink.PROJECTION_NONE)
+    curve.setName(base + "_Curve")
+    curve.setParent(frame)
+    project = rdk.AddMachiningProject(base + "_Settings", context["robot"])
+    project.setPoseFrame(frame)
+    project.setPoseTool(tool)
+    project.setJoints(parked)
+    project.setParam("Machining", {
+        "Algorithm": 0, "ApproachRetractAll": 1, "AutoUpdate": 0,
+        "AvoidCollisions": 0, "FollowAngleOn": 0, "FollowRealignOn": 0,
+        "FollowStepOn": 0, "JoinCurvesTol": 0.1,
+        "PointApproach": float(APPROACH_MM), "RapidApproachRetract": 1,
+        "RotZ_Range": 0, "SpeedOperation": float(SPEED_MM_S),
+        "SpeedRapid": float(TRAVEL_MM_S), "TurntableActive": 0, "VisibleNormals": 1,
+    })
+    project.setParam("ProgEvents", {
+        "CallPathStart": AIR_ON, "CallPathStartOn": 1,
+        "CallPathFinish": AIR_OFF, "CallPathFinishOn": 1,
+        "RapidSpeed": float(TRAVEL_MM_S), "Rounding": float(ROUNDING_MM),
+        "RoundingOn": 1,
+    })
+    project.setParam("Approach", "NTS %.6f 0 0" % APPROACH_MM)
+    project.setParam("Retract", "NTS %.6f 0 0" % RETRACT_MM)
+    project.setPose(pose_of(seed))
+    program, status = project.setMachiningParameters(part=curve)
+    if program.Valid() and float(status) >= 0:
+        program.setName(base)
+    return program, float(status)
+
+
+def measure_program(program, commanded: np.ndarray, points, parked) -> dict:
+    """Worst pose error over EVERY move instruction, plus the wrist report."""
+    row = {}
+    worst_angle, worst_axis, on_curve = -1.0, None, 0
+    for index in range(program.InstructionCount()):
+        record = program.Instruction(index)
+        if record[1] != robolink.INS_TYPE_MOVE or record[4] is None:
+            continue
+        T_ins = T_of(record[4])
+        angle, axis = rot_delta(commanded[:3, :3], T_ins[:3, :3])
+        if angle > worst_angle:
+            worst_angle, worst_axis = angle, axis
+        if float(np.min(np.linalg.norm(points - T_ins[:3, 3], axis=1))) <= 1.0:
+            if on_curve == 0:
+                row["commanded_rpw"] = [round(v, 2) for v in
+                                        rm.pose_2_xyzrpw(pose_of(commanded))[3:]]
+                row["generated_rpw"] = [round(v, 2) for v in
+                                        rm.pose_2_xyzrpw(record[4])[3:]]
+            on_curve += 1
+    row["moves_on_curve"] = on_curve
+    row["pose_delta_deg"] = round(worst_angle, 3)
+    row["verdict"] = (name_the_rotation(worst_angle, worst_axis)
+                      if worst_axis is not None else "no move instruction")
+    row["first_moves"] = []
+    for index, record in first_moves(program, 3):
+        mname, _t, movetype, isjoint, target, joints = record
+        row["first_moves"].append({
+            "index": index, "name": mname, "movetype": movetype,
+            "is_joint_target": isjoint,
+            "xyzrpw": rm.pose_2_xyzrpw(target) if target is not None else None,
+            "joints": jvals(joints) if joints is not None else None})
+    row.update({("path_" + k): v for k, v in
+                path_joint_report(program, parked).items()})
+    return row
+
+
+def probe_roll(context) -> list:
+    """Does a seed TRACK the commanded orientation, or only mirror it?
+
+    At this cell's parked pose the commanded RPW yaw is ~90.69 deg and the
+    generated one comes back as ~89.31 = 180 - 90.69.  Those two are 1.4 deg
+    apart *by coincidence of being near 90 deg*: RoboDK reflects the seeded roll
+    rather than reproducing it, so the naive seed is catastrophically wrong at any
+    other orientation.  Sweep three seed forms over yawed AND tilted commanded
+    orientations.  The tilted cases are the ones that decide whether the
+    coordinate-free matrix inverse may be used, or whether the RPW inverse (which
+    decomposes into Euler angles and can gimbal) has to be fenced off by a
+    documented tilt limit.
+    """
     tool = context["tools"][PRINT_TOOL_NAME]
     base_orientation = context["orientation"][PRINT_TOOL_NAME]
-    surface_normal = np.array([0.0, 0.0, 1.0])
+    points, parked = context["points"], context["parked"]
+    # (yaw about the tool axis, pitch, roll) applied to the commanded orientation
+    orientations = [(0.0, 0.0, 0.0), (20.0, 0.0, 0.0), (-20.0, 0.0, 0.0),
+                    (45.0, 0.0, 0.0), (0.0, 10.0, 0.0), (0.0, -10.0, 0.0),
+                    (0.0, 10.0, 5.0), (30.0, 10.0, 5.0)]
     results = []
-    cases = [(roll, mode) for roll in (0.0, 20.0, -20.0, 45.0)
-             for mode in ("plain", "unmirrored")]
-    for index, (roll_deg, mode) in enumerate(cases):
-        base = "SpikeR%02d" % index
-        row = {"roll_offset_deg": roll_deg, "seed_mode": mode, "base": base}
-        try:
-            for suffix in ("", "_Curve", "_Settings"):
-                drop(rdk, base + suffix)
-            commanded = base_orientation @ T_of(rm.rotz(math.radians(roll_deg)))
-            # is the parked wrist branch still available at this orientation?
-            probe_T = commanded.copy()
-            probe_T[:3, 3] = points[0]
-            accepted, _ = neutral_branch(robot, probe_T, tool.PoseTool(),
-                                         context["frame_pose"], parked,
-                                         context["parked_config"])
-            row["neutral_solutions_at_start"] = len(accepted)
-
-            vertices = np.column_stack(
-                (points, np.repeat(surface_normal.reshape(1, 3), len(points), axis=0)))
-            curve = rdk.AddCurve(vertices.tolist(),
-                                 projection_type=robolink.PROJECTION_NONE)
-            curve.setName(base + "_Curve")
-            curve.setParent(frame)
-            project = rdk.AddMachiningProject(base + "_Settings", robot)
-            project.setPoseFrame(frame)
-            project.setPoseTool(tool)
-            project.setJoints(parked)
-            project.setParam("Machining", {
-                "Algorithm": 0, "ApproachRetractAll": 1, "AutoUpdate": 0,
-                "AvoidCollisions": 0, "FollowAngleOn": 0, "FollowRealignOn": 0,
-                "FollowStepOn": 0, "JoinCurvesTol": 0.1,
-                "PointApproach": float(APPROACH_MM), "RapidApproachRetract": 1,
-                "RotZ_Range": 0, "SpeedOperation": float(SPEED_MM_S),
-                "SpeedRapid": float(TRAVEL_MM_S), "TurntableActive": 0,
-                "VisibleNormals": 1,
-            })
-            project.setParam("ProgEvents", {
-                "CallPathStart": AIR_ON, "CallPathStartOn": 1,
-                "CallPathFinish": AIR_OFF, "CallPathFinishOn": 1,
-                "RapidSpeed": float(TRAVEL_MM_S), "Rounding": float(ROUNDING_MM),
-                "RoundingOn": 1,
-            })
-            project.setParam("Approach", "NTS %.6f 0 0" % APPROACH_MM)
-            project.setParam("Retract", "NTS %.6f 0 0" % RETRACT_MM)
-            # "plain" is the seed that happened to work at the parked pose.
-            # "unmirrored" pre-applies the inverse of the mirror RoboDK was
-            # measured to impose (generated RPW = [-r, p, 180 - w]), so the
-            # generated roll should land back on the commanded one at ANY yaw.
-            if mode == "plain":
-                seed_source = commanded
-            else:
-                r, p, w = rm.pose_2_xyzrpw(pose_of(commanded))[3:]
-                seed_source = T_of(rm.xyzrpw_2_pose([0.0, 0.0, 0.0,
-                                                     -r, p, 180.0 - w]))
-                row["seed_source_rpw"] = [round(-r, 2), round(p, 2),
-                                          round(180.0 - w, 2)]
-            seed = seed_source @ T_of(rm.rotx(math.pi)) @ T_of(rm.rotz(math.pi))
-            project.setPose(pose_of(seed))
-            program, status = project.setMachiningParameters(part=curve)
-            row["setup_status"] = float(status)
-            if not (program.Valid() and float(status) >= 0):
-                row["verdict"] = "no program generated"
-                say("  roll%+6.1f %-10s: status=%s -> NO PROGRAM (neutral IK at start=%s)"
-                    % (roll_deg, mode, status, row["neutral_solutions_at_start"]))
-                results.append(row)
-                continue
-            program.setName(base)
-            for i in range(program.InstructionCount()):
-                record = program.Instruction(i)
-                if record[1] != robolink.INS_TYPE_MOVE or record[4] is None:
+    index = 0
+    for yaw, pitch, roll in orientations:
+        commanded = (base_orientation
+                     @ T_of(rm.rotz(math.radians(yaw)))
+                     @ T_of(rm.roty(math.radians(pitch)))
+                     @ T_of(rm.rotx(math.radians(roll))))
+        for mode in ("plain", "rpw", "matrix"):
+            base = "SpikeR%02d" % index
+            index += 1
+            row = {"yaw": yaw, "pitch": pitch, "roll": roll,
+                   "seed_mode": mode, "base": base}
+            label = "yaw%+5.1f pitch%+5.1f roll%+5.1f %-6s" % (yaw, pitch, roll, mode)
+            try:
+                probe_T = commanded.copy()
+                probe_T[:3, 3] = points[0]
+                accepted, _ = neutral_branch(
+                    context["robot"], probe_T, tool.PoseTool(),
+                    context["frame_pose"], parked, context["parked_config"])
+                row["neutral_solutions_at_start"] = len(accepted)
+                seed_source = {"plain": commanded,
+                               "rpw": seed_source_rpw(commanded),
+                               "matrix": seed_source_matrix(commanded)}[mode]
+                program, status = generate_native_program(
+                    context, base, tool, commanded, seed_from_source(seed_source))
+                row["setup_status"] = status
+                if not (program.Valid() and status >= 0):
+                    row["verdict"] = "no program generated"
+                    say("  %s: status=%s -> NO PROGRAM (neutral IK at start=%s)"
+                        % (label, status, row["neutral_solutions_at_start"]))
+                    results.append(row)
                     continue
-                T_ins = T_of(record[4])
-                if float(np.min(np.linalg.norm(points - T_ins[:3, 3], axis=1))) <= 1.0:
-                    angle, axis = rot_delta(commanded[:3, :3], T_ins[:3, :3])
-                    row["pose_delta_deg"] = round(angle, 2)
-                    row["verdict"] = name_the_rotation(angle, axis)
-                    row["commanded_rpw"] = [round(v, 2) for v in
-                                            rm.pose_2_xyzrpw(pose_of(commanded))[3:]]
-                    row["generated_rpw"] = [round(v, 2) for v in
-                                            rm.pose_2_xyzrpw(record[4])[3:]]
-                    break
-            row["first_moves"] = []
-            for i, record in first_moves(program, 3):
-                mname, _t, movetype, isjoint, target, joints = record
-                row["first_moves"].append({
-                    "index": i, "name": mname, "movetype": movetype,
-                    "is_joint_target": isjoint,
-                    "xyzrpw": rm.pose_2_xyzrpw(target) if target is not None else None,
-                    "joints": jvals(joints) if joints is not None else None})
-            row.update({("path_" + k): v for k, v in
-                        path_joint_report(program, parked).items()})
-            say("  roll%+6.1f %-10s: status=%s | %s (%.2f deg) | commanded RPW=%s "
-                "generated RPW=%s | dA4=%s dA5=%s dA6=%s | neutral IK at start=%s"
-                % (roll_deg, mode, status, row.get("verdict"), row.get("pose_delta_deg", -1),
-                   row.get("commanded_rpw"), row.get("generated_rpw"),
-                   row.get("path_dA4"), row.get("path_dA5"), row.get("path_dA6"),
-                   row["neutral_solutions_at_start"]))
-        except Exception as error:
-            row["error"] = f"{type(error).__name__}: {error}"
-            say("  roll%+6.1f %-10s: EXCEPTION %s" % (roll_deg, mode, row["error"]))
-        results.append(row)
+                row.update(measure_program(program, commanded, points, parked))
+                say("  %s: worst pose err=%7.3f deg | %s | dA4=%s dA5=%s dA6=%s"
+                    " | neutral IK at start=%s"
+                    % (label, row["pose_delta_deg"], row["verdict"],
+                       row.get("path_dA4"), row.get("path_dA5"),
+                       row.get("path_dA6"), row["neutral_solutions_at_start"]))
+            except Exception as error:
+                row["error"] = f"{type(error).__name__}: {error}"
+                say("  %s: EXCEPTION %s" % (label, row["error"]))
+            results.append(row)
     return results
 
 
@@ -1082,10 +1129,10 @@ def main() -> int:
             if move["joints"]:
                 say("        joints=" + fmt(move["joints"]))
     for row in results.get("R", []):
-        say("[PROBE R roll%+.1f %s]  (%s)"
-            % (row["roll_offset_deg"], row["seed_mode"], row["base"]))
+        say("[PROBE R yaw%+.1f pitch%+.1f roll%+.1f %s]  (%s)"
+            % (row["yaw"], row["pitch"], row["roll"], row["seed_mode"], row["base"]))
         for key in ("setup_status", "verdict", "pose_delta_deg", "commanded_rpw",
-                    "generated_rpw", "seed_source_rpw", "neutral_solutions_at_start",
+                    "generated_rpw", "moves_on_curve", "neutral_solutions_at_start",
                     "path_dA4", "path_dA5", "path_dA6", "path_samples", "error"):
             if key in row:
                 say("    %s: %s" % (key, row[key]))
