@@ -481,3 +481,59 @@ def test_apply_characterization_rewrites_recipe_and_placement(tmp_path, monkeypa
     assert after["setup"]["center_x_mm"] == 214.0 and after["setup"]["center_y_mm"] == 141.0
     assert after["setup"]["build_plane_z_mm"] == 0.0
     assert client.get("/api/modules/extrusion/plan").json()["fingerprint"] == after["fingerprint"]
+
+
+# --------------------------------------------------- paper summary (Task 11)
+
+from tasni.modules.extrusion.measure import paper_summary
+
+
+def _write_take(root, trial_id, layer_index, take, *, offset, offset_norm, rms, mean_abs, maximum,
+                acq_ms, valid=True):
+    manifest = LayerManifest(
+        trial_id=trial_id, layer_index=layer_index, take=take, mode="MEASURE_ONLY",
+        recipe=auto_plan().recipe, toolpath_fingerprint="f" * 64,
+        annotation={"introduced_offset_mm": offset},
+        metrics=DeviationMetrics(mean_absolute_mm=mean_abs, rms_mm=rms, maximum_mm=maximum,
+                                 measured_center_mm=(0, 0), measured_radius_mm=40,
+                                 path_completeness=0.99, maximum_angular_gap_deg=4, valid=valid,
+                                 center_offset_norm_mm=offset_norm, shape_rms_mm=0.4),
+        geometry=RingGeometry(top_z_mean_mm=6, top_z_min_mm=5, top_z_max_mm=9, top_z_std_mm=1,
+                              height_mean_mm=6, height_min_mm=5, height_max_mm=9,
+                              height_reference="build_plane", bead_width_mean_mm=8,
+                              bead_width_min_mm=7, bead_width_max_mm=9, bead_width_bins=36),
+        processing={"timings_ms": {"capture_ms": 40.0, "total_ms": acq_ms - 40.0,
+                                   "acquisition_to_path_ms": acq_ms}})
+    ExtrusionArchive(root).write_layer(manifest, nominal_xyz=np.zeros((4, 3)),
+                                       commanded_xyz=np.zeros((4, 3)))
+
+
+def test_paper_summary_groups_by_introduced_offset_and_reports_timing(tmp_path):
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, auto_plan(), note="rings")
+    t = session.trial_id
+    _write_take(root, t, 1, 1, offset=None, offset_norm=0.4, rms=0.5, mean_abs=0.4, maximum=1.1, acq_ms=900)
+    _write_take(root, t, 1, 2, offset=[0, 0], offset_norm=0.6, rms=0.6, mean_abs=0.5, maximum=1.3, acq_ms=1100)
+    _write_take(root, t, 2, 1, offset=[10, 0], offset_norm=9.8, rms=7.0, mean_abs=6.3, maximum=9.9, acq_ms=1000)
+    summary = paper_summary(root, t)
+    assert summary["mode"] == "MEASURE_ONLY" and summary["takes"] == 3 and summary["valid"] == 3
+    by_name = {c["condition"]: c for c in summary["conditions"]}
+    assert by_name["true (no introduced offset)"]["takes"] == 2
+    shifted = by_name["introduced offset (10, 0) mm"]
+    assert shifted["takes"] == 1 and shifted["center_offset_norm_mm"]["mean"] == 9.8
+    assert summary["timing_ms"]["acquisition_to_path_ms"]["mean"] == pytest.approx(1000.0)
+    assert summary["timing_ms"]["acquisition_to_path_ms"]["sd"] == pytest.approx(100.0)
+    assert summary["height_mm"]["height_max_mm"]["mean"] == 9.0
+    assert "10" in summary["markdown"] and "hand-placed" in summary["markdown"]
+
+
+def test_paper_summary_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    client = TestClient(create_app(AppConfig()))
+    api_plan(client)
+    trial_id = client.post("/api/modules/extrusion/measure/session/new", json={"note": ""}).json()["session"]["trial_id"]
+    _write_take(tmp_path / "runs" / "extrusion", trial_id, 1, 1, offset=None, offset_norm=0.5,
+                rms=0.5, mean_abs=0.4, maximum=1.0, acq_ms=950)
+    got = client.get(f"/api/modules/extrusion/trials/{trial_id}/paper-summary").json()
+    assert got["takes"] == 1 and "markdown" in got
+    assert client.get("/api/modules/extrusion/trials/nope/paper-summary").status_code == 404

@@ -13,7 +13,7 @@ from ...core.logging import REPO_ROOT
 from ..base import ServiceContainer, WorkflowModule
 from .inspection import inspection_plan
 from .measure import (MODE as MEASURE_MODE, MeasureSession, RingCharacterizeJob,
-                      RingMeasureJob)
+                      RingMeasureJob, paper_summary)
 from .models import CylinderPlan, CylinderRecipe, CylinderSetup
 from .service import (CylinderDryRunJob, CylinderPrintJob, geometry_preflight,
                       reprocess_saved_layer, station_requirements)
@@ -679,6 +679,13 @@ class ExtrusionModule(WorkflowModule):
                                 "measure_only_trials": measure_only_trials,
                                 "measure_only_takes": measure_only_takes},
                     "trials": items}
+
+        @router.get("/trials/{trial_id}/paper-summary")
+        def trial_paper_summary(trial_id: str) -> dict:
+            try:
+                return paper_summary(self._measure_root(), trial_id)
+            except (FileNotFoundError, ValueError) as exc:
+                raise HTTPException(404, str(exc)) from exc
 
         @router.post("/trials/{trial_id}/layers/{layer_index}/reprocess")
         def reprocess(trial_id: str, layer_index: int, take: int = 1) -> dict:

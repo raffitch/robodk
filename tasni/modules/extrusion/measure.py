@@ -420,3 +420,102 @@ class RingCharacterizeJob:
                 rdk.delete_items(list(dict.fromkeys(reversed(artifacts))))
             except Exception:
                 pass
+
+
+def _stat(values) -> dict:
+    arr = np.array([float(v) for v in values if v is not None], dtype=float)
+    return {"n": int(arr.size),
+            "mean": float(arr.mean()) if arr.size else None,
+            "sd": float(arr.std(ddof=1)) if arr.size > 1 else None,
+            "min": float(arr.min()) if arr.size else None,
+            "max": float(arr.max()) if arr.size else None}
+
+
+def _condition_name(manifest: dict) -> str:
+    offset = (manifest.get("annotation") or {}).get("introduced_offset_mm")
+    if not offset or not any(float(v) for v in offset):
+        return "true (no introduced offset)"
+    return f"introduced offset ({offset[0]:g}, {offset[1]:g}) mm"
+
+
+def _fmt(stat: dict, digits: int = 2) -> str:
+    if stat["mean"] is None:
+        return "-"
+    text = f"{stat['mean']:.{digits}f}"
+    return text if stat["sd"] is None else f"{text} +/- {stat['sd']:.{digits}f}"
+
+
+def paper_summary(root: Path, trial_id: str) -> dict:
+    """Numbers the PFH short paper asks for, grouped by the operator's ground truth.
+
+    The wording of the Markdown block matters: this is a controlled validation
+    of the sensing-and-comparison chain against a KNOWN introduced offset on
+    hand-placed dried beads. It is not the deposition deviation of a printed
+    cylinder, and the summary must not let it be read as one.
+    """
+    trial_dir = Path(root) / trial_id
+    trial_file = trial_dir / "trial.json"
+    if not trial_file.is_file():
+        raise FileNotFoundError(f"trial does not exist: {trial_id}")
+    trial = json.loads(trial_file.read_text(encoding="utf-8"))
+    takes = [json.loads(p.read_text(encoding="utf-8"))
+             for p in sorted(trial_dir.glob("layer-*/manifest.json"))]
+    groups: dict[str, list[dict]] = {}
+    for manifest in takes:
+        groups.setdefault(_condition_name(manifest), []).append(manifest)
+    conditions = []
+    for name, items in groups.items():
+        metrics = [m["metrics"] for m in items if m.get("metrics")]
+        conditions.append({
+            "condition": name, "takes": len(items),
+            "valid": sum(1 for x in metrics if x.get("valid")),
+            "center_offset_norm_mm": _stat(x.get("center_offset_norm_mm") for x in metrics),
+            "mean_absolute_mm": _stat(x.get("mean_absolute_mm") for x in metrics),
+            "rms_mm": _stat(x.get("rms_mm") for x in metrics),
+            "maximum_mm": _stat(x.get("maximum_mm") for x in metrics),
+            "shape_rms_mm": _stat(x.get("shape_rms_mm") for x in metrics)})
+    timings = [(m.get("processing") or {}).get("timings_ms") or {} for m in takes]
+    timing = {key: _stat(t.get(key) for t in timings)
+              for key in ("capture_ms", "total_ms", "acquisition_to_path_ms")}
+    geometry = [m["geometry"] for m in takes if m.get("geometry")]
+    height = {key: _stat(g.get(key) for g in geometry)
+              for key in ("height_mean_mm", "height_min_mm", "height_max_mm", "top_z_std_mm")}
+    bead = {key: _stat(g.get(key) for g in geometry)
+            for key in ("bead_width_mean_mm", "bead_width_min_mm", "bead_width_max_mm")}
+    valid = sum(1 for m in takes if (m.get("metrics") or {}).get("valid"))
+    session_file = trial_dir / "session.json"
+    characterization = None
+    if session_file.is_file():
+        found = json.loads(session_file.read_text(encoding="utf-8")).get("characterizations") or []
+        characterization = found[-1] if found else None
+
+    lines = [f"**Controlled validation of the sensing-and-comparison chain** - trial `{trial_id}`, "
+             f"hand-placed dried beads with a known introduced offset (not a printed-cylinder "
+             f"deposition deviation). {valid}/{len(takes)} measurements produced a valid, "
+             f"branch-free path.", "",
+             "| Condition | n | centre offset (mm) | mean abs dev (mm) | RMS (mm) | max (mm) | shape RMS (mm) |",
+             "|---|---|---|---|---|---|---|"]
+    for c in conditions:
+        lines.append(f"| {c['condition']} | {c['takes']} | {_fmt(c['center_offset_norm_mm'])} | "
+                     f"{_fmt(c['mean_absolute_mm'])} | {_fmt(c['rms_mm'])} | "
+                     f"{_fmt(c['maximum_mm'])} | {_fmt(c['shape_rms_mm'])} |")
+    acq = timing["acquisition_to_path_ms"]
+    if acq["n"]:
+        lines += ["", f"Across {acq['n']} processing cycles, RGB-D acquisition to reconstructed "
+                      f"three-dimensional path took {_fmt(acq, 0)} ms "
+                      f"(capture {_fmt(timing['capture_ms'], 0)} ms, processing "
+                      f"{_fmt(timing['total_ms'], 0)} ms)."]
+    if geometry:
+        lines += ["", f"Layer height along the ring: mean {_fmt(height['height_mean_mm'], 1)} mm, "
+                      f"min {_fmt(height['height_min_mm'], 1)} mm, max "
+                      f"{_fmt(height['height_max_mm'], 1)} mm; bead footprint width "
+                      f"{_fmt(bead['bead_width_mean_mm'], 1)} mm."]
+    if characterization:
+        lines += ["", f"Ring characterized from its own scan: radius "
+                      f"{characterization['radius_mm']:.1f} mm, bead "
+                      f"{characterization['bead_width_mm']:.1f} mm, height "
+                      f"{characterization['top_z_min_mm']:.1f}-{characterization['top_z_max_mm']:.1f} mm."]
+    return {"trial_id": trial_id, "mode": trial.get("mode", "LIVE_PRINT"),
+            "takes": len(takes), "valid": valid, "conditions": conditions,
+            "timing_ms": timing, "height_mm": height, "bead_width_mm": bead,
+            "characterization": characterization, "markdown": "\n".join(lines)}
