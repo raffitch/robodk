@@ -105,6 +105,29 @@ class DeviationMetrics(_Record):
     warnings: list[str] = Field(default_factory=list)
 
 
+class RingGeometry(_Record):
+    """What the ring looks like, not how far it is from nominal.
+
+    ``top_z_*`` are the measured centreline heights in the work frame;
+    ``height_*`` subtract the reference surface -- the build plane for the first
+    ring, or the previous ring's measured top at the nearest sample.
+    ``bead_width_*`` is the radial footprint of the deposit cloud per angular bin
+    (percentile extent, so the bead's flanks count, outliers do not).
+    """
+    top_z_mean_mm: float
+    top_z_min_mm: float
+    top_z_max_mm: float
+    top_z_std_mm: float
+    height_mean_mm: float
+    height_min_mm: float
+    height_max_mm: float
+    height_reference: str
+    bead_width_mean_mm: float
+    bead_width_min_mm: float
+    bead_width_max_mm: float
+    bead_width_bins: int
+
+
 class LayerManifest(_Record):
     schema_version: str = "1.0"
     trial_id: str
@@ -121,6 +144,7 @@ class LayerManifest(_Record):
     depth_file: str | None = None
     pointcloud_file: str | None = None
     metrics: DeviationMetrics | None = None
+    geometry: RingGeometry | None = None
     processing: dict[str, Any] = Field(default_factory=dict)
     provenance: dict[str, Any] = Field(default_factory=dict)
     valve_transitions: list[dict[str, Any]] = Field(default_factory=list)

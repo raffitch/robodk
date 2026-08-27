@@ -137,3 +137,37 @@ def test_floor_from_previous_layer_keeps_the_ring_below_out_of_the_measurement()
         return
     assert (abs(blended.metrics.center_offset_norm_mm - 10.0)
             > abs(floored.metrics.center_offset_norm_mm - 10.0) + 1.0)
+
+
+# ------------------------------------------------------ ring geometry (Task 5)
+
+def test_wavy_ring_height_profile_is_measured():
+    pytest.importorskip("open3d")
+    plan = scene_plan(layer_height=7.5)
+    out = observe(plan, 1, [syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.wavy(7.5, 2.5, lobes=2))])
+    g = out.geometry
+    assert g is not None and g.height_reference == "build_plane"
+    assert g.top_z_min_mm == pytest.approx(5.0, abs=1.5)
+    assert g.top_z_max_mm == pytest.approx(10.0, abs=1.5)
+    assert g.top_z_std_mm > 1.0
+    assert g.height_mean_mm == pytest.approx(7.5, abs=1.0)
+
+
+def test_bead_width_is_the_rings_radial_footprint():
+    pytest.importorskip("open3d")
+    plan = scene_plan()
+    out = observe(plan, 1, [syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.flat(6.0))])
+    g = out.geometry
+    assert g.bead_width_mean_mm == pytest.approx(8.0, rel=0.25)
+    assert g.bead_width_bins == 36
+
+
+def test_bead_width_profile_on_an_ideal_annulus():
+    from tasni.modules.extrusion.processing import bead_width_profile
+    rng = np.random.default_rng(1)
+    theta = rng.uniform(0, 2 * np.pi, 20000)
+    r = rng.uniform(36.0, 44.0, 20000)                # annulus 40 +/- 4 -> width 8
+    pts = np.column_stack((r * np.cos(theta), r * np.sin(theta), np.zeros(20000)))
+    w = bead_width_profile(pts, (0.0, 0.0), bins=36)
+    assert w["bins_with_data"] == 36
+    assert w["mean_mm"] == pytest.approx(8.0, abs=0.6)   # p97.5 - p2.5 of a uniform 8 mm band

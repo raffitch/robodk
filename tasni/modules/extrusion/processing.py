@@ -17,7 +17,7 @@ from scipy.spatial import cKDTree
 
 from ...core.geometry import transform_points
 from .comparison import compare_circle, corrected_circle
-from .models import CylinderPlan, DeviationMetrics, LayerPath
+from .models import CylinderPlan, DeviationMetrics, LayerPath, RingGeometry
 
 
 @dataclass
@@ -30,6 +30,7 @@ class ProcessingResult:
     comparison: np.ndarray
     report: dict
     filtered_xyz: np.ndarray | None = None
+    geometry: RingGeometry | None = None
 
 
 def depth_to_work_points(depth: np.ndarray, K: np.ndarray,
@@ -217,6 +218,63 @@ def _comparison_image(mask: np.ndarray, lo: np.ndarray, mm_per_pixel: float,
     return image
 
 
+def bead_width_profile(cluster_xyz, center_xy, *, bins: int = 36,
+                       low_pct: float = 2.5, high_pct: float = 97.5) -> dict:
+    """Radial extent of the deposit per angular bin, about ``center_xy``.
+
+    The XY FOOTPRINT width of the bead, not a cross-section measured normal to
+    the surface. Percentiles rather than min/max so a stray point cannot widen a
+    bin; bins with too little deposit report ``None`` rather than a guess.
+    """
+    pts = np.asarray(cluster_xyz, dtype=float)
+    rel = pts[:, :2] - np.asarray(center_xy, dtype=float)
+    radii = np.linalg.norm(rel, axis=1)
+    angle = np.mod(np.arctan2(rel[:, 1], rel[:, 0]), 2 * math.pi)
+    edges = np.linspace(0.0, 2 * math.pi, bins + 1)
+    which = np.clip(np.digitize(angle, edges) - 1, 0, bins - 1)
+    widths = np.full(bins, np.nan)
+    for index in range(bins):
+        r = radii[which == index]
+        if len(r) >= 8:
+            widths[index] = np.percentile(r, high_pct) - np.percentile(r, low_pct)
+    valid = widths[np.isfinite(widths)]
+    if not len(valid):
+        raise RuntimeError("bead width: no angular bin had enough deposit points")
+    return {"bins": bins, "bins_with_data": int(len(valid)),
+            "per_bin_mm": [None if not np.isfinite(w) else float(w) for w in widths],
+            "mean_mm": float(valid.mean()), "min_mm": float(valid.min()),
+            "max_mm": float(valid.max())}
+
+
+def ring_geometry(measured_xyz, cluster_xyz, center_xy, *, floor_profile=None,
+                  build_plane_z_mm: float = 0.0, bins: int = 36) -> RingGeometry:
+    """Height profile along the measured centreline plus the bead's footprint.
+
+    Height is measured against the previous ring's own measured top where one is
+    given, so a stacked ring reports ITS layer height rather than its absolute
+    elevation above the table.
+    """
+    measured = np.asarray(measured_xyz, dtype=float)
+    top = measured[:, 2]
+    if floor_profile is None:
+        reference = np.full(len(top), float(build_plane_z_mm))
+        reference_name = "build_plane"
+    else:
+        profile = np.asarray(floor_profile, dtype=float).reshape(-1, 3)
+        _, nearest = cKDTree(profile[:, :2]).query(measured[:, :2])
+        reference = profile[nearest, 2]
+        reference_name = "previous_layer_measured"
+    height = top - reference
+    width = bead_width_profile(cluster_xyz, center_xy, bins=bins)
+    return RingGeometry(
+        top_z_mean_mm=float(top.mean()), top_z_min_mm=float(top.min()),
+        top_z_max_mm=float(top.max()), top_z_std_mm=float(top.std()),
+        height_mean_mm=float(height.mean()), height_min_mm=float(height.min()),
+        height_max_mm=float(height.max()), height_reference=reference_name,
+        bead_width_mean_mm=width["mean_mm"], bead_width_min_mm=width["min_mm"],
+        bead_width_max_mm=width["max_mm"], bead_width_bins=bins)
+
+
 def _filter_deposit(points: np.ndarray, config, counts: dict) -> np.ndarray:
     """Voxel -> statistical -> radius outliers -> largest DBSCAN cluster (Open3D).
 
@@ -367,6 +425,10 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     nominal_center = (setup.center_x_mm, setup.center_y_mm)
     metrics = compare_circle(measured, recipe.radius_mm,
                              nominal_center_mm=nominal_center)
+    geometry = ring_geometry(measured, deposit, metrics.measured_center_mm,
+                             floor_profile=floor_profile,
+                             build_plane_z_mm=setup.build_plane_z_mm,
+                             bins=config.bead_width_bins)
     corrected = None
     if recipe.correction_enabled and metrics.valid:
         corrected = corrected_circle(
@@ -386,10 +448,10 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     timings["total_ms"] = (time.perf_counter() - started) * 1000
     report = {
         "counts": counts, "timings_ms": timings, "branch_guard_attempts": attempts,
-        "floor": floor,
+        "floor": floor, "geometry": geometry.model_dump(mode="json"),
         "coordinate_frame": plan.setup.work_frame, "units": "mm",
         "valid": metrics.valid, "warnings": metrics.warnings,
     }
     return ProcessingResult(measured, corrected, metrics, final_mask,
                             final_skeleton * 255, overlay, report,
-                            filtered_xyz=points.copy())
+                            filtered_xyz=points.copy(), geometry=geometry)
