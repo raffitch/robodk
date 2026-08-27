@@ -31,8 +31,18 @@ class FingerprintBody(BaseModel):
     fingerprint: str
 
 
+class QuickSimBody(FingerprintBody):
+    layer_indices: list[int] = Field(default_factory=list)
+    approve_full_plan: bool = False
+
+
+class RestoreQuickSimBody(FingerprintBody):
+    confirm_restore: bool = False
+
+
 class PrintBody(FingerprintBody):
     confirm_live: bool = False
+    collision_check_enabled: bool = True
 
 
 class TcpSeedBody(BaseModel):
@@ -58,7 +68,11 @@ class ExtrusionModule(WorkflowModule):
         super().__init__(services)
         self._plan: CylinderPlan | None = None
         self._geometry_preflight_fingerprint: str | None = None
+        self._quick_sim_fingerprint: str | None = None
+        self._quick_sim_layers: set[int] = set()
+        self._quick_sim_approves_full_plan = False
         self._dry_run_fingerprint: str | None = None
+        self._active_quick_job: CylinderDryRunJob | None = None
         self._active_dry_job: CylinderDryRunJob | None = None
         self._active_print_job: CylinderPrintJob | None = None
 
@@ -86,6 +100,7 @@ class ExtrusionModule(WorkflowModule):
             "center_x_mm": c.center_x_mm, "center_y_mm": c.center_y_mm,
             "build_plane_z_mm": c.build_plane_z_mm, "scan_run_id": None,
             "orientation_rpy_deg": list(c.orientation_rpy_deg),
+            "maximum_tool_axis_spin_deg": c.max_tool_axis_spin_deg,
             "approach_clearance_mm": c.approach_clearance_mm,
             "retreat_clearance_mm": c.retreat_clearance_mm,
         }
@@ -95,6 +110,16 @@ class ExtrusionModule(WorkflowModule):
         # comparison so a stale completion can never approve a newer plan.
         if self._plan is not None and self._plan.fingerprint == fingerprint:
             self._dry_run_fingerprint = fingerprint
+
+    def _accept_quick_sim(self, fingerprint: str, layer_indices: list[int],
+                          *, approve_full_plan: bool = False) -> None:
+        if self._plan is not None and self._plan.fingerprint == fingerprint:
+            self._quick_sim_fingerprint = fingerprint
+            self._quick_sim_layers.update(layer_indices)
+            all_layers = {layer.layer_index for layer in self._plan.layers}
+            self._quick_sim_approves_full_plan = bool(
+                self._quick_sim_approves_full_plan or approve_full_plan
+                or all_layers.issubset(self._quick_sim_layers))
 
     def router(self) -> "APIRouter":
         from fastapi import APIRouter, HTTPException
@@ -218,9 +243,20 @@ class ExtrusionModule(WorkflowModule):
                 raise HTTPException(409, "cannot regenerate while a robot job is running")
             self._plan = generate_cylinder_plan(body.recipe, body.setup)
             self._geometry_preflight_fingerprint = None
+            self._quick_sim_fingerprint = None
+            self._quick_sim_layers.clear()
+            self._quick_sim_approves_full_plan = False
             self._dry_run_fingerprint = None
+            self._active_quick_job = None
             self._active_dry_job = None
             self._active_print_job = None
+            return self._plan.model_dump(mode="json")
+
+        @router.get("/plan")
+        def current_plan() -> dict:
+            """Return the active plan so a reloaded UI can resume its workflow."""
+            if self._plan is None:
+                raise HTTPException(404, "no cylinder plan has been generated")
             return self._plan.model_dump(mode="json")
 
         @router.post("/preflight")
@@ -247,7 +283,9 @@ class ExtrusionModule(WorkflowModule):
                             points_xyz=np.asarray(sampled_xyz, dtype=float),
                             orientation_rpy_deg=self._plan.setup.orientation_rpy_deg,
                             print_tool=self._plan.setup.print_tool,
-                            work_frame=self._plan.setup.work_frame)
+                            work_frame=self._plan.setup.work_frame,
+                            maximum_tool_axis_spin_deg=(
+                                self._plan.setup.maximum_tool_axis_spin_deg))
                         station["reachability"] = reachability
                         station["ready"] = bool(reachability["all_reachable"])
                     result["station"] = station
@@ -261,17 +299,88 @@ class ExtrusionModule(WorkflowModule):
                 self._geometry_preflight_fingerprint = None
             return result
 
-        @router.post("/dry-run")
-        def dry_run(body: FingerprintBody) -> dict:
+        def require_simulation_ready(body: FingerprintBody) -> None:
             if self._plan is None or body.fingerprint != self._plan.fingerprint:
                 raise HTTPException(409, "toolpath changed; generate the current recipe again")
             if self._geometry_preflight_fingerprint != body.fingerprint:
                 raise HTTPException(409, "run geometry preflight for this toolpath first")
             if services.jobs.running:
                 raise HTTPException(409, "a job is already running")
+
+        @router.post("/quick-sim")
+        def quick_sim(body: QuickSimBody) -> dict:
+            require_simulation_ready(body)
+            available = {layer.layer_index for layer in self._plan.layers}
+            requested = sorted(set(body.layer_indices or available))
+            invalid = sorted(set(requested) - available)
+            if invalid:
+                raise HTTPException(400, f"invalid layer selection: {invalid}")
+            if not requested:
+                raise HTTPException(400, "select at least one layer to simulate")
+            self._active_quick_job = CylinderDryRunJob(
+                services, self._plan,
+                on_preview_pass=self._accept_quick_sim,
+                check_collisions=False, layer_indices=requested,
+                approve_full_plan=body.approve_full_plan)
+            try:
+                services.jobs.start(
+                    self._active_quick_job, name="extrusion-quick-sim")
+            except JobBusy as exc:
+                raise HTTPException(409, str(exc))
+            return {"status": "started", "mode": "QUICK_SIMULATION",
+                    "collision_check_enabled": False,
+                    "layer_indices": requested,
+                    "approve_full_plan_on_pass": body.approve_full_plan,
+                    "fingerprint": self._plan.fingerprint}
+
+        @router.post("/quick-sim/restore-full-pass")
+        def restore_full_quick_sim_pass(body: RestoreQuickSimBody) -> dict:
+            """Restore a completed all-layer preview after a backend restart.
+
+            Only an app-generated report for the exact active fingerprint, with
+            every layer present and all safety/output-blocking fields intact, is
+            accepted. Representative-layer overrides are deliberately not
+            restored by this endpoint.
+            """
+            if not body.confirm_restore:
+                raise HTTPException(400, "explicit restore confirmation is required")
+            if self._plan is None or body.fingerprint != self._plan.fingerprint:
+                raise HTTPException(409, "toolpath changed; run visual simulation again")
+            expected = {layer.layer_index for layer in self._plan.layers}
+            root = REPO_ROOT / "runs" / "extrusion-quick-simulation"
+            candidates = sorted(
+                root.glob("*/report.json") if root.is_dir() else [],
+                key=lambda path: path.stat().st_mtime, reverse=True)
+            for path in candidates:
+                try:
+                    report = json.loads(path.read_text(encoding="utf-8"))
+                    layers = {int(item["layer_index"]) for item in report["layers"]}
+                    valid = all(
+                        float(item[phase]["percent_ok"]) >= 99.999
+                        for item in report["layers"] for phase in ("path", "inspection"))
+                except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    continue
+                if (report.get("kind") == "cylinder_quick_simulation"
+                        and report.get("fingerprint") == body.fingerprint
+                        and report.get("all_ok") is True
+                        and report.get("returned_to_start") is True
+                        and report.get("physical_outputs_blocked") is True
+                        and report.get("collision_check_enabled") is False
+                        and layers == expected and valid):
+                    self._accept_quick_sim(
+                        body.fingerprint, sorted(layers), approve_full_plan=True)
+                    return {"status": "restored", "fingerprint": body.fingerprint,
+                            "layer_indices": sorted(layers), "report": str(path)}
+            raise HTTPException(
+                409, "no completed all-layer quick simulation report matches this plan")
+
+        @router.post("/dry-run")
+        def dry_run(body: FingerprintBody) -> dict:
+            require_simulation_ready(body)
             self._dry_run_fingerprint = None
             self._active_dry_job = CylinderDryRunJob(
-                services, self._plan, on_pass=self._accept_dry_run)
+                services, self._plan, on_pass=self._accept_dry_run,
+                check_collisions=True)
             try:
                 services.jobs.start(self._active_dry_job, name="extrusion-dry-run")
             except JobBusy as exc:
@@ -283,21 +392,28 @@ class ExtrusionModule(WorkflowModule):
         def live_print(body: PrintBody) -> dict:
             c = services.config.extrusion
             if self._plan is None or body.fingerprint != self._plan.fingerprint:
-                raise HTTPException(409, "toolpath changed; generate and dry-run it again")
-            if self._dry_run_fingerprint != body.fingerprint:
-                raise HTTPException(409, "current toolpath has not passed a RoboDK dry run")
+                raise HTTPException(
+                    409, "toolpath changed; generate and visually simulate it again")
+            if (self._quick_sim_fingerprint != body.fingerprint
+                    or not self._quick_sim_approves_full_plan):
+                raise HTTPException(
+                    409, "the full live run is not approved by the quick visual simulation; "
+                         "simulate every layer or approve selected layers as representative")
             if not c.hardware_io_test_approved:
                 raise HTTPException(423, "live extrusion locked until the hardware I/O test is approved")
             if not body.confirm_live:
                 raise HTTPException(400, "explicit live-run confirmation is required")
             if services.jobs.running:
                 raise HTTPException(409, "a job is already running")
-            self._active_print_job = CylinderPrintJob(services, self._plan)
+            self._active_print_job = CylinderPrintJob(
+                services, self._plan,
+                check_collisions=body.collision_check_enabled)
             try:
                 services.jobs.start(self._active_print_job, name="extrusion-print")
             except JobBusy as exc:
                 raise HTTPException(409, str(exc))
             return {"status": "started", "mode": "LIVE_PRINT",
+                    "collision_check_enabled": body.collision_check_enabled,
                     "fingerprint": self._plan.fingerprint}
 
         @router.post("/correction/apply")
@@ -311,6 +427,9 @@ class ExtrusionModule(WorkflowModule):
                 raise HTTPException(409, "wait for the current job to finish")
             self._plan = corrected_cylinder_plan(job.plan, job.corrected_reference_xyz)
             self._geometry_preflight_fingerprint = None
+            self._quick_sim_fingerprint = None
+            self._quick_sim_layers.clear()
+            self._quick_sim_approves_full_plan = False
             self._dry_run_fingerprint = None
             return self._plan.model_dump(mode="json")
 
@@ -333,7 +452,11 @@ class ExtrusionModule(WorkflowModule):
                         503, f"could not clean RoboDK extrusion artifacts: {exc}") from exc
             self._plan = None
             self._geometry_preflight_fingerprint = None
+            self._quick_sim_fingerprint = None
+            self._quick_sim_layers.clear()
+            self._quick_sim_approves_full_plan = False
             self._dry_run_fingerprint = None
+            self._active_quick_job = None
             self._active_dry_job = None
             self._active_print_job = None
             return {"status": "reset", "removed": removed}
@@ -351,12 +474,20 @@ class ExtrusionModule(WorkflowModule):
                            if self._plan else None),
                 "geometry_preflight_passed": bool(
                     fingerprint and fingerprint == self._geometry_preflight_fingerprint),
+                "quick_sim_passed": bool(
+                    fingerprint and fingerprint == self._quick_sim_fingerprint),
+                "quick_sim_layers": (sorted(self._quick_sim_layers)
+                                     if fingerprint == self._quick_sim_fingerprint else []),
+                "quick_sim_live_approved": bool(
+                    fingerprint and fingerprint == self._quick_sim_fingerprint
+                    and self._quick_sim_approves_full_plan),
                 "dry_run_passed": bool(
                     fingerprint and fingerprint == self._dry_run_fingerprint),
                 "hardware_io_test_approved": bool(
                     services.config.extrusion.hardware_io_test_approved),
                 "live_print_enabled": bool(
-                    fingerprint and fingerprint == self._dry_run_fingerprint and
+                    fingerprint and fingerprint == self._quick_sim_fingerprint and
+                    self._quick_sim_approves_full_plan and
                     services.config.extrusion.hardware_io_test_approved),
             }
 

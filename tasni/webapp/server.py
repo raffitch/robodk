@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..core import runs as runs_registry
 from ..core.config import AppConfig, load_config
-from ..core.health import ROBODK_API_PORT, tcp_probe
+from ..core.health import ROBODK_API_PORT, connection_route, tcp_probe
 from ..modules.base import ServiceContainer
 from ..modules.registry import build_registry
 
@@ -47,20 +47,40 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @app.get("/api/health")
     def health() -> dict:
         cam = services.config.camera
+        camera_route = connection_route(cam.ip)
+        camera_endpoint = f"{cam.ip}:{cam.port}"
+        camera_base = {"route": camera_route, "endpoint": camera_endpoint}
         robodk_ok = tcp_probe("127.0.0.1", ROBODK_API_PORT)
         # Don't probe the camera mid-capture — the unicast server serves one
         # client and a probe would steal the frame the lease holder expects. The
         # lease's owner label gives the precise holder ("live-preview",
         # "calibration-run", ...); fall back to the coarse job/live flags.
         if services.camera_lease.held:
-            camera = {"ok": None, "detail": f"in use by {services.camera_lease.owner}"}
+            camera = {
+                **camera_base, "ok": None, "state": "in_use",
+                "detail": f"in use by {services.camera_lease.owner} via "
+                          f"{camera_route} · {camera_endpoint}",
+            }
         elif services.jobs.running:
-            camera = {"ok": None, "detail": "in use by running job"}
+            camera = {
+                **camera_base, "ok": None, "state": "in_use",
+                "detail": f"in use by running job via {camera_route} · "
+                          f"{camera_endpoint}",
+            }
         elif services.live.running:
-            camera = {"ok": None, "detail": "in use by live preview"}
+            camera = {
+                **camera_base, "ok": None, "state": "in_use",
+                "detail": f"in use by live preview via {camera_route} · "
+                          f"{camera_endpoint}",
+            }
         else:
-            camera = {"ok": tcp_probe(cam.ip, cam.port),
-                      "detail": f"{cam.ip}:{cam.port}"}
+            camera_ok = tcp_probe(cam.ip, cam.port)
+            camera = {
+                **camera_base, "ok": camera_ok,
+                "state": "connected" if camera_ok else "offline",
+                "detail": f"{'connected' if camera_ok else 'offline/unreachable'} "
+                          f"via {camera_route} · {camera_endpoint}",
+            }
         return {
             "robodk": {"ok": robodk_ok, "detail": f"API :{ROBODK_API_PORT}"},
             "camera": camera,

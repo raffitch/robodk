@@ -45,10 +45,10 @@ class CameraConfig(_Model):
     """RealSense-over-TCP client settings (the Jetson camera server)."""
 
     # The Jetson camera host. The server binds 0.0.0.0:1024 (all interfaces), so
-    # this is just whichever Jetson IP the workstation can reach — confirmed
-    # 10.12.171.70 (the old 10.5.5.19 subnet is gone). Override per-machine in
-    # tasni.config.json if the IP changes.
-    ip: str = "10.12.171.70"
+    # this is just whichever Jetson IP the workstation can reach. Tailscale is
+    # the stable default because the cell's direct LAN address is not routable
+    # from every workstation; override per-machine if the network changes.
+    ip: str = "100.123.63.127"
     port: int = 1024
     # The server streams color at 1280x720 (server_unicast_syncronous.py), so the
     # intrinsics must be the 720p K — a 1080p setting would skew distance/tilt.
@@ -733,10 +733,23 @@ class ExtrusionConfig(_Model):
     center_y_mm: float = 0.0
     build_plane_z_mm: float = 0.0
     orientation_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # Keep the wrist near the operator's neutral starting configuration. The
+    # generated curve uses fixed TCP orientation, but redundant IK/interpolation
+    # branches can otherwise turn axis 4 or 6 by about 180 degrees.
+    max_tool_axis_spin_deg: float = Field(default=90.0, gt=0, le=180)
     approach_clearance_mm: float = Field(default=40.0, gt=0, le=500)
     retreat_clearance_mm: float = Field(default=60.0, gt=0, le=500)
     settle_s: float = Field(default=1.0, ge=0, le=30)
     grab_timeout_s: float = Field(default=15.0, gt=0, le=120)
+
+    # The scan module inserts both a two-triangle work-surface rectangle and a
+    # densely tessellated fitted-flat mesh of the same plane. Keep the rectangle
+    # in the collision map as the authoritative table proxy; excluding only the
+    # redundant display mesh avoids paying for ~hundreds of thousands of identical
+    # coplanar triangle checks during every generated program validation.
+    collision_visual_ignore_objects: list[str] = ["Tasni Scan Mesh"]
+    collision_surface_proxy_object: str = "Tasni Work Surface"
+    quick_simulation_speed_ratio: float = Field(default=5.0, ge=1.0, le=100.0)
 
     # -- automatic inspection pose (tasni/modules/extrusion/inspection.py) ---
     # The camera distance is derived from the cylinder's own diameter and the

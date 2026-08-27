@@ -10,12 +10,14 @@ from fastapi.testclient import TestClient
 
 from tasni.core import runs
 from tasni.core.config import AppConfig, ExtrusionConfig
+from tasni.core.health import connection_route
 from tasni.modules.extrusion.archive import ExtrusionArchive
 from tasni.modules.extrusion.comparison import compare_circle, corrected_circle
 from tasni.modules.extrusion.inspection import (aim_point_mm, cylinder_diameter_mm,
                                                 framing_standoff, inspection_plan,
                                                 pose_candidates)
 from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup, LayerManifest
+from tasni.modules.extrusion import module as extrusion_module
 from tasni.modules.extrusion.service import geometry_preflight, station_requirements
 from tasni.modules.extrusion.surface import (active_scan_surface, surface_check,
                                              surface_fit)
@@ -58,6 +60,25 @@ def test_config_keeps_verified_mapping_separate_from_hardware_approval():
     assert "-NEWINSTANCE" in LICENSED_ISOLATED_ARGS
     assert "-NOUI" in LICENSED_ISOLATED_ARGS
     assert "-SKIPINI" not in LICENSED_ISOLATED_ARGS
+
+
+def test_camera_route_labels_tailscale_lan_and_public_addresses():
+    assert connection_route("100.123.63.127") == "Tailscale"
+    assert connection_route("10.12.171.70") == "Direct/LAN"
+    assert connection_route("8.8.8.8") == "Public IP"
+    assert connection_route("jetson.local") == "IP/hostname"
+
+
+def test_global_health_reports_camera_route_and_exact_endpoint(monkeypatch):
+    cfg = AppConfig()
+    cfg.camera.ip = "100.123.63.127"
+    monkeypatch.setattr("tasni.webapp.server.tcp_probe", lambda host, port: True)
+    status = TestClient(create_app(cfg)).get("/api/health").json()["camera"]
+    assert status == {
+        "endpoint": "100.123.63.127:1024", "route": "Tailscale",
+        "ok": True, "state": "connected",
+        "detail": "connected via Tailscale · 100.123.63.127:1024",
+    }
 
 
 def test_plan_is_closed_layered_and_fingerprinted():
@@ -291,8 +312,10 @@ def test_api_registers_module_and_invalidates_preflight_on_regeneration():
     client = TestClient(create_app(AppConfig()))
     modules = client.get("/api/modules").json()["modules"]
     assert "extrusion" in {module["id"] for module in modules}
+    assert client.get("/api/modules/extrusion/plan").status_code == 404
     payload = generate_payload()
     first = client.post("/api/modules/extrusion/generate", json=payload).json()
+    assert client.get("/api/modules/extrusion/plan").json() == first
     ok = client.post("/api/modules/extrusion/preflight",
                      json={"fingerprint": first["fingerprint"]})
     assert ok.status_code == 200 and ok.json()["all_ok"]
@@ -309,7 +332,40 @@ def test_api_live_print_is_fail_closed():
     response = client.post("/api/modules/extrusion/print",
                            json={"fingerprint": plan["fingerprint"]})
     assert response.status_code == 409
-    assert "dry run" in response.json()["detail"]
+    assert "quick visual simulation" in response.json()["detail"]
+
+
+def test_api_can_restore_an_exact_all_layer_visual_pass(tmp_path, monkeypatch):
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    cfg = AppConfig()
+    cfg.extrusion.hardware_io_test_approved = True
+    client = TestClient(create_app(cfg))
+    plan = client.post("/api/modules/extrusion/generate", json=generate_payload()).json()
+    report_dir = tmp_path / "runs" / "extrusion-quick-simulation" / "prior"
+    report_dir.mkdir(parents=True)
+    layer_report = lambda index: {
+        "layer_index": index,
+        "path": {"percent_ok": 100.0},
+        "inspection": {"percent_ok": 100.0},
+    }
+    (report_dir / "report.json").write_text(json.dumps({
+        "kind": "cylinder_quick_simulation",
+        "fingerprint": plan["fingerprint"],
+        "all_ok": True,
+        "returned_to_start": True,
+        "physical_outputs_blocked": True,
+        "collision_check_enabled": False,
+        "layers": [layer_report(1), layer_report(2), layer_report(3)],
+    }), encoding="utf-8")
+
+    restored = client.post("/api/modules/extrusion/quick-sim/restore-full-pass", json={
+        "fingerprint": plan["fingerprint"], "confirm_restore": True,
+    })
+    assert restored.status_code == 200
+    status = client.get("/api/modules/extrusion/status").json()
+    assert status["quick_sim_layers"] == [1, 2, 3]
+    assert status["quick_sim_live_approved"] is True
+    assert status["live_print_enabled"] is True
 
 
 # -- automatic inspection pose ---------------------------------------------

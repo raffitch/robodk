@@ -17,6 +17,7 @@ interface Setup {
   center_x_mm: number; center_y_mm: number;
   build_plane_z_mm: number; scan_run_id: string | null;
   orientation_rpy_deg: [number, number, number];
+  maximum_tool_axis_spin_deg: number;
   approach_clearance_mm: number; retreat_clearance_mm: number;
 }
 interface SurfaceFit {
@@ -59,7 +60,9 @@ interface StationOptions { tools: string[]; frames: string[]; targets: string[];
 interface Status {
   status: string; running: boolean; result?: any; error?: string | null;
   fingerprint?: string | null; geometry_preflight_passed: boolean;
-  dry_run_passed: boolean; hardware_io_test_approved: boolean;
+  quick_sim_passed: boolean; quick_sim_layers: number[];
+  quick_sim_live_approved: boolean; dry_run_passed: boolean;
+  hardware_io_test_approved: boolean;
   live_print_enabled: boolean;
 }
 
@@ -192,7 +195,11 @@ export default function Extrusion() {
   const [logs, setLogs] = useState<string[]>([]);
   const [progress, setProgress] = useState({ step: 0, total: 1, message: "" });
   const [busy, setBusy] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [confirmLive, setConfirmLive] = useState(false);
+  const [quickLayers, setQuickLayers] = useState<number[]>([1]);
+  const [approveRepresentativeLayers, setApproveRepresentativeLayers] = useState(false);
+  const [liveCollisionCheck, setLiveCollisionCheck] = useState(true);
   const [surface, setSurface] = useState<ScanSurface | null>(null);
   const [inspection, setInspection] = useState<InspectionPreview | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
@@ -206,11 +213,14 @@ export default function Extrusion() {
   const refreshSurface = useCallback(() => {
     api.get<ScanSurface>("/scan-surface").then(setSurface).catch(() => setSurface(null));
   }, []);
-
   useEffect(() => {
     api.get<Config>("/config").then((value) => {
       setConfig(value); setRecipe(value.defaults); setSetup(value.setup_defaults);
     }).catch((e) => setMessage(e.message));
+    api.get<Plan>("/plan").then((value) => {
+      setPlan(value); setRecipe(value.recipe); setSetup(value.setup);
+      setSelectedLayer(1); setQuickLayers([1]);
+    }).catch(() => {});
     refreshStatus(); refreshSurface();
   }, [refreshStatus, refreshSurface]);
 
@@ -221,23 +231,51 @@ export default function Extrusion() {
     } else if (event.type === "log" && busy) {
       setLogs((old) => [...old, event.payload.message]);
     } else if (event.type === "result" && name?.startsWith("extrusion-")) {
-      setResult(event.payload.result); setBusy(false); setConfirmLive(false);
-      setMessage(name === "extrusion-dry-run" ? "Dry run passed for this exact plan." : "Print and layer archive completed.");
+      setResult(event.payload.result); setBusy(false); setCancelling(false); setConfirmLive(false);
+      setMessage(name === "extrusion-quick-sim"
+        ? `Quick visual simulation passed for layer(s) ${event.payload.result.simulated_layer_indices.join(", ")}.`
+        : name === "extrusion-dry-run"
+          ? "Collision-validated dry run passed for this exact plan."
+          : "Print and layer archive completed.");
       refreshStatus();
     } else if (event.type === "error" && name?.startsWith("extrusion-")) {
-      setBusy(false); setMessage(event.payload.message); setLogs((old) => [...old, `ERROR: ${event.payload.message}`]);
+      setBusy(false); setCancelling(false); setMessage(event.payload.message); setLogs((old) => [...old, `ERROR: ${event.payload.message}`]);
       refreshStatus();
     } else if (event.type === "status" && name?.startsWith("extrusion-")) {
+      if (event.payload.status === "cancelled") {
+        setBusy(false); setCancelling(false); setConfirmLive(false);
+        setMessage("Cancelled. RoboDK has finished the job exit sequence.");
+        setLogs((old) => [...old, "Cancellation complete."]);
+      }
       refreshStatus();
     }
   }), [subscribe, refreshStatus, busy]);
+
+  // Poll while cancellation is pending in case the terminal WebSocket event
+  // was emitted while this page was reconnecting.
+  useEffect(() => {
+    if (!cancelling) return;
+    const timer = window.setInterval(refreshStatus, 500);
+    return () => window.clearInterval(timer);
+  }, [cancelling, refreshStatus]);
+
+  useEffect(() => {
+    if (!cancelling || !status || status.running) return;
+    setBusy(false); setCancelling(false); setConfirmLive(false);
+    setMessage(status.status === "cancelled"
+      ? "Cancelled. RoboDK has finished the job exit sequence."
+      : `The job ended with status: ${status.status}.`);
+  }, [cancelling, status]);
 
   useEffect(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, [logs]);
 
   const invalidate = (note = "Inputs changed — generate again; prior checks were invalidated.") => {
     setPlan(null); setPreflight(null); setResult(null); setConfirmLive(false);
+    setQuickLayers([1]); setApproveRepresentativeLayers(false);
     setInspection(null); setMessage(note);
-    setStatus((old) => old ? { ...old, geometry_preflight_passed: false, dry_run_passed: false, live_print_enabled: false } : old);
+    setStatus((old) => old ? { ...old, geometry_preflight_passed: false,
+      quick_sim_passed: false, quick_sim_layers: [], quick_sim_live_approved: false,
+      dry_run_passed: false, live_print_enabled: false } : old);
   };
   const updateRecipe = (key: keyof Recipe, value: number | boolean) => {
     setRecipe((old) => old ? { ...old, [key]: value } : old); invalidate();
@@ -279,11 +317,16 @@ export default function Extrusion() {
     try {
       const response = await api.post<{ setup: Partial<Setup>; surface: ScanSurface; fit: SurfaceFit }>(
         "/center-on-surface", { radius_mm: recipe.radius_mm, bead_diameter_mm: recipe.bead_diameter_mm });
+      const frame = response.setup.work_frame || setup.work_frame;
+      const pose = await api.post<{ xyz_mm: number[]; rpy_deg: number[] }>("/current-tcp", {
+        print_tool: setup.print_tool, work_frame: frame,
+      });
       setSurface({ ...response.surface, applied: true });
-      setSetup({ ...setup, ...response.setup });
+      setSetup({ ...setup, ...response.setup,
+        orientation_rpy_deg: pose.rpy_deg as [number, number, number] });
       const size = response.surface.size_mm;
       invalidate(response.fit.inside
-        ? `Centred on the scanned surface${size ? ` (${size[0].toFixed(0)} × ${size[1].toFixed(0)} mm)` : ""} in ${response.setup.work_frame} — generate coordinates next.`
+        ? `Centred on the scanned surface${size ? ` (${size[0].toFixed(0)} × ${size[1].toFixed(0)} mm)` : ""} in ${response.setup.work_frame}; current neutral TCP orientation captured as ${pose.rpy_deg.map((v) => v.toFixed(1)).join(", ")}° — generate coordinates next.`
         : `Centred, but the wall overhangs the measured surface by ${Math.abs(response.fit.minimum_margin_mm ?? 0).toFixed(1)} mm. Reduce the radius or re-scan a larger surface; preflight will reject it.`);
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
@@ -302,7 +345,8 @@ export default function Extrusion() {
     setBusy(true);
     try {
       const next = await api.post<Plan>("/generate", { recipe, setup });
-      setPlan(next); setSelectedLayer(1); setPreflight(null); setResult(null);
+      setPlan(next); setSelectedLayer(1); setQuickLayers([1]);
+      setApproveRepresentativeLayers(false); setPreflight(null); setResult(null);
       // Pure geometry, no station: safe to show the derived viewpoint immediately.
       const derived = await api.post<InspectionPreview>(
         "/inspection-pose", { fingerprint: next.fingerprint }).catch(() => null);
@@ -325,25 +369,58 @@ export default function Extrusion() {
       refreshStatus();
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
-  const startJob = async (kind: "dry-run" | "print") => {
+  const startJob = async (kind: "quick-sim" | "dry-run" | "print") => {
     if (!plan) return;
-    setBusy(true); setLogs([]); setProgress({ step: 0, total: plan.layers.length, message: "Starting…" });
+    const selectedCount = kind === "quick-sim" ? quickLayers.length : plan.layers.length;
+    setBusy(true); setCancelling(false); setLogs([]); setProgress({ step: 0, total: selectedCount, message: "Starting…" });
     try {
       await api.post(`/${kind}`, kind === "print"
-        ? { fingerprint: plan.fingerprint, confirm_live: confirmLive }
-        : { fingerprint: plan.fingerprint });
-      setMessage(kind === "dry-run" ? "DRY_RUN started — physical outputs blocked." : "LIVE_PRINT started.");
+        ? { fingerprint: plan.fingerprint, confirm_live: confirmLive,
+            collision_check_enabled: liveCollisionCheck }
+        : kind === "quick-sim"
+          ? { fingerprint: plan.fingerprint, layer_indices: quickLayers,
+              approve_full_plan: approveRepresentativeLayers }
+          : { fingerprint: plan.fingerprint });
+      setMessage(kind === "quick-sim"
+        ? `QUICK SIMULATION started for layer(s) ${quickLayers.join(", ")} — collision checks and physical outputs are blocked.`
+        : kind === "dry-run"
+          ? "VALIDATED DRY RUN started — collision checks on; physical outputs blocked."
+          : `LIVE_PRINT started — collision checks ${liveCollisionCheck ? "ON" : "OFF by operator selection"}.`);
       refreshStatus();
     } catch (e: any) { setBusy(false); setMessage(e.message); }
   };
-  const cancel = async () => { await api.post("/cancel"); setMessage("Cancellation requested; forcing the safe exit sequence."); };
+  const cancel = async () => {
+    setCancelling(true);
+    try {
+      await api.post("/cancel");
+      setMessage("Cancellation requested. Waiting for the current RoboDK command to return, then completing the job exit sequence.");
+      refreshStatus();
+    } catch (e: any) {
+      setCancelling(false); setMessage(e.message);
+    }
+  };
+
+  const captureCurrentOrientation = async () => {
+    if (!setup?.print_tool || !setup.work_frame) return;
+    setBusy(true); setMessage("Capturing the current neutral TCP orientation…");
+    try {
+      const pose = await api.post<{ xyz_mm: number[]; rpy_deg: number[] }>("/current-tcp", {
+        print_tool: setup.print_tool, work_frame: setup.work_frame,
+      });
+      setSetup({ ...setup, orientation_rpy_deg: pose.rpy_deg as [number, number, number] });
+      invalidate(`Current neutral TCP orientation captured as ${pose.rpy_deg.map((v) => v.toFixed(1)).join(", ")}°. Cylinder center and build Z were not changed — generate coordinates next.`);
+    } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
+  };
   const resetGenerated = async () => {
     setBusy(true);
     try {
       const response = await api.post<{ removed: string[] }>("/reset");
       setPlan(null); setPreflight(null); setResult(null); setConfirmLive(false);
+      setQuickLayers([1]); setApproveRepresentativeLayers(false);
       setStatus((old) => old ? { ...old, fingerprint: null,
-        geometry_preflight_passed: false, dry_run_passed: false,
+        geometry_preflight_passed: false, quick_sim_passed: false,
+        quick_sim_layers: [], quick_sim_live_approved: false,
+        dry_run_passed: false,
         live_print_enabled: false } : old);
       setMessage(`Generated plan reset; removed ${response.removed.length} temporary RoboDK artifact(s).`);
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
@@ -353,8 +430,9 @@ export default function Extrusion() {
     setBusy(true);
     try {
       const corrected = await api.post<Plan>("/correction/apply", { fingerprint: plan.fingerprint });
-      setPlan(corrected); setSelectedLayer(1); setPreflight(null); setResult(null); setConfirmLive(false);
-      setMessage("Corrected command generated. It has a new fingerprint and must pass preflight + dry run.");
+      setPlan(corrected); setSelectedLayer(1); setQuickLayers([1]);
+      setApproveRepresentativeLayers(false); setPreflight(null); setResult(null); setConfirmLive(false);
+      setMessage("Corrected command generated. It has a new fingerprint and must pass preflight + visual simulation.");
       refreshStatus();
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
@@ -390,6 +468,11 @@ export default function Extrusion() {
   const selectionsReady = Boolean(setup?.print_tool && setup?.work_frame && setup?.inspection_tool
     && (setup?.inspection_auto || setup?.inspection_target));
   const stationReady = Boolean(preflight?.station?.ready);
+  const allQuickLayersSelected = Boolean(plan && quickLayers.length === plan.layers.length);
+  const toggleQuickLayer = (layerIndex: number) => setQuickLayers((old) =>
+    old.includes(layerIndex)
+      ? old.filter((value) => value !== layerIndex)
+      : [...old, layerIndex].sort((a, b) => a - b));
   const pct = progress.total ? Math.round(progress.step / progress.total * 100) : 0;
   const headlineMetrics = result?.kind === "cylinder_print" ? result.layers : [];
 
@@ -431,12 +514,17 @@ export default function Extrusion() {
             <label>Center Y (mm)<input type="number" value={setup.center_y_mm} onChange={(e) => updateSetup("center_y_mm", Number(e.target.value))} /></label>
             <label>Build plane Z (mm)<input type="number" value={setup.build_plane_z_mm} onChange={(e) => updateSetup("build_plane_z_mm", Number(e.target.value))} /></label>
             {["A / roll", "B / pitch", "C / yaw"].map((label, i) => <label key={label}>{label} (°)<input type="number" value={setup.orientation_rpy_deg[i]} onChange={(e) => updateOrientation(i, Number(e.target.value))} /></label>)}
+            <label>Maximum wrist rotation — axes 4 &amp; 6 (°)<input type="number" min="1" max="180"
+              value={setup.maximum_tool_axis_spin_deg}
+              onChange={(e) => updateSetup("maximum_tool_axis_spin_deg", Number(e.target.value))} /></label>
             <label>Approach (mm)<input type="number" min="1" value={setup.approach_clearance_mm} onChange={(e) => updateSetup("approach_clearance_mm", Number(e.target.value))} /></label>
             <label>Retreat (mm)<input type="number" min="1" value={setup.retreat_clearance_mm} onChange={(e) => updateSetup("retreat_clearance_mm", Number(e.target.value))} /></label>
           </div>
           <div className="btn-row">
-            <button className="secondary" disabled={!surface?.available || busy || status?.running}
+            <button className="secondary" disabled={!surface?.available || !connected || !setup.print_tool || busy || status?.running}
               onClick={centerOnScannedSurface}>Center on scanned surface</button>
+            <button className="secondary" disabled={!connected || busy || !setup.print_tool || !setup.work_frame}
+              onClick={captureCurrentOrientation}>Capture neutral orientation only</button>
             <button className="secondary" disabled={!connected || busy || !setup.print_tool || !setup.work_frame}
               onClick={seedFromCurrentTcp}>Seed path start from current TCP</button>
           </div>
@@ -448,7 +536,7 @@ export default function Extrusion() {
             <button className="secondary" disabled={busy} onClick={refreshSurface}>Re-check</button>
           </div>
           {surface?.applied && !surface.available && <div className="hint warn-text">{surface.note}</div>}
-          <div className="hint">Preferred flow: scan the surface, insert it, then <b>Center on scanned surface</b> — the cylinder lands in the middle of the measured rectangle (the scan frame's own origin is a corner, so 0,0 is not the middle). Jogging and seeding from the TCP is the manual alternative. Center, build-plane Z, and RoboDK XYZRPW are expressed in the selected work frame. Approach/retract follow the curve normal. These exact values are fingerprinted and dry-run.</div>
+          <div className="hint">Preferred flow: scan the surface, insert it, then <b>Center on scanned surface</b> — the cylinder lands in the middle of the measured rectangle and automatically captures the current neutral TCP orientation. <b>Capture neutral orientation only</b> refreshes orientation without changing the cylinder center or Z. Center, build-plane Z, and RoboDK XYZRPW are expressed in the selected work frame. The generated IK keeps the neutral front/elbow/wrist configuration, limits both axes 4 and 6 to ±90°, and samples the interpolated joint path to block hidden wrist flips before playback. These exact values are fingerprinted and simulated.</div>
           {setup.scan_run_id
             ? <div className="hint">Placed on scan run <code>{setup.scan_run_id}</code>. Re-scanning the surface invalidates this placement, and preflight rejects a wall that overhangs the measured rectangle.</div>
             : surface?.available && surface.frame !== setup.work_frame &&
@@ -502,7 +590,8 @@ export default function Extrusion() {
       <h2>Safety workflow</h2>
       <div className="workflow-steps"><span className={plan ? "done" : ""}>1 Generate</span>
         <span className={preflight?.all_ok && stationReady ? "done" : ""}>2 Preflight</span>
-        <span className={status?.dry_run_passed ? "done" : ""}>3 Complete dry run</span>
+        <span className={status?.quick_sim_passed ? "done" : ""}>3a Visual simulation</span>
+        <span className={status?.dry_run_passed ? "done" : ""}>3b Collision-validated dry run</span>
         <span className={result?.kind === "cylinder_print" ? "done" : ""}>4 Print & record</span></div>
       <p className="status-line">{message}</p>
       {(busy || status?.running) && <><div className="progress"><div style={{ width: `${pct}%` }} /></div><div className="status-line">{progress.message}</div></>}
@@ -525,11 +614,44 @@ export default function Extrusion() {
         {inspection.warnings.map((w) => ` ${w}`)}
       </div>}
       {preflight?.station?.reachability && <div className="io-note">Path IK sample: <b>{preflight.station.reachability.reachable_count}/{preflight.station.reachability.sample_count}</b> reachable in <code>{preflight.station.reachability.frame}</code>. Full curve generation and collision validation still run in the dry run.</div>}
-      <div className="btn-row"><button disabled={!plan || !preflight?.all_ok || !stationReady || busy || status?.running} onClick={() => startJob("dry-run")}>Run complete RoboDK dry run</button>
-        {(busy || status?.running) && <button className="secondary" onClick={cancel}>Cancel safely</button>}</div>
-      <label className="live-confirm"><input type="checkbox" checked={confirmLive} onChange={(e) => setConfirmLive(e.target.checked)} disabled={!status?.dry_run_passed || status?.running} />
+      {plan && <div className="io-note">
+        <b>Quick-simulation layers:</b>
+        <div className="btn-row">
+          <button className="secondary" disabled={busy || status?.running}
+            onClick={() => setQuickLayers([visualSelectedLayer])}>Current layer {visualSelectedLayer}</button>
+          <button className="secondary" disabled={busy || status?.running}
+            onClick={() => setQuickLayers(plan.layers.map((item) => item.layer_index))}>All layers</button>
+          {plan.layers.map((item) => <button key={item.layer_index}
+            className={quickLayers.includes(item.layer_index) ? "" : "secondary"}
+            disabled={busy || status?.running} onClick={() => toggleQuickLayer(item.layer_index)}>
+            L{item.layer_index}</button>)}
+        </div>
+        <label className="live-confirm"><input type="checkbox"
+          checked={approveRepresentativeLayers} disabled={allQuickLayersSelected || busy || status?.running}
+          onChange={(e) => setApproveRepresentativeLayers(e.target.checked)} />
+          Treat the selected layer(s) as representative and approve all remaining layers for the live run.
+        </label>
+        <div className="hint">Without that approval, Live Print unlocks only after every layer has been visually simulated. Layer coverage accumulates for this exact fingerprint.</div>
+      </div>}
+      {status?.quick_sim_passed && <div className={`io-note ${status.quick_sim_live_approved ? "" : "warn-text"}`}>
+        Visual simulation passed for layer(s) <b>{status.quick_sim_layers.join(", ")}</b> with collision checking disabled. {status.quick_sim_live_approved
+          ? "The complete live plan is approved for operator confirmation."
+          : "Simulate the remaining layers or approve the selected layers as representative."}
+      </div>}
+      <div className="btn-row"><button className="secondary" disabled={!plan || quickLayers.length === 0 || !preflight?.all_ok || !stationReady || busy || status?.running} onClick={() => startJob("quick-sim")}>Quick visual simulation — collisions OFF</button>
+        <button disabled={!plan || !preflight?.all_ok || !stationReady || busy || status?.running} onClick={() => startJob("dry-run")}>Complete validated dry run — collisions ON</button>
+        {(busy || status?.running) && <button className="secondary" onClick={cancel}
+          disabled={cancelling}>{cancelling ? "Cancellation requested…" : "Cancel safely"}</button>}</div>
+      <label className="live-confirm"><input type="checkbox" checked={liveCollisionCheck}
+        onChange={(e) => setLiveCollisionCheck(e.target.checked)} disabled={!status?.quick_sim_live_approved || status?.running} />
+        Validate collisions before each physical layer (slower).
+      </label>
+      {!liveCollisionCheck && status?.quick_sim_live_approved && <div className="io-note warn-text">
+        Live collision validation is disabled. The physical run will rely on the visual simulation, preflight IK sampling, and your cell-clearance confirmation.
+      </div>}
+      <label className="live-confirm"><input type="checkbox" checked={confirmLive} onChange={(e) => setConfirmLive(e.target.checked)} disabled={!status?.live_print_enabled || status?.running} />
         I confirm the selected tool/frame/orientation, cell clearance, material system, and live extrusion run.</label>
-      <button className="live-print-btn" disabled={!plan || !status?.live_print_enabled || !confirmLive || busy || status?.running} onClick={() => startJob("print")}>Print & record — LIVE ROBOT</button>
+      <button className="live-print-btn" disabled={!plan || !status?.live_print_enabled || !confirmLive || busy || status?.running} onClick={() => startJob("print")}>Print & record — LIVE ROBOT · collisions {liveCollisionCheck ? "ON" : "OFF"}</button>
       <div className="log" ref={logRef}>{logs.length ? logs.map((line, i) => <div key={i} className={line.startsWith("ERROR") ? "err" : ""}>{line}</div>) : "Job timeline will appear here."}</div>
     </div>
 

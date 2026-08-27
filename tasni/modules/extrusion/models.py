@@ -51,6 +51,7 @@ class CylinderSetup(_Record):
     # a plan whose coordinates were derived from the previous surface.
     scan_run_id: str | None = None
     orientation_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    maximum_tool_axis_spin_deg: float = Field(default=90.0, gt=0, le=180)
     approach_clearance_mm: float = Field(default=40.0, gt=0, le=500)
     retreat_clearance_mm: float = Field(default=60.0, gt=0, le=500)
 

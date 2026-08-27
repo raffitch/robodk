@@ -24,7 +24,10 @@ export default function Layout({ children }: { children: ReactNode }) {
         </div>
         <div className="pills">
           <StatusPill label="robodk" ok={health?.robodk.ok} detail={health?.robodk.detail} />
-          <StatusPill label="camera" ok={health?.camera.ok} detail={health?.camera.detail} />
+          <StatusPill label="camera" ok={health?.camera.ok} detail={health?.camera.detail}
+            summary={health?.camera
+              ? `${health.camera.route} · ${health.camera.endpoint}`
+              : "checking…"} />
           <StatusPill label="link" ok={connected} detail="job event stream" />
         </div>
       </header>

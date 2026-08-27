@@ -128,7 +128,7 @@ Jetson deployment behavior, read `docs/agent-debug-map.md` and `docs/jetson-scan
     for a password). A failed restart would leave old code running with no future
     auto-restart. **Prefer the root auto-pull.** Read-only SSH checks (`git rev-parse`,
     `ss`, `systemctl is-active`, `test -f`) work fine over the key.
-  - SSH: `ssh -i ~/.ssh/jetson_robodk jetson@10.12.171.70`.
+  - SSH: `ssh -i ~/.ssh/jetson_robodk jetson@100.123.63.127` (Tailscale).
 
 ---
 

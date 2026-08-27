@@ -15,7 +15,7 @@ If you only need to *read* state (joints, gate telemetry) do the read-only check
 | Frontend (Vite dev) | `http://127.0.0.1:5173` | proxies to :8000; browser reconnects on backend restart |
 | Event stream | `ws://127.0.0.1:8000/ws` | JSON `{type, payload}`; `gate` events carry the HUD readout |
 | RoboDK API | attach, `:20500` | the app binds the running GUI (`RdkSession` mode `attach`) |
-| Jetson camera | `10.12.171.70:1024` | H.264 + scan-telemetry stream; flaky Wi-Fi |
+| Jetson camera | `100.123.63.127:1024` | Tailscale route; H.264 + scan-telemetry stream |
 
 Health/probe (read-only):
 

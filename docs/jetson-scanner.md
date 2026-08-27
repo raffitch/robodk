@@ -7,12 +7,12 @@ probed on **2026-06-19** via `tools/jetson_probe.py`.
 
 > Credentials are **not** in this repo. They live in `secrets/jetson.env` (git-ignored).
 > An SSH key (`~/.ssh/jetson_robodk`) was installed on the Jetson, so access is now
-> **passwordless**: `ssh -i ~/.ssh/jetson_robodk jetson@10.12.171.70`.
+> **passwordless**: `ssh -i ~/.ssh/jetson_robodk jetson@100.123.63.127`.
 
 ## Connection
 | | |
 |---|---|
-| Host (scan network) | `10.12.171.70` — used by `3DScan.py`, `3DScanParam.py` |
+| Host (Tailscale) | `100.123.63.127` — used by Tasni camera/scan clients |
 | Host (other network) | `10.5.5.19` — used by `AutoCalibrate.py`, `ArucoToPlane.py` (same camera, different subnet? **open question**) |
 | User | `jetson` |
 | Stream port | TCP **1024** |
@@ -213,7 +213,7 @@ Jetson, or run the equivalent over SSH). The sync variant also force-cools the b
    crash. Port 1024 should be open whenever the Jetson is up. ✅ (fixed 2026-06-19)
 2. **Legacy `/etc/crontab` autostart removed** — it was 39 broken lines pointing at a
    non-existent `~/EtherSense` dir, spawning failing processes every minute. Gone.
-3. **Flaky connectivity** — SSH to `10.12.171.70` times out intermittently (the tooling
+3. **Flaky connectivity** — SSH to `100.123.63.127` times out when the Jetson is offline (the tooling
    auto-reconnects/retries). Scans depend on a stable link — worth investigating the
    physical/Wi-Fi link as a separate reliability item.
 4. **sudo password = login password** (`JETSON_SUDO_PASSWORD` in secrets); the password

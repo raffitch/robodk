@@ -240,6 +240,14 @@ class RdkIO:
             return robot.SolveIK(pose, None, tool)
         return robot.SolveIK(pose)
 
+    def _solve_ik_all(self, T: np.ndarray):
+        """Return every IK branch for an active-frame TCP pose, without motion."""
+        if self._frame_wrt_base_T is not None:
+            T = self._frame_wrt_base_T @ np.asarray(T, dtype=float)
+        pose = T_to_pose(T)
+        tool = T_to_pose(self._tool_pose) if self._tool_pose is not None else None
+        return self.robot().SolveIK_All(pose, tool)
+
     def is_reachable(self, T: np.ndarray) -> bool:
         """True if the robot has an IK solution placing the **camera** at this pose
         (camera tool passed explicitly — not the flange)."""
@@ -281,6 +289,77 @@ class RdkIO:
             return self._ik_to_joints(self._solve_ik(T), seed)
         except Exception:
             return None
+
+    def solve_joints_on_neutral_branch(
+            self, T: np.ndarray, neutral_joints, previous_joints=None,
+            maximum_wrist_rotation_deg: float = 90.0):
+        """Solve an extrusion pose without allowing an elbow/wrist branch flip.
+
+        RoboDK's seeded ``SolveIK`` can still select the opposite wrist solution
+        after a Curve Follow Project has changed the station's current simulated
+        posture. Enumerate all solutions instead, retain the neutral robot
+        configuration (front/rear, elbow and wrist-flip flags), bound axes 4 and 6
+        relative to neutral, then choose the solution nearest both neutral and the
+        preceding path point. This is read-only; no robot joints are set here.
+        """
+        import robodk.robomath as robomath
+
+        neutral_values = self._joint_values(neutral_joints)
+        if neutral_values is None or len(neutral_values) < 6:
+            return None
+        prior_reference = neutral_joints if previous_joints is None else previous_joints
+        previous_values = self._joint_values(prior_reference)
+        robot = self.robot()
+        try:
+            neutral_config = tuple(
+                int(round(v)) for v in robot.JointsConfig(neutral_joints).list()[:3])
+        except Exception:
+            neutral_config = None
+
+        candidates = []
+        try:
+            candidates = list(self._solve_ik_all(T))
+        except Exception:
+            pass
+        if not candidates:
+            fallback = self.solve_joints_for_pose(T, prior_reference)
+            if fallback is not None:
+                candidates = [fallback]
+
+        accepted: list[tuple[float, object]] = []
+        limit = float(maximum_wrist_rotation_deg)
+        for candidate in candidates:
+            joints = self._ik_to_joints(candidate, neutral_joints)
+            if joints is None:
+                continue
+            joints = self._nearest_equivalent_joints(joints, neutral_joints)
+            values = self._joint_values(joints)
+            if values is None or len(values) < 6:
+                continue
+            deltas = [float(values[i] - neutral_values[i]) for i in range(6)]
+            if abs(deltas[3]) > limit or abs(deltas[5]) > limit:
+                continue
+            if neutral_config is not None:
+                try:
+                    config = tuple(
+                        int(round(v)) for v in robot.JointsConfig(joints).list()[:3])
+                except Exception:
+                    config = neutral_config
+                if config != neutral_config:
+                    continue
+            continuity = 0.0
+            if previous_values is not None and len(previous_values) >= 6:
+                continuity = sum(
+                    (((values[i] - previous_values[i] + 180.0) % 360.0) - 180.0) ** 2
+                    for i in range(6))
+            neutral_distance = sum(delta * delta for delta in deltas)
+            accepted.append((neutral_distance + 0.25 * continuity, joints))
+        if not accepted:
+            return None
+        accepted.sort(key=lambda item: item[0])
+        # Re-materialise a plain Mat so no extra configuration columns can leak
+        # from SolveIK_All into a program target.
+        return robomath.Mat(self._joint_values(accepted[0][1]))
 
     # -- temporary targets (auto pose generation) ---------------------------
     def add_target(self, name: str, T: np.ndarray, joints=None):
@@ -1058,6 +1137,7 @@ class RdkIO:
             "frame": robolink.ITEM_TYPE_FRAME,
             "target": robolink.ITEM_TYPE_TARGET,
             "program": robolink.ITEM_TYPE_PROGRAM,
+            "object": robolink.ITEM_TYPE_OBJECT,
         }
         if kind not in types or not name:
             return False
@@ -1102,7 +1182,8 @@ class RdkIO:
 
     def extrusion_reachability_report(
             self, *, points_xyz: np.ndarray, orientation_rpy_deg,
-            print_tool: str, work_frame: str, maximum_samples: int = 24) -> dict:
+            print_tool: str, work_frame: str, maximum_samples: int = 24,
+            maximum_tool_axis_spin_deg: float = 90.0) -> dict:
         """Sample exact fixed-orientation path poses with IK, without robot motion.
 
         This is an early placement check, not a replacement for Curve Follow
@@ -1116,6 +1197,7 @@ class RdkIO:
         self.use_named_tool_frame(print_tool, work_frame)
         robot = self.robot()
         seed = robot.Joints()
+        start_joints = seed
         orientation = self.xyzrpy_pose_T([0.0, 0.0, 0.0], orientation_rpy_deg)
         count = min(max(1, int(maximum_samples)), len(pts))
         indices = sorted(set(int(round(v)) for v in
@@ -1125,18 +1207,32 @@ class RdkIO:
             target = orientation.copy()
             target[:3, 3] = pts[index]
             try:
-                joints = self._ik_to_joints(self._solve_ik(target, seed), seed)
-                if joints is None:
-                    joints = self._ik_to_joints(self._solve_ik(target), seed)
+                joints = self.solve_joints_on_neutral_branch(
+                    target, start_joints, seed, maximum_tool_axis_spin_deg)
             except Exception:
                 joints = None
+            if joints is not None:
+                joints = self._nearest_equivalent_joints(joints, seed)
+            axis_4_rotation = self._joint_delta_deg(joints, start_joints, axis=3)
+            axis_6_rotation = self._joint_delta_deg(joints, start_joints, axis=5)
+            wrist_ok = (axis_4_rotation is not None and axis_6_rotation is not None
+                        and abs(axis_4_rotation) <= maximum_tool_axis_spin_deg
+                        and abs(axis_6_rotation) <= maximum_tool_axis_spin_deg)
             reachable = joints is not None
+            acceptable = reachable and wrist_ok
             samples.append({
                 "point_index": index,
                 "xyz_mm": [float(v) for v in pts[index]],
-                "reachable": reachable,
+                "reachable": acceptable,
+                "ik_reachable": reachable,
+                "axis_4_rotation_deg": axis_4_rotation,
+                "tool_axis_spin_deg": axis_6_rotation,
+                "reason": ("" if acceptable else
+                           ("no IK solution on the neutral wrist branch within "
+                            f"±{maximum_tool_axis_spin_deg:.1f} deg") if not reachable else
+                           "wrist rotation exceeds the neutral limit"),
             })
-            if reachable:
+            if acceptable:
                 seed = joints
         failed = [sample for sample in samples if not sample["reachable"]]
         return {
@@ -1147,9 +1243,86 @@ class RdkIO:
             "frame": work_frame,
             "tool": print_tool,
             "orientation_rpy_deg": [float(v) for v in orientation_rpy_deg],
+            "maximum_tool_axis_spin_deg": float(maximum_tool_axis_spin_deg),
             "note": ("Sampled poses have IK solutions; full curve/collision dry run is still required."
                      if not failed else
-                     "At least one sampled path pose has no IK solution."),
+                     "At least one sampled path pose has no solution on the neutral "
+                     "robot configuration inside the axis-4/axis-6 rotation limit."),
+        }
+
+    @staticmethod
+    def _joint_values(joints) -> list[float] | None:
+        if joints is None:
+            return None
+        try:
+            return [float(v) for v in np.asarray(joints.list(), dtype=float).ravel()]
+        except Exception:
+            try:
+                return [float(v) for v in np.asarray(joints, dtype=float).ravel()]
+            except Exception:
+                return None
+
+    @classmethod
+    def _nearest_equivalent_joints(cls, joints, reference):
+        """Return the same revolute configuration unwrapped nearest ``reference``."""
+        import robodk.robomath as robomath
+
+        values = cls._joint_values(joints)
+        prior = cls._joint_values(reference)
+        if values is None or prior is None or len(values) != len(prior):
+            return joints
+        # This cell's KUKA has six revolute robot axes. Leave any external axes
+        # untouched; only normalize equivalent ±360-degree representations.
+        for index in range(min(6, len(values))):
+            values[index] = prior[index] + ((values[index] - prior[index] + 180.0) % 360.0 - 180.0)
+        return robomath.Mat(values)
+
+    @classmethod
+    def _joint_delta_deg(cls, joints, reference, *, axis: int) -> float | None:
+        values = cls._joint_values(joints)
+        prior = cls._joint_values(reference)
+        if values is None or prior is None or axis >= len(values) or axis >= len(prior):
+            return None
+        return float(values[axis] - prior[axis])
+
+    @classmethod
+    def _program_neutral_wrist_report(
+            cls, program, neutral_joints, maximum_wrist_rotation_deg: float) -> dict:
+        """Sample the interpolated program path and reject hidden wrist flips."""
+        neutral = cls._joint_values(neutral_joints)
+        if neutral is None or len(neutral) < 6:
+            raise RuntimeError("neutral robot joints are unavailable for wrist validation")
+        message, joint_list, status = program.InstructionListJoints(
+            mm_step=10.0, deg_step=3.0, collision_check=0)
+        if int(status) < 0:
+            raise RuntimeError(
+                "RoboDK could not sample the generated joint path: "
+                + str(message or f"status {status}"))
+        samples = list(joint_list)
+        if not samples:
+            raise RuntimeError("RoboDK returned no joint samples for the generated path")
+        max_axis_4 = 0.0
+        max_axis_6 = 0.0
+        limit = float(maximum_wrist_rotation_deg)
+        for sample_index, sample in enumerate(samples):
+            values = [float(v) for v in sample]
+            if len(values) < 6:
+                raise RuntimeError("RoboDK returned an incomplete joint-path sample")
+            axis_4 = ((values[3] - neutral[3] + 180.0) % 360.0) - 180.0
+            axis_6 = ((values[5] - neutral[5] + 180.0) % 360.0) - 180.0
+            max_axis_4 = max(max_axis_4, abs(axis_4))
+            max_axis_6 = max(max_axis_6, abs(axis_6))
+            if abs(axis_4) > limit or abs(axis_6) > limit:
+                axis_name = "axis 4" if abs(axis_4) > limit else "axis 6"
+                rotation = axis_4 if axis_name == "axis 4" else axis_6
+                raise RuntimeError(
+                    f"generated path sample {sample_index + 1} turns {axis_name} "
+                    f"{rotation:.1f} deg from neutral; limit is ±{limit:.1f} deg. "
+                    "The wrist-flipped path was blocked before simulation or robot motion.")
+        return {
+            "sample_count": len(samples),
+            "maximum_axis_4_rotation_seen_deg": float(max_axis_4),
+            "maximum_axis_6_rotation_seen_deg": float(max_axis_6),
         }
 
     @staticmethod
@@ -1181,7 +1354,8 @@ class RdkIO:
             print_tool: str, work_frame: str, speed_mm_s: float,
             travel_speed_mm_s: float, rounding_mm: float,
             approach_clearance_mm: float, retreat_clearance_mm: float,
-            air_on_program: str, air_off_program: str) -> dict:
+            air_on_program: str, air_off_program: str,
+            maximum_tool_axis_spin_deg: float = 90.0) -> dict:
         """Build a disposable native RoboDK Curve Follow Project for one layer.
 
         Dense samples live inside one curve object (XYZ+IJK), not as station
@@ -1205,6 +1379,9 @@ class RdkIO:
         robot = self.robot()
         frame = self.rdk.Item(work_frame, robolink.ITEM_TYPE_FRAME)
         print_tcp = self.rdk.Item(print_tool, robolink.ITEM_TYPE_TOOL)
+        # Cache the exact selected TCP/frame for deterministic seeded IK below.
+        self.use_named_tool_frame(print_tool, work_frame)
+        start_joints = robot.Joints()
         curve_name = name + "_Curve"
         project_name = name + "_Settings"
         for item_name, item_type in ((name, robolink.ITEM_TYPE_PROGRAM),
@@ -1234,23 +1411,12 @@ class RdkIO:
             raise RuntimeError("RoboDK could not create the Curve Follow Project")
         project.setPoseFrame(frame)
         project.setPoseTool(print_tcp)
-        project.setPose(T_to_pose(orientation))
-        project.setJoints(robot.Joints())
-        program, setup_status = project.setMachiningParameters(part=curve)
-        if not program.Valid() or setup_status < 0:
-            bounds_min = pts.min(axis=0)
-            bounds_max = pts.max(axis=0)
-            raise RuntimeError(
-                "RoboDK found no feasible start/path for the Curve Follow Project "
-                f"(status {setup_status}). Frame={work_frame!r}, tool={print_tool!r}, "
-                f"XYZ bounds=[{bounds_min[0]:.1f}..{bounds_max[0]:.1f}, "
-                f"{bounds_min[1]:.1f}..{bounds_max[1]:.1f}, "
-                f"{bounds_min[2]:.1f}..{bounds_max[2]:.1f}] mm, "
-                f"XYZRPW={[float(v) for v in orientation_rpy_deg]}. "
-                f"The failed artifacts {curve_name!r} and {project_name!r} were kept "
-                "for inspection; Reset removes them. Jog the selected TCP to the intended "
-                "path start and seed the coordinates again.")
-        program.setName(name)
+        project.setJoints(start_joints)
+        # Apply every deterministic path option before selecting the curve.
+        # setMachiningParameters generates immediately and otherwise inherits the
+        # station-wide CAM defaults for that first solve. In this cell those defaults
+        # may enable the unrelated Positioner (TurntableActive) and orientation search,
+        # making setup fail even when the exact fixed TCP poses passed our IK preflight.
         project.setParam("Machining", {
             "Algorithm": 0,
             "ApproachRetractAll": 1,
@@ -1265,6 +1431,7 @@ class RdkIO:
             "RotZ_Range": 0,
             "SpeedOperation": float(speed_mm_s),
             "SpeedRapid": float(travel_speed_mm_s),
+            "TurntableActive": 0,
             "VisibleNormals": 1,
         })
         project.setParam("ProgEvents", {
@@ -1278,6 +1445,43 @@ class RdkIO:
         })
         project.setParam("Approach", f"NTS {float(approach_clearance_mm):.6f} 0 0")
         project.setParam("Retract", f"NTS {float(retreat_clearance_mm):.6f} 0 0")
+        # RoboDK's Curve Follow initializer can reject an otherwise reachable fixed
+        # TCP pose depending on the selected tool's mounting transform. LongCalibTool
+        # is one such case: its identity path-to-tool seed returns -5, while the
+        # equivalent local-X-flipped seed produces the path. This pose is only an
+        # internal generation seed. Every generated motion is pinned back to the exact
+        # requested ``orientation`` below, then IK/collision validated, so the fallback
+        # cannot silently change the commanded print orientation. Keep the curve normal
+        # unchanged so approach/retract remain on the safe +normal side of the surface.
+        flip_local_x = np.eye(4)
+        flip_local_x[1, 1] = -1.0
+        flip_local_x[2, 2] = -1.0
+        generation_orientations = (orientation, orientation @ flip_local_x)
+        setup_attempts: list[float] = []
+        program = None
+        setup_status = -1.0
+        for generation_orientation in generation_orientations:
+            project.setPose(T_to_pose(generation_orientation))
+            candidate, candidate_status = project.setMachiningParameters(part=curve)
+            setup_status = float(candidate_status)
+            setup_attempts.append(setup_status)
+            if candidate.Valid() and setup_status >= 0:
+                program = candidate
+                break
+        if program is None:
+            bounds_min = pts.min(axis=0)
+            bounds_max = pts.max(axis=0)
+            raise RuntimeError(
+                "RoboDK found no feasible start/path for the Curve Follow Project "
+                f"(statuses {setup_attempts}). Frame={work_frame!r}, tool={print_tool!r}, "
+                f"XYZ bounds=[{bounds_min[0]:.1f}..{bounds_max[0]:.1f}, "
+                f"{bounds_min[1]:.1f}..{bounds_max[1]:.1f}, "
+                f"{bounds_min[2]:.1f}..{bounds_max[2]:.1f}] mm, "
+                f"XYZRPW={[float(v) for v in orientation_rpy_deg]}. "
+                f"The failed artifacts {curve_name!r} and {project_name!r} were kept "
+                "for inspection; Reset removes them. Jog the selected TCP to the intended "
+                "path start and seed the coordinates again.")
+        program.setName(name)
         project.setParam("UpdatePath")
         generation = project.Update(robolink.COLLISION_OFF)
         if float(generation[3]) < 0:
@@ -1294,25 +1498,87 @@ class RdkIO:
                 f"Failed artifacts {curve_name!r} and {project_name!r} were kept; "
                 "Reset removes them.")
         program.setName(name)
-        # Curve normals constrain tool Z and the project optimizes the redundant
-        # rotation about it. This workflow exposes an exact fixed XYZRPW instead,
-        # so pin every generated motion pose to that requested rotation. Positions,
-        # interpolation, approach/retract, speeds, and events remain project-owned.
-        for index in range(program.InstructionCount()):
-            (instruction_name, instruction_type, move_type, _is_joint_target,
-             target_pose, joints) = program.Instruction(index)
-            if instruction_type != robolink.INS_TYPE_MOVE:
-                continue
-            target_T = pose_to_T(target_pose)
-            target_T[:3, :3] = orientation[:3, :3]
-            program.setInstruction(
-                index, instruction_name, instruction_type, move_type,
-                False, T_to_pose(target_T), joints)
-        artifacts = [curve_name, project_name, name]
+        # A Curve Follow program does not reliably retain joint vectors written
+        # through setInstruction: on this station the next read/playback silently
+        # re-solves the local-X fallback into the opposite axis-4 wrist branch.
+        # Rebuild the linked program from named joint targets instead. The curve and
+        # project remain visible/auditable, while every motion endpoint is now a real
+        # target locked to the selected neutral IK branch.
+        for instruction_index in reversed(range(program.InstructionCount())):
+            program.InstructionDelete(instruction_index)
+        program.setPoseFrame(frame)
+        program.setPoseTool(print_tcp)
+        program.setRounding(float(rounding_mm))
+        prior_joints = start_joints
+        maximum_axis_4_seen = 0.0
+        maximum_spin_seen = 0.0
+        target_names: list[str] = []
+
+        def locked_target(label: str, xyz) -> object:
+            nonlocal prior_joints, maximum_axis_4_seen, maximum_spin_seen
+            target_T = orientation.copy()
+            target_T[:3, 3] = np.asarray(xyz, dtype=float)
+            solved = self.solve_joints_on_neutral_branch(
+                target_T, start_joints, prior_joints,
+                maximum_tool_axis_spin_deg)
+            if solved is None:
+                raise RuntimeError(
+                    f"generated target {label!r} has no IK solution on the neutral "
+                    "front/elbow/wrist branch within the axis-4/axis-6 rotation "
+                    "limit; artifacts were kept for inspection")
+            solved = self._nearest_equivalent_joints(solved, prior_joints)
+            axis_4 = self._joint_delta_deg(solved, start_joints, axis=3)
+            spin = self._joint_delta_deg(solved, start_joints, axis=5)
+            if (axis_4 is None or spin is None
+                    or abs(axis_4) > float(maximum_tool_axis_spin_deg)
+                    or abs(spin) > float(maximum_tool_axis_spin_deg)):
+                raise RuntimeError(
+                    f"generated target {label!r} leaves the neutral wrist range "
+                    f"(axis 4={axis_4 if axis_4 is not None else 'unknown'} deg, "
+                    f"axis 6={spin if spin is not None else 'unknown'} deg); limit is "
+                    f"±{float(maximum_tool_axis_spin_deg):.1f} deg. "
+                    "Capture the current TCP orientation and regenerate the plan.")
+            maximum_axis_4_seen = max(maximum_axis_4_seen, abs(axis_4))
+            maximum_spin_seen = max(maximum_spin_seen, abs(spin))
+            target_name = f"{name}_{label}"
+            target = self.add_target(target_name, target_T, solved)
+            target_names.append(target_name)
+            prior_joints = solved
+            return target
+
+        approach_xyz = pts[0] + normal * float(approach_clearance_mm)
+        retract_xyz = pts[-1] + normal * float(retreat_clearance_mm)
+        approach_target = locked_target("Approach", approach_xyz)
+        path_targets = [locked_target(f"P{index:04d}", xyz)
+                        for index, xyz in enumerate(pts)]
+        retract_target = locked_target("Retract", retract_xyz)
+
+        program.setSpeed(float(travel_speed_mm_s))
+        program.MoveJ(approach_target)
+        program.MoveL(path_targets[0])
+        program.RunInstruction(air_on_program, robolink.INSTRUCTION_CALL_PROGRAM)
+        program.setSpeed(float(speed_mm_s))
+        for target in path_targets[1:]:
+            program.MoveL(target)
+        program.RunInstruction(air_off_program, robolink.INSTRUCTION_CALL_PROGRAM)
+        program.setSpeed(float(travel_speed_mm_s))
+        program.MoveL(retract_target)
+        trajectory = self._program_neutral_wrist_report(
+            program, start_joints, maximum_tool_axis_spin_deg)
+        artifacts = [curve_name, project_name, name, *target_names]
         return {
             "program": name, "curve": curve_name, "project": project_name,
-            "artifacts": artifacts, "targets": [], "point_count": len(pts),
+            "artifacts": artifacts, "targets": target_names, "point_count": len(pts),
             "setup_status": float(setup_status),
+            "setup_attempts": setup_attempts,
+            "maximum_tool_axis_spin_deg": float(maximum_tool_axis_spin_deg),
+            "maximum_axis_4_rotation_seen_deg": max(
+                float(maximum_axis_4_seen),
+                trajectory["maximum_axis_4_rotation_seen_deg"]),
+            "maximum_tool_axis_spin_seen_deg": max(
+                float(maximum_spin_seen),
+                trajectory["maximum_axis_6_rotation_seen_deg"]),
+            "joint_path_sample_count": trajectory["sample_count"],
             "project_generation_percent": float(generation[3]) * 100.0,
         }
 
@@ -1394,6 +1660,14 @@ class RdkIO:
         return {"instructions_ok": int(result[0]), "time_s": float(result[1]),
                 "distance_mm": float(result[2]), "percent_ok": float(result[3]) * 100.0,
                 "problems": str(result[4] or "")}
+
+    def simulation_speed(self) -> float:
+        """Current RoboDK playback speed ratio (read only)."""
+        return float(self.rdk.SimulationSpeed())
+
+    def set_simulation_speed(self, ratio: float) -> None:
+        """Set RoboDK playback speed; this never changes robot run mode or hardware."""
+        self.rdk.setSimulationSpeed(float(ratio))
 
     def start_program(self, name: str, *, real_robot: bool) -> int:
         """Start a named program with an explicit simulator/robot run type."""

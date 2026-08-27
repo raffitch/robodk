@@ -134,6 +134,9 @@ def _wait_program(ctx: JobContext, rdk: RdkIO, name: str) -> None:
             rdk.stop_program(name)
             ctx.check_cancel()
         time.sleep(0.05)
+    # A cancellation can arrive after the final busy poll. Do not let the
+    # caller continue into inspection, capture, or the next layer in that race.
+    ctx.check_cancel()
 
 
 def _program_valid(report: dict) -> bool:
@@ -149,7 +152,8 @@ def _require_program_valid(report: dict, layer_index: int) -> None:
 
 def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
                            inspection_name: str, config, camera,
-                           seed_pose: dict | None = None) -> dict:
+                           seed_pose: dict | None = None,
+                           collisions: bool = True) -> dict:
     """Create the inspection program for one layer and return its validation.
 
     Manual mode moves to the taught target, exactly as before. Automatic mode
@@ -171,7 +175,7 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
         created = rdk.create_inspection_program(
             name=inspection_name, inspection_tool=plan.setup.inspection_tool,
             inspection_target=plan.setup.inspection_target, speed_mm_s=speed_mm_s)
-        validation = rdk.update_program(inspection_name, collisions=True)
+        validation = rdk.update_program(inspection_name, collisions=collisions)
         _require_program_valid(validation, layer.layer_index)
         return {"artifacts": [created["program"]], "validation": validation,
                 "target": plan.setup.inspection_target, "pose": None}
@@ -200,7 +204,7 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
         created = rdk.create_inspection_program(
             name=inspection_name, inspection_tool=plan.setup.inspection_tool,
             inspection_target=target_name, speed_mm_s=speed_mm_s)
-        validation = rdk.update_program(inspection_name, collisions=True)
+        validation = rdk.update_program(inspection_name, collisions=collisions)
         if _program_valid(validation):
             return {
                 "artifacts": [target_name, created["program"]],
@@ -216,20 +220,41 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
                                     or f"validated at only {validation['percent_ok']:.1f}%")})
     tried = ", ".join(f"tilt {r['tilt_deg']:.0f}/azimuth {r['azimuth_deg']:.0f}/"
                       f"roll {r['roll_deg']:.0f} deg: {r['reason']}" for r in rejected)
+    qualification = "reachable, collision-free" if collisions else "reachable, feasible"
     raise RuntimeError(
-        f"layer {layer.layer_index}: no reachable, collision-free inspection pose at "
+        f"layer {layer.layer_index}: no {qualification} inspection pose at "
         f"{framing['standoff_mm']:.0f} mm above "
         f"[{aim[0]:.1f}, {aim[1]:.1f}, {aim[2]:.1f}] in {plan.setup.work_frame!r}. "
         f"Tried {len(rejected)} viewpoint(s) — {tried}")
 
 
 class CylinderDryRunJob:
-    """Execute the complete cylinder in RoboDK SIMULATE with mock-only valve calls."""
+    """Execute a cylinder simulation with mock-only valve calls.
 
-    def __init__(self, services, plan: CylinderPlan, *, on_pass=None):
+    ``check_collisions=False`` is an explicitly visual preview. The caller decides
+    whether its selected-layer coverage is sufficient to unlock a physical run; the
+    report always records exactly which layers were actually simulated.
+    """
+
+    def __init__(self, services, plan: CylinderPlan, *, on_pass=None,
+                 on_preview_pass=None, check_collisions: bool = True,
+                 layer_indices: list[int] | None = None,
+                 approve_full_plan: bool = False):
         self.services = services
         self.plan = plan.model_copy(deep=True)
         self.on_pass = on_pass
+        self.on_preview_pass = on_preview_pass
+        self.check_collisions = bool(check_collisions)
+        self.approve_full_plan = bool(approve_full_plan)
+        available = {layer.layer_index for layer in self.plan.layers}
+        requested = (list(layer_indices) if layer_indices is not None
+                     else sorted(available))
+        if not requested:
+            raise ValueError("select at least one layer to simulate")
+        invalid = sorted(set(requested) - available)
+        if invalid:
+            raise ValueError(f"layer indices are outside this plan: {invalid}")
+        self.layer_indices = sorted(set(requested))
         self.result: dict | None = None
 
     def __call__(self, ctx: JobContext) -> dict:
@@ -248,19 +273,62 @@ class CylinderDryRunJob:
         reports: list[dict] = []
         valve_events: list[dict] = []
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        run_dir = new_run_dir("extrusion-dry-run", stamp)
+        run_kind = ("extrusion-dry-run" if self.check_collisions
+                    else "extrusion-quick-simulation")
+        run_dir = new_run_dir(run_kind, stamp)
+        collision_map_optimization = None
+        prior_simulation_speed = None
         try:
             rdk.apply_run_mode("simulate")
+            # Program.Update(COLLISION_ON/OFF) below is the authoritative validation.
+            # RoboDK's global collision toolbar is a separate per-animation check; if
+            # left on it repeats expensive dense-mesh work during playback. Keep it off
+            # for both modes so checked runs validate once, not twice.
+            rdk.set_collision_checking(False)
+            if not self.check_collisions:
+                prior_simulation_speed = rdk.simulation_speed()
+                rdk.set_simulation_speed(ecfg.quick_simulation_speed_ratio)
+            if self.check_collisions:
+                ignored = list(ecfg.collision_visual_ignore_objects)
+                proxy = ecfg.collision_surface_proxy_object
+                if ignored and rdk.item_exists_as(proxy, "object"):
+                    collision_map_optimization = rdk.disable_object_collision_pairs(ignored)
+                    collision_map_optimization["surface_proxy"] = proxy
+                    if collision_map_optimization["objects"]:
+                        ctx.log(
+                            "collision validation: excluded redundant visual mesh(es) "
+                            + ", ".join(collision_map_optimization["objects"])
+                            + f"; {proxy} and all other station/robot/tool checks "
+                              "remain active")
+                elif ignored:
+                    collision_map_optimization = {
+                        "objects": [], "pairs_disabled": 0, "pairs_failed": 0,
+                        "surface_proxy": proxy, "skipped": True,
+                        "reason": "collision surface proxy is absent",
+                    }
+                    ctx.log(
+                        f"collision optimization skipped: required proxy {proxy!r} "
+                        "is absent; all geometry remains collision-active")
             mock_on, mock_off = rdk.ensure_mock_valve_programs(
-                f"TasniDry_{self.plan.fingerprint[:8]}_")
+                f"Tasni{'Dry' if self.check_collisions else 'Quick'}_"
+                f"{self.plan.fingerprint[:8]}_")
             mock_artifacts.extend((mock_on, mock_off))
-            ctx.log("DRY_RUN: SIMULATE mode; physical valve/rate outputs blocked")
-            total = len(self.plan.layers)
+            if self.check_collisions:
+                ctx.log("DRY_RUN: SIMULATE mode; collision validation ON; "
+                        "physical valve/rate outputs blocked")
+            else:
+                ctx.log("QUICK_SIMULATION: collision validation OFF; advisory visual "
+                        "preview only; physical valve/rate outputs blocked")
+            selected_layers = [layer for layer in self.plan.layers
+                               if layer.layer_index in self.layer_indices]
+            total = len(selected_layers)
             last_inspection_pose: dict | None = None
-            for index, layer in enumerate(self.plan.layers, start=1):
+            for index, layer in enumerate(selected_layers, start=1):
                 ctx.check_cancel()
-                ctx.progress(index, total, f"dry-running layer {layer.layer_index}")
-                name = _program_name(self.plan, layer.layer_index, "DRY")
+                action = "dry-running" if self.check_collisions else "quick-simulating"
+                ctx.progress(index, total, f"{action} layer {layer.layer_index}")
+                program_mode = "DRY" if self.check_collisions else "QUICK"
+                name = _program_name(self.plan, layer.layer_index, program_mode)
                 built = rdk.create_extrusion_layer_program(
                     name=name, points_xyz=points_array(layer),
                     orientation_rpy_deg=self.plan.setup.orientation_rpy_deg,
@@ -271,10 +339,18 @@ class CylinderDryRunJob:
                     rounding_mm=self.plan.recipe.path_rounding_mm,
                     approach_clearance_mm=self.plan.setup.approach_clearance_mm,
                     retreat_clearance_mm=self.plan.setup.retreat_clearance_mm,
-                    air_on_program=mock_on, air_off_program=mock_off)
+                    air_on_program=mock_on, air_off_program=mock_off,
+                    maximum_tool_axis_spin_deg=(
+                        self.plan.setup.maximum_tool_axis_spin_deg))
                 path_artifacts.extend(built["artifacts"])
                 current_program = name
-                validation = rdk.update_program(name, collisions=True)
+                # Generation and Update are synchronous RoboDK calls. A cancel
+                # received during either call is acted on as soon as it returns,
+                # before any simulated program can be started.
+                ctx.check_cancel()
+                validation = rdk.update_program(
+                    name, collisions=self.check_collisions)
+                ctx.check_cancel()
                 _require_program_valid(validation, layer.layer_index)
                 valve_events.extend([
                     {"layer_index": layer.layer_index, "event": "AirOn",
@@ -291,7 +367,9 @@ class CylinderDryRunJob:
                 inspect = _build_inspection_move(
                     rdk, self.plan, layer, inspection_name=inspection_name,
                     config=ecfg, camera=self.services.config.camera,
-                    seed_pose=last_inspection_pose)
+                    seed_pose=last_inspection_pose,
+                    collisions=self.check_collisions)
+                ctx.check_cancel()
                 if inspect["pose"]:
                     last_inspection_pose = inspect["pose"]
                 path_artifacts.extend(inspect["artifacts"])
@@ -318,9 +396,21 @@ class CylinderDryRunJob:
                         f"valve ON/OFF shown as mock events")
             rdk.move_j_joints(start_joints)
             report = {
-                "kind": "cylinder_dry_run", "mode": "DRY_RUN",
+                "kind": ("cylinder_dry_run" if self.check_collisions
+                         else "cylinder_quick_simulation"),
+                "mode": ("DRY_RUN" if self.check_collisions
+                         else "QUICK_SIMULATION"),
                 "fingerprint": self.plan.fingerprint, "all_ok": True,
                 "returned_to_start": True, "physical_outputs_blocked": True,
+                "collision_check_enabled": self.check_collisions,
+                "simulated_layer_indices": self.layer_indices,
+                "full_plan_simulated": len(self.layer_indices) == len(self.plan.layers),
+                "representative_layers_approve_full_plan": self.approve_full_plan,
+                "live_print_approved": bool(
+                    not self.check_collisions and
+                    (self.approve_full_plan
+                     or len(self.layer_indices) == len(self.plan.layers))),
+                "collision_map_optimization": collision_map_optimization,
                 "layers": reports, "valve_events": valve_events,
                 "setup": self.plan.setup.model_dump(mode="json"),
                 "recipe": self.plan.recipe.model_dump(mode="json"),
@@ -328,9 +418,18 @@ class CylinderDryRunJob:
             }
             (run_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             self.result = report
-            if self.on_pass is not None:
+            if self.on_pass is not None and self.check_collisions:
                 self.on_pass(self.plan.fingerprint)
-            ctx.log("dry run PASS: complete path, collisions, valve mocks, inspection, return-to-start")
+            if self.on_preview_pass is not None and not self.check_collisions:
+                self.on_preview_pass(
+                    self.plan.fingerprint, self.layer_indices,
+                    approve_full_plan=self.approve_full_plan)
+            if self.check_collisions:
+                ctx.log("dry run PASS: complete path, collisions, valve mocks, "
+                        "inspection, return-to-start")
+            else:
+                ctx.log("quick visual simulation PASS: collision checks were skipped; "
+                        f"simulated layer(s) {self.layer_indices}")
             completed = True
             return report
         finally:
@@ -348,6 +447,11 @@ class CylinderDryRunJob:
                 rdk.delete_items(list(dict.fromkeys(reversed(cleanup))))
             except Exception:
                 pass
+            if prior_simulation_speed is not None:
+                try:
+                    rdk.set_simulation_speed(prior_simulation_speed)
+                except Exception:
+                    pass
             if not completed and path_artifacts:
                 ctx.log("dry run failed: native curve/project/program kept in RoboDK; "
                         "Reset / clean RoboDK path removes them")
@@ -357,9 +461,10 @@ class CylinderDryRunJob:
 class CylinderPrintJob:
     """Print, capture one RGB-D frame, process, and archive each cylinder layer."""
 
-    def __init__(self, services, plan: CylinderPlan):
+    def __init__(self, services, plan: CylinderPlan, *, check_collisions: bool = True):
         self.services = services
         self.plan = plan.model_copy(deep=True)
+        self.check_collisions = bool(check_collisions)
         self.result: dict | None = None
         self.corrected_reference_xyz: np.ndarray | None = None
 
@@ -375,6 +480,21 @@ class CylinderPrintJob:
             raise RuntimeError("hardware I/O test is not approved")
         if services.live.running:
             services.live.stop()
+        # Prove that the inspection dependency is available before switching to
+        # RUN_ROBOT or issuing even the fail-safe valve program. A dead Jetson
+        # must block the run here, not after material has already been deposited.
+        try:
+            with _camera_hold(services, "extrusion-startup-camera-check"):
+                camera_check = services.camera.grab(
+                    with_depth=True, timeout=ecfg.grab_timeout_s)
+            if camera_check.depth is None:
+                raise RuntimeError("RGB-D readiness frame contained no depth")
+        except Exception as exc:
+            raise RuntimeError(
+                "live print blocked before robot motion: inspection camera is not ready: "
+                f"{exc}") from exc
+        ctx.log("inspection camera ready: depth frame received before robot motion")
+        ctx.check_cancel()
         applied = rdk.apply_run_mode("run_robot")
         if applied != "run_robot":
             raise RuntimeError("RoboDK refused RUN_ROBOT mode")
@@ -440,9 +560,16 @@ class CylinderPrintJob:
                         approach_clearance_mm=self.plan.setup.approach_clearance_mm,
                         retreat_clearance_mm=self.plan.setup.retreat_clearance_mm,
                         air_on_program=ecfg.air_on_program,
-                        air_off_program=ecfg.air_off_program)
+                        air_off_program=ecfg.air_off_program,
+                        maximum_tool_axis_spin_deg=(
+                            self.plan.setup.maximum_tool_axis_spin_deg))
                     artifacts.extend(built["artifacts"])
-                    validation = rdk.update_program(name, collisions=True)
+                    # Never start real motion if cancellation arrived during a
+                    # blocking RoboDK generation or collision-validation call.
+                    ctx.check_cancel()
+                    validation = rdk.update_program(
+                        name, collisions=self.check_collisions)
+                    ctx.check_cancel()
                     _require_program_valid(validation, layer.layer_index)
                     current_program = name
                     scheduled_at = _utcnow()
@@ -465,7 +592,9 @@ class CylinderPrintJob:
                     inspect = _build_inspection_move(
                         rdk, self.plan, layer, inspection_name=inspection_name,
                         config=ecfg, camera=services.config.camera,
-                        seed_pose=last_inspection_pose)
+                        seed_pose=last_inspection_pose,
+                        collisions=self.check_collisions)
+                    ctx.check_cancel()
                     if inspect["pose"]:
                         last_inspection_pose = inspect["pose"]
                     artifacts.extend(inspect["artifacts"])
@@ -554,6 +683,7 @@ class CylinderPrintJob:
             result = {"kind": "cylinder_print", "mode": "LIVE_PRINT",
                       "fingerprint": self.plan.fingerprint, "trial_id": trial_id,
                       "trial_dir": str(trial_dir), "layers": summaries,
+                      "collision_check_enabled": self.check_collisions,
                       "correction_available": self.corrected_reference_xyz is not None,
                       "correction_executed": False}
             (trial_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")

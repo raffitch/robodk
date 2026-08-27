@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from tasni.core.camera import Frame
+from tasni.core.camera import CameraError, Frame
 from tasni.core.camera_lease import CameraLease
 from tasni.core.config import AppConfig
 from tasni.modules.extrusion.models import (CylinderRecipe, CylinderSetup,
@@ -46,6 +46,13 @@ class FakeRdk:
     def apply_run_mode(self, mode): self.mode = 1 if mode == "simulate" else 6; self.events.append(("mode", mode)); return mode
     def current_joints(self): return "START"
     def move_j_joints(self, joints): self.events.append(("move-joints", joints))
+    def set_collision_checking(self, active):
+        self.events.append(("global-collisions", active)); return True
+    def simulation_speed(self): return 1.0
+    def set_simulation_speed(self, ratio): self.events.append(("sim-speed", ratio))
+    def disable_object_collision_pairs(self, names):
+        self.events.append(("collision-ignore", tuple(names)))
+        return {"objects": list(names), "pairs_disabled": len(names), "pairs_failed": 0}
     def ensure_mock_valve_programs(self, prefix):
         names = (prefix + "AirOn", prefix + "AirOff"); self.events.append(("mock", names)); return names
     def create_extrusion_layer_program(self, **kwargs):
@@ -146,7 +153,64 @@ def test_dry_run_uses_mock_outputs_and_restores_mode(tmp_path, monkeypatch):
     assert all(call["travel_speed_mm_s"] == 200 and
                call["rounding_mm"] == 1 for call in rdk.created)
     assert not any(event[0] == "station-program" for event in rdk.events)
+    assert ("collision-ignore", ("Tasni Scan Mesh",)) in rdk.events
+    assert ("global-collisions", False) in rdk.events
+    assert all(event[2] is True for event in rdk.events if event[0] == "update")
+    assert output["collision_check_enabled"] is True
+    assert output["full_plan_simulated"] is True
     assert rdk.mode == 6
+
+
+def test_quick_visual_simulation_skips_collisions_and_never_grants_live_approval(
+        tmp_path, monkeypatch):
+    svc, rdk, camera = services(tmp_path)
+    monkeypatch.setattr(service_mod, "new_run_dir",
+                        lambda module, stamp: _mkdir(tmp_path / module / stamp))
+    approved = []
+    previewed = []
+
+    output = CylinderDryRunJob(
+        svc, plan(), on_pass=approved.append,
+        on_preview_pass=lambda fingerprint, layers, **_: previewed.append((fingerprint, layers)),
+        check_collisions=False)(Ctx())
+
+    assert output["kind"] == "cylinder_quick_simulation"
+    assert output["mode"] == "QUICK_SIMULATION"
+    assert output["collision_check_enabled"] is False
+    assert output["simulated_layer_indices"] == [1, 2]
+    assert output["full_plan_simulated"] is True
+    assert approved == []
+    assert previewed == [(output["fingerprint"], [1, 2])]
+    assert camera.grabs == 0
+    assert not any(event[0] == "collision-ignore" for event in rdk.events)
+    assert ("global-collisions", False) in rdk.events
+    assert ("sim-speed", 5.0) in rdk.events
+    assert ("sim-speed", 1.0) in rdk.events
+    assert all(event[2] is False for event in rdk.events if event[0] == "update")
+    assert all(call["name"].startswith("TasniCylinder_QUICK_")
+               for call in rdk.created)
+
+
+def test_quick_visual_simulation_can_run_only_selected_layers(tmp_path, monkeypatch):
+    svc, rdk, _ = services(tmp_path)
+    monkeypatch.setattr(service_mod, "new_run_dir",
+                        lambda module, stamp: _mkdir(tmp_path / module / stamp))
+    previewed = []
+
+    output = CylinderDryRunJob(
+        svc, plan(layers=3), check_collisions=False, layer_indices=[2],
+        approve_full_plan=True,
+        on_preview_pass=lambda fingerprint, layers, **_: previewed.append((fingerprint, layers)),
+    )(Ctx())
+
+    assert output["simulated_layer_indices"] == [2]
+    assert output["full_plan_simulated"] is False
+    assert output["representative_layers_approve_full_plan"] is True
+    assert output["live_print_approved"] is True
+    assert previewed == [(output["fingerprint"], [2])]
+    assert len(rdk.created) == 1 and "_L002" in rdk.created[0]["name"]
+    assert not any("_L001" in str(event) or "_L003" in str(event)
+                   for event in rdk.events)
 
 
 def test_failed_dry_run_keeps_path_for_inspection_but_deletes_mock_io(tmp_path, monkeypatch):
@@ -165,6 +229,26 @@ def test_failed_dry_run_keeps_path_for_inspection_but_deletes_mock_io(tmp_path, 
     assert any("kept in RoboDK" in message for message in ctx.logs)
 
 
+def test_cancel_during_blocking_validation_never_starts_program(tmp_path, monkeypatch):
+    """A cancel received inside RoboDK Update must win before playback starts."""
+    svc, rdk, _ = services(tmp_path)
+    monkeypatch.setattr(service_mod, "new_run_dir",
+                        lambda module, stamp: _mkdir(tmp_path / module / stamp))
+    ctx = Ctx()
+    original_update = rdk.update_program
+
+    def update_then_cancel(name, collisions=True):
+        report = original_update(name, collisions=collisions)
+        ctx._cancelled = True
+        return report
+
+    rdk.update_program = update_then_cancel
+    with pytest.raises(RuntimeError, match="cancelled"):
+        CylinderDryRunJob(svc, plan(layers=1))(ctx)
+
+    assert not any(event[0] == "start" for event in rdk.events)
+
+
 def _mkdir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -177,10 +261,12 @@ def test_live_print_forces_off_captures_once_and_archives(tmp_path, monkeypatch)
     monkeypatch.setattr(service_mod, "_git_commit", lambda: "abc123")
     monkeypatch.setattr(service_mod.time, "sleep", lambda _: None)
     monkeypatch.setattr(service_mod.runs, "read_active", lambda module: {"run_id": "cal-1"})
-    output = CylinderPrintJob(svc, plan())(Ctx())
+    output = CylinderPrintJob(svc, plan(), check_collisions=False)(Ctx())
     assert output["kind"] == "cylinder_print"
+    assert output["collision_check_enabled"] is False
     assert output["correction_available"] and not output["correction_executed"]
-    assert camera.grabs == 2
+    # One readiness frame before any robot command, then one measurement/layer.
+    assert camera.grabs == 3
     # First real-cell action after mode/link setup is fail-safe AirOff, before create/motion.
     first_off = next(i for i, e in enumerate(rdk.events) if e[0] == "station-program")
     first_create = next(i for i, e in enumerate(rdk.events) if e[0] == "create")
@@ -190,6 +276,7 @@ def test_live_print_forces_off_captures_once_and_archives(tmp_path, monkeypatch)
                call["work_frame"] == "SelectedFrame" for call in rdk.created)
     assert all(call["air_on_program"] == "AirOn" and
                call["air_off_program"] == "AirOff" for call in rdk.created)
+    assert all(event[2] is False for event in rdk.events if event[0] == "update")
     for index in (1, 2):
         layer = Path(output["trial_dir"]) / f"layer-{index:03d}"
         for name in ("manifest.json", "color.png", "depth.npy", "segmentation.png",
@@ -219,6 +306,21 @@ def test_live_print_forces_off_after_processing_fault(tmp_path, monkeypatch):
     trial = next((tmp_path / "runs" / "extrusion").iterdir())
     assert (trial / "layer-001" / "depth.npy").is_file()
     assert "bad skeleton" in (trial / "layer-001" / "report.json").read_text()
+
+
+def test_live_print_blocks_before_any_robot_command_when_camera_is_offline(tmp_path):
+    svc, rdk, _ = services(tmp_path)
+
+    class OfflineCamera:
+        def grab(self, **kwargs):
+            raise CameraError("camera timeout (10.12.171.70:1024)")
+
+    svc.camera = OfflineCamera()
+    with pytest.raises(RuntimeError, match="blocked before robot motion"):
+        CylinderPrintJob(svc, plan(layers=1))(Ctx())
+
+    assert not any(event[0] in {"mode", "station-program", "create", "start"}
+                   for event in rdk.events)
 
 
 def test_failed_final_valve_off_inhibits_return_motion(tmp_path, monkeypatch):

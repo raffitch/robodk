@@ -3,7 +3,13 @@ import { apiGet } from "./client";
 
 export interface Health {
   robodk: { ok: boolean | null; detail: string };
-  camera: { ok: boolean | null; detail: string };
+  camera: {
+    ok: boolean | null;
+    state: "connected" | "offline" | "in_use";
+    detail: string;
+    route: string;
+    endpoint: string;
+  };
   job: { status: string; running: boolean };
 }
 
