@@ -217,6 +217,59 @@ def _comparison_image(mask: np.ndarray, lo: np.ndarray, mm_per_pixel: float,
     return image
 
 
+def _filter_deposit(points: np.ndarray, config, counts: dict) -> np.ndarray:
+    """Voxel -> statistical -> radius outliers -> largest DBSCAN cluster (Open3D).
+
+    Everything the deposit IS, flanks included -- the bead's full footprint. The
+    upward-facing crest is a further selection made by :func:`_top_surface`; bead
+    width has to be measured before that selection throws the flanks away.
+    """
+    try:
+        import open3d as o3d
+    except ImportError as exc:
+        raise RuntimeError("Open3D is required for extrusion processing; install tasni[scan]") from exc
+    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+    cloud = cloud.voxel_down_sample(config.voxel_size_m * 1000.0)
+    counts["after_voxel"] = len(cloud.points)
+    cloud, _ = cloud.remove_statistical_outlier(
+        nb_neighbors=config.statistical_neighbors, std_ratio=config.statistical_std_ratio)
+    counts["after_statistical"] = len(cloud.points)
+    cloud, _ = cloud.remove_radius_outlier(
+        nb_points=config.radius_neighbors, radius=config.radius_m * 1000.0)
+    counts["after_radius"] = len(cloud.points)
+    if len(cloud.points) < config.cluster_min_points:
+        raise RuntimeError("deposited cloud was removed by outlier filtering")
+    labels = np.asarray(cloud.cluster_dbscan(
+        eps=config.cluster_eps_m * 1000.0, min_points=config.cluster_min_points,
+        print_progress=False))
+    points = _largest_label(np.asarray(cloud.points), labels)
+    counts["after_largest_cluster"] = len(points)
+    return points
+
+
+def _top_surface(points: np.ndarray, config, counts: dict) -> np.ndarray:
+    """Upward-facing points of the deposit, then the largest cluster of those.
+
+    This is the surface the centreline is read from: the crest, not the flanks.
+    """
+    import open3d as o3d
+    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+    cloud.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=100.0, max_nn=30))
+    cloud.orient_normals_to_align_with_direction(np.array([0.0, 0.0, 1.0]))
+    normals = np.asarray(cloud.normals)
+    points = points[normals[:, 2] > config.upwards_normal_z]
+    counts["after_upward_normals"] = len(points)
+    if len(points) < config.cluster_min_points:
+        raise RuntimeError("too few upward-facing deposited points")
+    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
+    labels = np.asarray(cloud.cluster_dbscan(
+        eps=config.normal_cluster_eps_m * 1000.0,
+        min_points=config.cluster_min_points, print_progress=False))
+    points = _largest_label(points, labels)
+    counts["after_normal_cluster"] = len(points)
+    return points
+
+
 def process_observation(*, color: np.ndarray, depth: np.ndarray,
                         T_work_camera: np.ndarray, K: np.ndarray,
                         plan: CylinderPlan, layer: LayerPath, config) -> ProcessingResult:
@@ -245,40 +298,8 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
         raise RuntimeError("not enough deposited-geometry points inside the configured work ROI")
 
     mark = time.perf_counter()
-    try:
-        import open3d as o3d
-    except ImportError as exc:
-        raise RuntimeError("Open3D is required for extrusion processing; install tasni[scan]") from exc
-    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-    cloud = cloud.voxel_down_sample(config.voxel_size_m * 1000.0)
-    counts["after_voxel"] = len(cloud.points)
-    cloud, _ = cloud.remove_statistical_outlier(
-        nb_neighbors=config.statistical_neighbors, std_ratio=config.statistical_std_ratio)
-    counts["after_statistical"] = len(cloud.points)
-    cloud, _ = cloud.remove_radius_outlier(
-        nb_points=config.radius_neighbors, radius=config.radius_m * 1000.0)
-    counts["after_radius"] = len(cloud.points)
-    if len(cloud.points) < config.cluster_min_points:
-        raise RuntimeError("deposited cloud was removed by outlier filtering")
-    labels = np.asarray(cloud.cluster_dbscan(
-        eps=config.cluster_eps_m * 1000.0, min_points=config.cluster_min_points,
-        print_progress=False))
-    points = _largest_label(np.asarray(cloud.points), labels)
-    counts["after_largest_cluster"] = len(points)
-    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-    cloud.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=100.0, max_nn=30))
-    cloud.orient_normals_to_align_with_direction(np.array([0.0, 0.0, 1.0]))
-    normals = np.asarray(cloud.normals)
-    points = points[normals[:, 2] > config.upwards_normal_z]
-    counts["after_upward_normals"] = len(points)
-    if len(points) < config.cluster_min_points:
-        raise RuntimeError("too few upward-facing deposited points")
-    cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points))
-    labels = np.asarray(cloud.cluster_dbscan(
-        eps=config.normal_cluster_eps_m * 1000.0,
-        min_points=config.cluster_min_points, print_progress=False))
-    points = _largest_label(points, labels)
-    counts["after_normal_cluster"] = len(points)
+    deposit = _filter_deposit(points, config, counts)
+    points = _top_surface(deposit, config, counts)
     timings["filter_ms"] = (time.perf_counter() - mark) * 1000
 
     attempts: list[dict] = []

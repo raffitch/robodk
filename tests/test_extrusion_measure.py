@@ -51,3 +51,65 @@ def test_old_metrics_payload_without_offset_fields_still_validates():
                            measured_center_mm=(0, 0), measured_radius_mm=40,
                            path_completeness=1, maximum_angular_gap_deg=2, valid=True)
     assert old.center_offset_norm_mm == 0.0 and old.shape_rms_mm == 0.0
+
+
+# ------------------------------------------------- end-to-end synthetic processing
+
+from tasni.core.config import ExtrusionConfig
+from tasni.modules.extrusion.inspection import aim_point_mm
+from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup
+from tasni.modules.extrusion.processing import process_observation
+from tasni.modules.extrusion.toolpath import generate_cylinder_plan
+
+CENTER = (200.0, 150.0)
+
+
+def scene_plan(*, radius=60.0, bead=8.0, layers=1, layer_height=6.0, center=CENTER):
+    recipe = CylinderRecipe(radius_mm=radius, layer_count=layers, layer_height_mm=layer_height,
+                            bead_diameter_mm=bead, robot_speed_mm_s=75, extrusion_rate_pct=0,
+                            points_per_circle=180)
+    setup = CylinderSetup(print_tool="LongCalibTool", work_frame="Tasni Work Frame",
+                          inspection_tool="Realsense", inspection_auto=True,
+                          center_x_mm=center[0], center_y_mm=center[1])
+    return generate_cylinder_plan(recipe, setup)
+
+
+def observe(plan, layer_index, rings, *, config=None, floor_profile=None, seed=0):
+    """Render the rings from the derived inspection pose and process that frame."""
+    layer = plan.layers[layer_index - 1]
+    T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, layer_index), 300.0)
+    depth = syn.render_scene(rings, T, plane_center_xy_mm=(plan.setup.center_x_mm,
+                                                           plan.setup.center_y_mm), seed=seed)
+    color = np.zeros((syn.SIZE_720P[1], syn.SIZE_720P[0], 3), np.uint8)
+    kwargs = {} if floor_profile is None else {"floor_profile": floor_profile}
+    return process_observation(color=color, depth=depth, T_work_camera=T, K=syn.K_720P,
+                               plan=plan, layer=layer, config=config or ExtrusionConfig(),
+                               **kwargs)
+
+
+def test_true_ring_measures_as_true():
+    pytest.importorskip("open3d")
+    plan = scene_plan()
+    out = observe(plan, 1, [syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.flat(6.0))])
+    m = out.metrics
+    assert m.valid, m.warnings
+    assert m.mean_absolute_mm < 1.0 and m.rms_mm < 1.0
+    assert abs(m.measured_radius_mm - 60.0) < 1.0
+    assert m.center_offset_norm_mm < 1.0
+    assert m.path_completeness >= 0.95
+    assert out.report["timings_ms"]["total_ms"] > 0
+
+
+def test_ring_shifted_10mm_reports_the_shift():
+    pytest.importorskip("open3d")
+    plan = scene_plan()
+    out = observe(plan, 1, [syn.RingSpec(60.0, 8.0, (CENTER[0] + 10.0, CENTER[1]),
+                                          height_fn=syn.flat(6.0))])
+    m = out.metrics
+    assert m.valid, m.warnings
+    assert m.center_offset_mm[0] == pytest.approx(10.0, abs=1.0)
+    assert abs(m.center_offset_mm[1]) < 1.0
+    assert m.maximum_mm == pytest.approx(10.0, abs=1.5)
+    assert m.mean_absolute_mm == pytest.approx(6.36, abs=1.0)
+    assert m.rms_mm == pytest.approx(7.06, abs=1.0)
+    assert m.shape_rms_mm < 1.0
