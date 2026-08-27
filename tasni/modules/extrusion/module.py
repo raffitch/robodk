@@ -525,12 +525,12 @@ class ExtrusionModule(WorkflowModule):
                     "trials": items}
 
         @router.post("/trials/{trial_id}/layers/{layer_index}/reprocess")
-        def reprocess(trial_id: str, layer_index: int) -> dict:
+        def reprocess(trial_id: str, layer_index: int, take: int = 1) -> dict:
             if services.jobs.running:
                 raise HTTPException(409, "cannot reprocess while a robot job is running")
             try:
                 return reprocess_saved_layer(
-                    REPO_ROOT / "runs" / "extrusion", trial_id, layer_index)
+                    REPO_ROOT / "runs" / "extrusion", trial_id, layer_index, take)
             except (ValueError, FileNotFoundError) as exc:
                 raise HTTPException(404, str(exc)) from exc
             except RuntimeError as exc:

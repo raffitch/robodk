@@ -198,3 +198,43 @@ def test_characterize_recovers_a_ring_the_recipe_got_wrong():
     assert found.top_z_mean_mm == pytest.approx(6.0, abs=1.5)
     assert found.report["coarse"]["radius_mm"] == pytest.approx(60.0, abs=3.0)
     assert found.measured_xyz.shape[1] == 3
+
+
+# ------------------------------------------------------------- archive (Task 7)
+
+from tasni.modules.extrusion.archive import ExtrusionArchive
+from tasni.modules.extrusion.models import LayerManifest
+
+
+def test_archive_keeps_every_take_of_a_layer_and_records_the_mode(tmp_path):
+    plan = scene_plan()
+    archive = ExtrusionArchive(tmp_path)
+    trial = archive.create_trial("t1", plan, mode="MEASURE_ONLY",
+                                 experiment={"note": "dried rings, hand-placed"})
+    data = json.loads((trial / "trial.json").read_text())
+    assert data["mode"] == "MEASURE_ONLY" and data["experiment"]["note"].startswith("dried")
+    nominal = np.zeros((4, 3))
+    for take in (1, 2):
+        manifest = LayerManifest(trial_id="t1", layer_index=2, take=take, mode="MEASURE_ONLY",
+                                 recipe=plan.recipe, toolpath_fingerprint=plan.fingerprint,
+                                 annotation={"introduced_offset_mm": [10, 0]})
+        archive.write_layer(manifest, nominal_xyz=nominal, commanded_xyz=nominal)
+    assert (tmp_path / "t1" / "layer-002" / "manifest.json").is_file()
+    assert (tmp_path / "t1" / "layer-002-take02" / "manifest.json").is_file()
+    assert archive.layer_dir("t1", 2, take=2).name == "layer-002-take02"
+    loaded = json.loads((tmp_path / "t1" / "layer-002-take02" / "manifest.json").read_text())
+    assert loaded["take"] == 2 and loaded["annotation"]["introduced_offset_mm"] == [10, 0]
+
+
+def test_archive_writes_a_characterization_directory(tmp_path):
+    plan = scene_plan()
+    archive = ExtrusionArchive(tmp_path)
+    archive.create_trial("t1", plan, mode="MEASURE_ONLY")
+    out = archive.write_characterization(
+        "t1", 1, color=np.zeros((4, 4, 3), np.uint8), depth=np.zeros((4, 4), np.uint16),
+        measured_xyz=np.zeros((5, 3)),
+        derived_images={"comparison.png": np.zeros((4, 4, 3), np.uint8)},
+        report={"radius_mm": 60.0})
+    assert out.name == "characterize-01"
+    for name in ("color.png", "depth.npy", "measured_path.json", "comparison.png", "report.json"):
+        assert (out / name).is_file(), name

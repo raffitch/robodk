@@ -134,6 +134,13 @@ class LayerManifest(_Record):
     layer_index: int = Field(ge=1)
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     mode: str = "LIVE_PRINT"
+    # One layer can be measured repeatedly in the ring-stack experiment (noise
+    # floor, re-placement repeatability), so a layer index no longer identifies
+    # an archived directory on its own.
+    take: int = Field(default=1, ge=1)
+    # Operator ground truth for the measure-only experiment, e.g.
+    # {"introduced_offset_mm": [10.0, 0.0], "note": "ring 3 shifted +X"}.
+    annotation: dict[str, Any] = Field(default_factory=dict)
     recipe: CylinderRecipe
     toolpath_fingerprint: str
     nominal_path_file: str = "nominal_path.json"
