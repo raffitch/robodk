@@ -282,10 +282,26 @@ class RdkIO:
                 sol = self._ik_to_joints(self._solve_ik(T, seed), seed)
                 if sol is not None:
                     return sol
+                # A seedless SolveIK returns the branch nearest the robot's CURRENT
+                # joints, so the retry is only deterministic with the robot standing
+                # at the seed. That is how the question is asked, not an intended
+                # move: park it back afterwards, or a reachability preflight (or a
+                # target-generation sweep) silently walks the simulated cell along
+                # the sampled path and leaves it there.
+                parked = None
                 try:
-                    robot.setJoints(seed)   # deterministic 'nearest' for the retry
+                    parked = robot.Joints()
+                    robot.setJoints(seed)
                 except Exception:
-                    pass
+                    parked = None
+                try:
+                    return self._ik_to_joints(self._solve_ik(T), seed)
+                finally:
+                    if parked is not None:
+                        try:
+                            robot.setJoints(parked)
+                        except Exception:
+                            pass
             return self._ik_to_joints(self._solve_ik(T), seed)
         except Exception:
             return None
@@ -1161,6 +1177,43 @@ class RdkIO:
         self._frame_wrt_base_T = self._frame_pose_wrt_base(frame)
         return self._tool_pose
 
+    def active_tool_and_frame(self):
+        """The robot's currently selected ``(tool, frame)`` items; ``None`` if unset.
+
+        A read-only query still has to *select* the tool and frame it asks RoboDK
+        about, which replaces whatever the operator had active — with a long TCP
+        that visibly relocates the tool and re-bases the GUI's coordinate readout.
+        Capture the selection first so :meth:`restore_tool_and_frame` can hand it
+        back. Only the station-visible selection is captured; every consumer
+        re-activates via :meth:`use_named_tool_frame` before it queries, so the
+        cached ``_tool_pose``/``_frame`` are deliberately left alone."""
+        import robolink
+
+        robot = self.robot()
+        selected = []
+        for item_type in (robolink.ITEM_TYPE_TOOL, robolink.ITEM_TYPE_FRAME):
+            try:
+                item = robot.getLink(item_type)
+            except Exception:
+                item = None
+            selected.append(item if item is not None and item.Valid() else None)
+        return tuple(selected)
+
+    def restore_tool_and_frame(self, tool, frame) -> None:
+        """Re-select a selection captured by :meth:`active_tool_and_frame`.
+
+        Never raises: this runs in ``finally`` blocks, where losing the original
+        failure to a restore error would hide the real problem."""
+        robot = self.robot()
+        for setter, item in ((robot.setPoseTool, tool),
+                             (robot.setPoseFrame, frame)):
+            if item is None:
+                continue
+            try:
+                setter(item)
+            except Exception:
+                pass
+
     def _frame_pose_wrt_base(self, frame) -> np.ndarray:
         """Pose of ``frame`` w.r.t. the robot's base frame, via station-absolute
         poses — correct wherever either sits in the station tree."""
@@ -1188,67 +1241,76 @@ class RdkIO:
 
         This is an early placement check, not a replacement for Curve Follow
         generation or the collision-enabled complete program dry run.
+
+        Asking the question requires selecting ``print_tool``/``work_frame``, which
+        replaces the operator's active selection; the original is restored on the
+        way out (including on failure) so running a preflight does not appear to
+        relocate the robot in the RoboDK view.
         """
         pts = np.asarray(points_xyz, dtype=float)
         if pts.ndim != 2 or pts.shape[1] != 3 or not len(pts):
             raise ValueError("reachability path must be an Nx3 array")
         if not np.isfinite(pts).all():
             raise ValueError("reachability path contains non-finite coordinates")
-        self.use_named_tool_frame(print_tool, work_frame)
-        robot = self.robot()
-        seed = robot.Joints()
-        start_joints = seed
-        orientation = self.xyzrpy_pose_T([0.0, 0.0, 0.0], orientation_rpy_deg)
-        count = min(max(1, int(maximum_samples)), len(pts))
-        indices = sorted(set(int(round(v)) for v in
-                             np.linspace(0, len(pts) - 1, count)))
-        samples: list[dict] = []
-        for index in indices:
-            target = orientation.copy()
-            target[:3, 3] = pts[index]
-            try:
-                joints = self.solve_joints_on_neutral_branch(
-                    target, start_joints, seed, maximum_tool_axis_spin_deg)
-            except Exception:
-                joints = None
-            if joints is not None:
-                joints = self._nearest_equivalent_joints(joints, seed)
-            axis_4_rotation = self._joint_delta_deg(joints, start_joints, axis=3)
-            axis_6_rotation = self._joint_delta_deg(joints, start_joints, axis=5)
-            wrist_ok = (axis_4_rotation is not None and axis_6_rotation is not None
-                        and abs(axis_4_rotation) <= maximum_tool_axis_spin_deg
-                        and abs(axis_6_rotation) <= maximum_tool_axis_spin_deg)
-            reachable = joints is not None
-            acceptable = reachable and wrist_ok
-            samples.append({
-                "point_index": index,
-                "xyz_mm": [float(v) for v in pts[index]],
-                "reachable": acceptable,
-                "ik_reachable": reachable,
-                "axis_4_rotation_deg": axis_4_rotation,
-                "tool_axis_spin_deg": axis_6_rotation,
-                "reason": ("" if acceptable else
-                           ("no IK solution on the neutral wrist branch within "
-                            f"±{maximum_tool_axis_spin_deg:.1f} deg") if not reachable else
-                           "wrist rotation exceeds the neutral limit"),
-            })
-            if acceptable:
-                seed = joints
-        failed = [sample for sample in samples if not sample["reachable"]]
-        return {
-            "all_reachable": not failed,
-            "sample_count": len(samples),
-            "reachable_count": len(samples) - len(failed),
-            "first_unreachable": failed[0] if failed else None,
-            "frame": work_frame,
-            "tool": print_tool,
-            "orientation_rpy_deg": [float(v) for v in orientation_rpy_deg],
-            "maximum_tool_axis_spin_deg": float(maximum_tool_axis_spin_deg),
-            "note": ("Sampled poses have IK solutions; full curve/collision dry run is still required."
-                     if not failed else
-                     "At least one sampled path pose has no solution on the neutral "
-                     "robot configuration inside the axis-4/axis-6 rotation limit."),
-        }
+        previous_tool, previous_frame = self.active_tool_and_frame()
+        try:
+            self.use_named_tool_frame(print_tool, work_frame)
+            robot = self.robot()
+            seed = robot.Joints()
+            start_joints = seed
+            orientation = self.xyzrpy_pose_T([0.0, 0.0, 0.0], orientation_rpy_deg)
+            count = min(max(1, int(maximum_samples)), len(pts))
+            indices = sorted(set(int(round(v)) for v in
+                                 np.linspace(0, len(pts) - 1, count)))
+            samples: list[dict] = []
+            for index in indices:
+                target = orientation.copy()
+                target[:3, 3] = pts[index]
+                try:
+                    joints = self.solve_joints_on_neutral_branch(
+                        target, start_joints, seed, maximum_tool_axis_spin_deg)
+                except Exception:
+                    joints = None
+                if joints is not None:
+                    joints = self._nearest_equivalent_joints(joints, seed)
+                axis_4_rotation = self._joint_delta_deg(joints, start_joints, axis=3)
+                axis_6_rotation = self._joint_delta_deg(joints, start_joints, axis=5)
+                wrist_ok = (axis_4_rotation is not None and axis_6_rotation is not None
+                            and abs(axis_4_rotation) <= maximum_tool_axis_spin_deg
+                            and abs(axis_6_rotation) <= maximum_tool_axis_spin_deg)
+                reachable = joints is not None
+                acceptable = reachable and wrist_ok
+                samples.append({
+                    "point_index": index,
+                    "xyz_mm": [float(v) for v in pts[index]],
+                    "reachable": acceptable,
+                    "ik_reachable": reachable,
+                    "axis_4_rotation_deg": axis_4_rotation,
+                    "tool_axis_spin_deg": axis_6_rotation,
+                    "reason": ("" if acceptable else
+                               ("no IK solution on the neutral wrist branch within "
+                                f"±{maximum_tool_axis_spin_deg:.1f} deg") if not reachable else
+                               "wrist rotation exceeds the neutral limit"),
+                })
+                if acceptable:
+                    seed = joints
+            failed = [sample for sample in samples if not sample["reachable"]]
+            return {
+                "all_reachable": not failed,
+                "sample_count": len(samples),
+                "reachable_count": len(samples) - len(failed),
+                "first_unreachable": failed[0] if failed else None,
+                "frame": work_frame,
+                "tool": print_tool,
+                "orientation_rpy_deg": [float(v) for v in orientation_rpy_deg],
+                "maximum_tool_axis_spin_deg": float(maximum_tool_axis_spin_deg),
+                "note": ("Sampled poses have IK solutions; full curve/collision dry run is still required."
+                         if not failed else
+                         "At least one sampled path pose has no solution on the neutral "
+                         "robot configuration inside the axis-4/axis-6 rotation limit."),
+            }
+        finally:
+            self.restore_tool_and_frame(previous_tool, previous_frame)
 
     @staticmethod
     def _joint_values(joints) -> list[float] | None:
