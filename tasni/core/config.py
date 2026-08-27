@@ -798,6 +798,15 @@ class ExtrusionConfig(_Model):
     raster_mm_per_pixel: float = Field(default=1.0, gt=0, le=10)
     measured_spline_points: int = Field(default=180, ge=24, le=4000)
 
+    # -- ring-stack measure-only experiment (modules/extrusion/measure.py) ----
+    # Layer N keeps only points above the PREVIOUS layer's measured top at the
+    # nearest XY sample plus this margin, so a displaced ring cannot drag the
+    # exposed crescent of the ring beneath it into the skeleton.
+    layer_floor_margin_mm: float = Field(default=2.0, ge=0, le=20)
+    characterize_search_radius_mm: float = Field(default=150.0, gt=0, le=1000)
+    characterize_max_height_mm: float = Field(default=40.0, gt=0, le=200)
+    bead_width_bins: int = Field(default=36, ge=4, le=360)
+
 
 class WebConfig(_Model):
     host: str = "127.0.0.1"

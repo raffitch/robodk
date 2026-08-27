@@ -113,3 +113,27 @@ def test_ring_shifted_10mm_reports_the_shift():
     assert m.mean_absolute_mm == pytest.approx(6.36, abs=1.0)
     assert m.rms_mm == pytest.approx(7.06, abs=1.0)
     assert m.shape_rms_mm < 1.0
+
+
+def test_floor_from_previous_layer_keeps_the_ring_below_out_of_the_measurement():
+    pytest.importorskip("open3d")
+    plan = scene_plan(layers=2, layer_height=6.0)
+    ring1 = syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.flat(6.0))
+    first = observe(plan, 1, [ring1])
+    assert first.metrics.valid and first.report["floor"]["source"] == "build_plane"
+
+    ring2 = syn.RingSpec(60.0, 8.0, (CENTER[0] + 10.0, CENTER[1]), z_base_mm=6.0,
+                         height_fn=syn.flat(6.0))
+    floored = observe(plan, 2, [ring1, ring2], floor_profile=first.measured_xyz)
+    assert floored.metrics.valid, floored.metrics.warnings
+    assert floored.report["floor"]["source"] == "previous_layer_measured"
+    assert floored.metrics.center_offset_norm_mm == pytest.approx(10.0, abs=1.5)
+
+    # Without the floor the exposed crescent of ring 1 contaminates the answer:
+    # either the branch guard rejects it, or the offset is pulled well under 10.
+    try:
+        blended = observe(plan, 2, [ring1, ring2])
+    except RuntimeError:
+        return
+    assert (abs(blended.metrics.center_offset_norm_mm - 10.0)
+            > abs(floored.metrics.center_offset_norm_mm - 10.0) + 1.0)

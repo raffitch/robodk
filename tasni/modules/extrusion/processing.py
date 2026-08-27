@@ -272,8 +272,17 @@ def _top_surface(points: np.ndarray, config, counts: dict) -> np.ndarray:
 
 def process_observation(*, color: np.ndarray, depth: np.ndarray,
                         T_work_camera: np.ndarray, K: np.ndarray,
-                        plan: CylinderPlan, layer: LayerPath, config) -> ProcessingResult:
-    """Reconstruct one layer from exactly one saved synchronized RGB-D frame."""
+                        plan: CylinderPlan, layer: LayerPath, config,
+                        floor_profile: np.ndarray | None = None) -> ProcessingResult:
+    """Reconstruct one layer from exactly one saved synchronized RGB-D frame.
+
+    ``floor_profile`` is the previous layer's measured centreline (Nx3, work
+    frame). Given it, the ROI floor becomes that surface's local height at the
+    nearest XY sample rather than a single build-plane number -- which is what
+    lets a DISPLACED ring be measured without the exposed crescent of the ring
+    beneath it being dragged into the same skeleton. Omitted, behaviour is
+    exactly as before.
+    """
     started = time.perf_counter()
     timings: dict[str, float] = {}
     counts: dict[str, int] = {}
@@ -293,6 +302,15 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
            (radius >= recipe.radius_mm - config.radial_roi_margin_mm) &
            (radius <= recipe.radius_mm + config.radial_roi_margin_mm))
     points = points[roi]
+    floor = {"source": "build_plane", "margin_mm": 0.0, "mean_mm": float(min_z)}
+    if floor_profile is not None and len(points):
+        profile = np.asarray(floor_profile, dtype=float).reshape(-1, 3)
+        _, nearest = cKDTree(profile[:, :2]).query(points[:, :2])
+        local = profile[nearest, 2] + config.layer_floor_margin_mm
+        points = points[points[:, 2] >= local]
+        floor = {"source": "previous_layer_measured",
+                 "margin_mm": float(config.layer_floor_margin_mm),
+                 "mean_mm": float(local.mean())}
     counts["after_work_roi"] = len(points)
     if len(points) < config.cluster_min_points:
         raise RuntimeError("not enough deposited-geometry points inside the configured work ROI")
@@ -368,6 +386,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     timings["total_ms"] = (time.perf_counter() - started) * 1000
     report = {
         "counts": counts, "timings_ms": timings, "branch_guard_attempts": attempts,
+        "floor": floor,
         "coordinate_frame": plan.setup.work_frame, "units": "mm",
         "valid": metrics.valid, "warnings": metrics.warnings,
     }
