@@ -404,3 +404,80 @@ def test_characterize_job_measures_the_ring_and_stores_it_in_the_session(tmp_pat
     assert "station-program" not in kinds and "create" not in kinds
     assert rdk.events[-1] == ("move-joints", "START")
     assert MeasureSession.load(root, session.trial_id).characterizations[-1]["radius_mm"] == 61.2
+
+
+# ------------------------------------------------------------- API (Task 10)
+
+from fastapi.testclient import TestClient
+from tasni.core.config import AppConfig
+from tasni.modules.extrusion import module as extrusion_module
+from tasni.webapp.server import create_app
+
+
+def api_plan(client):
+    payload = {"recipe": auto_plan().recipe.model_dump(mode="json"),
+               "setup": auto_plan().setup.model_dump(mode="json")}
+    return client.post("/api/modules/extrusion/generate", json=payload).json()
+
+
+def test_measure_layer_is_gated_on_fingerprint_confirm_and_connection_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    cfg = AppConfig()
+    cfg.extrusion.hardware_io_test_approved = False          # irrelevant to measuring
+    client = TestClient(create_app(cfg))
+    plan = api_plan(client)
+    body = {"fingerprint": "stale", "layer_index": 1, "annotation": {},
+            "confirm_robot_motion": True}
+    assert client.post("/api/modules/extrusion/measure/layer", json=body).status_code == 409
+    body["fingerprint"] = plan["fingerprint"]
+    body["confirm_robot_motion"] = False
+    assert client.post("/api/modules/extrusion/measure/layer", json=body).status_code == 400
+    body["confirm_robot_motion"] = True
+    body["layer_index"] = 99
+    assert client.post("/api/modules/extrusion/measure/layer", json=body).status_code == 400
+    body["layer_index"] = 1
+    refused = client.post("/api/modules/extrusion/measure/layer", json=body)
+    assert refused.status_code == 409 and "RoboDK" in refused.json()["detail"]
+    assert "hardware" not in refused.json()["detail"].lower()
+
+
+def test_measure_session_is_created_listed_and_excluded_from_print_counts(tmp_path, monkeypatch):
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    client = TestClient(create_app(AppConfig()))
+    assert client.get("/api/modules/extrusion/measure/session").json()["session"] is None
+    assert client.post("/api/modules/extrusion/measure/session/new",
+                       json={"note": "x"}).status_code == 409      # needs a generated plan
+    api_plan(client)
+    created = client.post("/api/modules/extrusion/measure/session/new", json={"note": "rings"}).json()
+    trial_id = created["session"]["trial_id"]
+    assert (tmp_path / "runs" / "extrusion" / trial_id / "session.json").is_file()
+    assert client.get("/api/modules/extrusion/measure/session").json()["session"]["trial_id"] == trial_id
+    assert client.get("/api/modules/extrusion/status").json()["measure_session"] == trial_id
+    # A LIVE_PRINT trial beside it: only that one is a printed trial.
+    live = ExtrusionArchive(tmp_path / "runs" / "extrusion")
+    live.create_trial("20990101-000000-live0000", auto_plan())
+    trials = client.get("/api/modules/extrusion/trials").json()
+    assert trials["summary"]["total_trials"] == 1
+    assert trials["summary"]["measure_only_trials"] == 1
+    assert {t["trial_id"]: t["mode"] for t in trials["trials"]} == {
+        trial_id: "MEASURE_ONLY", "20990101-000000-live0000": "LIVE_PRINT"}
+
+
+def test_apply_characterization_rewrites_recipe_and_placement(tmp_path, monkeypatch):
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    client = TestClient(create_app(AppConfig()))
+    before = api_plan(client)
+    assert client.post("/api/modules/extrusion/measure/apply-characterization").status_code == 409
+    client.post("/api/modules/extrusion/measure/session/new", json={"note": ""})
+    session = MeasureSession.latest(tmp_path / "runs" / "extrusion")
+    session.characterizations.append({"index": 1, "radius_mm": 61.24, "center_mm": [214.0, 141.0],
+                                      "bead_width_mm": 8.31, "top_z_mean_mm": 6.44,
+                                      "top_z_min_mm": 5.1, "top_z_max_mm": 9.8})
+    session.save()
+    after = client.post("/api/modules/extrusion/measure/apply-characterization").json()
+    assert after["fingerprint"] != before["fingerprint"]
+    assert after["recipe"]["radius_mm"] == 61.2 and after["recipe"]["bead_diameter_mm"] == 8.3
+    assert after["recipe"]["layer_height_mm"] == 6.4
+    assert after["setup"]["center_x_mm"] == 214.0 and after["setup"]["center_y_mm"] == 141.0
+    assert after["setup"]["build_plane_z_mm"] == 0.0
+    assert client.get("/api/modules/extrusion/plan").json()["fingerprint"] == after["fingerprint"]

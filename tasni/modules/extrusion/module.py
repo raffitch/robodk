@@ -12,6 +12,8 @@ from ...core.jobrunner import JobBusy
 from ...core.logging import REPO_ROOT
 from ..base import ServiceContainer, WorkflowModule
 from .inspection import inspection_plan
+from .measure import (MODE as MEASURE_MODE, MeasureSession, RingCharacterizeJob,
+                      RingMeasureJob)
 from .models import CylinderPlan, CylinderRecipe, CylinderSetup
 from .service import (CylinderDryRunJob, CylinderPrintJob, geometry_preflight,
                       reprocess_saved_layer, station_requirements)
@@ -20,6 +22,11 @@ from .toolpath import corrected_cylinder_plan, generate_cylinder_plan
 
 if TYPE_CHECKING:
     from fastapi import APIRouter
+
+try:  # FastAPI is optional at import time; the helpers below need HTTPException.
+    from fastapi import HTTPException
+except ImportError:  # pragma: no cover - exercised only without the web extra
+    HTTPException = None  # type: ignore[assignment]
 
 
 class GenerateBody(BaseModel):
@@ -50,6 +57,22 @@ class TcpSeedBody(BaseModel):
     work_frame: str
 
 
+class MeasureSessionBody(BaseModel):
+    note: str = ""
+
+
+class MeasureLayerBody(FingerprintBody):
+    layer_index: int = Field(ge=1)
+    annotation: dict = Field(default_factory=dict)
+    confirm_robot_motion: bool = False
+    collision_check_enabled: bool = True
+
+
+class CharacterizeBody(BaseModel):
+    confirm_robot_motion: bool = False
+    collision_check_enabled: bool = True
+
+
 class SurfaceCenterBody(BaseModel):
     """The wall footprint to fit while centring, so the answer carries its own check."""
 
@@ -75,6 +98,38 @@ class ExtrusionModule(WorkflowModule):
         self._active_quick_job: CylinderDryRunJob | None = None
         self._active_dry_job: CylinderDryRunJob | None = None
         self._active_print_job: CylinderPrintJob | None = None
+        self._measure_session: MeasureSession | None = None
+        self._active_measure_job = None
+
+    def _measure_root(self):
+        return REPO_ROOT / "runs" / "extrusion"
+
+    def _session(self, *, create: bool = False) -> MeasureSession | None:
+        """The MEASURE_ONLY session, always re-read from disk.
+
+        A running job holds its OWN ``MeasureSession`` object and saves after
+        every take, so the API's view must come from ``session.json`` and never
+        from a cached copy that predates those saves.
+        """
+        root = self._measure_root()
+        if (self._measure_session is not None
+                and (root / self._measure_session.trial_id / "session.json").is_file()):
+            self._measure_session = MeasureSession.load(root, self._measure_session.trial_id)
+        elif self._measure_session is None:
+            self._measure_session = MeasureSession.latest(root)
+        if self._measure_session is None and create:
+            if self._plan is None:
+                raise HTTPException(
+                    409, "generate coordinates first; a session records the plan it measures against")
+            self._measure_session = MeasureSession.create(root, self._plan, note="")
+        return self._measure_session
+
+    def _invalidate_checks(self) -> None:
+        self._geometry_preflight_fingerprint = None
+        self._quick_sim_fingerprint = None
+        self._quick_sim_layers.clear()
+        self._quick_sim_approves_full_plan = False
+        self._dry_run_fingerprint = None
 
     def _default_recipe(self) -> CylinderRecipe:
         c = self.services.config.extrusion
@@ -461,6 +516,90 @@ class ExtrusionModule(WorkflowModule):
             self._active_print_job = None
             return {"status": "reset", "removed": removed}
 
+        # -- ring-stack measure-only experiment (measure.py) ------------------
+        # No dry-run, quick-sim or hardware-I/O gate here on purpose: the only
+        # motion is the inspection move, which is collision-validated and
+        # wrist-gated at execution exactly as it is inside the live print.
+
+        @router.get("/measure/session")
+        def measure_session() -> dict:
+            session = self._session()
+            return {"mode": MEASURE_MODE,
+                    "session": None if session is None else session.to_json()}
+
+        @router.post("/measure/session/new")
+        def measure_session_new(body: MeasureSessionBody) -> dict:
+            if self._plan is None:
+                raise HTTPException(409, "generate coordinates first")
+            if services.jobs.running:
+                raise HTTPException(409, "a job is already running")
+            self._measure_session = MeasureSession.create(
+                self._measure_root(), self._plan, note=body.note)
+            return {"mode": MEASURE_MODE, "session": self._measure_session.to_json()}
+
+        def _require_measure_ready(confirm: bool) -> None:
+            if self._plan is None:
+                raise HTTPException(409, "generate coordinates first")
+            if not confirm:
+                raise HTTPException(400, "confirm that the robot may move to the inspection pose")
+            if not services.session.is_open:
+                raise HTTPException(409, "connect to RoboDK first (the camera move is a real robot motion)")
+            if services.jobs.running:
+                raise HTTPException(409, "a job is already running")
+
+        @router.post("/measure/characterize")
+        def measure_characterize(body: CharacterizeBody) -> dict:
+            _require_measure_ready(body.confirm_robot_motion)
+            session = self._session(create=True)
+            self._active_measure_job = RingCharacterizeJob(
+                services, self._plan, session, check_collisions=body.collision_check_enabled)
+            try:
+                services.jobs.start(self._active_measure_job, name="extrusion-characterize")
+            except JobBusy as exc:
+                raise HTTPException(409, str(exc))
+            return {"status": "started", "mode": MEASURE_MODE, "trial_id": session.trial_id}
+
+        @router.post("/measure/apply-characterization")
+        def measure_apply() -> dict:
+            session = self._session()
+            if session is None or not session.characterizations:
+                raise HTTPException(409, "characterize a ring first")
+            if services.jobs.running:
+                raise HTTPException(409, "wait for the current job to finish")
+            found = session.characterizations[-1]
+            base_recipe = self._plan.recipe if self._plan else self._default_recipe()
+            base_setup = (self._plan.setup.model_dump(mode="json") if self._plan
+                          else self._default_setup())
+            recipe = base_recipe.model_copy(update={
+                "radius_mm": round(float(found["radius_mm"]), 1),
+                "bead_diameter_mm": round(max(0.5, float(found["bead_width_mm"])), 1),
+                "layer_height_mm": round(max(0.5, float(found["top_z_mean_mm"])), 1)})
+            setup = CylinderSetup(**{**base_setup,
+                                     "center_x_mm": float(found["center_mm"][0]),
+                                     "center_y_mm": float(found["center_mm"][1]),
+                                     "build_plane_z_mm": 0.0})
+            self._plan = generate_cylinder_plan(recipe, setup)
+            self._invalidate_checks()
+            return self._plan.model_dump(mode="json")
+
+        @router.post("/measure/layer")
+        def measure_layer(body: MeasureLayerBody) -> dict:
+            if self._plan is None or body.fingerprint != self._plan.fingerprint:
+                raise HTTPException(409, "toolpath changed; generate coordinates again")
+            if body.layer_index > len(self._plan.layers):
+                raise HTTPException(400, f"layer_index must be 1..{len(self._plan.layers)}")
+            _require_measure_ready(body.confirm_robot_motion)
+            session = self._session(create=True)
+            self._active_measure_job = RingMeasureJob(
+                services, self._plan, session, body.layer_index,
+                annotation=body.annotation, check_collisions=body.collision_check_enabled)
+            try:
+                services.jobs.start(self._active_measure_job, name="extrusion-measure")
+            except JobBusy as exc:
+                raise HTTPException(409, str(exc))
+            return {"status": "started", "mode": MEASURE_MODE, "trial_id": session.trial_id,
+                    "layer_index": body.layer_index, "take": session.next_take(body.layer_index)}
+
         @router.get("/status")
         def status() -> dict:
             fingerprint = self._plan.fingerprint if self._plan else None
@@ -483,6 +622,8 @@ class ExtrusionModule(WorkflowModule):
                     and self._quick_sim_approves_full_plan),
                 "dry_run_passed": bool(
                     fingerprint and fingerprint == self._dry_run_fingerprint),
+                "measure_session": (self._measure_session.trial_id
+                                    if self._measure_session else None),
                 "hardware_io_test_approved": bool(
                     services.config.extrusion.hardware_io_test_approved),
                 "live_print_enabled": bool(
@@ -493,23 +634,28 @@ class ExtrusionModule(WorkflowModule):
 
         @router.get("/trials")
         def trials() -> dict:
-            root = REPO_ROOT / "runs" / "extrusion"
+            root = self._measure_root()
             items = []
             recipe_keys: set[str] = set()
-            total_layers = 0
+            total_trials = total_layers = 0
+            measure_only_trials = measure_only_takes = 0
             if root.is_dir():
                 for path in sorted(root.iterdir(), reverse=True):
                     trial_file = path / "trial.json"
                     if path.is_dir() and trial_file.is_file():
                         data = json.loads(trial_file.read_text(encoding="utf-8"))
-                        recipe_keys.add(json.dumps(data.get("recipe", {}), sort_keys=True))
+                        mode = data.get("mode", "LIVE_PRINT")
+                        data["mode"] = mode
                         layers = []
                         for manifest_path in sorted(path.glob("layer-*/manifest.json")):
                             try:
                                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                                 layers.append({
                                     "layer_index": manifest.get("layer_index"),
+                                    "take": manifest.get("take", 1),
+                                    "annotation": manifest.get("annotation", {}),
                                     "metrics": manifest.get("metrics"),
+                                    "geometry": manifest.get("geometry"),
                                     "valid": bool((manifest.get("metrics") or {}).get("valid")),
                                     "has_comparison": (manifest_path.parent / "comparison.png").is_file(),
                                 })
@@ -517,11 +663,21 @@ class ExtrusionModule(WorkflowModule):
                                 continue
                         data["layers_archived"] = len(layers)
                         data["layers"] = layers
-                        total_layers += len(layers)
+                        # A measurement session is not a print. Counting one as a
+                        # trial would inflate exactly the number the paper cites.
+                        if mode == "LIVE_PRINT":
+                            recipe_keys.add(json.dumps(data.get("recipe", {}), sort_keys=True))
+                            total_trials += 1
+                            total_layers += len(layers)
+                        else:
+                            measure_only_trials += 1
+                            measure_only_takes += len(layers)
                         items.append(data)
-            return {"summary": {"total_trials": len(items),
+            return {"summary": {"total_trials": total_trials,
                                 "total_layers": total_layers,
-                                "total_recipes": len(recipe_keys)},
+                                "total_recipes": len(recipe_keys),
+                                "measure_only_trials": measure_only_trials,
+                                "measure_only_takes": measure_only_takes},
                     "trials": items}
 
         @router.post("/trials/{trial_id}/layers/{layer_index}/reprocess")
