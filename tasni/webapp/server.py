@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..core import runs as runs_registry
+from ..core.build_info import build_info
 from ..core.config import AppConfig, load_config
 from ..core.health import ROBODK_API_PORT, connection_route, tcp_probe
 from ..modules.base import ServiceContainer
@@ -85,6 +86,10 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "robodk": {"ok": robodk_ok, "detail": f"API :{ROBODK_API_PORT}"},
             "camera": camera,
             "job": {"status": services.jobs.status, "running": services.jobs.running},
+            # Whether this process is still running the code that is on disk.
+            # Editing tasni/**.py does nothing until the app restarts, and a cell
+            # test against stale code looks exactly like a failed fix.
+            "build": build_info(),
         }
 
     @app.get("/api/rdk/status")

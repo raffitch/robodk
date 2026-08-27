@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from ...core import runs
+from ...core.build_info import build_info, staleness_warning
 from ...core.config import ExtrusionConfig
 from ...core.jobrunner import JobContext
 from ...core.logging import REPO_ROOT, new_run_dir
@@ -112,12 +113,25 @@ def station_requirements(rdk: RdkIO, plan: CylinderPlan, config) -> dict:
 
 
 def _git_commit() -> str:
+    """The CHECKED-OUT commit. Kept for continuity in archived reports.
+
+    This is not necessarily the code that ran: the app caches imported modules,
+    so a report could name a commit the process never loaded. ``build_info()``
+    records the running build, which is the value to trust.
+    """
     try:
         return subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT,
             text=True, stderr=subprocess.DEVNULL).strip()
     except Exception:
         return "unknown"
+
+
+def _warn_if_stale(ctx) -> None:
+    """Say so, loudly and early, when the process is running stale code."""
+    warning = staleness_warning()
+    if warning:
+        ctx.log("STALE CODE: " + warning)
 
 
 def _utcnow() -> str:
@@ -319,6 +333,7 @@ class CylinderDryRunJob:
             else:
                 ctx.log("QUICK_SIMULATION: collision validation OFF; advisory visual "
                         "preview only; physical valve/rate outputs blocked")
+            _warn_if_stale(ctx)
             selected_layers = [layer for layer in self.plan.layers
                                if layer.layer_index in self.layer_indices]
             total = len(selected_layers)
@@ -415,6 +430,7 @@ class CylinderDryRunJob:
                 "setup": self.plan.setup.model_dump(mode="json"),
                 "recipe": self.plan.recipe.model_dump(mode="json"),
                 "run_dir": str(run_dir), "git_commit": _git_commit(),
+                "build": build_info(),
             }
             (run_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             self.result = report
@@ -472,6 +488,7 @@ class CylinderPrintJob:
         services = self.services
         rdk: RdkIO = services.rdk
         ecfg = services.config.extrusion
+        _warn_if_stale(ctx)
         required = station_requirements(rdk, self.plan, ecfg)
         if not required["ready"]:
             missing = ", ".join(f"{v['type']} {v['name']!r}" for v in required["missing"])
@@ -508,7 +525,8 @@ class CylinderPrintJob:
         archive = ExtrusionArchive(REPO_ROOT / "runs" / "extrusion")
         calibration = runs.read_active("calibration")
         provenance = {
-            "git_commit": _git_commit(), "calibration": calibration,
+            "git_commit": _git_commit(), "build": build_info(),
+            "calibration": calibration,
             "camera_resolution": services.config.camera.resolution,
             "camera_intrinsics": {
                 "K": np.asarray(services.config.camera.K, dtype=float).tolist(),
