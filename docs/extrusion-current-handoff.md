@@ -265,7 +265,12 @@ workflow:
 5. Machining parameters configure process/rapid speeds, blending, approach/retract,
    and `CallPathStart`/`CallPathFinish`.
 6. `UpdatePath` and project `Update(COLLISION_OFF)` generate the linked program.
-7. Generated motion instructions are pinned to the exact requested fixed rotation.
+7. The path-to-tool seed is COMPUTED (`curve_follow_seed_T`) so RoboDK generates
+   the commanded rotation: a Curve Follow Project mirrors the roll it is seeded
+   with, and inverting that mirror is what removed the axis-4 wrist flip. The
+   generated program is then kept as emitted — **zero station targets** — and
+   verified: per-instruction pose error, the interpolated wrist-flip sample check,
+   valve-call placement, and an unchanged station target count.
 8. Program `Update(COLLISION_ON)` is the authoritative complete validation.
 
 Official references used during implementation:
