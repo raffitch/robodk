@@ -24,6 +24,10 @@ routes side by side, in ONE process, against the real station:
   import half is opt-in (``--try-src-import``): RoboDK opens a MODAL import dialog
   for a ``.src``, so headless it blocks forever and the dialog lands on the
   operator's screen.  Writing the ``.src`` (``Item.MakeProgram``) works fine.
+* **Probe V** - WHERE RoboDK places the CallPathStart/CallPathFinish valve
+  calls.  Safety-relevant: the extruder must not open at the approach standoff.
+  Measured: it opens right after the nozzle descends to the first path point and
+  closes before the retract lifts it.
 * **Probe C** - one-target neutral prefix on Probe A's best program (fallback).
 
 Measured verdicts on this cell (2026-08-27), full numbers in the repo handoff:
@@ -621,6 +625,81 @@ def probe_roll(context) -> list:
     return results
 
 
+# --- PROBE V ------------------------------------------------------------------
+
+def probe_valves(context) -> dict:
+    """WHERE does RoboDK put the CallPathStart / CallPathFinish program calls?
+
+    Safety-relevant: the extruder valve must open once the nozzle is down at the
+    first path point, not while it is still at the approach standoff 40 mm above
+    the plane.  The old hand-built program placed them itself; the native program
+    places them by RoboDK's own rule, so that rule has to be measured before
+    anything asserts on it.
+    """
+    tool = context["tools"][PRINT_TOOL_NAME]
+    commanded = context["orientation"][PRINT_TOOL_NAME]
+    points, parked = context["points"], context["parked"]
+    plane_z = float(points[0][2])
+    seed = seed_from_source(seed_source_matrix(commanded))
+    program, status = generate_native_program(context, "SpikeV", tool, commanded, seed)
+    out = {"setup_status": status}
+    if not (program.Valid() and status >= 0):
+        out["error"] = "no program generated"
+        say("  no program generated (status %s)" % status)
+        return out
+    types = {value: key for key, value in vars(robolink).items()
+             if key.startswith("INS_TYPE_")}
+    rows, move_ordinal = [], 0
+    total = program.InstructionCount()
+    for index in range(total):
+        name, instype, movetype, isjoint, target, _joints = program.Instruction(index)
+        entry = {"index": index, "name": name,
+                 "type": types.get(instype, instype), "move_ordinal": None,
+                 "height_mm": None, "xy": None}
+        if instype == robolink.INS_TYPE_MOVE:
+            entry["move_ordinal"] = move_ordinal
+            move_ordinal += 1
+            if target is not None:
+                position = T_of(target)[:3, 3]
+                entry["height_mm"] = round(float(position[2]) - plane_z, 2)
+                entry["xy"] = fmt(position[:2], 1)
+        rows.append(entry)
+        if name == AIR_ON:
+            out["air_on_index"] = index
+        if name == AIR_OFF:
+            out["air_off_index"] = index
+    out["instruction_count"] = total
+    out["move_count"] = move_ordinal
+
+    def describe(where):
+        if where is None:
+            return "ABSENT"
+        before = next((r for r in reversed(rows[:where]) if r["move_ordinal"] is not None), None)
+        after = next((r for r in rows[where + 1:] if r["move_ordinal"] is not None), None)
+        return ("after move #%s at %s mm, before move #%s at %s mm"
+                % (before and before["move_ordinal"], before and before["height_mm"],
+                   after and after["move_ordinal"], after and after["height_mm"]))
+
+    out["air_on_placement"] = describe(out.get("air_on_index"))
+    out["air_off_placement"] = describe(out.get("air_off_index"))
+    say("  %d instructions, %d moves. AirOn at index %s: %s"
+        % (total, move_ordinal, out.get("air_on_index"), out["air_on_placement"]))
+    say("  AirOff at index %s: %s" % (out.get("air_off_index"), out["air_off_placement"]))
+    say("  first 10 instructions:")
+    for entry in rows[:10]:
+        say("    [%3d] %-34r %-22s move#%-4s height%+8s mm  xy=%s"
+            % (entry["index"], entry["name"], entry["type"],
+               entry["move_ordinal"], entry["height_mm"], entry["xy"]))
+    say("  last 10 instructions:")
+    for entry in rows[-10:]:
+        say("    [%3d] %-34r %-22s move#%-4s height%+8s mm  xy=%s"
+            % (entry["index"], entry["name"], entry["type"],
+               entry["move_ordinal"], entry["height_mm"], entry["xy"]))
+    out.update({("path_" + k): v for k, v in
+                path_joint_report(program, parked).items()})
+    return out
+
+
 # --- PROBE B ------------------------------------------------------------------
 
 def krl_pose(T) -> str:
@@ -905,7 +984,7 @@ def probe_c(context, base: str, tool_name: str) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="extrusion inline-program probe")
     parser.add_argument("--station", default=DEFAULT_STATION)
-    parser.add_argument("--probes", default="A,R,B,C")
+    parser.add_argument("--probes", default="A,R,V,B,C")
     parser.add_argument("--try-src-import", action="store_true",
                         help="attempt Robolink.AddFile on the generated .src files. "
                              "OFF by default: the importer opens a modal dialog, so "
@@ -1034,6 +1113,13 @@ def main() -> int:
         say("PROBE R - does the winning seed TRACK the commanded roll or mirror it?")
         say("-" * 78)
         results["R"] = probe_roll(context)
+
+    if "V" in wanted:
+        say("")
+        say("-" * 78)
+        say("PROBE V - where does RoboDK place the AirOn / AirOff program calls?")
+        say("-" * 78)
+        results["V"] = probe_valves(context)
 
     if "B" in wanted:
         say("")
