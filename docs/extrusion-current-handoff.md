@@ -171,6 +171,39 @@ the checkbox and the dropdown is required again.
 Primary code: `tasni/modules/extrusion/inspection.py` (pure numpy),
 `service.py:_build_inspection_move`, `rdk_io.py:create_inspection_target`.
 
+## Ring-stack measure-only experiment (paper evidence, 2026-08-27)
+
+Design: `docs/superpowers/specs/2026-08-27-ring-stack-measure-only-design.md`;
+plan: `docs/superpowers/plans/2026-08-27-ring-stack-measure-only.md`.
+
+`MEASURE_ONLY` (`tasni/modules/extrusion/measure.py`) measures hand-placed dried
+rings: each press moves only the camera to the derived inspection pose, takes one
+RGB-D frame, runs `process_observation` (with the previous ring's measured top as
+the floor) and archives a take under a `MEASURE_ONLY` trial that `/trials` never
+counts as a print. `characterize_ring` derives radius / bead / height / centre from
+ring 1 so the recipe comes from the physical ring, not a caliper.
+`GET /trials/{id}/paper-summary` groups takes by the operator's introduced offset
+and reports deviation, timing (`acquisition_to_path_ms`), height and bead numbers
+with a ready-to-paste Markdown block.
+
+Cell protocol: scan surface applied → Center on scanned surface → Generate → place
+ring 1 → Characterize → Apply → Generate → Measure L1 ×5 (noise floor) → re-place
+×3 → ring 2 true → Measure L2 → ring 3 true → Measure L3 → shift a ring 10 mm
+(type it in) → Measure → shift 15 mm → Measure → Paper summary. Keep offsets
+≤ 25 mm (radial ROI ±30 mm). Expected for a pure shift d: offset ≈ d, max ≈ d,
+mean ≈ 0.64 d, RMS ≈ 0.71 d.
+
+Proven on synthetic RGB-D before any robot motion (`tests/extrusion_synthetic.py`
+renders rings through the cell's real 720p intrinsics from the pose the job
+derives): a true 60 mm ring reads mean 0.80 / RMS 0.92 mm; the same ring shifted
+10 mm in +X reads offset 9.92, max 10.96, mean 6.39, RMS 7.12 mm; a stacked ring
+shifted 10 mm over a true ring 1 reads 10.17 mm WITH the per-layer floor and
+exhausts the branch guard without it.
+
+After the first real capture, copy `color.png` + `depth.npy` + `manifest.json` from
+the take into `tests/fixtures/extrusion/ring1/` (npz-compressed) and add a
+regression test that reprocesses it to the archived metrics.
+
 ## Exact operator retry sequence
 
 1. Refresh the Cylinder Test page and connect/refresh the RoboDK station.

@@ -152,6 +152,9 @@ you drive the real cell, not an empty station). Run it on Windows with
     **dry tour** (reachability / collision / return-to-start) before the real run.
   - Next ideas: model the board + table as collision objects (so a pose that would
     bump the physical board is auto-filtered, not just tool↔arm); live 3D viewport.
+- ✅ **Ring-stack measure-only experiment** (paper evidence): measure hand-placed rings
+  through the inspection chain, characterize ring 1, paper summary. Spec + plan in
+  docs/superpowers/. Cell run pending.
 - Then integrate the rest into the same app: scan (with **TSDF fusion** — biggest quality
   win), ArUco-to-plane, target generation. RealSense High-Accuracy preset + filter order
   live in `server/server_unicast_syncronous.py`. Tailscale (off-LAN) deferred.

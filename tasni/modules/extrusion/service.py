@@ -756,10 +756,11 @@ class CylinderPrintJob:
                 pass
 
 
-def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int) -> dict:
+def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
+                          take: int = 1) -> dict:
     """Rebuild only derived artifacts from one archived raw RGB-D observation."""
     archive = ExtrusionArchive(root)
-    layer_dir = archive.layer_dir(trial_id, layer_index)
+    layer_dir = archive.layer_dir(trial_id, layer_index, take=take)
     trial_dir = layer_dir.parent
     trial = json.loads((trial_dir / "trial.json").read_text(encoding="utf-8"))
     manifest = LayerManifest.model_validate_json(

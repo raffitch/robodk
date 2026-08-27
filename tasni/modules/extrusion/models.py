@@ -94,7 +94,38 @@ class DeviationMetrics(_Record):
     path_completeness: float
     maximum_angular_gap_deg: float
     valid: bool
+    # Fitted-circle centre minus the NOMINAL centre: the direct readout of a
+    # bodily displacement of the ring (the paper's introduced-offset check).
+    center_offset_mm: tuple[float, float] = (0.0, 0.0)
+    center_offset_norm_mm: float = 0.0
+    # Radial scatter about the FITTED circle: "ring is not round", separated
+    # from "ring placed wrong".
+    shape_rms_mm: float = 0.0
+    shape_max_mm: float = 0.0
     warnings: list[str] = Field(default_factory=list)
+
+
+class RingGeometry(_Record):
+    """What the ring looks like, not how far it is from nominal.
+
+    ``top_z_*`` are the measured centreline heights in the work frame;
+    ``height_*`` subtract the reference surface -- the build plane for the first
+    ring, or the previous ring's measured top at the nearest sample.
+    ``bead_width_*`` is the radial footprint of the deposit cloud per angular bin
+    (percentile extent, so the bead's flanks count, outliers do not).
+    """
+    top_z_mean_mm: float
+    top_z_min_mm: float
+    top_z_max_mm: float
+    top_z_std_mm: float
+    height_mean_mm: float
+    height_min_mm: float
+    height_max_mm: float
+    height_reference: str
+    bead_width_mean_mm: float
+    bead_width_min_mm: float
+    bead_width_max_mm: float
+    bead_width_bins: int
 
 
 class LayerManifest(_Record):
@@ -103,6 +134,13 @@ class LayerManifest(_Record):
     layer_index: int = Field(ge=1)
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     mode: str = "LIVE_PRINT"
+    # One layer can be measured repeatedly in the ring-stack experiment (noise
+    # floor, re-placement repeatability), so a layer index no longer identifies
+    # an archived directory on its own.
+    take: int = Field(default=1, ge=1)
+    # Operator ground truth for the measure-only experiment, e.g.
+    # {"introduced_offset_mm": [10.0, 0.0], "note": "ring 3 shifted +X"}.
+    annotation: dict[str, Any] = Field(default_factory=dict)
     recipe: CylinderRecipe
     toolpath_fingerprint: str
     nominal_path_file: str = "nominal_path.json"
@@ -113,6 +151,7 @@ class LayerManifest(_Record):
     depth_file: str | None = None
     pointcloud_file: str | None = None
     metrics: DeviationMetrics | None = None
+    geometry: RingGeometry | None = None
     processing: dict[str, Any] = Field(default_factory=dict)
     provenance: dict[str, Any] = Field(default_factory=dict)
     valve_transitions: list[dict[str, Any]] = Field(default_factory=list)
