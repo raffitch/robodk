@@ -44,6 +44,24 @@ station target count.
 All of it is reproducible with **`tools/probe_extrusion_branch.py`** (probes A, R, V,
 B, C) against a private headless licensed instance.
 
+**The INSPECTION move had the same class of bug** (fixed on
+`extrusion-inspection-roll`). Not the seed this time, but the same shape: an
+arbitrary orientation convention that happens to be exactly 180° off on this cell.
+`pose_from_aim` hard-coded its roll reference to the work frame's +X, while the
+Realsense TCP at the parked joints reads X=[-1,0,0] Y=[0,1,0] Z=[0,0,-1] in
+`Tasni Work Frame` — so "roll 0" was 179.7° from the robot's own camera
+orientation. RoboDK returned only four IK branches for it and every one was flipped
+(|dA4| or |dA6| ≈ 178°); the seeded `SolveIK` stored
+`[91.9, -50.4, 117.1, -177.9, -82.2, 1.9]` (dA4 = −178.1) and it passed collision
+validation, because a flipped wrist is not a collision. The roll-180 candidate is
+0.8° from the parked camera orientation and solves to
+`[89.8, -62.5, 147.8, 0.9, -54.1, -0.2]`. Fix: roll is referenced to the camera at
+the job's start joints, and the target is solved with
+`solve_joints_on_neutral_branch` instead of a seeded `SolveIK`. Lesson worth
+generalising: **any fixed orientation convention in this cell deserves a gate that
+compares against the robot's own neutral pose**, because a wrong one still
+collision-validates.
+
 ---
 
 

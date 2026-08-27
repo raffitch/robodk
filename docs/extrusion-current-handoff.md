@@ -131,6 +131,28 @@ on, and a **joint** target is created per layer.
 - **Fronto-parallel first.** The 2026-08-13 characterization measured incidence
   costing ~4× what distance costs, so candidates are ordered straight-down → roll
   (free: still square to the surface, different wrist config) → 10° tilt.
+- **Roll is measured from the ROBOT, not the work frame.** `pose_from_aim` takes a
+  `reference_x`, and the service passes the camera's own +X at the job's start
+  joints (read back with `RdkIO.camera_axes_in_frame`, no motion), so "roll 0"
+  means the orientation the operator parked the camera in. It used to be
+  hard-coded to the work frame's +X, and on this cell those are 180° apart: the
+  Realsense TCP at the parked joints reads X=[-1,0,0] Y=[0,1,0] Z=[0,0,-1] in
+  `Tasni Work Frame`, so frame-referenced "roll 0" was 179.7° from the robot's
+  natural camera orientation and RoboDK could only reach it by flipping the wrist.
+  The station-less `/inspection-pose` preview has no robot to ask, so it keeps the
+  frame axis and LABELS which convention it used (`roll_reference` is `"frame_x"`
+  or `"camera_at_start"`, with the vector) — a roll number without that label can
+  be read exactly backwards.
+- **The wrist branch is gated, not assumed.** The target is solved with
+  `solve_joints_on_neutral_branch` (same JointsConfig as start, A4/A6 bounded by
+  `setup.maximum_tool_axis_spin_deg`), not a seeded `SolveIK` — a seeded solve
+  returns whichever branch is nearest and will hand back a flip. Measured: the old
+  frame-referenced viewpoint had four IK branches, ALL flipped, and the stored one
+  sat 178° from parked on axis 4 while passing collision validation, because a
+  flipped wrist is not a collision. No qualifying branch is a candidate REJECTION,
+  not a run failure. The accepted joints and their dA4/dA5/dA6 vs start are
+  recorded in the pose block, and the inspection program gets the same
+  interpolated wrist check the layer path uses.
 - **Same authoritative gate.** Each candidate is created, given an inspection
   program, and put through `update_program(collisions=True)`; the first to pass is
   used. If none does, the run fails with every rejection listed. Nothing backs off,

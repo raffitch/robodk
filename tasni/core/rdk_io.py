@@ -1756,20 +1756,69 @@ class RdkIO:
                     removed.append(item_name)
         return removed
 
+    def program_neutral_wrist_report(self, name: str, neutral_joints,
+                                     maximum_wrist_rotation_deg: float = 90.0) -> dict:
+        """Wrist check for a program looked up BY NAME; raises on a hidden flip.
+
+        The layer path applies this to the program item it just generated; the
+        inspection move only has the name, and its caller turns the raise into a
+        candidate rejection rather than a run failure.
+        """
+        import robolink
+
+        program = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
+        if not program.Valid():
+            raise RuntimeError(f"program {name!r} not found")
+        return self._program_neutral_wrist_report(
+            program, neutral_joints, maximum_wrist_rotation_deg)
+
+    def camera_axes_in_frame(self, inspection_tool: str, work_frame: str,
+                             joints) -> np.ndarray:
+        """Camera TCP pose in ``work_frame`` at ``joints`` — read-only, no motion.
+
+        ``inv(frame_wrt_base) @ SolveFK(joints) @ PoseTool``. The service takes the
+        +X column as the roll reference for derived inspection poses, so "roll 0"
+        means the operator's own neutral camera orientation rather than an
+        arbitrary work-frame axis.
+
+        Asking the question requires selecting the tool/frame, which replaces the
+        operator's active selection, so the original is restored on the way out
+        exactly as :meth:`extrusion_reachability_report` does.
+        """
+        previous_tool, previous_frame = self.active_tool_and_frame()
+        try:
+            self.use_named_tool_frame(inspection_tool, work_frame)
+            flange = pose_to_T(self.robot().SolveFK(joints))
+            camera = flange @ np.asarray(self._tool_pose, dtype=float)
+            if self._frame_wrt_base_T is None:
+                return camera
+            return invert_T(self._frame_wrt_base_T) @ camera
+        finally:
+            self.restore_tool_and_frame(previous_tool, previous_frame)
+
     def create_inspection_target(self, *, name: str, T: np.ndarray,
-                                 inspection_tool: str, work_frame: str) -> dict:
+                                 inspection_tool: str, work_frame: str,
+                                 neutral_joints,
+                                 maximum_wrist_rotation_deg: float = 90.0) -> dict:
         """Create a derived inspection target at camera pose ``T`` (work frame).
 
         ``T`` places the **camera** — the inspection tool's TCP — not the flange:
-        :meth:`solve_joints_for_pose` passes the tool mount to ``SolveIK``
-        explicitly, so the joints put the lens at the requested viewpoint. The
-        target is stored as a **joint** target locked to that solution, so the
-        configuration RoboDK then collision-validates is the one actually visited
-        (a cartesian target can be reached in a different, colliding IK branch).
+        the solver passes the tool mount to ``SolveIK`` explicitly, so the joints
+        put the lens at the requested viewpoint. The target is stored as a
+        **joint** target locked to that solution, so the configuration RoboDK then
+        collision-validates is the one actually visited (a cartesian target can be
+        reached in a different, colliding IK branch).
 
-        Returns ``{"created": False, "reason": ...}`` rather than raising when the
-        pose has no IK solution: the caller is walking an ordered candidate list
-        and an unreachable viewpoint is an expected outcome, not a fault.
+        The branch comes from :meth:`solve_joints_on_neutral_branch`, not from a
+        seeded ``SolveIK``. A seeded solve returns whichever branch is nearest and
+        will hand back a wrist flip without complaint: measured on this cell, the
+        old frame-fixed roll-zero viewpoint had four IK branches, ALL flipped, and
+        the one it stored sat 178 deg from the parked pose on axis 4 — then passed
+        collision validation, because a flipped wrist is not a collision.
+
+        Returns ``{"created": False, "reason": ...}`` rather than raising when no
+        branch qualifies: the caller is walking an ordered candidate list and an
+        unreachable viewpoint is an expected outcome, not a fault.
         """
         import robolink
 
@@ -1777,12 +1826,21 @@ class RdkIO:
         old = self.rdk.Item(name, robolink.ITEM_TYPE_TARGET)
         if old.Valid():
             old.Delete()
-        joints = self.solve_joints_for_pose(T, self.robot().Joints())
+        limit = float(maximum_wrist_rotation_deg)
+        joints = self.solve_joints_on_neutral_branch(
+            np.asarray(T, dtype=float), neutral_joints, self.robot().Joints(), limit)
         if joints is None:
             return {"created": False, "target": name,
-                    "reason": "no IK solution places the camera at this viewpoint"}
+                    "reason": ("no IK solution on the neutral wrist branch within "
+                               f"±{limit:.0f} deg of the start pose")}
+        deltas = [self._joint_delta_deg(joints, neutral_joints, axis=axis)
+                  for axis, _ in self.WRIST_AXES]
         self.add_target(name, np.asarray(T, dtype=float), joints)
-        return {"created": True, "target": name, "reason": ""}
+        return {"created": True, "target": name, "reason": "",
+                "joints": self._joint_values(joints),
+                "axis_4_rotation_deg": deltas[0],
+                "axis_5_rotation_deg": deltas[1],
+                "axis_6_rotation_deg": deltas[2]}
 
     def create_inspection_program(self, *, name: str, inspection_tool: str,
                                   inspection_target: str, speed_mm_s: float) -> dict:

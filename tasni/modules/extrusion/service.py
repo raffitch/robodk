@@ -166,7 +166,7 @@ def _require_program_valid(report: dict, layer_index: int) -> None:
 
 def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
                            inspection_name: str, config, camera,
-                           seed_pose: dict | None = None,
+                           start_joints, seed_pose: dict | None = None,
                            collisions: bool = True) -> dict:
     """Create the inspection program for one layer and return its validation.
 
@@ -204,14 +204,21 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
     aim = aim_point_mm(plan.recipe, plan.setup, layer.layer_index)
     target_name = inspection_name + "_Target"
     rejected: list[dict] = []
+    # Roll zero must mean "the camera as the operator parked it", not "aligned
+    # with the work frame's X". Those are 180 deg apart on this cell, and the
+    # frame-referenced one is only reachable through a wrist flip.
+    reference_x = [float(v) for v in rdk.camera_axes_in_frame(
+        plan.setup.inspection_tool, plan.setup.work_frame, start_joints)[:3, 0]]
     candidates = order_candidates_seed_first(
-        pose_candidates(aim, framing["standoff_mm"], config), seed_pose)
+        pose_candidates(aim, framing["standoff_mm"], config, reference_x), seed_pose)
     for candidate in candidates:
         descriptor = {k: v for k, v in candidate.items() if k != "T"}
         made = rdk.create_inspection_target(
             name=target_name, T=candidate["T"],
             inspection_tool=plan.setup.inspection_tool,
-            work_frame=plan.setup.work_frame)
+            work_frame=plan.setup.work_frame,
+            neutral_joints=start_joints,
+            maximum_wrist_rotation_deg=plan.setup.maximum_tool_axis_spin_deg)
         if not made["created"]:
             rejected.append({**descriptor, "reason": made["reason"]})
             continue
@@ -220,6 +227,17 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
             inspection_target=target_name, speed_mm_s=speed_mm_s)
         validation = rdk.update_program(inspection_name, collisions=collisions)
         if _program_valid(validation):
+            # Same gate the layer program uses: the interpolated path, not just
+            # the endpoint, has to stay on the neutral wrist branch. A flip found
+            # here rejects THIS candidate and the walk carries on, exactly as a
+            # collision does -- an unusable viewpoint is not a run failure.
+            try:
+                wrist = rdk.program_neutral_wrist_report(
+                    inspection_name, start_joints,
+                    plan.setup.maximum_tool_axis_spin_deg)
+            except RuntimeError as error:
+                rejected.append({**descriptor, "reason": str(error)})
+                continue
             return {
                 "artifacts": [target_name, created["program"]],
                 "validation": validation, "target": target_name,
@@ -227,6 +245,13 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
                          "aim_mm": [float(v) for v in aim],
                          "clamped_to": framing["clamped_to"],
                          "fill_fraction": framing["fill_fraction"],
+                         "roll_reference": "camera_at_start",
+                         "roll_reference_x": reference_x,
+                         "joints": made.get("joints"),
+                         "axis_4_rotation_deg": made.get("axis_4_rotation_deg"),
+                         "axis_5_rotation_deg": made.get("axis_5_rotation_deg"),
+                         "axis_6_rotation_deg": made.get("axis_6_rotation_deg"),
+                         "wrist": wrist,
                          "rejected": rejected},
             }
         rejected.append({**descriptor,
@@ -383,7 +408,7 @@ class CylinderDryRunJob:
                 inspect = _build_inspection_move(
                     rdk, self.plan, layer, inspection_name=inspection_name,
                     config=ecfg, camera=self.services.config.camera,
-                    seed_pose=last_inspection_pose,
+                    start_joints=start_joints, seed_pose=last_inspection_pose,
                     collisions=self.check_collisions)
                 ctx.check_cancel()
                 if inspect["pose"]:
@@ -614,7 +639,7 @@ class CylinderPrintJob:
                     inspect = _build_inspection_move(
                         rdk, self.plan, layer, inspection_name=inspection_name,
                         config=ecfg, camera=services.config.camera,
-                        seed_pose=last_inspection_pose,
+                        start_joints=start_joints, seed_pose=last_inspection_pose,
                         collisions=self.check_collisions)
                     ctx.check_cancel()
                     if inspect["pose"]:

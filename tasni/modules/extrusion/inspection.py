@@ -98,8 +98,37 @@ def aim_point_mm(recipe, setup, layer_index: int) -> np.ndarray:
                      layer_top_z_mm(recipe, setup, layer_index)], dtype=float)
 
 
+FRAME_ROLL_REFERENCE = np.array([1.0, 0.0, 0.0])
+
+
+def _roll_reference_axis(z_axis: np.ndarray, reference_x) -> np.ndarray:
+    """Unit vector for roll zero, perpendicular to the optical axis.
+
+    ``reference_x`` (work-frame coordinates) lets the caller measure roll from the
+    ROBOT rather than from the work frame. That distinction is not cosmetic: on
+    this cell the camera's own +X at the parked pose reads ``[-1, 0, 0]`` in the
+    work frame, so the frame-fixed default put "roll 0" 179.7 deg from the robot's
+    natural camera orientation, and RoboDK could only reach it through a wrist
+    flip — every branch came back with |dA4| or |dA6| about 178 deg.
+
+    Falls back to the frame axis when no reference is given, and when the one
+    given projects to nothing because it lies along the optical axis.
+    """
+    if reference_x is not None:
+        candidate = np.asarray(reference_x, dtype=float).reshape(3)
+        projected = candidate - float(candidate @ z_axis) * z_axis
+        if float(np.linalg.norm(projected)) > 1e-6:
+            return projected / np.linalg.norm(projected)
+    reference = FRAME_ROLL_REFERENCE
+    if abs(float(reference @ z_axis)) > 0.9:         # degenerate: aim along +X
+        reference = np.array([0.0, 1.0, 0.0])
+    projected = reference - float(reference @ z_axis) * z_axis
+    return projected / np.linalg.norm(projected)
+
+
 def pose_from_aim(aim_mm, standoff_mm: float, *, tilt_deg: float = 0.0,
-                  azimuth_deg: float = 0.0, roll_deg: float = 0.0) -> np.ndarray:
+                  azimuth_deg: float = 0.0, roll_deg: float = 0.0,
+                  reference_x=None) -> np.ndarray:
     """Camera pose (4x4, work frame) looking at ``aim_mm`` from ``standoff_mm``.
 
     OpenCV camera convention: +Z out of the lens, +X right in the image, +Y down.
@@ -107,6 +136,8 @@ def pose_from_aim(aim_mm, standoff_mm: float, *, tilt_deg: float = 0.0,
     (``azimuth_deg`` picks which side), so the aim point stays exactly on the
     optical axis at exactly the standoff for every candidate — tilt trades
     incidence for reach, never centring or distance.
+
+    ``reference_x`` decides what roll zero MEANS — see :func:`_roll_reference_axis`.
     """
     aim = np.asarray(aim_mm, dtype=float).reshape(3)
     tilt = math.radians(tilt_deg)
@@ -116,11 +147,7 @@ def pose_from_aim(aim_mm, standoff_mm: float, *, tilt_deg: float = 0.0,
                      math.sin(tilt) * math.sin(azimuth),
                      math.cos(tilt)], dtype=float)
     z_axis = -away                                   # camera looks back down it
-    reference = np.array([1.0, 0.0, 0.0])
-    if abs(float(reference @ z_axis)) > 0.9:         # degenerate: aim along +X
-        reference = np.array([0.0, 1.0, 0.0])
-    x_axis = reference - float(reference @ z_axis) * z_axis
-    x_axis /= np.linalg.norm(x_axis)
+    x_axis = _roll_reference_axis(z_axis, reference_x)
     y_axis = np.cross(z_axis, x_axis)
     roll = math.radians(roll_deg)
     rolled_x = math.cos(roll) * x_axis + math.sin(roll) * y_axis
@@ -131,7 +158,8 @@ def pose_from_aim(aim_mm, standoff_mm: float, *, tilt_deg: float = 0.0,
     return T
 
 
-def pose_candidates(aim_mm, standoff_mm: float, config) -> list[dict]:
+def pose_candidates(aim_mm, standoff_mm: float, config,
+                    reference_x=None) -> list[dict]:
     """Ordered poses to try: straight down first, tilted only as a fallback.
 
     Roll is tried before tilt because rotating about the optical axis costs the
@@ -151,7 +179,8 @@ def pose_candidates(aim_mm, standoff_mm: float, config) -> list[dict]:
     candidates = []
     for tilt, azimuth, roll in ordered:
         T = pose_from_aim(aim_mm, standoff_mm, tilt_deg=tilt,
-                          azimuth_deg=azimuth, roll_deg=roll)
+                          azimuth_deg=azimuth, roll_deg=roll,
+                          reference_x=reference_x)
         candidates.append({
             "tilt_deg": tilt, "azimuth_deg": azimuth, "roll_deg": roll,
             "xyz_mm": [float(v) for v in T[:3, 3]], "T": T,
@@ -160,7 +189,7 @@ def pose_candidates(aim_mm, standoff_mm: float, config) -> list[dict]:
 
 
 def inspection_plan(recipe, setup, *, K: np.ndarray, size_px: tuple[int, int],
-                    config) -> dict:
+                    config, reference_x=None) -> dict:
     """The complete derived inspection geometry for one cylinder — JSON-safe.
 
     Candidate *descriptors* only (no 4x4s), so this is what preflight and the API
@@ -182,10 +211,18 @@ def inspection_plan(recipe, setup, *, K: np.ndarray, size_px: tuple[int, int],
             "aim_mm": [float(v) for v in aim],
             "camera_z_mm": float(aim[2] + standoff),
             "candidates": [{k: v for k, v in candidate.items() if k != "T"}
-                           for candidate in pose_candidates(aim, standoff, config)],
+                           for candidate in pose_candidates(aim, standoff, config,
+                                                            reference_x)],
         })
+    # Roll zero is meaningless without saying what it is measured FROM, and the
+    # two answers are 180 deg apart on this cell. Label it so a report cannot be
+    # read backwards.
+    used_reference = (FRAME_ROLL_REFERENCE if reference_x is None
+                      else np.asarray(reference_x, dtype=float).reshape(3))
     return {
         "auto": bool(getattr(setup, "inspection_auto", False)),
+        "roll_reference": "frame_x" if reference_x is None else "camera_at_start",
+        "roll_reference_x": [float(v) for v in used_reference],
         "object_diameter_mm": diameter,
         "standoff_mm": standoff,
         "framing": framing,

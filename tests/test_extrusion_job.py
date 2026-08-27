@@ -37,6 +37,7 @@ class FakeRdk:
         self.mode = 6; self.events = []; self.created = []; self.deleted = []
         self.station_calls = 0; self.fail_station_call = None
         self.targets = []; self.unreachable_targets = 0; self.bad_inspections = 0
+        self.flipped_inspections = 0
     def item_exists_as(self, name, kind): return bool(name)
     def program_instructions(self, name):
         return (["Set IO_508=1", "Set IO_601=1"] if name == "AirOn"
@@ -69,8 +70,30 @@ class FakeRdk:
         xyz = np.asarray(kwargs["T"], dtype=float)[:3, 3]
         self.events.append(("create-target", kwargs["name"], tuple(np.round(xyz, 3))))
         if len(self.targets) <= self.unreachable_targets:
-            return {"created": False, "target": kwargs["name"], "reason": "no IK solution"}
-        return {"created": True, "target": kwargs["name"], "reason": ""}
+            return {"created": False, "target": kwargs["name"],
+                    "reason": "no IK solution on the neutral wrist branch within +/-90 deg"}
+        return {"created": True, "target": kwargs["name"], "reason": "",
+                "joints": [89.8, -62.5, 147.8, 0.9, -54.1, -0.2],
+                "axis_4_rotation_deg": 0.69, "axis_5_rotation_deg": -11.58,
+                "axis_6_rotation_deg": -0.83}
+
+    def camera_axes_in_frame(self, tool, frame, joints):
+        """Measured on the cell: the camera's +X reads [-1, 0, 0] in the work frame."""
+        self.events.append(("camera-axes", tool, frame, joints))
+        T = np.eye(4)
+        T[:3, 0], T[:3, 1], T[:3, 2] = [-1, 0, 0], [0, 1, 0], [0, 0, -1]
+        return T
+
+    def program_neutral_wrist_report(self, name, neutral_joints, limit=90.0):
+        self.events.append(("wrist", name, limit))
+        if self.flipped_inspections:
+            self.flipped_inspections -= 1
+            raise RuntimeError(
+                "generated path sample 3 turns axis 4 178.1 deg from neutral; "
+                "limit is +/-90.0 deg. The wrist-flipped path was blocked.")
+        return {"sample_count": 12, "maximum_axis_4_rotation_seen_deg": 0.7,
+                "maximum_axis_5_rotation_seen_deg": 11.6,
+                "maximum_axis_6_rotation_seen_deg": 0.9}
     def update_program(self, name, collisions=True):
         self.events.append(("update", name, collisions))
         if name.endswith("_Inspect") and self.bad_inspections:
@@ -374,7 +397,7 @@ def test_auto_inspection_moves_to_the_next_candidate_when_one_collides(
     assert output["all_ok"]
     chosen = output["layers"][0]["inspection_pose"]
     assert len(rdk.targets) == 3, "tried straight down, then the rejected one, then a third"
-    assert chosen["rejected"][0]["reason"] == "no IK solution"
+    assert "neutral wrist branch" in chosen["rejected"][0]["reason"]
     assert "Collision detected" in chosen["rejected"][1]["reason"]
     assert (chosen["tilt_deg"], chosen["roll_deg"]) != (0.0, 0.0)
 
@@ -425,3 +448,59 @@ def test_auto_inspection_reuses_the_previous_layers_winner(tmp_path, monkeypatch
     assert (second["tilt_deg"], second["azimuth_deg"], second["roll_deg"]) == \
         (first["tilt_deg"], first["azimuth_deg"], first["roll_deg"])
     assert second["rejected"] == []          # no wasted candidates on layer 2
+
+
+def test_auto_inspection_rolls_relative_to_the_camera_not_the_work_frame(
+        tmp_path, monkeypatch):
+    """Roll zero must mean the operator's parked camera orientation.
+
+    Measured on the cell: the camera's +X reads [-1, 0, 0] in the work frame, so
+    a frame-referenced roll zero is 180 deg away and RoboDK can only reach it
+    through a wrist flip.
+    """
+    svc, rdk, _ = services(tmp_path)
+    monkeypatch.setattr(service_mod, "new_run_dir",
+                        lambda module, stamp: _mkdir(tmp_path / module / stamp))
+
+    output = CylinderDryRunJob(svc, plan(layers=1, auto_inspection=True))(Ctx())
+
+    pose = output["layers"][0]["inspection_pose"]
+    assert pose["roll_reference"] == "camera_at_start"
+    assert pose["roll_reference_x"] == [-1.0, 0.0, 0.0]
+    chosen = rdk.targets[0]["T"]
+    np.testing.assert_allclose(np.asarray(chosen)[:3, 0], [-1.0, 0.0, 0.0], atol=1e-9)
+    assert ("camera-axes", "SelectedCamera", "SelectedFrame", "START") in rdk.events
+
+
+def test_auto_inspection_records_the_joints_it_actually_locked(tmp_path, monkeypatch):
+    svc, rdk, _ = services(tmp_path)
+    monkeypatch.setattr(service_mod, "new_run_dir",
+                        lambda module, stamp: _mkdir(tmp_path / module / stamp))
+
+    output = CylinderDryRunJob(svc, plan(layers=1, auto_inspection=True))(Ctx())
+
+    pose = output["layers"][0]["inspection_pose"]
+    assert pose["joints"] == [89.8, -62.5, 147.8, 0.9, -54.1, -0.2]
+    assert pose["axis_4_rotation_deg"] == 0.69
+    assert pose["axis_5_rotation_deg"] == -11.58
+    assert pose["wrist"]["maximum_axis_4_rotation_seen_deg"] == 0.7
+
+
+def test_an_inspection_path_that_flips_mid_move_rejects_that_candidate(
+        tmp_path, monkeypatch):
+    """The endpoint can be neutral while the path RoboDK interpolates is not.
+
+    That is a rejection like a collision, not a run failure -- the walk moves on.
+    """
+    svc, rdk, _ = services(tmp_path)
+    monkeypatch.setattr(service_mod, "new_run_dir",
+                        lambda module, stamp: _mkdir(tmp_path / module / stamp))
+    rdk.flipped_inspections = 1
+
+    output = CylinderDryRunJob(svc, plan(layers=1, auto_inspection=True))(Ctx())
+
+    assert output["all_ok"]
+    chosen = output["layers"][0]["inspection_pose"]
+    assert len(chosen["rejected"]) == 1
+    assert "turns axis 4" in chosen["rejected"][0]["reason"]
+    assert (chosen["tilt_deg"], chosen["azimuth_deg"], chosen["roll_deg"]) != (0.0, 0.0, 0.0)

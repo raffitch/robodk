@@ -15,7 +15,7 @@ from tasni.modules.extrusion.archive import ExtrusionArchive
 from tasni.modules.extrusion.comparison import compare_circle, corrected_circle
 from tasni.modules.extrusion.inspection import (aim_point_mm, cylinder_diameter_mm,
                                                 framing_standoff, inspection_plan,
-                                                pose_candidates)
+                                                pose_candidates, pose_from_aim)
 from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup, LayerManifest
 from tasni.modules.extrusion import module as extrusion_module
 from tasni.modules.extrusion.service import geometry_preflight, station_requirements
@@ -543,3 +543,86 @@ def test_seed_first_reordering_moves_last_winner_to_front():
     assert order_candidates_seed_first(candidates, None) == candidates
     unknown = {"tilt_deg": 5.0, "azimuth_deg": 0.0, "roll_deg": 45.0}
     assert order_candidates_seed_first(candidates, unknown) == candidates
+
+
+# --- roll is referenced to the ROBOT, not the work frame ----------------------
+#
+# Measured read-only on the operator's station: at the parked joints
+# [89.22, -74.25, 147.96, 0.21, -42.52, 0.63] the Realsense TCP reads, in
+# `Tasni Work Frame`, X=[-1,0,0] Y=[0,1,0] Z=[0,0,-1]. The frame-fixed
+# `reference = [1,0,0]` therefore made "roll 0" 179.7 deg from the robot's own
+# natural camera orientation, and RoboDK's only solutions for it were flipped
+# (every branch |dA4| or |dA6| ~ 178).
+
+PARKED_CAMERA_X = np.array([-1.0, 0.0, 0.0])
+
+
+def test_roll_zero_can_be_referenced_to_the_cameras_own_x_axis():
+    aim = np.array([212.39, 148.69, 15.0])
+
+    T = pose_from_aim(aim, 300.0, reference_x=PARKED_CAMERA_X)
+
+    np.testing.assert_allclose(T[:3, 0], [-1.0, 0.0, 0.0], atol=1e-9)
+    np.testing.assert_allclose(T[:3, 1], [0.0, 1.0, 0.0], atol=1e-9)
+    np.testing.assert_allclose(T[:3, 2], [0.0, 0.0, -1.0], atol=1e-9)
+    np.testing.assert_allclose(T[:3, 3], aim + [0.0, 0.0, 300.0], atol=1e-9)
+
+
+def test_the_frame_axis_is_still_the_default_so_the_preview_is_unchanged():
+    aim = np.array([212.39, 148.69, 15.0])
+
+    T = pose_from_aim(aim, 300.0)
+
+    np.testing.assert_allclose(T[:3, 0], [1.0, 0.0, 0.0], atol=1e-9)
+
+
+def test_a_reference_is_projected_perpendicular_to_the_optical_axis():
+    """The camera X at the start pose need not be perpendicular to the new
+    optical axis, so only its in-plane part can define roll zero."""
+    aim = np.array([0.0, 0.0, 0.0])
+
+    T = pose_from_aim(aim, 300.0, reference_x=[-1.0, 0.0, 0.6])
+
+    np.testing.assert_allclose(T[:3, 0], [-1.0, 0.0, 0.0], atol=1e-9)
+    assert abs(float(T[:3, 0] @ T[:3, 2])) < 1e-12
+
+
+def test_a_reference_along_the_optical_axis_falls_back_to_the_frame_axis():
+    aim = np.array([0.0, 0.0, 0.0])
+
+    T = pose_from_aim(aim, 300.0, reference_x=[0.0, 0.0, 1.0])
+
+    np.testing.assert_allclose(T[:3, 0], [1.0, 0.0, 0.0], atol=1e-9)
+
+
+def test_a_zero_reference_falls_back_to_the_frame_axis():
+    aim = np.array([0.0, 0.0, 0.0])
+
+    T = pose_from_aim(aim, 300.0, reference_x=[0.0, 0.0, 0.0])
+
+    np.testing.assert_allclose(T[:3, 0], [1.0, 0.0, 0.0], atol=1e-9)
+
+
+def test_the_reference_reaches_every_candidate():
+    candidates = pose_candidates(np.array([0.0, 0.0, 0.0]), 300.0, ExtrusionConfig(),
+                                 reference_x=PARKED_CAMERA_X)
+
+    first = candidates[0]
+    assert (first["tilt_deg"], first["azimuth_deg"], first["roll_deg"]) == (0.0, 0.0, 0.0)
+    np.testing.assert_allclose(first["T"][:3, 0], [-1.0, 0.0, 0.0], atol=1e-9)
+
+
+def test_the_plan_labels_which_reference_its_rolls_are_measured_from():
+    """A report that does not say this can be read exactly backwards."""
+    made = recipe(layer_count=1)
+
+    frame_referenced = inspection_plan(made, setup(), K=CAMERA.K, size_px=CAMERA.size,
+                                       config=ExtrusionConfig())
+    robot_referenced = inspection_plan(made, setup(), K=CAMERA.K, size_px=CAMERA.size,
+                                       config=ExtrusionConfig(),
+                                       reference_x=PARKED_CAMERA_X)
+
+    assert frame_referenced["roll_reference"] == "frame_x"
+    np.testing.assert_allclose(frame_referenced["roll_reference_x"], [1.0, 0.0, 0.0])
+    assert robot_referenced["roll_reference"] == "camera_at_start"
+    np.testing.assert_allclose(robot_referenced["roll_reference_x"], [-1.0, 0.0, 0.0])
