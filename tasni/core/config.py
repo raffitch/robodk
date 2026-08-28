@@ -755,7 +755,7 @@ class ExtrusionConfig(_Model):
     # lands before RoboDK marks it running does not skip the wait. A real
     # dispatch registers in milliseconds; this only bounds the pathological
     # case where it never does.
-    program_start_grace_s: float = 0.5
+    program_start_grace_s: float = 5.0
     orientation_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
     # Keep the wrist near the operator's neutral starting configuration. The
     # generated curve uses fixed TCP orientation, but redundant IK/interpolation

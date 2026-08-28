@@ -238,14 +238,32 @@ def _wait_program(ctx: JobContext, rdk: RdkIO, name: str, *,
     program was never seen running, which :func:`program_runtime_fault` uses to
     tell "finished instantly" from "never started".
     """
+    def _busy() -> bool:
+        # Either signal counts. RoboDK documents Busy() as "checks if a ROBOT or
+        # program is currently running (busy or moving)", and for a program
+        # dispatched to the controller it is the robot that moves — polling only
+        # the program item gives up while the arm is still starting.
+        if rdk.program_busy(name):
+            return True
+        probe = getattr(rdk, "robot_busy", None)
+        if probe is None:
+            return False
+        try:
+            return bool(probe())
+        except Exception:
+            return False
+
     started_at = clock()
     observed_busy = False
     deadline = started_at + start_timeout_s
-    while not rdk.program_busy(name) and clock() < deadline:
+    while clock() < deadline:
+        if _busy():
+            observed_busy = True     # seen running, even if it stops immediately
+            break
         if ctx.cancelled:
             ctx.check_cancel()
         sleep(poll_s)
-    while rdk.program_busy(name):
+    while _busy():
         observed_busy = True
         if ctx.cancelled:
             rdk.stop_program(name)

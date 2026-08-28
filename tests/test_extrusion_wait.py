@@ -55,3 +55,40 @@ def test_returns_promptly_once_a_running_program_finishes():
     rdk = Rdk([True, True, True, False])
     _wait_program(Ctx(), rdk, "P", sleep=lambda s: None)
     assert rdk.polls >= 4
+
+
+class RobotRdk(Rdk):
+    """The driver case: the PROGRAM item never reports busy, the ROBOT does.
+
+    RoboDK's Busy() is documented as "checks if a robot or program is currently
+    running (busy or moving)". For a program dispatched to the controller it is
+    the robot that moves, so polling only the program item gives up while the arm
+    is still starting -- which on the cell looked like "finished in 0.5 s, never
+    observed running" even though the controller was audibly responding.
+    """
+    def __init__(self, robot_script):
+        super().__init__([])
+        self.robot_script = list(robot_script)
+        self.robot_polls = 0
+    def robot_busy(self):
+        self.robot_polls += 1
+        return self.robot_script.pop(0) if self.robot_script else False
+
+
+def test_a_moving_robot_counts_as_the_program_running():
+    rdk = RobotRdk([False, True, True, True, False])
+    _wait_program(Ctx(), rdk, "P", start_timeout_s=1.0, sleep=lambda s: None)
+    assert rdk.robot_polls >= 5, "must poll the robot, not only the program item"
+
+
+def test_the_wait_reports_busy_when_only_the_robot_moved():
+    rdk = RobotRdk([True, True, False])
+    _, observed_busy = _wait_program(Ctx(), rdk, "P", sleep=lambda s: None)
+    assert observed_busy is True
+
+
+def test_a_missing_robot_busy_probe_is_tolerated():
+    """Older fakes/drivers without the probe must not break the wait."""
+    rdk = Rdk([True, False])
+    elapsed, observed = _wait_program(Ctx(), rdk, "P", sleep=lambda s: None)
+    assert observed is True

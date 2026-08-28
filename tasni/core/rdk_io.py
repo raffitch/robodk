@@ -1906,6 +1906,20 @@ class RdkIO:
                             else self.RUNMODE_SIMULATE)
         return int(program.RunCode())
 
+    def robot_busy(self) -> bool:
+        """Is the ROBOT moving? The signal that matters for a driver-run program.
+
+        RoboDK documents Busy() as "checks if a robot or program is currently
+        running (busy or moving)". When a program is dispatched to the controller
+        the program item may never report busy — the arm is what moves — so
+        polling only the program gives up while the robot is still starting.
+        Never raises: a missing/!Valid robot must not break the wait.
+        """
+        try:
+            return bool(self.robot().Busy())
+        except Exception:
+            return False
+
     def program_busy(self, name: str) -> bool:
         import robolink
 
