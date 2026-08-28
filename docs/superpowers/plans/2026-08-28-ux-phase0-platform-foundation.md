@@ -869,6 +869,41 @@ def test_solve_record_survives_a_later_tour_and_another_module(tmp_path, monkeyp
     assert ext["jobs"] == {} and ext["result"] is None and ext["running"] is None
 
 
+def test_saved_calibration_survives_a_restart_and_can_be_reapplied(tmp_path, monkeypatch):
+    """A fresh app == a restarted backend: job history is empty, but active.json and
+    the run's report are on disk, so /status still reports `applied` and
+    POST /apply {run_id} restores the tool pose from disk."""
+    import json
+    import numpy as np
+
+    client, services = _client(tmp_path, monkeypatch)
+    X = np.eye(4); X[:3, 3] = [40.0, -15.0, 55.0]
+    d = runs.run_dir("calibration", "20260814-1022", tmp_path)
+    d.mkdir(parents=True)
+    (d / "report.json").write_text(json.dumps({
+        "X_cam2gripper": X.tolist(), "method": "PARK", "refined": True,
+        "train": {"rms_px": 0.5, "max_px": 1.0, "n_views": 12},
+        "validation": {"rms_px": 0.9, "max_px": 1.5, "n_views": 3},
+        "diagnosis": {"verdict": "pass"}}), encoding="utf-8")
+    runs.write_active("calibration", {"module": "calibration", "run_id": "20260814-1022",
+                                      "applied_at": "2026-08-14T10:22:00", "tool": "Realsense",
+                                      "quality": {"verdict": "pass"}}, tmp_path)
+
+    class FakeRdk:
+        applied = None
+
+        def set_tool_pose(self, tool, T):
+            FakeRdk.applied = (tool, np.asarray(T, dtype=float))
+    services.rdk = FakeRdk()
+
+    s = client.get("/api/modules/calibration/status").json()
+    assert s["jobs"] == {} and s["applied"]["run_id"] == "20260814-1022"
+    r = client.post("/api/modules/calibration/apply", json={"run_id": "20260814-1022"})
+    assert r.status_code == 200 and r.json()["source"] == "run_id"
+    assert FakeRdk.applied[0] == "Realsense" and np.allclose(FakeRdk.applied[1], X)
+    assert client.get("/api/modules/calibration/status").json()["applied"]["source"] == "run_id"
+
+
 def test_extrusion_result_is_the_latest_finished_kind(tmp_path, monkeypatch):
     client, services = _client(tmp_path, monkeypatch)
     _run(services, lambda ctx: {"kind": "cylinder_quick_simulation"},
@@ -1082,20 +1117,84 @@ class CellBusy(RuntimeError):
 
 
 class CellArbiter:
+    """Re-entrant within a thread (a live start acquires the camera lease inside
+    its own hold; the outermost owner is reported), non-blocking across threads."""
+
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._depth = 0
         self.owner: str | None = None
 
     @contextmanager
     def hold(self, owner: str):
         if not self._lock.acquire(blocking=False):
             raise CellBusy(f"cell is busy: {self.owner}")
-        self.owner = owner
+        self._depth += 1
+        if self._depth == 1:
+            self.owner = owner
         try:
             yield self
         finally:
-            self.owner = None
+            self._depth -= 1
+            if self._depth == 0:
+                self.owner = None
             self._lock.release()
+```
+`tasni/core/camera_lease.py` — the lease is the *long* hold on the camera; taking
+the arbiter momentarily around its acquisition is what makes Connect's
+"camera busy?" check atomic (a request-path capture such as the scan lock's
+authoritative grab holds the lease with no job running). `CameraLease.__init__(self, arbiter=None)` stores `self._arbiter`; in `acquire` (`:53-62`) wrap the lock attempt:
+```python
+        from contextlib import nullcontext
+        from .arbiter import CellBusy
+        gate = self._arbiter.hold(f"camera:{owner}") if self._arbiter else nullcontext()
+        try:
+            with gate:
+                got = (self._lock.acquire(True, timeout) if blocking
+                       else self._lock.acquire(False))
+        except CellBusy:
+            return False          # connect holds the cell: refuse, exactly like "held"
+        if got:
+            with self._guard:
+                self._owner = owner
+        return got
+```
+`ServiceContainer.build`: create `arbiter = CellArbiter()` **before** the lease and pass `CameraLease(arbiter=arbiter)`.
+
+Add to `tests/test_arbiter.py`:
+```python
+def test_hold_is_reentrant_in_thread_but_exclusive_across_threads():
+    a = CellArbiter()
+    with a.hold("live:scan"):
+        with a.hold("camera:live-preview"):        # nested: live start takes the lease
+            assert a.owner == "live:scan"
+        assert a.owner == "live:scan"
+        seen = {}
+
+        def other():
+            try:
+                with a.hold("job:scan:scan"):
+                    seen["ok"] = True
+            except CellBusy as e:
+                seen["err"] = str(e)
+        t = threading.Thread(target=other); t.start(); t.join(1)
+        assert seen == {"err": "cell is busy: live:scan"}
+    assert a.owner is None
+
+
+def test_camera_lease_refused_while_connect_holds_the_cell():
+    from tasni.core.camera_lease import CameraLease
+    a = CellArbiter()
+    lease = CameraLease(arbiter=a)
+    with a.hold("connect"):
+        seen = {}
+
+        def other():
+            seen["got"] = lease.acquire("scan-surface-lock")
+        t = threading.Thread(target=other); t.start(); t.join(1)
+        assert seen == {"got": False} and not lease.held
+    assert lease.acquire("scan-surface-lock") is True
+    lease.release("scan-surface-lock")
 ```
 `tasni/core/jobrunner.py`: `def __init__(self, bus: EventBus, arbiter=None)` storing `self._arbiter = arbiter`; add `from contextlib import nullcontext` and `from .arbiter import CellBusy`; in `start` wrap the critical section:
 ```python
@@ -1492,12 +1591,12 @@ Add `import time` to the imports, `from ..core.arbiter import CellBusy`, `from .
         (that is exactly when it is needed); refused while a job runs; serialized
         against connect through the arbiter (it holds it for up to
         robot_connect_timeout_s, so start the camera BEFORE linking — Task 8b)."""
-        if not services.session.is_open:
-            raise HTTPException(409, "connect the cell first")
-        if services.jobs.running:
-            raise HTTPException(409, "a job is running")
         try:
-            with services.arbiter.hold("link"):
+            with services.arbiter.hold("link"):     # checks INSIDE the hold: atomic
+                if not services.session.is_open:
+                    raise HTTPException(409, "connect the cell first")
+                if services.jobs.running:
+                    raise HTTPException(409, "a job is running")
                 attempt = ensure_robot_link(services.rdk, services.config.robodk)
         except CellBusy as e:
             raise HTTPException(409, f"cannot link now: {e}")
@@ -2220,14 +2319,27 @@ and replace the four lines `const [conn, setConn] = …`, `const [connInfo, setC
 
 - [ ] **Step 2: Rehydrate from the module's own `/status` (running job + solve result)**
 
-Add above the component:
+Add above the component (keep `apiGet` in the client import — it is used for `/api/readiness` below):
 ```tsx
 interface JobRec { job_id: string; kind: string; status: string; result: any; error: string | null; }
+// runs/calibration/active.json — what is applied to the cell, independent of job
+// history (which is in-memory and empty after a backend restart).
+interface AppliedCalibration {
+  run_id: string | null; applied_at: string; tool: string; source?: string;
+  quality?: { verdict?: string | null; val_rms_px?: number | null; train_rms_px?: number | null } | null;
+}
 interface ModuleStatus {
   running: { module: string; kind: string; job_id: string } | null;
   status: string; jobs?: Record<string, JobRec>;
+  applied?: AppliedCalibration | null;
 }
 ```
+State, next to `foreignJob`:
+```tsx
+  const [applied, setApplied] = useState<AppliedCalibration | null>(null);
+  const [presence, setPresence] = useState<{ present: boolean | null; reason: string } | null>(null);
+```
+and in `refreshJob`, as the first line after `const s = await api.get<ModuleStatus>("/status");`: `setApplied(s.applied ?? null);`.
 Replace `refreshJob` (`:153-158`) with — it is now the single **reconciler**: it
 hydrates a solve result, follows an own running job, locks on a foreign one, and
 settles a job whose terminal event was missed (fast job, socket reconnect —
@@ -2372,6 +2484,58 @@ In the Aim card, directly after the `<div className="lamps">…</div>` block add
 Buttons: Create targets `disabled={!ready || locked || generating || !gate?.ok || poseStale}`; Dry run `disabled={locked || !ready || targets == null}`; Run `disabled={locked || !ready || targets == null || !scaleOk || holdoutInvalid}`; Clear targets `disabled={locked}`; Cancel stays `disabled={!running}`.
 
 `AimHud.tsx`: in `export interface GateReading` add `pose_live?: boolean; pose_live_required?: boolean;`.
+
+- [ ] **Step 5b: Saved calibration on file — shown independently of job history, with Re-apply**
+
+Handlers (after `apply`):
+```tsx
+  // Recorded vs present for the calibration card (spec §4.7). Only meaningful once
+  // the cell is connected; the endpoint answers null/"not connected" otherwise.
+  const refreshPresence = useCallback(async () => {
+    try {
+      const r = await apiGet<{ calibration: { present: boolean | null; reason: string } }>("/api/readiness");
+      setPresence(r.calibration);
+    } catch { setPresence(null); }
+  }, []);
+  const reapply = async () => {
+    if (!applied?.run_id) return;
+    try {
+      const r = await api.post<{ tool: string; run_id: string }>("/apply", { run_id: applied.run_id });
+      addLog(`re-applied saved calibration ${r.run_id} to tool "${r.tool}".`);
+      refreshJob(); refreshPresence();
+    } catch (e: any) { addLog("re-apply: " + e.message, true); setRunError("Re-apply: " + e.message); }
+  };
+```
+In `apply`, after `setCanApply(false);` add `refreshJob(); refreshPresence();`. In the `ready` effect add `refreshPresence();`.
+
+JSX — in the **Quality metrics** card, directly before its `<div className="btn-row">`:
+```tsx
+        {applied ? (
+          <div className={"calib-stamp " + (applied.quality?.verdict ?? "")}>
+            Calibration on file · {applied.applied_at.replace("T", " ")}
+            {applied.quality?.verdict ? ` · ${applied.quality.verdict}` : ""}
+            {applied.quality?.val_rms_px != null ? ` · ${applied.quality.val_rms_px.toFixed(2)} px val` : ""}
+            {" · tool "}{applied.tool}
+            {presence?.present === false && <span className="warn-text"> — {presence.reason}</span>}
+            {presence?.present === null && <span className="hint"> — {presence.reason}</span>}
+            {presence?.present === true && <span className="ok-text"> — present in the station</span>}
+          </div>
+        ) : (
+          <div className="hint">No calibration on file yet.</div>
+        )}
+        <div className="hint">A calibration does not expire on its own. Recalibrate after a mount,
+          camera or tool change, a failed accuracy check, or by your own decision.</div>
+```
+and inside that `btn-row`, after the Apply button:
+```tsx
+          {applied?.run_id && (
+            <button className={presence?.present === false ? "" : "secondary"}
+                    onClick={reapply} disabled={!ready || locked}
+                    title="Write the saved run's camera pose into the tool again (POST /apply with its run_id)">
+              Re-apply saved calibration
+            </button>
+          )}
+```
 
 - [ ] **Step 6: Typecheck + build, then commit**
 
@@ -2677,7 +2841,7 @@ import { vi } from "vitest";
 import type { JobEvent } from "../platform/PlatformProvider";
 
 type Route = (init?: RequestInit) => unknown;
-const calls: Array<{ url: string; method: string }> = [];
+const calls: Array<{ url: string; method: string; body: string | null }> = [];
 
 export class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
@@ -2702,7 +2866,8 @@ export function installFakes(routes: Record<string, Route>) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : (input as Request).url ?? String(input);
     const path = url.replace(/^https?:\/\/[^/]+/, "");
-    calls.push({ url: path, method: init?.method ?? "GET" });
+    calls.push({ url: path, method: init?.method ?? "GET",
+                 body: typeof init?.body === "string" ? init.body : null });
     const key = `${init?.method ?? "GET"} ${path}`;
     const route = routes[key] ?? routes[path];
     if (!route) return new Response(JSON.stringify({ detail: `no fake route for ${key}` }), { status: 404 });
@@ -2816,7 +2981,7 @@ import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 import { PlatformProvider } from "../platform/PlatformProvider";
 import Calibration from "../pages/Calibration";
-import { FakeWebSocket, installFakes, okHealth, readyRdk } from "./fakes";
+import { FakeWebSocket, fetchCalls, installFakes, okHealth, readyRdk } from "./fakes";
 
 const config = () => ({
   robot: "KUKA KR150 R2700", camera_tool: "Realsense",
@@ -2869,6 +3034,24 @@ describe("Calibration page (phase 0)", () => {
     mount();
     await waitFor(() => expect(screen.getByRole("button", { name: /Start camera/ })).toBeTruthy());
     expect(screen.queryByRole("button", { name: /Connect & open Tasni station/ })).toBeNull();
+  });
+
+  it("shows the saved calibration after a backend restart and can re-apply it", async () => {
+    // Restarted backend: job history empty, active.json present, tool pose differs.
+    const applied = { run_id: "20260814-1022", applied_at: "2026-08-14T10:22:00", tool: "Realsense",
+                      quality: { verdict: "pass", val_rms_px: 0.91 } };
+    const routes = base({ running: null, status: "idle", jobs: {}, applied });
+    routes["/api/readiness"] = () => ({
+      calibration: { recorded: applied, present: false, reason: "tool pose differs from the applied run — re-apply" },
+      surface: { recorded: null, present: null, reason: "nothing inserted" } });
+    routes["POST /api/modules/calibration/apply"] = () => ({ status: "applied", tool: "Realsense", run_id: "20260814-1022" });
+    installFakes(routes);
+    mount();
+    await waitFor(() => expect(screen.getByText(/Calibration on file · 2026-08-14 10:22 · pass · 0.91 px val/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/tool pose differs/)).toBeTruthy());
+    act(() => { screen.getByRole("button", { name: /Re-apply saved calibration/ }).click(); });
+    await waitFor(() => expect(fetchCalls().some((c) =>
+      c.url === "/api/modules/calibration/apply" && c.body === JSON.stringify({ run_id: "20260814-1022" }))).toBe(true));
   });
 
   it("settles a job whose result arrived before the start response (fast job)", async () => {
@@ -2951,6 +3134,17 @@ describe("Scan page (phase 0)", () => {
     await waitFor(() => expect(screen.getByText(/extrusion job \(extrusion-print\) is running/)).toBeTruthy());
     expect(screen.getByRole("button", { name: /Lock & create targets/ })).toBeDisabled();
   });
+
+  it("stays usable after a backend restart with a saved calibration and no job history", async () => {
+    const r = routes({ running: null, status: "idle", jobs: {}, locked: false, prepared: false });
+    r["/api/runs/active?module=calibration"] = () => ({ active: { run_id: "20260814-1022",
+      applied_at: "2026-08-14T10:22:00", tool: "Realsense", quality: { verdict: "pass" } } });
+    installFakes(r);
+    mount();
+    await waitFor(() => expect(countCalls("/api/runs/active?module=calibration")).toBe(1));
+    expect(screen.getByRole("button", { name: /Lock & create targets/ })).toBeTruthy();
+    expect(screen.queryByText(/ERROR/)).toBeNull();
+  });
 });
 ```
 
@@ -3019,7 +3213,7 @@ git commit -m "test(webui): vitest + integration tests for the provider and the 
 - [ ] **Step 1: README + CLAUDE.md**
 
 In `tasni/README.md` "Run" paragraph replace the sentence beginning "The guide's **Open Tasni station** button loads `Tasni.rdk`…" with:
-> The topbar **Connect** button opens `Tasni.rdk` (`POST /api/rdk/connect`, station-only, refused while a job runs); every module reads that one connection. Entering Aim/Survey links the real-robot driver (`POST /api/rdk/link`) so the RoboDK model tracks the arm — **Create targets** and **Lock surface** refuse (409 `pose_not_live`) until it does, because they seed from the model pose. `GET /api/readiness` tells the Dashboard what is recorded vs actually present in the open station.
+> The topbar **Connect** button opens `Tasni.rdk` (`POST /api/rdk/connect`, station-only, refused while a job runs); every module reads that one connection. Entering Aim/Survey links the real-robot driver (`POST /api/rdk/link`) so the RoboDK model tracks the arm — **Create targets** and **Lock surface** refuse (409 `pose_not_live`) until it does, because they seed from the model pose. `GET /api/readiness` tells the Dashboard what is recorded vs actually present in the open station. The applied calibration lives in `runs/calibration/active.json` and survives a backend restart: the Calibration page shows "Calibration on file · date · verdict" from it and offers **Re-apply saved calibration** (`POST /apply {run_id}`) when the tool pose in the station differs. A calibration does not expire on its own — recalibrate after a mount, camera or tool change, a failed accuracy check, or by operator decision.
 
 Under "Architecture" add to the `core/` list: `jobrunner, events  … every event carries module + job_id + kind (live previews: stream_id); outcomes kept per (module, kind)`.
 
@@ -3050,4 +3244,5 @@ Then use `superpowers:finishing-a-development-branch` to merge `ux-phase0` → `
 - **Spec coverage (§4.5, §4.7, §7, §8, §9 phase 0):** events + ids → T1–T3; per-(module, kind) history + `/status` → T1, T4; station-only connect with 409/lock → T5; link endpoint + consolidation + config doc → T5; live-pose gate + `pose_live` in the calibration gate + `require_live_pose` → T6; readiness recorded-vs-present → T7; provider refresh rules, filtered `subscribe`, topbar Connect, banners dropped, auto-link on Aim/Survey, gate reasons → T8a–d; integration tests (foreign events, rehydrate, health failure, terminal refresh) + backend scope/connect/readiness tests → T1–T7, T9. **Deferred to phase 1 by design:** `?step=` seeding, the Dashboard readiness *cards* (the endpoint ships here), per-module last-job UI beyond `result`.
 - **Deviations to note:** module `/connect` routes stay until phase 4 (spec); `robotLinkNote` moved into the provider (was in `Calibration.tsx`); `survey` events are request-path (module-scoped, no `stream_id`) — the spec's §4.5 list is corrected accordingly.
 - **Plan review (2026-08-28, second agent) — all seven findings accepted and folded in:** (1) "running" now precedes the worker + post-start/reconnect reconcile via `/status` + fast-job tests (T1, T8b–d, T9); (2) `LivePreview.start(stream_id=)` resume + scan `live_start(resume=True)` + boundary stamped (T2, T3); (3) `CellArbiter` makes connect/link/job/live transitions atomic (T5a, T5); (4) strict link verifies a manual link when auto-link is off; error text corrected (T5); (5) `ready = rdk.ready && health.robodk.ok !== false`, Connect disabled on camera `in_use` too (T8a); (6) reconciler clears stale `running` (T8b–d); (7) tests for fast job, reconnect racing starts, cross-module preview ownership, Scan/Extrusion filtering, stale-green readiness (T2, T5, T9). Scan no longer auto-connects; the spec status changes only after cell validation (T8c, T10).
+- **Plan review round 2 (same day) — all accepted:** `applied` hydrated into the Calibration page and shown as "Calibration on file · date · verdict" independent of job history, with **Re-apply saved calibration** → `POST /apply {run_id}` when readiness says the tool pose is absent/different (T8b 5b); no-expiry policy stated in the page, README and spec (T8b, T10); backend + frontend restart tests: empty `jobs` + `active.json` → status shows `applied`, re-apply restores the pose, Scan stays usable (T4, T9); `/api/rdk/link` checks moved inside the arbiter hold (T5); camera-lease acquisition passes through a now re-entrant arbiter so Connect's camera-busy check is atomic (T5a).
 - **Type consistency:** `JobRunner.start(kind=, module=, name=) -> str`, `module_status()` keys `running/status/jobs`, `JobEvent.{module,job_id,kind,stream_id}`, `LivePreview.start(owner=) -> str` / `.stream_id` / `.owner`, `ensure_robot_link(rdk, cfg, *, strict, log) -> {enabled, connected, message, ip, configured}`, `pose_not_live_detail(rdk, cfg)`, `usePlatform()` value keys — used identically across tasks.

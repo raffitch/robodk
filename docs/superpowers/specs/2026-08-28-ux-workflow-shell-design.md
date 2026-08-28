@@ -265,9 +265,13 @@ session on a socket error mid-load, check robot + camera tool). Response = the
   camera lease is held (its error path resets the session —
   `calibration/module.py:186` — which must never happen under a running job); a
   concurrent second call gets 409 "connect in progress"; a job or preview start
-  during a connect fails fast with 409 "cell is busy: connect". Link holds the
-  arbiter too (up to `robot_connect_timeout_s`), so pages start the camera
-  *before* linking.
+  during a connect fails fast with 409 "cell is busy: connect". Camera-lease
+  acquisition passes through the arbiter momentarily as well (the arbiter is
+  re-entrant within a thread, since a live start takes the lease inside its own
+  hold), so a request-path capture cannot slip in after Connect's camera check.
+  Link holds the arbiter too (up to `robot_connect_timeout_s`) and performs its
+  own session/job checks inside the hold, so pages start the camera *before*
+  linking.
 
 The three module `/connect` routes are deleted in phase 4 once every page uses the
 platform one (the web UI is their only client; `tasni.cli` does not call them).
@@ -391,6 +395,15 @@ its *Board* step and are also linked from the guide.
 
    A card whose `present` is false says so ("recorded 2026-08-27 · **not in the
    current station** — re-insert"); `null` renders as "connect to verify".
+
+   **A calibration does not expire on its own.** `active.json` is the record of
+   what is applied; the app never ages it into "stale". A new calibration is
+   required only after a mount, camera or tool change, a failed accuracy check,
+   or an explicit operator decision. Because job history is in-memory, the
+   Calibration page shows the saved run from `active.json` (via its `/status`
+   `applied` field) independently of any job, and offers **Re-apply saved
+   calibration** — `POST /apply {run_id}`, which loads the run from disk — whenever
+   readiness reports the tool pose absent or different.
 2. **Modules grid** — unchanged (registry-driven).
 3. **Recent runs** — rows become clickable and open a `RunDetail` drawer from a new
    `GET /api/runs/{module}/{stamp}` (`core/runs.load_meta` + `load_report`) showing
@@ -435,7 +448,7 @@ Summaries are what the collapsed step shows. Primary action in **bold**.
 | 1 | Board | board preview, page select (A4/A3/Letter), Open PDF / Download, measured-square check, **scale ack** (hard gate, unchanged) | **Confirm print scale** · "8×6 @ 30 mm · A4 · scale verified" |
 | 2 | Aim & targets | `PrereqChip` real-robot link (auto-linked on entry, §4.5); live frame + `AimHud` + `StreamStats`, lamps + LOCK, jog-frame note (one line; details in guide), `CollisionPanel` as a `PrereqChip` + expandable pairs, `ConeDiagram` in the guide slot | **Create targets** (locked until LOCK **and** `pose_live`) · "15 targets (TasniCalib_*)" — Change → Clear |
 | 3 | Run | kv (robot/tool/camera/board), held-out count + refine toggle, `holdoutInvalid` warning, `RunControls` (Simulate → `TourResult` → Run on robot → dialog), progress, thumbnails | **Run on robot** · "solved 2026-08-28 14:02 · 15 poses" |
-| 4 | Review & apply | `Metrics` + verdict banner | **Apply** · "applied · PASS · 0.9 px val" |
+| 4 | Review & apply | `Metrics` + verdict banner; "Calibration on file · date · verdict · tool" from `active.json` with recorded-vs-present from `/api/readiness` (independent of job history, so it survives a backend restart); no-expiry note; **Re-apply saved calibration** (`POST /apply {run_id}`) when the pose is absent/different | **Apply** · "applied · PASS · 0.9 px val" |
 
 The cell-connected requirement locks step 2 (not step 1 — printing needs no robot).
 
@@ -628,6 +641,16 @@ Fourth round, same day — review of the phase 0 implementation plan
 | R17 | `ready` could go stale-green after a health failure; Connect ignored preview/lease | `ready = rdk.ready && health.robodk.ok !== false`; Connect disabled while the camera is in use (§4.5) |
 | R18 | rehydration never cleared stale `running` | the module `/status` reconciler settles finished own jobs (§7) |
 | R19 | tests missed the strongest promises; Scan auto-connected silently; spec marked "implemented" before validation | tests added (§8); decision 13; status changes only after cell validation |
+
+Fifth round, same day — second review of the phase 0 plan; all accepted:
+
+| # | Finding | Resolution |
+|---|---|---|
+| R20 | the Calibration page ignored `/status`'s `applied`; after a backend restart (empty job history) it could show neither the saved calibration nor a way to re-apply it | `applied` hydrated and shown as "Calibration on file · date · verdict" independent of jobs; **Re-apply saved calibration** → `POST /apply {run_id}` (§4.7, §5.1) |
+| R21 | expiry policy unstated | a calibration never expires on its own; recalibrate only after mount/camera/tool change, failed accuracy check, or operator decision (§4.7, page copy, README) |
+| R22 | no restart test | backend: empty `jobs` + `active.json` → `applied` reported, re-apply restores the pose; frontend: page shows the saved run and re-applies; Scan stays usable (§8) |
+| R23 | `/api/rdk/link` checked session/job before taking the arbiter | checks moved inside the hold (§4.5) |
+| R24 | camera-lease acquisition bypassed the arbiter, so Connect's camera check was not atomic | lease acquisition passes through the (re-entrant) arbiter (§4.5) |
 
 ## Appendix A — control mapping (today → new home)
 
