@@ -95,6 +95,10 @@ class MeasureSession:
         self.last_pose: dict | None = None
         self.characterizations: list[dict] = []
         self.records: list[dict] = []
+        # The plan the operator APPLIED from a characterization: the only plan
+        # this session's takes may be scored against, and the one to rebuild
+        # after a backend restart.
+        self.applied: dict | None = None
 
     # -- persistence --------------------------------------------------------
     @classmethod
@@ -118,6 +122,7 @@ class MeasureSession:
         session.last_pose = data.get("last_pose")
         session.characterizations = list(data.get("characterizations", []))
         session.records = list(data.get("records", []))
+        session.applied = data.get("applied")
         return session
 
     @classmethod
@@ -140,7 +145,8 @@ class MeasureSession:
     def to_json(self) -> dict:
         return {"trial_id": self.trial_id, "mode": MODE, "takes": self.takes,
                 "tops": self.tops, "last_pose": self.last_pose,
-                "characterizations": self.characterizations, "records": self.records}
+                "characterizations": self.characterizations, "records": self.records,
+                "applied": self.applied}
 
     # -- experiment state ---------------------------------------------------
     def next_take(self, layer_index: int) -> int:
@@ -153,12 +159,60 @@ class MeasureSession:
 
     def record_take(self, *, layer_index: int, take: int, measured_xyz, pose: dict | None,
                     summary: dict) -> None:
-        self.takes[layer_index] = take
+        """Record one take. ``measured_xyz`` None (a failure) leaves the floor alone.
+
+        A ring that could not be measured is not a surface to stack the next
+        layer's ROI on, so a failed take must never become ``tops[layer]``.
+        """
+        self.takes[layer_index] = max(take, self.takes.get(layer_index, 0))
         if measured_xyz is not None:
             self.tops[layer_index] = np.asarray(measured_xyz, dtype=float).tolist()
         if pose:
             self.last_pose = pose
+        self.upsert_record(summary)
+
+    def upsert_record(self, summary: dict) -> None:
+        """Replace the record for this (layer, take) or append it, keeping order.
+
+        Reprocessing an archived take rewrites a record that already exists;
+        appending a second one would double-count it in the paper statistics.
+        """
+        key = (summary.get("layer_index"), summary.get("take"))
+        for index, existing in enumerate(self.records):
+            if (existing.get("layer_index"), existing.get("take")) == key:
+                self.records[index] = summary
+                return
         self.records.append(summary)
+
+    def sync_take_from_archive(self, layer_dir: Path, manifest: dict, measured_xyz) -> dict:
+        """Fold an offline-reprocessed take back into the session.
+
+        ``reprocess_saved_layer`` rewrites a take's manifest; without this the
+        session that the next layer's floor and the operator's table are read
+        from would still hold the failed take (cell, 2026-08-28: layer-001 was
+        rescued to a valid measurement while session.json stayed empty).
+        """
+        summary = take_summary(layer_dir, manifest, reprocessed=True)
+        self.record_take(layer_index=summary["layer_index"], take=summary["take"],
+                         measured_xyz=measured_xyz if summary["valid"] else None,
+                         pose=None, summary=summary)
+        self.save()
+        return summary
+
+
+def take_summary(layer_dir: Path, manifest: dict, *, reprocessed: bool = False) -> dict:
+    """One row of the session table, built from what the archive actually holds."""
+    processing = manifest.get("processing") or {}
+    metrics = manifest.get("metrics")
+    return {"layer_index": int(manifest["layer_index"]), "take": int(manifest.get("take", 1)),
+            "layer_dir": str(layer_dir), "layer_name": Path(layer_dir).name,
+            "annotation": manifest.get("annotation") or {},
+            "metrics": metrics, "geometry": manifest.get("geometry"),
+            "timings_ms": processing.get("timings_ms") or {},
+            "valid": bool((metrics or {}).get("valid", False)),
+            "error": processing.get("error"),
+            "reprocessed": bool(reprocessed or processing.get("offline_reprocess")),
+            "timestamp": _utcnow()}
 
 
 def _inspect_and_capture(services, ctx: JobContext, plan: CylinderPlan, layer, *,
@@ -297,10 +351,18 @@ class RingMeasureJob:
                         **base, processing={"valid": False, "error": str(exc),
                                             "timings_ms": {"capture_ms": capture_ms}},
                         warnings=[str(exc)])
-                    archive.write_layer(manifest, nominal_xyz=nominal, commanded_xyz=nominal,
-                                        color=frame.color, depth=frame.depth,
-                                        report={"valid": False, "error": str(exc)})
-                    self.session.takes[self.layer_index] = take
+                    failed_dir = archive.write_layer(
+                        manifest, nominal_xyz=nominal, commanded_xyz=nominal,
+                        color=frame.color, depth=frame.depth,
+                        report={"valid": False, "error": str(exc)})
+                    # A failure the operator cannot see is a failure they cannot
+                    # reprocess -- and the raw frame that would rescue it is
+                    # already on disk.
+                    self.session.record_take(
+                        layer_index=self.layer_index, take=take, measured_xyz=None,
+                        pose=inspect["pose"],
+                        summary=take_summary(failed_dir,
+                                             manifest.model_dump(mode="json")))
                     self.session.save()
                     raise RuntimeError(
                         f"layer {self.layer_index} take {take} measurement invalid; "
@@ -569,10 +631,42 @@ def detection_error_mm(manifest: dict) -> "float | None":
 
 
 def _condition_name(manifest: dict) -> str:
-    offset = (manifest.get("annotation") or {}).get("introduced_offset_mm")
-    if not offset or not any(float(v) for v in offset):
-        return "true (no introduced offset)"
-    return f"introduced offset ({offset[0]:g}, {offset[1]:g}) mm"
+    """Layer + the phase the operator recorded + the ground truth they typed.
+
+    Five untouched takes (sensing noise floor) and three re-placed takes
+    (placement repeatability) are different experiments that share an empty
+    offset; pooling them hides one inside the other. The layer matters too --
+    per-layer numbers are the evidence that measuring climbs with the stack.
+    """
+    annotation = manifest.get("annotation") or {}
+    parts = [f"layer {int(manifest.get('layer_index', 0))}"]
+    phase = str(annotation.get("phase") or "").strip()
+    if phase:
+        parts.append(phase)
+    offset = annotation.get("introduced_offset_mm")
+    if offset and any(float(v) for v in offset):
+        parts.append(f"introduced offset ({offset[0]:g}, {offset[1]:g}) mm")
+    elif not phase:
+        parts.append("no introduced offset")
+    return " - ".join(parts)
+
+
+def live_timings(manifest: dict) -> dict:
+    """The timings measured ON THE CELL for this take, if any.
+
+    An offline reprocess produces a processing time for a run that never
+    happened; requirement 3 is scan-to-feedback time on the real cell, so an
+    offline take contributes only what stayed true -- the capture it was
+    reprocessed from -- unless its original live timings were preserved.
+    """
+    processing = manifest.get("processing") or {}
+    timings = dict(processing.get("timings_ms") or {})
+    if not processing.get("offline_reprocess"):
+        return timings
+    preserved = dict(processing.get("live_timings_ms") or {})
+    if preserved:
+        return preserved
+    return {"capture_ms": timings.get("capture_ms")}
 
 
 def _fmt(stat: dict, digits: int = 2) -> str:
@@ -602,7 +696,11 @@ def paper_summary(root: Path, trial_id: str) -> dict:
         groups.setdefault(_condition_name(manifest), []).append(manifest)
     conditions = []
     for name, items in groups.items():
-        metrics = [m["metrics"] for m in items if m.get("metrics")]
+        # Only a take that produced a branch-free path measured anything. An
+        # invalid take is still reported (takes vs valid) but never averaged:
+        # its deviation numbers describe a reconstruction that failed.
+        measured = [m for m in items if (m.get("metrics") or {}).get("valid")]
+        metrics = [m["metrics"] for m in measured]
         introduced = introduced_offset_mm(items[0])
         introduced_norm = float(math.hypot(*introduced))
         deviation = {"mean_absolute_mm": _stat(x.get("mean_absolute_mm") for x in metrics),
@@ -613,15 +711,19 @@ def paper_summary(root: Path, trial_id: str) -> dict:
             "valid": sum(1 for x in metrics if x.get("valid")),
             "introduced_offset_mm": list(introduced),
             "introduced_norm_mm": introduced_norm,
+            "layer_index": int(items[0].get("layer_index", 0)),
+            "phase": str((items[0].get("annotation") or {}).get("phase") or "") or None,
             "center_offset_norm_mm": _stat(x.get("center_offset_norm_mm") for x in metrics),
-            "detection_error_mm": _stat(detection_error_mm(m) for m in items),
+            "detection_error_mm": _stat(detection_error_mm(m) for m in measured),
             **deviation,
             "shape_rms_mm": _stat(x.get("shape_rms_mm") for x in metrics),
             "shift_consistency": shift_consistency(
                 {key: stat["mean"] for key, stat in deviation.items()}, introduced_norm)})
-    timings = [(m.get("processing") or {}).get("timings_ms") or {} for m in takes]
+    timings = [live_timings(m) for m in takes]
     timing = {key: _stat(t.get(key) for t in timings)
               for key in ("capture_ms", "total_ms", "acquisition_to_path_ms")}
+    timing["offline_reprocessed_takes"] = sum(
+        1 for m in takes if (m.get("processing") or {}).get("offline_reprocess"))
     geometry = [m["geometry"] for m in takes if m.get("geometry")]
     height = {key: _stat(g.get(key) for g in geometry)
               for key in ("height_mean_mm", "height_min_mm", "height_max_mm", "top_z_std_mm")}
@@ -672,6 +774,11 @@ def paper_summary(root: Path, trial_id: str) -> dict:
                       f"three-dimensional path took {_fmt(acq, 0)} ms "
                       f"(capture {_fmt(timing['capture_ms'], 0)} ms, processing "
                       f"{_fmt(timing['total_ms'], 0)} ms)."]
+    if timing["offline_reprocessed_takes"]:
+        lines += ["", f"{timing['offline_reprocessed_takes']} take(s) were reprocessed offline "
+                      "from their archived RGB-D frame; their geometry counts, and their "
+                      "processing time is excluded from the cycle statistic above unless it "
+                      "was measured live."]
     if geometry:
         lines += ["", f"Layer height along the ring: mean {_fmt(height['height_mean_mm'], 1)} mm, "
                       f"min {_fmt(height['height_min_mm'], 1)} mm, max "

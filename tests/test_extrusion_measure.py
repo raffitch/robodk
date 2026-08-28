@@ -744,15 +744,19 @@ from tasni.modules.extrusion.measure import paper_summary
 
 
 def _write_take(root, trial_id, layer_index, take, *, offset, rms, mean_abs, maximum,
-                acq_ms, valid=True, offset_norm=None, measured_offset=None):
+                acq_ms, valid=True, offset_norm=None, measured_offset=None,
+                phase=None, offline=False):
     if measured_offset is None:
         measured_offset = (float(offset_norm or 0.0), 0.0)
     if offset_norm is None:
         offset_norm = float(np.hypot(*measured_offset))
+    annotation = {"introduced_offset_mm": offset}
+    if phase is not None:
+        annotation["phase"] = phase
     manifest = LayerManifest(
         trial_id=trial_id, layer_index=layer_index, take=take, mode="MEASURE_ONLY",
         recipe=auto_plan().recipe, toolpath_fingerprint="f" * 64,
-        annotation={"introduced_offset_mm": offset},
+        annotation=annotation,
         metrics=DeviationMetrics(mean_absolute_mm=mean_abs, rms_mm=rms, maximum_mm=maximum,
                                  measured_center_mm=(0, 0), measured_radius_mm=40,
                                  path_completeness=0.99, maximum_angular_gap_deg=4, valid=valid,
@@ -762,8 +766,11 @@ def _write_take(root, trial_id, layer_index, take, *, offset, rms, mean_abs, max
                               height_mean_mm=6, height_min_mm=5, height_max_mm=9,
                               height_reference="build_plane", bead_width_mean_mm=8,
                               bead_width_min_mm=7, bead_width_max_mm=9, bead_width_bins=36),
-        processing={"timings_ms": {"capture_ms": 40.0, "total_ms": acq_ms - 40.0,
-                                   "acquisition_to_path_ms": acq_ms}})
+        processing={"offline_reprocess": offline,
+                    "timings_ms": ({"capture_ms": 40.0, "total_ms": acq_ms - 40.0}
+                                   if offline else
+                                   {"capture_ms": 40.0, "total_ms": acq_ms - 40.0,
+                                    "acquisition_to_path_ms": acq_ms})})
     ExtrusionArchive(root).write_layer(manifest, nominal_xyz=np.zeros((4, 3)),
                                        commanded_xyz=np.zeros((4, 3)))
 
@@ -778,8 +785,10 @@ def test_paper_summary_groups_by_introduced_offset_and_reports_timing(tmp_path):
     summary = paper_summary(root, t)
     assert summary["mode"] == "MEASURE_ONLY" and summary["takes"] == 3 and summary["valid"] == 3
     by_name = {c["condition"]: c for c in summary["conditions"]}
-    assert by_name["true (no introduced offset)"]["takes"] == 2
-    shifted = by_name["introduced offset (10, 0) mm"]
+    # A condition is the layer AND the ground truth: see
+    # test_conditions_separate_the_layer_and_the_phase_the_operator_recorded.
+    assert by_name["layer 1 - no introduced offset"]["takes"] == 2
+    shifted = by_name["layer 2 - introduced offset (10, 0) mm"]
     assert shifted["takes"] == 1 and shifted["center_offset_norm_mm"]["mean"] == 9.8
     assert summary["timing_ms"]["acquisition_to_path_ms"]["mean"] == pytest.approx(1000.0)
     assert summary["timing_ms"]["acquisition_to_path_ms"]["sd"] == pytest.approx(100.0)
@@ -816,7 +825,7 @@ def test_paper_summary_scores_the_measurement_against_the_offset_the_operator_ty
                 rms=7.1, mean_abs=6.4, maximum=10.1, acq_ms=1000)
 
     shifted = {c["condition"]: c for c in paper_summary(root, t)["conditions"]}[
-        "introduced offset (10, 0) mm"]
+        "layer 2 - introduced offset (10, 0) mm"]
 
     assert shifted["introduced_norm_mm"] == pytest.approx(10.0)
     # |(10.4, 0.3) - (10, 0)| and |(9.6, -0.3) - (10, 0)| are both exactly 0.5 mm
@@ -1044,3 +1053,302 @@ def test_the_trial_stack_figure_is_served_for_the_whole_session(tmp_path, monkey
     assert (root / "t1" / "figures" / "stack.png").is_file()
     assert client.get("/api/modules/extrusion/trials/t1/figures/plan.png").status_code == 404
     assert client.get("/api/modules/extrusion/trials/nope/figures/stack.png").status_code == 404
+
+
+# ============================================================================
+# The operator journey: a session that stays truthful across restarts,
+# reprocessing, and the conditions the paper protocol deliberately creates.
+# ============================================================================
+
+def _archive_failed_take(root, session, plan, *, capture_ms=2874.0, layer_index=1, take=1):
+    """A take that failed on the cell: raw RGB-D archived, nothing derived.
+
+    This is exactly what the paper trial's layer-001 looked like the night the
+    board-noise defect was found.
+    """
+    layer = plan.layers[layer_index - 1]
+    T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, layer_index), 300.0)
+    depth = syn.render_scene([syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.flat(6.0))], T,
+                             plane_center_xy_mm=CENTER, seed=3)
+    manifest = LayerManifest(
+        trial_id=session.trial_id, layer_index=layer_index, take=take, mode="MEASURE_ONLY",
+        recipe=plan.recipe, toolpath_fingerprint=plan.fingerprint,
+        color_file="color.png", depth_file="depth.npy",
+        annotation={"introduced_offset_mm": None, "note": "MAIN-TEST-1"},
+        processing={"valid": False, "error": "branch guard exhausted",
+                    "timings_ms": {"capture_ms": capture_ms}},
+        provenance={"T_work_camera": np.asarray(T, dtype=float).tolist(),
+                    "camera_intrinsics": {"K": syn.K_720P.tolist()},
+                    "processing_config": ExtrusionConfig().model_dump(mode="json")})
+    nominal = points_array(layer)
+    ExtrusionArchive(root).write_layer(
+        manifest, nominal_xyz=nominal, commanded_xyz=nominal,
+        color=np.zeros((*depth.shape, 3), np.uint8), depth=depth, report={"valid": False})
+    session.takes[layer_index] = take
+    session.save()
+
+
+def test_reprocessing_an_archived_take_puts_it_back_into_the_session(tmp_path):
+    """A take rescued offline must re-enter the session, not only its manifest.
+
+    session.json is what layer N+1's floor and the operator's table read. On the
+    cell (2026-08-28) the paper trial's layer-001 was reprocessed to a valid
+    measurement while session.json still said records: [] and tops: {} -- so
+    layer 2 would have been measured against the build plane instead of ring 1's
+    measured top, the floor the spec proves is load-bearing.
+    """
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion.service import reprocess_saved_layer
+
+    root = tmp_path / "runs" / "extrusion"
+    plan = scene_plan(radius=60.0, bead=8.0, layer_height=6.0, center=CENTER)
+    session = MeasureSession.create(root, plan, note="rings")
+    _archive_failed_take(root, session, plan)
+
+    reprocess_saved_layer(root, session.trial_id, 1)
+
+    reloaded = MeasureSession.load(root, session.trial_id)
+    assert reloaded.takes == {1: 1}
+    assert [(r["layer_index"], r["take"]) for r in reloaded.records] == [(1, 1)]
+    assert reloaded.records[0]["valid"] is True
+    assert reloaded.records[0]["reprocessed"] is True
+    assert reloaded.records[0]["layer_name"] == "layer-001"     # the UI addresses figures by it
+    assert np.asarray(reloaded.tops[1]).shape[1] == 3           # layer 2 now has its floor
+
+
+def test_a_reprocessed_take_keeps_the_capture_time_it_was_measured_with(tmp_path):
+    """Capture time is a fact about the cell; offline processing time is not.
+
+    Overwriting capture_ms with an offline number would corrupt the paper's
+    acquisition-to-path statistic with a measurement that never happened.
+    """
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion.service import reprocess_saved_layer
+
+    root = tmp_path / "runs" / "extrusion"
+    plan = scene_plan(radius=60.0, bead=8.0, layer_height=6.0, center=CENTER)
+    session = MeasureSession.create(root, plan)
+    _archive_failed_take(root, session, plan, capture_ms=2874.0)
+
+    reprocess_saved_layer(root, session.trial_id, 1)
+
+    manifest = json.loads((session.trial_dir / "layer-001" / "manifest.json").read_text())
+    timings = manifest["processing"]["timings_ms"]
+    assert timings["capture_ms"] == pytest.approx(2874.0)
+    assert manifest["processing"]["offline_reprocess"] is True
+    # No acquisition-to-path: this take never produced a path on the cell.
+    assert "acquisition_to_path_ms" not in timings
+
+
+def test_an_offline_reprocessed_take_is_kept_out_of_the_live_timing_statistic(tmp_path):
+    """Requirement 3 is scan-to-feedback time ON THE CELL, over ~10 runs."""
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, auto_plan(), note="rings")
+    t = session.trial_id
+    _write_take(root, t, 1, 1, offset=None, offset_norm=0.4, rms=0.5, mean_abs=0.4,
+                maximum=1.1, acq_ms=1000)
+    _write_take(root, t, 1, 2, offset=None, offset_norm=0.5, rms=0.5, mean_abs=0.4,
+                maximum=1.2, acq_ms=99999, offline=True)
+
+    summary = paper_summary(root, t)
+
+    acq = summary["timing_ms"]["acquisition_to_path_ms"]
+    assert acq["n"] == 1 and acq["mean"] == pytest.approx(1000.0)
+    assert summary["timing_ms"]["offline_reprocessed_takes"] == 1
+    assert "reprocessed offline" in summary["markdown"]
+    # Both takes still count as measurements of the ring.
+    assert summary["takes"] == 2
+
+
+def test_conditions_separate_the_layer_and_the_phase_the_operator_recorded(tmp_path):
+    """Five untouched takes and three re-placed takes are different experiments.
+
+    Pooled into one "no introduced offset" row they hide sensing repeatability
+    inside placement repeatability, and the per-layer evidence that the camera
+    climbs with the stack disappears entirely.
+    """
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, auto_plan(), note="rings")
+    t = session.trial_id
+    for take in (1, 2):
+        _write_take(root, t, 1, take, offset=None, offset_norm=0.4, rms=0.5, mean_abs=0.4,
+                    maximum=1.1, acq_ms=1000, phase="noise floor")
+    _write_take(root, t, 1, 3, offset=None, offset_norm=1.9, rms=1.6, mean_abs=1.4,
+                maximum=2.6, acq_ms=1000, phase="re-placed")
+    _write_take(root, t, 2, 1, offset=None, offset_norm=0.8, rms=0.7, mean_abs=0.6,
+                maximum=1.4, acq_ms=1000, phase="stacked true")
+    _write_take(root, t, 2, 2, offset=[10, 0], offset_norm=9.8, rms=7.0, mean_abs=6.3,
+                maximum=9.9, acq_ms=1000, phase="top ring shifted")
+
+    summary = paper_summary(root, t)
+
+    by_name = {c["condition"]: c for c in summary["conditions"]}
+    assert by_name["layer 1 - noise floor"]["takes"] == 2
+    assert by_name["layer 1 - re-placed"]["takes"] == 1
+    assert by_name["layer 2 - stacked true"]["takes"] == 1
+    shifted = by_name["layer 2 - top ring shifted - introduced offset (10, 0) mm"]
+    assert shifted["takes"] == 1 and shifted["layer_index"] == 2
+    assert shifted["introduced_norm_mm"] == pytest.approx(10.0)
+
+
+def test_takes_of_the_same_layer_stay_separate_when_no_phase_was_recorded(tmp_path):
+    """Without a phase the layer still separates the conditions."""
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, auto_plan())
+    t = session.trial_id
+    _write_take(root, t, 1, 1, offset=None, offset_norm=0.4, rms=0.5, mean_abs=0.4,
+                maximum=1.1, acq_ms=1000)
+    _write_take(root, t, 2, 1, offset=None, offset_norm=0.6, rms=0.6, mean_abs=0.5,
+                maximum=1.3, acq_ms=1000)
+
+    by_name = {c["condition"]: c for c in paper_summary(root, t)["conditions"]}
+
+    assert by_name["layer 1 - no introduced offset"]["takes"] == 1
+    assert by_name["layer 2 - no introduced offset"]["takes"] == 1
+
+
+def test_an_invalid_take_is_reported_but_never_averaged_into_the_deviations(tmp_path):
+    """An invalid take has no reconstructed path; its numbers are not measurements."""
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, auto_plan())
+    t = session.trial_id
+    _write_take(root, t, 1, 1, offset=None, offset_norm=0.5, rms=0.5, mean_abs=0.4,
+                maximum=1.0, acq_ms=1000, phase="noise floor")
+    _write_take(root, t, 1, 2, offset=None, offset_norm=44.0, rms=51.0, mean_abs=48.0,
+                maximum=77.0, acq_ms=1000, phase="noise floor", valid=False)
+
+    condition = paper_summary(root, t)["conditions"][0]
+
+    assert condition["takes"] == 2 and condition["valid"] == 1
+    assert condition["rms_mm"]["n"] == 1 and condition["rms_mm"]["mean"] == pytest.approx(0.5)
+    assert condition["center_offset_norm_mm"]["mean"] == pytest.approx(0.5)
+
+
+# --------------------------------------------- the plan a session is bound to
+
+def _characterized(client, root, *, radius_mm=61.24, center=(214.0, 141.0)):
+    """Characterize + Apply, as the protocol requires between placing and measuring."""
+    client.post("/api/modules/extrusion/measure/session/new", json={"note": "rings"})
+    session = MeasureSession.latest(root)
+    session.characterizations.append({"index": 1, "radius_mm": radius_mm,
+                                      "center_mm": list(center), "bead_width_mm": 8.31,
+                                      "top_z_mean_mm": 6.44, "top_z_min_mm": 5.1,
+                                      "top_z_max_mm": 9.8})
+    session.save()
+    return client.post("/api/modules/extrusion/measure/apply-characterization").json()
+
+
+def test_measuring_against_a_plan_that_is_not_the_applied_one_is_refused(tmp_path, monkeypatch):
+    """The stale-plan artifact, blocked at the source.
+
+    On the cell (2026-08-28) *Apply to recipe & placement* was skipped between
+    Characterize and Measure, and layer-001 measured the ring against a plan it
+    was never placed on: 15.38 mm centre offset, 11.31 mm RMS, both meaningless.
+    Pressing *Center on scanned surface -> Generate* after Apply does the same
+    damage. Once a characterization is applied, a session measures against THAT
+    plan or refuses.
+    """
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    client = TestClient(create_app(AppConfig()))
+    api_plan(client)
+    applied = _characterized(client, tmp_path / "runs" / "extrusion")
+
+    regenerated = api_plan(client)                       # the pre-Apply plan, again
+    assert regenerated["fingerprint"] != applied["fingerprint"]
+    refused = client.post("/api/modules/extrusion/measure/layer",
+                          json={"fingerprint": regenerated["fingerprint"], "layer_index": 1,
+                                "annotation": {}, "confirm_robot_motion": True})
+
+    assert refused.status_code == 409
+    detail = refused.json()["detail"]
+    assert "Apply to recipe & placement" in detail and "characteriz" in detail.lower()
+
+
+def test_the_applied_plan_comes_back_after_a_restart(tmp_path, monkeypatch):
+    """The plan lives in memory; the session outlives the process.
+
+    "After a backend restart press Apply FIRST" was folklore the operator had to
+    remember mid-experiment. The session already records what was applied.
+    """
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    client = TestClient(create_app(AppConfig()))
+    api_plan(client)
+    applied = _characterized(client, tmp_path / "runs" / "extrusion")
+
+    restarted = TestClient(create_app(AppConfig()))              # a fresh process
+    plan = restarted.get("/api/modules/extrusion/plan").json()
+
+    assert plan["fingerprint"] == applied["fingerprint"]
+    assert plan["recipe"]["radius_mm"] == applied["recipe"]["radius_mm"]
+    assert plan["setup"]["center_x_mm"] == pytest.approx(214.0)
+    assert plan["restored_from"] == MeasureSession.latest(tmp_path / "runs" / "extrusion").trial_id
+
+
+def test_measuring_layer_two_before_layer_one_has_a_measured_top_is_refused(tmp_path, monkeypatch):
+    """Layer N's ROI floor IS layer N-1's latest measured take.
+
+    Measured without it, a stacked ring blends with the ring beneath and the
+    synthetic proof shows the branch guard exhausting outright.
+    """
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    client = TestClient(create_app(AppConfig()))
+    api_plan(client)
+    applied = _characterized(client, tmp_path / "runs" / "extrusion")
+
+    refused = client.post("/api/modules/extrusion/measure/layer",
+                          json={"fingerprint": applied["fingerprint"], "layer_index": 2,
+                                "annotation": {}, "confirm_robot_motion": True})
+
+    assert refused.status_code == 409
+    assert "layer 1" in refused.json()["detail"]
+
+
+def test_a_failed_take_stays_visible_in_the_session(tmp_path, monkeypatch):
+    """A failure the operator cannot see is a failure they cannot reprocess.
+
+    The raw frame is archived, so the take is recoverable -- but only if the
+    session shows it happened.
+    """
+    svc, rdk, _ = measure_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(measure_mod, "process_observation",
+                        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("bad skeleton")))
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    with pytest.raises(RuntimeError, match="raw RGB-D archived"):
+        RingMeasureJob(svc, plan, session, 1, annotation={"phase": "noise floor"},
+                       check_collisions=True)(Ctx())
+
+    reloaded = MeasureSession.load(tmp_path / "runs" / "extrusion", session.trial_id)
+    assert len(reloaded.records) == 1
+    record = reloaded.records[0]
+    assert record["valid"] is False and record["layer_name"] == "layer-001"
+    assert "bad skeleton" in record["error"]
+    assert record["annotation"] == {"phase": "noise floor"}
+    assert 1 not in reloaded.tops                       # a failure is not a floor
+
+
+def test_apply_after_a_restart_rebuilds_from_the_sessions_own_trial(tmp_path, monkeypatch):
+    """A session that predates the applied-plan record still recovers exactly.
+
+    The paper session (20260828-204846-5b455377) was applied before the session
+    recorded what it applied, so a restart can only rebuild it from the trial it
+    was created with. Falling back to the module's config defaults instead would
+    hand the operator a different work frame, orientation and path resolution --
+    a plan the ring was never measured against.
+    """
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    root = tmp_path / "runs" / "extrusion"
+    client = TestClient(create_app(AppConfig()))
+    api_plan(client)                                     # points_per_circle 24, not the default 180
+    applied = _characterized(client, root)
+
+    session = MeasureSession.latest(root)
+    session.applied = None                               # as an archive from before this existed
+    session.save()
+    restarted = TestClient(create_app(AppConfig()))
+    recovered = restarted.post("/api/modules/extrusion/measure/apply-characterization").json()
+
+    assert recovered["fingerprint"] == applied["fingerprint"]
+    assert recovered["recipe"]["points_per_circle"] == 24
+    assert recovered["setup"]["work_frame"] == "Tasni Work Frame"
