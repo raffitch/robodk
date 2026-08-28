@@ -17,7 +17,7 @@ from .inspection import inspection_plan
 from .measure import (MODE as MEASURE_MODE, MeasureSession, RingCharacterizeJob,
                       RingMeasureJob, paper_summary)
 from .models import CylinderPlan, CylinderRecipe, CylinderSetup
-from .service import (CylinderDryRunJob, CylinderPrintJob, geometry_preflight,
+from .service import (CylinderDryRunJob, CylinderPrintJob, _utcnow, geometry_preflight,
                       reprocess_saved_layer, station_requirements)
 from .surface import active_scan_surface, surface_fit
 from .toolpath import corrected_cylinder_plan, generate_cylinder_plan
@@ -74,6 +74,11 @@ class MeasureLayerBody(FingerprintBody):
     layer_index: int = Field(ge=1)
     annotation: dict = Field(default_factory=dict)
     confirm_robot_motion: bool = False
+    # Escape hatch for a layer whose floor can never be measured (every take of
+    # the layer below failed). Deliberately not in the UI: the floor is
+    # load-bearing, and skipping it silently would produce a number the paper
+    # cannot use.
+    allow_missing_floor: bool = False
     confirm_close_range_tool_clear: bool = False
     collision_check_enabled: bool = False
 
@@ -111,6 +116,7 @@ class ExtrusionModule(WorkflowModule):
         self._active_print_job: CylinderPrintJob | None = None
         self._measure_session: MeasureSession | None = None
         self._active_measure_job = None
+        self._restored_from: str | None = None
 
     def _measure_root(self):
         return REPO_ROOT / "runs" / "extrusion"
@@ -134,6 +140,59 @@ class ExtrusionModule(WorkflowModule):
                     409, "generate coordinates first; a session records the plan it measures against")
             self._measure_session = MeasureSession.create(root, self._plan, note="")
         return self._measure_session
+
+    def _restore_plan_from_session(self) -> str | None:
+        """Rebuild the plan a session's characterization was applied as.
+
+        The plan lives only in memory, so a backend restart mid-experiment used
+        to leave the operator with no plan and a documented ritual ("press Apply
+        FIRST") to remember -- and pressing *Center on scanned surface ->
+        Generate* instead rebuilt the PRE-Apply plan and turned every later take
+        into the stale-plan artifact. The session already records exactly what
+        was applied, so restore that and nothing else.
+        """
+        if self._plan is not None:
+            return self._restored_from
+        session = self._session()
+        applied = None if session is None else session.applied
+        if not applied:
+            return None
+        try:
+            plan = generate_cylinder_plan(
+                CylinderRecipe.model_validate(applied["recipe"]),
+                CylinderSetup.model_validate(applied["setup"]))
+        except Exception:
+            return None
+        # Refuse to pretend: if the geometry no longer hashes to what was
+        # applied, the recipe or the generator changed and the operator must
+        # apply again deliberately.
+        if plan.fingerprint != applied.get("fingerprint"):
+            return None
+        self._plan = plan
+        self._invalidate_checks()
+        self._restored_from = session.trial_id
+        return self._restored_from
+
+    def _session_base(self, session: MeasureSession):
+        """What a characterization is applied ON TOP of: recipe + setup.
+
+        The plan in memory first; then the plan the SESSION was created with, so
+        a backend restart recovers the operator's own station selections and path
+        resolution instead of config defaults -- which need not even name a tool
+        (applying onto those raises a validation error, exactly when the operator
+        is following "press Apply first" after a restart).
+        """
+        if self._plan is not None:
+            return self._plan.recipe, self._plan.setup.model_dump(mode="json")
+        trial_file = session.trial_dir / "trial.json"
+        if trial_file.is_file():
+            try:
+                trial = json.loads(trial_file.read_text(encoding="utf-8"))
+                return (CylinderRecipe.model_validate(trial["recipe"]),
+                        CylinderSetup.model_validate(trial["setup"]).model_dump(mode="json"))
+            except Exception:
+                pass
+        return self._default_recipe(), self._default_setup()
 
     def _invalidate_checks(self) -> None:
         self._geometry_preflight_fingerprint = None
@@ -309,6 +368,7 @@ class ExtrusionModule(WorkflowModule):
             if services.jobs.running:
                 raise HTTPException(409, "cannot regenerate while a robot job is running")
             self._plan = generate_cylinder_plan(body.recipe, body.setup)
+            self._restored_from = None
             self._geometry_preflight_fingerprint = None
             self._quick_sim_fingerprint = None
             self._quick_sim_layers.clear()
@@ -317,14 +377,22 @@ class ExtrusionModule(WorkflowModule):
             self._active_quick_job = None
             self._active_dry_job = None
             self._active_print_job = None
-            return self._plan.model_dump(mode="json")
+            # Same payload shape as GET /plan: the UI stores whichever it saw
+            # last, so an extra key on one of them alone is a silent difference.
+            return {**self._plan.model_dump(mode="json"), "restored_from": None}
 
         @router.get("/plan")
         def current_plan() -> dict:
-            """Return the active plan so a reloaded UI can resume its workflow."""
+            """Return the active plan so a reloaded UI can resume its workflow.
+
+            After a backend restart this also brings back the plan a measurement
+            session applied from its characterization, so the UI reopens on the
+            ring it was measuring rather than on a stale default.
+            """
+            restored = self._restore_plan_from_session()
             if self._plan is None:
                 raise HTTPException(404, "no cylinder plan has been generated")
-            return self._plan.model_dump(mode="json")
+            return {**self._plan.model_dump(mode="json"), "restored_from": restored}
 
         @router.post("/preflight")
         def preflight(body: FingerprintBody) -> dict:
@@ -583,9 +651,8 @@ class ExtrusionModule(WorkflowModule):
             if services.jobs.running:
                 raise HTTPException(409, "wait for the current job to finish")
             found = session.characterizations[-1]
-            base_recipe = self._plan.recipe if self._plan else self._default_recipe()
-            base_setup = (self._plan.setup.model_dump(mode="json") if self._plan
-                          else self._default_setup())
+            self._restore_plan_from_session()
+            base_recipe, base_setup = self._session_base(session)
             recipe = base_recipe.model_copy(update={
                 "radius_mm": round(float(found["radius_mm"]), 1),
                 "bead_diameter_mm": round(max(0.5, float(found["bead_width_mm"])), 1),
@@ -596,14 +663,47 @@ class ExtrusionModule(WorkflowModule):
                                      "build_plane_z_mm": 0.0})
             self._plan = generate_cylinder_plan(recipe, setup)
             self._invalidate_checks()
-            return self._plan.model_dump(mode="json")
+            self._restored_from = None
+            # Bind the session to this plan: every later take is scored against
+            # it, and a restart rebuilds it from here.
+            session.applied = {"characterization_index": found.get("index"),
+                               "recipe": recipe.model_dump(mode="json"),
+                               "setup": setup.model_dump(mode="json"),
+                               "fingerprint": self._plan.fingerprint,
+                               "applied_at": _utcnow()}
+            session.save()
+            return {**self._plan.model_dump(mode="json"), "restored_from": None}
 
         @router.post("/measure/layer")
         def measure_layer(body: MeasureLayerBody) -> dict:
+            self._restore_plan_from_session()
             if self._plan is None or body.fingerprint != self._plan.fingerprint:
                 raise HTTPException(409, "toolpath changed; generate coordinates again")
             if body.layer_index > len(self._plan.layers):
                 raise HTTPException(400, f"layer_index must be 1..{len(self._plan.layers)}")
+            # Data-integrity gates BEFORE the motion gates: they are the two ways
+            # a cell run silently produces numbers the paper cannot use, and
+            # neither needs a robot to detect.
+            existing = self._session()
+            applied = None if existing is None else existing.applied
+            if applied and applied.get("fingerprint") != self._plan.fingerprint:
+                raise HTTPException(
+                    409,
+                    "this session is bound to the plan applied from its characterization "
+                    f"({str(applied.get('fingerprint'))[:10]}), but the current plan is "
+                    f"{self._plan.fingerprint[:10]}. Press 'Apply to recipe & placement' "
+                    "to measure against the characterized ring again — scoring a take "
+                    "against a plan the ring was never placed on is the stale-plan "
+                    "artifact (2026-08-28: a 15 mm centre offset that measured nothing).")
+            if (body.layer_index > 1 and existing is not None
+                    and not body.allow_missing_floor
+                    and existing.floor_profile(body.layer_index) is None):
+                raise HTTPException(
+                    409,
+                    f"measure layer {body.layer_index - 1} first: layer {body.layer_index}'s "
+                    f"measurement floor IS layer {body.layer_index - 1}'s latest measured "
+                    "take, and without it a stacked ring blends into the ring beneath it "
+                    "(the synthetic proof exhausts the branch guard outright).")
             _require_measure_ready(body.confirm_robot_motion)
             session = self._session(create=True)
             self._active_measure_job = RingMeasureJob(

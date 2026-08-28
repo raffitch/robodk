@@ -46,6 +46,8 @@ interface Layer { layer_index: number; nominal_z_mm: number; points: Point[]; }
 interface Plan {
   fingerprint: string; recipe: Recipe; setup: Setup;
   total_path_length_mm: number; layers: Layer[];
+  /** Set when the backend rebuilt this plan from a measurement session after a restart. */
+  restored_from?: string | null;
 }
 interface Config {
   defaults: Recipe; setup_defaults: Setup;
@@ -73,13 +75,23 @@ interface MeasureTake {
   layer_index: number; take: number; layer_dir: string; valid: boolean; timestamp: string;
   // Absent on takes archived before figures existed; derived from index+take then.
   layer_name?: string;
-  annotation: { introduced_offset_mm?: [number, number] | null; note?: string };
+  annotation: { introduced_offset_mm?: [number, number] | null; note?: string; phase?: string };
+  // A take whose processing failed has no metrics: its raw RGB-D is archived and it
+  // can be reprocessed offline, so it stays in the table with the reason.
   metrics: { mean_absolute_mm: number; rms_mm: number; maximum_mm: number;
     center_offset_mm: [number, number]; center_offset_norm_mm: number; shape_rms_mm: number;
-    measured_radius_mm: number; path_completeness: number };
+    measured_radius_mm: number; path_completeness: number } | null;
   geometry: { height_mean_mm: number; height_min_mm: number; height_max_mm: number;
     bead_width_mean_mm: number } | null;
-  timings_ms: { capture_ms: number; total_ms: number; acquisition_to_path_ms: number };
+  timings_ms: { capture_ms?: number; total_ms?: number; acquisition_to_path_ms?: number };
+  error?: string | null;
+  reprocessed?: boolean;
+}
+/** The plan a session applied from its characterization: every take is scored against it. */
+interface AppliedPlan {
+  fingerprint: string; applied_at?: string; characterization_index?: number;
+  recipe: { radius_mm: number; bead_diameter_mm: number; layer_height_mm: number; layer_count: number };
+  setup: { center_x_mm: number; center_y_mm: number };
 }
 interface Characterization {
   index: number; radius_mm: number; center_mm: [number, number]; bead_width_mm: number;
@@ -90,7 +102,20 @@ interface MeasureSession {
   characterizations: Characterization[];
   // layer index -> the measured centreline of its latest take, in work-frame mm.
   tops?: Record<string, number[][]>;
+  applied?: AppliedPlan | null;
 }
+
+/** The protocol's phases. Grouped by the paper summary, so they must be recorded. */
+const PHASES: Array<{ value: string; label: string; hint: string }> = [
+  { value: "noise floor", label: "Noise floor",
+    hint: "ring untouched between takes — this is sensing repeatability" },
+  { value: "re-placed", label: "Re-placed",
+    hint: "ring lifted and put back by hand — placement repeatability" },
+  { value: "stacked true", label: "Stacked true",
+    hint: "the next ring placed as accurately as you can, no deliberate offset" },
+  { value: "top ring shifted", label: "Top ring shifted",
+    hint: "the TOP ring displaced by the offset you typed — the controlled validation" },
+];
 
 /** The archive's own naming: take 1 keeps the historical name, repeats get a suffix. */
 function layerDirName(take: MeasureTake): string {
@@ -298,6 +323,8 @@ export default function Extrusion() {
   const [offsetX, setOffsetX] = useState(0);
   const [offsetY, setOffsetY] = useState(0);
   const [measureNote, setMeasureNote] = useState("");
+  const [phase, setPhase] = useState<string>("noise floor");
+  const [guideOpen, setGuideOpen] = useState(true);
   const [confirmMotion, setConfirmMotion] = useState(false);
   const [paper, setPaper] = useState<string | null>(null);
   const [openTake, setOpenTake] = useState<string | null>(null);
@@ -413,6 +440,15 @@ export default function Extrusion() {
 
   const centerOnScannedSurface = async () => {
     if (!setup || !recipe) return;
+    // Re-centring on the scanned surface throws away a placement measured from
+    // the physical ring. Doing that mid-session and regenerating is exactly how
+    // the 2026-08-28 stale-plan artifact was produced.
+    if (measureSession?.applied && !window.confirm(
+      `This session measures against the ring characterized at r ${measureSession.applied.recipe.radius_mm} mm, `
+      + `centre (${measureSession.applied.setup.center_x_mm.toFixed(1)}, `
+      + `${measureSession.applied.setup.center_y_mm.toFixed(1)}). Centring on the scanned surface `
+      + "replaces that placement with the table centre, and measuring against it would score the "
+      + "ring against a plan it was never placed on.\n\nRe-centre anyway?")) return;
     setBusy(true); setMessage("Reading the applied scan surface…");
     try {
       const response = await api.post<{ setup: Partial<Setup>; surface: ScanSurface; fit: SurfaceFit }>(
@@ -501,6 +537,14 @@ export default function Extrusion() {
   // running -> idle edge rather than polling.
   useEffect(() => { if (status && !status.running) refreshMeasure(); },
             [status?.running, refreshMeasure]);
+  /** What this press will archive as ground truth, in the operator's words. */
+  const annotationLabel = (): string => {
+    const parts = [`layer ${measureLayer}`];
+    if (phase) parts.push(phase);
+    parts.push(offsetX || offsetY ? `introduced offset (${offsetX}, ${offsetY}) mm`
+                                 : "no introduced offset");
+    return parts.join(" · ");
+  };
   const newMeasureSession = async () => {
     setBusy(true);
     try {
@@ -510,7 +554,7 @@ export default function Extrusion() {
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
   const characterize = async () => {
-    setBusy(true);
+    setBusy(true); setLogs([]);
     try {
       await api.post("/measure/characterize", {
         confirm_robot_motion: confirmMotion,
@@ -532,18 +576,40 @@ export default function Extrusion() {
   };
   const measure = async () => {
     if (!plan) return;
-    setBusy(true);
+    // One take's timeline per take: stale lines from the previous ring read as
+    // this one's.
+    setBusy(true); setLogs([]);
     try {
       const shifted = offsetX !== 0 || offsetY !== 0;
       await api.post("/measure/layer", {
         fingerprint: plan.fingerprint, layer_index: measureLayer,
-        annotation: { introduced_offset_mm: shifted ? [offsetX, offsetY] : null, note: measureNote },
+        annotation: { introduced_offset_mm: shifted ? [offsetX, offsetY] : null,
+                      phase: phase || undefined, note: measureNote },
         confirm_robot_motion: confirmMotion,
         collision_check_enabled: false,
       });
-      setMessage(`MEASURE layer ${measureLayer} started — collision validation OFF; camera move only, no extrusion, no valve.`);
+      // Echo the ground truth back: it is the number every detection-error
+      // figure is measured against, and nothing else on screen repeats it.
+      setMessage(`MEASURE started — recording as ${annotationLabel()}. `
+        + "Collision validation OFF; camera move only, no extrusion, no valve.");
       refreshStatus();
     } catch (e: any) { setBusy(false); setMessage(e.message); }
+  };
+  const reprocessTake = async (take: MeasureTake) => {
+    if (!measureSession) return;
+    setBusy(true);
+    setMessage(`Reprocessing layer ${take.layer_index} take ${take.take} from its archived `
+      + "RGB-D frame — no robot motion.");
+    try {
+      const done = await api.post<{ metrics: { valid: boolean; rms_mm: number } }>(
+        `/trials/${encodeURIComponent(measureSession.trial_id)}/layers/${take.layer_index}`
+        + `/reprocess?take=${take.take}`);
+      setMessage(done.metrics.valid
+        ? `Reprocessed: VALID, RMS ${done.metrics.rms_mm.toFixed(2)} mm. The take is back in `
+          + "the session and can serve as the floor for the layer above."
+        : "Reprocessed, but the measurement is still invalid — see the take's figures.");
+      refreshMeasure();
+    } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
   const showPaper = async () => {
     if (!measureSession) return;
@@ -638,6 +704,65 @@ export default function Extrusion() {
       : [...old, layerIndex].sort((a, b) => a - b));
   const pct = progress.total ? Math.round(progress.step / progress.total * 100) : 0;
   const headlineMetrics = result?.kind === "cylinder_print" ? result.layers : [];
+
+  // -- ring-stack protocol state ---------------------------------------------
+  // Every count below is of VALID takes: an invalid one measured nothing, so it
+  // cannot satisfy a step of the protocol.
+  const takes = measureSession?.records ?? [];
+  const validTakes = takes.filter((t) => t.valid);
+  const offsetNorm = (t: MeasureTake) => {
+    const o = t.annotation?.introduced_offset_mm;
+    return o ? Math.hypot(o[0], o[1]) : 0;
+  };
+  const countPhase = (layerIndex: number, want: string) => validTakes.filter(
+    (t) => t.layer_index === layerIndex && (t.annotation?.phase || "") === want
+           && offsetNorm(t) === 0).length;
+  const countOffset = (millimetres: number) => validTakes.filter(
+    (t) => Math.abs(offsetNorm(t) - millimetres) < 0.51).length;
+  const applied = measureSession?.applied ?? null;
+  const planIsApplied = !applied || plan?.fingerprint === applied.fingerprint;
+  const floorReady = measureLayer <= 1
+    || Boolean(measureSession?.tops?.[String(measureLayer - 1)]);
+  const layerCount = plan?.layers.length ?? recipe?.layer_count ?? 0;
+  const guide: Array<{ title: string; detail: string; done: boolean; progress?: string }> = [
+    { title: "Set Layers to 3, then Generate coordinates",
+      detail: "Apply keeps whatever layer count the recipe already has, so a session "
+        + "generated with 1 layer refuses Measure layer 2 later.",
+      done: layerCount >= 3 && Boolean(plan) },
+    { title: "New session",
+      detail: "One trial directory for the whole experiment. Every take, its raw RGB-D "
+        + "frame and its figures land inside it.",
+      done: Boolean(measureSession) },
+    { title: "Place ring 1 within ~50 mm of the table centre → Characterize ring",
+      detail: "The recipe comes from the physical ring — no calipers. The robot moves the "
+        + "camera, measures the ring and returns.",
+      done: (measureSession?.characterizations?.length ?? 0) > 0 },
+    { title: "Apply to recipe & placement",
+      detail: "The step that was skipped on 2026-08-28. Without it every take is scored "
+        + "against a plan the ring was never placed on.",
+      done: Boolean(applied) && planIsApplied },
+    { title: "Noise floor — Measure layer 1 five times, touching nothing",
+      detail: "Phase “noise floor”. This is the sensing repeatability the paper reads "
+        + "every other number against.",
+      progress: `${countPhase(1, "noise floor")}/5`, done: countPhase(1, "noise floor") >= 5 },
+    { title: "Placement repeatability — lift and re-place ring 1, three times",
+      detail: "Phase “re-placed”, offset still zero. Measure after each re-placement.",
+      progress: `${countPhase(1, "re-placed")}/3`, done: countPhase(1, "re-placed") >= 3 },
+    { title: "Stack — ring 2 on layer 2 (×3), then ring 3 on layer 3 (×3)",
+      detail: "Phase “stacked true”, placed as accurately as you can. Check completeness "
+        + "on layer 2's first take: the floor margin is 2 mm and these rings are wavy.",
+      progress: `L2 ${countPhase(2, "stacked true")}/3 · L3 ${countPhase(3, "stacked true")}/3`,
+      done: countPhase(2, "stacked true") >= 3 && countPhase(3, "stacked true") >= 3 },
+    { title: "Introduced offsets — TOP ring only, 10 mm then 15 mm, three takes each",
+      detail: "Type the offset BEFORE pressing Measure so the ground truth is archived "
+        + "beside the result. Slide the ring by ChArUco square pitches along a board edge.",
+      progress: `10 mm ${countOffset(10)}/3 · 15 mm ${countOffset(15)}/3`,
+      done: countOffset(10) >= 3 && countOffset(15) >= 3 },
+    { title: "Paper summary → copy the Markdown block",
+      detail: "Grouped per layer and phase, with detection error against what you typed.",
+      done: Boolean(paper) },
+  ];
+  const nextStep = guide.findIndex((step) => !step.done);
 
   return <div>
     <h1 className="page-title">Cylinder Test</h1>
@@ -840,6 +965,34 @@ export default function Extrusion() {
         was rejecting otherwise good inspection poses. The pose is still IK-checked and reachable, and
         the camera stops ≥300 mm above the ring — but nothing screens the path against the real cell.
         Keep hands clear and watch the first move.</div>
+      <details className="ring-guide" open={guideOpen}
+               onToggle={(e) => setGuideOpen((e.target as HTMLDetailsElement).open)}>
+        <summary>Run guide — the protocol, in order
+          <span className="hint">{nextStep < 0 ? "every step done"
+            : `next: ${guide[nextStep].title}`}</span></summary>
+        <ol className="guide-steps">
+          {guide.map((step, i) => <li key={step.title}
+            className={step.done ? "done" : i === nextStep ? "current" : ""}>
+            <b>{step.title}</b>{step.progress && <em>{step.progress}</em>}
+            <span>{step.detail}</span>
+          </li>)}
+        </ol>
+        <div className="io-note">
+          <b>Placing the rings.</b> Displace only the <b>TOP</b> ring: layer N is measured
+          above layer N−1's latest take, so moving a ring underneath corrupts everything
+          stacked on it. Keep every offset ≤ 25 mm (the search band is ±30 mm). The work
+          frame's axes run along the board edges, so the ChArUco square pitch is your
+          ruler — slide the ring by whole squares and type that number. Take one throwaway
+          measurement first to learn which edge is +X: the reported offset tells you the sign.
+        </div>
+        <div className="io-note">
+          <b>What the numbers mean.</b> A pure shift of d reads centre offset ≈ d, max ≈ d,
+          mean ≈ 0.64 d, RMS ≈ 0.71 d — the summary checks that relation for you and warns
+          if it disagrees. This cell's error floor is 1.26 mm (hand-eye board consistency),
+          so nothing sub-millimetre can be claimed. Nothing here is extruded: this is a
+          controlled validation of the sensing-and-comparison chain, not print deviation.
+        </div>
+      </details>
       <div className="btn-row">
         <input placeholder="session / ring note" value={measureNote} onChange={(e) => setMeasureNote(e.target.value)} />
         <button className="secondary" disabled={!plan || busy || status?.running} onClick={newMeasureSession}>New session</button>
@@ -847,6 +1000,17 @@ export default function Extrusion() {
           : plan ? "no session yet (one is created on first measure)"
             : "New session needs a plan: run Generate coordinates & fingerprint above — a session records the plan it measures against"}</span>
       </div>
+      {plan?.restored_from && <div className="hint">Plan restored from session
+        <code> {plan.restored_from} </code>after a backend restart — the characterization it
+        applied (r {applied?.recipe.radius_mm} mm, bead {applied?.recipe.bead_diameter_mm} mm,
+        {" "}{applied?.recipe.layer_count} layers) is back. You do not need to press Apply again.</div>}
+      {applied && !planIsApplied && <div className="io-note warn-text">
+        <b>The current plan is not the one this session applied.</b> It measures against the
+        ring characterized at r {applied.recipe.radius_mm} mm, centre
+        ({applied.setup.center_x_mm.toFixed(1)}, {applied.setup.center_y_mm.toFixed(1)}).
+        Press <b>Apply to recipe &amp; placement</b> before measuring — scoring a take against
+        a plan the ring was never placed on is the stale-plan artifact, and Measure will refuse.
+      </div>}
       <label><input type="checkbox" checked={confirmMotion} onChange={(e) => setConfirmMotion(e.target.checked)} />
         I confirm the robot may move the camera to the inspection pose with collision validation off
         (hands clear of the cell).</label>
@@ -866,30 +1030,81 @@ export default function Extrusion() {
         <label>Layer <select value={measureLayer} onChange={(e) => setMeasureLayer(Number(e.target.value))}>
           {(plan?.layers ?? []).map((l) => <option key={l.layer_index} value={l.layer_index}>{l.layer_index}</option>)}
         </select></label>
+        <label>Phase <select value={phase} onChange={(e) => setPhase(e.target.value)}>
+          <option value="">(none)</option>
+          {PHASES.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+        </select></label>
         <label>Introduced offset X <input type="number" step={1} value={offsetX} onChange={(e) => setOffsetX(Number(e.target.value))} /> mm</label>
         <label>Y <input type="number" step={1} value={offsetY} onChange={(e) => setOffsetY(Number(e.target.value))} /> mm</label>
-        <button disabled={!plan || !connected || !confirmMotion || busy || status?.running} onClick={measure}>Measure layer {measureLayer} — ROBOT MOVES · collisions OFF</button>
+        {(offsetX !== 0 || offsetY !== 0) && <button className="secondary"
+          onClick={() => { setOffsetX(0); setOffsetY(0); }}>Clear offset</button>}
+      </div>
+      <div className="hint">{PHASES.find((p) => p.value === phase)?.hint
+        || "No phase recorded: takes of this layer will be grouped only by the offset you typed."}</div>
+      {/* The ground truth every detection-error number is measured against. It is
+          sticky between presses, so it is echoed where the operator is looking. */}
+      <div className={`take-echo ${offsetX || offsetY ? "shifted" : ""}`}>
+        <span className="k">This press records</span>
+        <b>{annotationLabel()}</b>
+        {(offsetX !== 0 || offsetY !== 0) &&
+          <span className="warn-text">move the TOP ring by exactly this before pressing</span>}
+      </div>
+      {!floorReady && <div className="io-note warn-text">
+        <b>Measure layer {measureLayer - 1} first.</b> Layer {measureLayer}'s measurement floor
+        IS layer {measureLayer - 1}'s latest measured take; without it a stacked ring blends
+        into the ring beneath. Measure will refuse.
+      </div>}
+      <div className="btn-row">
+        <button disabled={!plan || !connected || !confirmMotion || busy || status?.running
+                          || !planIsApplied || !floorReady}
+                onClick={measure}>Measure layer {measureLayer} — ROBOT MOVES · collisions OFF</button>
         {(busy || status?.running) && <button className="secondary" onClick={cancel}>Cancel</button>}
       </div>
-      {measureSession?.records?.length ? <table className="metrics">
-        <thead><tr><th>Layer</th><th>Take</th><th>Introduced</th><th>Offset dx/dy (|d|)</th><th>Mean |dev|</th><th>RMS</th><th>Max</th><th>Shape RMS</th><th>Height min/mean/max</th><th>Bead</th><th>Acq→path</th><th>Valid</th></tr></thead>
-        <tbody>{measureSession.records.map((r) => <tr key={`${r.layer_index}-${r.take}`}
-          className={`clickable${openTake === layerDirName(r) ? " selected" : ""}`}
-          title="Show the figures for this take"
-          onClick={() => setOpenTake(openTake === layerDirName(r) ? null : layerDirName(r))}>
-          <td>{r.layer_index}</td><td>{r.take}</td>
-          <td>{r.annotation?.introduced_offset_mm ? `(${r.annotation.introduced_offset_mm.join(", ")}) mm` : "—"}</td>
-          <td className="num">{r.metrics.center_offset_mm[0].toFixed(1)} / {r.metrics.center_offset_mm[1].toFixed(1)} ({r.metrics.center_offset_norm_mm.toFixed(2)})</td>
-          <td className="num">{r.metrics.mean_absolute_mm.toFixed(2)}</td><td className="num">{r.metrics.rms_mm.toFixed(2)}</td>
-          <td className="num">{r.metrics.maximum_mm.toFixed(2)}</td><td className="num">{r.metrics.shape_rms_mm.toFixed(2)}</td>
-          <td className="num">{r.geometry ? `${r.geometry.height_min_mm.toFixed(1)} / ${r.geometry.height_mean_mm.toFixed(1)} / ${r.geometry.height_max_mm.toFixed(1)}` : "—"}</td>
-          <td className="num">{r.geometry ? r.geometry.bead_width_mean_mm.toFixed(1) : "—"}</td>
-          <td className="num">{Math.round(r.timings_ms.acquisition_to_path_ms)} ms</td>
-          <td><span className={`badge ${r.valid ? "good" : "bad"}`}>{r.valid ? "VALID" : "INVALID"}</span></td>
-        </tr>)}</tbody></table> : null}
-      {measureSession?.records?.length ? <p className="hint">
+      {logs.length > 0 && <div className="log measure-log">{logs.slice(-6).map((line, i) =>
+        <div key={i} className={line.startsWith("ERROR") ? "err" : ""}>{line}</div>)}</div>}
+      {takes.length ? <table className="metrics">
+        <thead><tr><th>Layer</th><th>Take</th><th>Phase</th><th>Introduced</th><th>Offset dx/dy (|d|)</th><th>Detected</th><th>Mean |dev|</th><th>RMS</th><th>Max</th><th>Shape RMS</th><th>Height min/mean/max</th><th>Bead</th><th>Acq→path</th><th>Valid</th></tr></thead>
+        <tbody>{takes.map((r) => {
+          const truth = r.annotation?.introduced_offset_mm;
+          // How far the measured displacement lands from the one that was typed:
+          // the claim the paper actually makes, per take.
+          const detection = r.metrics
+            ? Math.hypot(r.metrics.center_offset_mm[0] - (truth?.[0] ?? 0),
+                         r.metrics.center_offset_mm[1] - (truth?.[1] ?? 0))
+            : null;
+          return <tr key={`${r.layer_index}-${r.take}`}
+            className={`clickable${openTake === layerDirName(r) ? " selected" : ""}${r.valid ? "" : " invalid"}`}
+            title="Show the figures for this take"
+            onClick={() => setOpenTake(openTake === layerDirName(r) ? null : layerDirName(r))}>
+            <td>{r.layer_index}</td><td>{r.take}{r.reprocessed && <sup title="reprocessed offline from the archived frame">R</sup>}</td>
+            <td>{r.annotation?.phase || "—"}</td>
+            <td>{truth ? `(${truth.join(", ")}) mm` : "—"}</td>
+            <td className="num">{r.metrics ? `${r.metrics.center_offset_mm[0].toFixed(1)} / ${r.metrics.center_offset_mm[1].toFixed(1)} (${r.metrics.center_offset_norm_mm.toFixed(2)})` : "—"}</td>
+            <td className="num">{detection === null ? "—" : detection.toFixed(2)}</td>
+            <td className="num">{r.metrics ? r.metrics.mean_absolute_mm.toFixed(2) : "—"}</td>
+            <td className="num">{r.metrics ? r.metrics.rms_mm.toFixed(2) : "—"}</td>
+            <td className="num">{r.metrics ? r.metrics.maximum_mm.toFixed(2) : "—"}</td>
+            <td className="num">{r.metrics ? r.metrics.shape_rms_mm.toFixed(2) : "—"}</td>
+            <td className="num">{r.geometry ? `${r.geometry.height_min_mm.toFixed(1)} / ${r.geometry.height_mean_mm.toFixed(1)} / ${r.geometry.height_max_mm.toFixed(1)}` : "—"}</td>
+            <td className="num">{r.geometry ? r.geometry.bead_width_mean_mm.toFixed(1) : "—"}</td>
+            <td className="num">{r.timings_ms?.acquisition_to_path_ms
+              ? `${Math.round(r.timings_ms.acquisition_to_path_ms)} ms` : "—"}</td>
+            <td><span className={`badge ${r.valid ? "good" : "bad"}`}>{r.valid ? "VALID" : "INVALID"}</span>
+              {!r.valid && <button className="secondary reprocess-btn" disabled={busy || status?.running}
+                onClick={(e) => { e.stopPropagation(); reprocessTake(r); }}>Reprocess</button>}</td>
+          </tr>;
+        })}</tbody></table> : null}
+      {takes.some((t) => !t.valid) ? <p className="hint warn-text">
+        An invalid take measured nothing and is left out of every statistic — but its raw
+        RGB-D frame is archived, so <b>Reprocess</b> re-runs the current processing on it
+        with no robot motion. {takes.filter((t) => !t.valid).map((t) =>
+          `L${t.layer_index} take ${t.take}: ${t.error || "invalid"}`).join(" · ")}
+      </p> : null}
+      {takes.length ? <p className="hint">
         Click a take to see its figures. They are drawn from the archived frame, so a take
         measured before figures existed renders on its first view — the robot never moves.
+        A take marked <sup>R</sup> was reprocessed offline; its capture time is real, its
+        processing time is not, and the summary keeps it out of the cycle statistic.
       </p> : null}
       {openTake && measureSession ? (() => {
         const take = measureSession.records.find((r) => layerDirName(r) === openTake);

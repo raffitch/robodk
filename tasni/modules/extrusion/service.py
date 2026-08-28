@@ -1175,12 +1175,28 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
         plan=plan, layer=plan.layers[layer_index - 1],
         config=ExtrusionConfig.model_validate(processing_payload))
     reprocessed_at = _utcnow()
+    # Timing honesty. The capture is the same frame, so its capture_ms stays
+    # true; the processing time is now a desktop measurement of a run that
+    # never happened on the cell, and acquisition-to-path (the paper's
+    # scan-to-feedback number) cannot be claimed from it at all. If the take
+    # DID produce a live path before it was reprocessed, keep those timings so
+    # a curiosity reprocess never deletes evidence.
+    previous = dict((manifest.processing or {}).get("timings_ms") or {})
+    timings = dict(processed.report.get("timings_ms") or {})
+    if previous.get("capture_ms") is not None:
+        timings["capture_ms"] = float(previous["capture_ms"])
+    timings.pop("acquisition_to_path_ms", None)
+    preserved = ((manifest.processing or {}).get("live_timings_ms")
+                 or (previous if previous.get("acquisition_to_path_ms") is not None else None))
     report = {
         **processed.report,
+        "timings_ms": timings,
         "metrics": processed.metrics.model_dump(mode="json"),
         "offline_reprocess": True,
         "reprocessed_at": reprocessed_at,
     }
+    if preserved:
+        report["live_timings_ms"] = dict(preserved)
     next_manifest = manifest.model_copy(update={
         "measured_path_file": "measured_path.json",
         "corrected_path_file": ("corrected_path.json"
@@ -1204,7 +1220,17 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
                         "skeleton.png": processed.skeleton,
                         "comparison.png": processed.comparison},
         report=report)
+    # Fold the rescued take back into the measurement session: session.json is
+    # what the next layer's ROI floor and the operator's table read, and a take
+    # that lives only in its manifest is invisible to both.
+    session_record = None
+    if (trial_dir / "session.json").is_file():
+        from .measure import MeasureSession        # local: measure.py imports this module
+        session_record = MeasureSession.load(
+            trial_dir.parent, trial_id).sync_take_from_archive(
+                layer_dir, next_manifest.model_dump(mode="json"), processed.measured_xyz)
     return {
+        "session_record": session_record,
         "trial_id": trial_id, "layer_index": layer_index,
         "reprocessed_at": reprocessed_at,
         "metrics": processed.metrics.model_dump(mode="json"),
