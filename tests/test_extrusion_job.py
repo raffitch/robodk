@@ -110,7 +110,7 @@ class FakeRdk:
             self.bad_inspections -= 1
             return {"instructions_ok": 1, "time_s": 0, "distance_mm": 0,
                     "percent_ok": 41.0, "problems": "Collision detected: spindle/Table"}
-        return {"instructions_ok": 100, "time_s": 2, "distance_mm": 100,
+        return {"instructions_ok": 100, "time_s": 0.5, "distance_mm": 100,
                 "percent_ok": 100.0, "problems": ""}
     def start_program(self, name, real_robot): self.events.append(("start", name, real_robot)); return 1
     def program_busy(self, name): return False

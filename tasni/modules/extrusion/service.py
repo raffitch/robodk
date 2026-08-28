@@ -144,9 +144,38 @@ def _program_name(plan: CylinderPlan, layer_index: int, mode: str) -> str:
     return f"TasniCylinder_{mode}_{plan.fingerprint[:10]}_L{layer_index:03d}"
 
 
+def program_runtime_fault(*, expected_s: float, actual_s: float,
+                          observed_busy: bool, min_ratio: float = 0.5,
+                          floor_s: float = 1.0) -> "str | None":
+    """Flag a program that reported success but cannot have executed.
+
+    ``start_program`` returning >= 0 only means RoboDK accepted the program. On
+    the cell 2026-08-28 the controller acknowledged it audibly and the arm never
+    moved: the program was never observed busy, the wait returned after its start
+    grace, and the job continued as though the layer had printed. Nothing noticed
+    until the ROI came back empty two minutes later.
+
+    RoboDK predicts each program's duration (``update_program`` -> ``time_s``), so
+    a layer it says takes seconds that "finishes" in a fraction of one did not
+    run. Only a gross shortfall counts -- the prediction is an estimate -- and
+    programs predicted shorter than ``floor_s`` are not policed at all, since a
+    genuinely brief one can finish before it is ever observed busy.
+    """
+    if expected_s <= floor_s:
+        return None
+    if actual_s >= expected_s * min_ratio:
+        return None
+    seen = "" if observed_busy else " and it was never observed running"
+    return (f"program finished in {actual_s:.1f} s but RoboDK predicted "
+            f"{expected_s:.1f} s{seen} — the controller did not execute the "
+            "motion. Check the pendant: operating mode (AUT/EXT, not T1/T2), "
+            "drives enabled, and no active safety stop. Nothing was deposited, "
+            "so measuring this layer would be meaningless.")
+
+
 def _wait_program(ctx: JobContext, rdk: RdkIO, name: str, *,
                   start_timeout_s: float = 3.0, poll_s: float = 0.05,
-                  sleep=time.sleep, clock=time.monotonic) -> None:
+                  sleep=time.sleep, clock=time.monotonic) -> "tuple[float, bool]":
     """Block until a started program has actually finished.
 
     A bare ``while program_busy(name)`` loses a start race: RunCode() dispatches
@@ -160,13 +189,20 @@ def _wait_program(ctx: JobContext, rdk: RdkIO, name: str, *,
     So: first give the program a bounded chance to *become* busy, then wait for
     it to clear. The bound matters because a genuinely instantaneous program may
     finish before we ever observe it busy — that must not hang the job.
+
+    Returns ``(elapsed_s, observed_busy)``; ``observed_busy`` False means the
+    program was never seen running, which :func:`program_runtime_fault` uses to
+    tell "finished instantly" from "never started".
     """
-    deadline = clock() + start_timeout_s
+    started_at = clock()
+    observed_busy = False
+    deadline = started_at + start_timeout_s
     while not rdk.program_busy(name) and clock() < deadline:
         if ctx.cancelled:
             ctx.check_cancel()
         sleep(poll_s)
     while rdk.program_busy(name):
+        observed_busy = True
         if ctx.cancelled:
             rdk.stop_program(name)
             ctx.check_cancel()
@@ -174,6 +210,7 @@ def _wait_program(ctx: JobContext, rdk: RdkIO, name: str, *,
     # A cancellation can arrive after the final busy poll. Do not let the
     # caller continue into inspection, capture, or the next layer in that race.
     ctx.check_cancel()
+    return clock() - started_at, observed_busy
 
 
 def _program_valid(report: dict) -> bool:
@@ -638,8 +675,16 @@ class CylinderPrintJob:
                     # Never start real motion if cancellation arrived during a
                     # blocking RoboDK generation or collision-validation call.
                     ctx.check_cancel()
+                    ctx.log(f"layer {layer.layer_index}: validating program in RoboDK"
+                            f"{' with collision checking' if self.check_collisions else ''}"
+                            " — this is the slow step on a large station")
+                    _validate_started = time.monotonic()
                     validation = rdk.update_program(
                         name, collisions=self.check_collisions)
+                    ctx.log(f"layer {layer.layer_index}: validated in "
+                            f"{time.monotonic() - _validate_started:.1f} s "
+                            f"(RoboDK predicts {float(validation.get('time_s') or 0.0):.1f} s "
+                            "of robot motion)")
                     ctx.check_cancel()
                     _require_program_valid(validation, layer.layer_index)
                     current_program = name
@@ -655,8 +700,19 @@ class CylinderPrintJob:
                     started = rdk.start_program(name, real_robot=True)
                     if started < 0:
                         raise RuntimeError(f"layer {layer.layer_index} live program could not start")
-                    _wait_program(ctx, rdk, name, start_timeout_s=ecfg.program_start_grace_s)
+                    ran_s, saw_busy = _wait_program(
+                        ctx, rdk, name, start_timeout_s=ecfg.program_start_grace_s)
                     current_program = None
+                    # start_program returning success only means RoboDK ACCEPTED the
+                    # program. Compare against the duration RoboDK predicted for it:
+                    # a layer that should take seconds and returns in a fraction of
+                    # one never executed, and printing nothing must not be mistaken
+                    # for printing something.
+                    runtime_fault = program_runtime_fault(
+                        expected_s=float(validation.get("time_s") or 0.0),
+                        actual_s=ran_s, observed_busy=saw_busy)
+                    if runtime_fault:
+                        raise RuntimeError(f"layer {layer.layer_index} {runtime_fault}")
                     valve_off(f"layer {layer.layer_index} completion/inspection confirmation",
                               required=True)
                     inspection_name = name + "_Inspect"
