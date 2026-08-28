@@ -73,12 +73,19 @@ real-robot programs while retaining `RunCode()` for simulation. On the first app
 Characterize moved to the overhead pose, captured RGB-D, archived it, and returned; this
 validates app dispatch without involving a valve. Python `robodk>=6.0.1` is required.
 
-**Next action:** after restarting onto the ring-selector fix, run **Ring stack →
-Characterize ring 1** once more. The first archived frame exposed a separate processing
-bug: the largest DBSCAN cluster was a broad ChArUco-board depth residual, not the ring.
-The new selector uses angular coverage and radial compactness; offline replay of that
-exact frame reads radius 39.17 mm, centre (217.94, 150.44) mm, bead footprint 13.26 mm
-and top Z 6.14 mm. Confirm the new `characterize-02` mask is annular before Apply.
+The first archived frame exposed a separate processing bug: the largest DBSCAN cluster
+was a broad ChArUco-board depth residual, not the ring. The new selector uses angular
+coverage and radial compactness; offline replay of that exact frame reads radius 39.17
+mm, centre (217.94, 150.44) mm, bead footprint 13.26 mm and top Z 6.14 mm.
+
+**Next action:** restart onto the close-range measure-only change, enable its explicit
+"extrusion tool detached/clear" confirmation, then run **Ring stack → Characterize ring
+1**. The second 300 mm cell attempt found no independent ring cluster even though the
+operator confirmed the ring was present. Depth is already the D435i's native maximum
+1280×720; the current recipe optically fits at 135 mm but was clamped to 300 mm. The
+opt-in measure-only path clamps at the 1280×720 MinZ of 175 mm (~67% frame height), while
+live-print inspection stays at 300 mm and all collision/wrist gates remain. Failed
+characterization now archives raw RGB-D instead of losing the only diagnostic frame.
 
 > **Picking this up? Read [docs/live-print-next-session.md](docs/live-print-next-session.md)**
 > — the continuation handoff: current state, the full decision tree for each bisect
@@ -90,7 +97,9 @@ and top Z 6.14 mm. Confirm the new `characterize-02` mask is annular before Appl
 measurements of an empty board and must not reach the paper. Trial
 `20260828-171615-f088cf48/characterize-01` does contain the real ring, but its archived
 52.77 mm radius / 51.12 mm bead result selected the board residual and is invalid. Keep
-the raw frame as regression evidence; do not use its metrics in the paper.
+the raw frame as regression evidence; do not use its metrics in the paper. The following
+300 mm retry was rejected by the ring-shape gate and predated failed-frame archiving, so
+it produced no `characterize-02` directory and is also not evidence.
 
 ## 5. How to work here
 

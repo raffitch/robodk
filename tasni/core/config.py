@@ -823,6 +823,11 @@ class ExtrusionConfig(_Model):
     measured_spline_points: int = Field(default=180, ge=24, le=4000)
 
     # -- ring-stack measure-only experiment (modules/extrusion/measure.py) ----
+    # Close-range measurement is opt-in per request and requires the operator to
+    # confirm that the extrusion tool is detached or otherwise clear. 175 mm is
+    # the D435i MinZ used by this cell at the native 1280x720 depth profile; live
+    # printing continues to use inspection_min_mm (300 mm).
+    measure_close_range_min_mm: float = Field(default=175.0, gt=0, le=2000)
     # Layer N keeps only points above the PREVIOUS layer's measured top at the
     # nearest XY sample plus this margin, so a displaced ring cannot drag the
     # exposed crescent of the ring beneath it into the skeleton.

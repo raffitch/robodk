@@ -125,6 +125,16 @@ class ExtrusionArchive:
         (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         return out
 
+    def next_characterization_index(self, trial_id: str) -> int:
+        """First unused characterization directory, including failed captures."""
+        trial = self.root / _segment(trial_id, "trial id")
+        if not (trial / "trial.json").is_file():
+            raise FileNotFoundError(f"trial does not exist: {trial_id}")
+        index = 1
+        while (trial / f"characterize-{index:02d}").exists():
+            index += 1
+        return index
+
     def rewrite_processing(self, manifest: LayerManifest, *, measured_xyz,
                            corrected_xyz=None, pointcloud_xyz=None,
                            derived_images: dict[str, np.ndarray], report: dict) -> Path:

@@ -128,6 +128,13 @@ on, and a **joint** target is created per layer.
   300 mm and the UI says so (`framing.clamped_to = "near"`, ~40% of frame height).
   An object too large to frame *within* the band is refused, never answered by
   backing the camera out past `inspection_max_mm`.
+- **Measure-only close range is separately gated.** The D435i server already requests
+  its maximum native depth profile, 1280×720 at 30 fps. For the current 95 mm outside
+  ring diameter, the pinhole fit with 15% margin is 135 mm; the 1280×720 MinZ is about
+  175 mm. When the operator explicitly confirms the extrusion tool is detached or
+  otherwise clear, only `MEASURE_ONLY` uses a 175 mm near clamp (~67% frame height).
+  Leaving that confirmation clear and every live-print inspection retain 300 mm. IK,
+  wrist and collision validation are identical at either distance.
 - **Fronto-parallel first.** The 2026-08-13 characterization measured incidence
   costing ~4× what distance costs, so candidates are ordered straight-down → roll
   (free: still square to the surface, different wrist config) → 10° tilt.
@@ -157,8 +164,9 @@ on, and a **joint** target is created per layer.
   program, and put through `update_program(collisions=True)`; the first to pass is
   used. If none does, the run fails with every rejection listed. Nothing backs off,
   tilts past the configured cone, or drops collision checking to obtain a pass —
-  straight down at 300 mm over a fresh print is the tightest clearance in this
-  workflow, and the spindle shares the flange with the camera.
+  straight down at 300 mm over a fresh print remains the tightest live-print
+  clearance, and the spindle shares the flange with the camera. The separately
+  confirmed measure-only close-range mode assumes that tool is physically clear.
 - Targets are named `<program>_Inspect_Target`, i.e. inside the existing
   `TasniCylinder_` namespace, so **Reset** and the normal artifact lifecycle already
   clean them. The chosen pose (and every rejected candidate) is logged in the dry-run
@@ -195,6 +203,13 @@ cluster. Offline replay of the exact frame returns radius 39.17 mm, centre
 (217.94, 150.44) mm, bead footprint 13.26 mm and top Z 6.14 mm; the real depth
 fixture is in `tests/fixtures/extrusion/ring1/`. A fresh cell characterization is
 still required before Apply or paper measurements.
+
+A second cell attempt at 300 mm (after the ring-selector fix) was safely rejected:
+the ring was physically present, but the depth frame yielded one broad 5,748-point
+board-like cluster and no independent ring-like cluster. That attempt exposed two
+operational needs now implemented: opt-in 175 mm close-range measurement for a detached/
+clear extrusion tool, and raw color/depth/pose archiving even when characterization
+fails. The rejected attempt predated that archiving and therefore has no raw frame.
 
 Cell protocol: scan surface applied → Center on scanned surface → Generate → place
 ring 1 → Characterize → Apply → Generate → Measure L1 ×5 (noise floor) → re-place

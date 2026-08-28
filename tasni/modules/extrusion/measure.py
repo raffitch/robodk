@@ -139,14 +139,14 @@ class MeasureSession:
 
 def _inspect_and_capture(services, ctx: JobContext, plan: CylinderPlan, layer, *,
                          inspection_name: str, start_joints, seed_pose, collisions: bool,
-                         artifacts: list[str]) -> dict:
+                         artifacts: list[str], near_mm: float | None = None) -> dict:
     """Move the camera to the derived pose, settle, read the pose, grab ONE frame."""
     rdk: RdkIO = services.rdk
     ecfg = services.config.extrusion
     inspect = _build_inspection_move(
         rdk, plan, layer, inspection_name=inspection_name, config=ecfg,
         camera=services.config.camera, start_joints=start_joints,
-        seed_pose=seed_pose, collisions=collisions)
+        seed_pose=seed_pose, collisions=collisions, near_mm=near_mm)
     ctx.check_cancel()
     artifacts.extend(inspect["artifacts"])
     if rdk.start_program(inspection_name, real_robot=True) < 0:
@@ -207,7 +207,8 @@ class RingMeasureJob:
 
     def __init__(self, services, plan: CylinderPlan, session: MeasureSession,
                  layer_index: int, *, annotation: dict | None = None,
-                 check_collisions: bool = True):
+                 check_collisions: bool = True,
+                 close_range_tool_clear: bool = False):
         if not 1 <= layer_index <= len(plan.layers):
             raise ValueError(f"layer_index {layer_index} outside 1..{len(plan.layers)}")
         self.services = services
@@ -216,6 +217,7 @@ class RingMeasureJob:
         self.layer_index = int(layer_index)
         self.annotation = dict(annotation or {})
         self.check_collisions = bool(check_collisions)
+        self.close_range_tool_clear = bool(close_range_tool_clear)
         self.result: dict | None = None
 
     def __call__(self, ctx: JobContext) -> dict:
@@ -237,7 +239,9 @@ class RingMeasureJob:
                 captured = _inspect_and_capture(
                     services, ctx, self.plan, layer, inspection_name=inspection_name,
                     start_joints=start_joints, seed_pose=self.session.last_pose,
-                    collisions=self.check_collisions, artifacts=artifacts)
+                    collisions=self.check_collisions, artifacts=artifacts,
+                    near_mm=(ecfg.measure_close_range_min_mm
+                             if self.close_range_tool_clear else None))
                 current_program = None
                 inspect, frame = captured["inspect"], captured["frame"]
                 T_work_camera, capture_ms = captured["T_work_camera"], captured["capture_ms"]
@@ -340,11 +344,13 @@ class RingCharacterizeJob:
     """
 
     def __init__(self, services, plan: CylinderPlan, session: MeasureSession, *,
-                 check_collisions: bool = True):
+                 check_collisions: bool = True,
+                 close_range_tool_clear: bool = False):
         self.services = services
         self.plan = plan.model_copy(deep=True)
         self.session = session
         self.check_collisions = bool(check_collisions)
+        self.close_range_tool_clear = bool(close_range_tool_clear)
         self.result: dict | None = None
 
     def __call__(self, ctx: JobContext) -> dict:
@@ -364,19 +370,45 @@ class RingCharacterizeJob:
                 captured = _inspect_and_capture(
                     services, ctx, self.plan, layer, inspection_name=inspection_name,
                     start_joints=start_joints, seed_pose=self.session.last_pose,
-                    collisions=self.check_collisions, artifacts=artifacts)
+                    collisions=self.check_collisions, artifacts=artifacts,
+                    near_mm=(ecfg.measure_close_range_min_mm
+                             if self.close_range_tool_clear else None))
                 current_program = None
                 frame = captured["frame"]
                 ctx.progress(2, 3, "characterizing the ring")
-                found = characterize_ring(
-                    color=frame.color, depth=frame.depth,
-                    T_work_camera=captured["T_work_camera"], K=services.config.camera.K,
-                    search_center_mm=(float(self.plan.setup.center_x_mm),
-                                      float(self.plan.setup.center_y_mm)),
-                    work_frame=self.plan.setup.work_frame, config=ecfg,
-                    inspection_tool=self.plan.setup.inspection_tool,
-                    print_tool=self.plan.setup.print_tool)
-                index = len(self.session.characterizations) + 1
+                index = archive.next_characterization_index(self.session.trial_id)
+                provenance = {**_provenance(services),
+                              "T_work_camera": np.asarray(
+                                  captured["T_work_camera"], dtype=float).tolist()}
+                try:
+                    found = characterize_ring(
+                        color=frame.color, depth=frame.depth,
+                        T_work_camera=captured["T_work_camera"], K=services.config.camera.K,
+                        search_center_mm=(float(self.plan.setup.center_x_mm),
+                                          float(self.plan.setup.center_y_mm)),
+                        work_frame=self.plan.setup.work_frame, config=ecfg,
+                        inspection_tool=self.plan.setup.inspection_tool,
+                        print_tool=self.plan.setup.print_tool)
+                except Exception as exc:
+                    failed_report = {
+                        "kind": "characterization", "valid": False, "error": str(exc),
+                        "capture_ms": captured["capture_ms"],
+                        "inspection_pose": captured["inspect"]["pose"],
+                        "search_center_mm": [self.plan.setup.center_x_mm,
+                                             self.plan.setup.center_y_mm],
+                        "depth_shape": list(np.asarray(frame.depth).shape),
+                        "provenance": provenance,
+                    }
+                    capture_dir = archive.write_characterization(
+                        self.session.trial_id, index, color=frame.color, depth=frame.depth,
+                        measured_xyz=np.empty((0, 3)), derived_images={},
+                        report=failed_report)
+                    if captured["inspect"]["pose"]:
+                        self.session.last_pose = captured["inspect"]["pose"]
+                    self.session.save()
+                    raise RuntimeError(
+                        f"ring characterization invalid; raw RGB-D archived: {capture_dir}: "
+                        f"{exc}") from exc
                 summary = {**found.summary(), "index": index, "timestamp": _utcnow(),
                            "capture_ms": captured["capture_ms"],
                            "inspection_pose": captured["inspect"]["pose"],
@@ -389,9 +421,7 @@ class RingCharacterizeJob:
                                     "skeleton.png": found.skeleton,
                                     "comparison.png": found.comparison},
                     report={**found.report, "summary": summary,
-                            "provenance": {**_provenance(services),
-                                           "T_work_camera": np.asarray(
-                                               captured["T_work_camera"], dtype=float).tolist()}})
+                            "provenance": provenance})
                 summary["capture_dir"] = str(capture_dir)
                 self.session.characterizations.append(summary)
                 if captured["inspect"]["pose"]:

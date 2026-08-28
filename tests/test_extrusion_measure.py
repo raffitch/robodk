@@ -457,10 +457,53 @@ def test_characterize_job_measures_the_ring_and_stores_it_in_the_session(tmp_pat
     assert fake_characterize.calls[-1]["work_frame"] == "Tasni Work Frame"
     assert Path(out["capture_dir"]).name == "characterize-01"
     assert (Path(out["capture_dir"]) / "depth.npy").is_file()
+    assert out["characterization"]["inspection_pose"]["standoff_mm"] == 300.0
     kinds = [e[0] for e in rdk.events]
     assert "station-program" not in kinds and "create" not in kinds
     assert rdk.events[-1] == ("move-joints", START_JOINTS)
     assert MeasureSession.load(root, session.trial_id).characterizations[-1]["radius_mm"] == 61.2
+
+
+def test_measure_only_close_range_requires_explicit_job_option(tmp_path, monkeypatch):
+    svc, _, _ = measure_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(measure_mod, "characterize_ring", fake_characterize)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    out = RingCharacterizeJob(
+        svc, plan, session, check_collisions=True,
+        close_range_tool_clear=True)(Ctx())
+
+    pose = out["characterization"]["inspection_pose"]
+    assert pose["near_mm"] == 175.0
+    assert pose["standoff_mm"] == 175.0
+    assert pose["d_fit_mm"] < pose["standoff_mm"]
+    assert pose["fill_fraction"]["height"] > 0.6
+
+
+def test_characterize_archives_raw_frame_when_ring_processing_fails(tmp_path, monkeypatch):
+    svc, rdk, _ = measure_env(tmp_path, monkeypatch)
+    plan = auto_plan()
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, plan)
+    # A prior successful characterization occupies index 1; a failed capture
+    # must advance to index 2 rather than overwrite it or disappear.
+    monkeypatch.setattr(measure_mod, "characterize_ring", fake_characterize)
+    RingCharacterizeJob(svc, plan, session, check_collisions=True)(Ctx())
+    monkeypatch.setattr(
+        measure_mod, "characterize_ring",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("no ring-like cluster")))
+
+    with pytest.raises(RuntimeError, match="raw RGB-D archived"):
+        RingCharacterizeJob(svc, plan, session, check_collisions=True)(Ctx())
+
+    failed = session.trial_dir / "characterize-02"
+    assert (failed / "color.png").is_file()
+    assert (failed / "depth.npy").is_file()
+    report = json.loads((failed / "report.json").read_text())
+    assert not report["valid"] and "no ring-like cluster" in report["error"]
+    assert report["depth_shape"] == [16, 16]
+    assert rdk.events[-1] == ("move-joints", START_JOINTS)
 
 
 # ------------------------------------------------------------- API (Task 10)

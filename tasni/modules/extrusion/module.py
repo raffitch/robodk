@@ -68,11 +68,13 @@ class MeasureLayerBody(FingerprintBody):
     layer_index: int = Field(ge=1)
     annotation: dict = Field(default_factory=dict)
     confirm_robot_motion: bool = False
+    confirm_close_range_tool_clear: bool = False
     collision_check_enabled: bool = True
 
 
 class CharacterizeBody(BaseModel):
     confirm_robot_motion: bool = False
+    confirm_close_range_tool_clear: bool = False
     collision_check_enabled: bool = True
 
 
@@ -200,6 +202,7 @@ class ExtrusionModule(WorkflowModule):
                     "hardware_io_test_approved": c.hardware_io_test_approved,
                     "extrusion_rate_control": "record_only",
                 },
+                "measure_close_range_min_mm": c.measure_close_range_min_mm,
                 "live_print_enabled": bool(c.valve_mapping_verified and
                                            c.hardware_io_test_approved),
             }
@@ -557,7 +560,9 @@ class ExtrusionModule(WorkflowModule):
             _require_measure_ready(body.confirm_robot_motion)
             session = self._session(create=True)
             self._active_measure_job = RingCharacterizeJob(
-                services, self._plan, session, check_collisions=body.collision_check_enabled)
+                services, self._plan, session,
+                check_collisions=body.collision_check_enabled,
+                close_range_tool_clear=body.confirm_close_range_tool_clear)
             try:
                 services.jobs.start(self._active_measure_job, name="extrusion-characterize")
             except JobBusy as exc:
@@ -597,7 +602,8 @@ class ExtrusionModule(WorkflowModule):
             session = self._session(create=True)
             self._active_measure_job = RingMeasureJob(
                 services, self._plan, session, body.layer_index,
-                annotation=body.annotation, check_collisions=body.collision_check_enabled)
+                annotation=body.annotation, check_collisions=body.collision_check_enabled,
+                close_range_tool_clear=body.confirm_close_range_tool_clear)
             try:
                 services.jobs.start(self._active_measure_job, name="extrusion-measure")
             except JobBusy as exc:

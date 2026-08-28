@@ -389,7 +389,8 @@ def _require_program_valid(report: dict, layer_index: int) -> None:
 def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
                            inspection_name: str, config, camera,
                            start_joints, seed_pose: dict | None = None,
-                           collisions: bool = True) -> dict:
+                           collisions: bool = True,
+                           near_mm: float | None = None) -> dict:
     """Create the inspection program for one layer and return its validation.
 
     Manual mode moves to the taught target, exactly as before. Automatic mode
@@ -402,9 +403,9 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
 
     Fails loudly with every rejection when none survives. Backing off, tilting
     past the configured cone, or dropping collision checking to obtain a pass are
-    all deliberately absent: straight down at ~300 mm over a fresh print is the
-    tightest clearance in this workflow, and the print tool shares the flange with
-    the camera.
+    all deliberately absent. ``near_mm`` is used only by explicitly-confirmed
+    measure-only jobs whose extrusion tool is detached/clear; normal inspection
+    retains the configured 300 mm live-print clearance.
     """
     speed_mm_s = plan.recipe.travel_speed_mm_s
     if not plan.setup.inspection_auto:
@@ -416,11 +417,13 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
         return {"artifacts": [created["program"]], "validation": validation,
                 "target": plan.setup.inspection_target, "pose": None}
 
+    effective_near_mm = (float(config.inspection_min_mm) if near_mm is None
+                         else float(near_mm))
     framing = framing_standoff(
         width_mm=cylinder_diameter_mm(plan.recipe),
         height_mm=cylinder_diameter_mm(plan.recipe), K=camera.K, size_px=camera.size,
         frame_margin=config.inspection_frame_margin,
-        near_mm=config.inspection_min_mm, far_mm=config.inspection_max_mm)
+        near_mm=effective_near_mm, far_mm=config.inspection_max_mm)
     if not framing["fits"]:
         raise RuntimeError("; ".join(framing["warnings"]))
     aim = aim_point_mm(plan.recipe, plan.setup, layer.layer_index)
@@ -464,8 +467,10 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
                 "artifacts": [target_name, created["program"]],
                 "validation": validation, "target": target_name,
                 "pose": {**descriptor, "standoff_mm": framing["standoff_mm"],
-                         "aim_mm": [float(v) for v in aim],
-                         "clamped_to": framing["clamped_to"],
+                          "aim_mm": [float(v) for v in aim],
+                          "d_fit_mm": framing["d_fit_mm"],
+                          "near_mm": framing["near_mm"],
+                          "clamped_to": framing["clamped_to"],
                          "fill_fraction": framing["fill_fraction"],
                          "roll_reference": "camera_at_start",
                          "roll_reference_x": reference_x,
