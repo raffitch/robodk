@@ -72,56 +72,89 @@ Paths: `runs/extrusion/<trial>/layer-NNN/figures/*.pdf` and
 
 ## 3. What is left — the cell run
 
-**The one thing that went wrong last time: *Apply to recipe & placement* was skipped**
-between Characterize and Measure. Layer-001's 15.38 mm centre offset and 11.31 mm RMS
-are therefore the ring measured against a stale plan — **an artifact, not a result.**
-Do not put that number, or `layer-001`'s plan/profile figures, in the paper.
+**The app now carries this protocol.** The Extrusion page's *Ring stack — measure
+only* card opens with a **Run guide** listing every step below with live progress
+(`3/5` takes done, etc.), the traps beside the buttons, and the ground truth echoed
+back before each press. What follows is the same thing on paper.
 
-Restart the backend first (it caches imported modules — check `/api/health` →
+**The one thing that went wrong last time — *Apply to recipe & placement* was
+skipped** between Characterize and Measure. Layer-001's 15.38 mm centre offset and
+11.31 mm RMS are the ring measured against a stale plan: **an artifact, not a
+result.** That class of mistake is now refused rather than archived — see *Gates*
+below — but the order still matters.
+
+Restart the backend first (it caches imported modules; check `/api/health` →
 `build.stale`), then, in the Extrusion page:
 
-0. **Set Layers to 3** before anything else, and press **New session**. The 2026-08-28
-   trial ran with `layer_count: 1`, so *Measure layer 2* would be refused
-   (`layer_index must be 1..1`). *Apply to recipe & placement* keeps whatever layer
-   count the recipe already has — it only rewrites radius, bead, layer height and centre.
+0. **Set Layers to 3** before anything else, and press **New session**. *Apply to
+   recipe & placement* keeps whatever layer count the recipe already has — it only
+   rewrites radius, bead, layer height and centre — and *Measure layer 2* is
+   refused with `layer_index must be 1..1` on a one-layer plan.
 1. Scan surface applied → **Center on scanned surface** → **Generate**.
 2. Place ring 1 within ~50 mm of the table centre → **Characterize ring**.
 3. **Apply to recipe & placement** → **Generate**. ← *the step that was missed*
-4. **Noise floor**: Measure layer 1 **five times** without touching the ring.
-5. **Placement repeatability**: lift and re-place ring 1 **three times**, measure each.
-6. **Stack**: ring 2 placed true → Measure L2 (×3); ring 3 true → Measure L3 (×3).
-7. **Introduced offsets — on the TOP ring only.** Type the value into *introduced offset
-   X/Y* **before** pressing Measure, so ground truth is archived beside the result.
-   Shift the top ring **10 mm** along frame +X → Measure ×3; then **15 mm** → Measure ×3.
-   Optional: prop one side for a tilt case.
+4. **Noise floor** (phase `noise floor`): Measure layer 1 **five times** without
+   touching the ring.
+5. **Placement repeatability** (phase `re-placed`): lift and re-place ring 1
+   **three times**, measure each.
+6. **Stack** (phase `stacked true`): ring 2 placed true → Measure L2 (×3); ring 3
+   true → Measure L3 (×3).
+7. **Introduced offsets — on the TOP ring only** (phase `top ring shifted`). Type
+   the value into *introduced offset X/Y* **before** pressing Measure, so ground
+   truth is archived beside the result. Shift the top ring **10 mm** along frame +X
+   → Measure ×3; then **15 mm** → Measure ×3. Optional: prop one side for a tilt case.
 8. **Paper summary** → copy the Markdown block.
 
-### Resuming after a backend restart (the code fix needs one)
+**Set the Phase selector on every take.** The summary groups by *layer + phase +
+introduced offset*, so the phase is what separates sensing repeatability (step 4)
+from placement repeatability (step 5) — pooled into one row they hide each other,
+and the paper wants both.
 
-The plan lives only in memory. After a restart press **Apply to recipe & placement**
-first: it re-applies the characterization stored in the session (`session.json`) and
-regenerates the plan — check the recipe reads **r 42.6 / bead 12.8 / layers 3**
-before pressing Measure. Do **not** press *Center on scanned surface → Generate* again:
-that rebuilds the pre-Apply plan and every take would be measured against it — the
-stale-plan artifact all over again.
+### Gates: what the app now refuses
+
+None of these need a robot to detect, so they fire before the motion checks.
+
+- **Measuring against a plan that is not the one this session applied.** Once
+  *Apply* has run, the session is bound to that plan's fingerprint. Pressing
+  *Center on scanned surface → Generate* (or regenerating for any other reason)
+  makes Measure refuse and name the fix: press **Apply to recipe & placement**
+  again. Re-centring while a session is bound also asks for confirmation first.
+- **Measuring layer N before layer N−1 has a measured top.** Layer N's ROI floor
+  IS layer N−1's latest measured take; without it a stacked ring blends into the
+  ring beneath (the synthetic proof exhausts the branch guard outright).
+- **Invalid takes** are shown in the table with their reason and a **Reprocess**
+  button (no robot motion — it re-runs the current processing on the archived
+  RGB-D frame). They are counted as takes but never averaged into any statistic.
+
+### Resuming after a backend restart
+
+The plan lives in memory, but the session records what it applied, so **the app
+restores it on its own** — the card says *"Plan restored from session …"* and you
+can measure straight away. If a session predates that record (the 2026-08-28 paper
+session does), press **Apply to recipe & placement** once: it now applies the
+characterization onto the plan the *session* was created with, and reproduces the
+exact fingerprint its takes were measured against (verified offline for
+`20260828-204846-5b455377`: `7465b81877`, r 42.6 / bead 12.8 / layers 3). Do
+**not** press *Center on scanned surface → Generate* to recover — that rebuilds
+the pre-Apply plan.
 
 ### Board depth noise — fixed in code, do not work around it in config
 
 The `branch guard exhausted` on layer-001 take 1 was the board's own depth noise
-(z p99 +4.8 mm on a bare board; 22.7 % of it clears the 2.5 mm floor) joining the ring's
-cluster and dilating into a lobe. Fixed by a radial trim about the fitted ring
-(`extrusion.radial_trim_schedule_mm`, see `docs/extrusion-current-handoff.md`). Do
-**not** raise `deposit_min_height_mm` (a 3 mm floor read r 36.7 for this 42.6 mm ring
-and called it valid) and do not narrow `radial_roi_margin_mm` (it caps the introduced
-offset at ~18 mm). If a take still fails, its raw RGB-D is archived and
-`reprocess_saved_layer` now scores it against the take's own plan.
+(z p99 +4.8 mm on a bare board; 22.7 % of it clears the 2.5 mm floor) joining the
+ring's cluster and dilating into a lobe. Fixed by a radial trim about the fitted
+ring (`extrusion.radial_trim_schedule_mm`, see `docs/extrusion-current-handoff.md`).
+Do **not** raise `deposit_min_height_mm` (a 3 mm floor read r 36.7 for this 42.6 mm
+ring and called it valid) and do not narrow `radial_roi_margin_mm` (it caps the
+introduced offset at ~18 mm). If a take still fails, its raw RGB-D is archived and
+**Reprocess** scores it against the take's own plan.
 
 ### Why displacements go on the top ring, and why three takes
 
 - **Top ring only.** Layer N's ROI floor is the *latest take* of layer N−1
-  (`MeasureSession.floor_profile`). Displacing a ring that something else is measured
-  on top of corrupts that floor for every take above it. Displace the highest ring in
-  the stack and nothing downstream is affected.
+  (`MeasureSession.floor_profile`). Displacing a ring that something else is
+  measured on top of corrupts that floor for every take above it. Displace the
+  highest ring in the stack and nothing downstream is affected.
 - **Three takes per condition, not one.** `paper-summary` reports mean ± sd per
   condition; a single take has no sd, and requirement #3 needs ≥ 12 measurements in
   total anyway.
@@ -130,12 +163,15 @@ offset at ~18 mm). If a take still fails, its raw RGB-D is archived and
 
 "Shift it 10 mm" done by eye is the least trustworthy number in the experiment, and
 every detection-error figure is measured against it. The work frame came from the
-board rectangle, so **its axes are parallel to the board edges and the ChArUco squares
-are a ruler**: slide the ring by exactly one square pitch along an edge and type that
-pitch. Take one throwaway measurement first to learn which edge is frame **+X** and
-its sign (the reported `center_offset_mm` tells you), then re-take with the annotation
-right — the summary groups by what you typed, so a sign error puts good data in a
-mislabelled group.
+board rectangle, so **its axes are parallel to the board edges and the ChArUco
+squares are a ruler**: slide the ring by exactly one square pitch along an edge and
+type that pitch. Take one throwaway measurement first to learn which edge is frame
+**+X** and its sign (the reported `center_offset_mm` tells you), then re-take with
+the annotation right — the summary groups by what you typed, so a sign error puts
+good data in a mislabelled group. The offset fields are **sticky between presses**:
+the card echoes *"This press records: layer 2 · top ring shifted · introduced offset
+(10, 0) mm"* above the button, and there is a **Clear offset** button — read that
+line before every press.
 
 ### Watch this on layer 2's first take
 
@@ -143,10 +179,10 @@ Layer N keeps only points above the measured top of layer N−1 plus
 `layer_floor_margin_mm` (2.0). These rings run **2.9–11.0 mm** tall, so where ring 2
 sits only ~3 mm above ring 1 there is under 1 mm of margin and its low stretches can
 be clipped — showing up as reduced `path_completeness` or an angular gap, i.e.
-`valid: false`. The synthetic proof used a *uniform* ring, so this case is untested on
-real geometry. **Check completeness on L2 take 1 before continuing.** If it clips,
-lower `extrusion.layer_floor_margin_mm` and reprocess — every take archives its raw
-RGB-D, so no cell time is lost.
+`valid: false`. The synthetic proof used a *uniform* ring, so this case is untested
+on real geometry. **Check completeness on L2 take 1 before continuing.** If it
+clips, lower `extrusion.layer_floor_margin_mm` and press **Reprocess** — every take
+archives its raw RGB-D, so no cell time is lost.
 
 Constraints and expectations:
 
@@ -155,7 +191,9 @@ Constraints and expectations:
   A 10 mm shift should read ≈ 10 / 10 / 6.4 / 7.1 mm. **If it does not, stop and
   investigate — that relation is the built-in sanity check.** `paper-summary` now checks
   it for you and prints a `WARNING` naming which statistic disagrees.
-- ≥ 12 measurements total gives requirement #3 its mean ± sd.
+- ≥ 12 measurements total gives requirement #3 its mean ± sd. Takes reprocessed
+  offline do not contribute to it (their processing time is a desktop number); the
+  summary says how many it left out.
 - 300 mm is the sensor floor at 1280×720 (MinZ ≈ 280 mm). Closer needs a lower depth
   profile on the Jetson — a separate, deliberate change, not something to try mid-run.
   The camera already **climbs with the stack**: it aims at the cylinder axis at the top
@@ -171,8 +209,10 @@ Constraints and expectations:
   (nominal + that offset, teal dash-dot) in `plan` and in the trial `stack`, so the
   figure shows the extracted centreline landing on where the ring was actually moved
   to rather than merely displaced from nominal.
-- **Paper summary** gives the deviation table grouped by introduced offset, timing
-  mean ± sd, height/bead stats and valid X/N, already worded correctly. It also reports
+- **Paper summary** gives the deviation table grouped by **layer, phase and
+  introduced offset**, timing mean ± sd, height/bead stats and valid X/N, already
+  worded correctly. Invalid takes are counted but excluded from every average, and
+  offline-reprocessed takes are kept out of the cycle-time statistic. It also reports
   the **detection error** — `|measured centre offset − the offset you typed|` — which is
   the claim the paper actually makes, and a sentence per condition ("a 10.0 mm introduced
   offset was recovered as 10.05 ± 0.28 mm"). A take archived before that field existed
