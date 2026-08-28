@@ -323,7 +323,11 @@ class RingMeasureJob:
                     report={**processed.report,
                             "metrics": processed.metrics.model_dump(mode="json")})
                 summary = {"layer_index": self.layer_index, "take": take,
-                           "layer_dir": str(layer_dir), "annotation": self.annotation,
+                           "layer_dir": str(layer_dir),
+                           # The directory NAME as well as the path: the browser
+                           # addresses figures by it and cannot use an absolute
+                           # server path.
+                           "layer_name": layer_dir.name, "annotation": self.annotation,
                            "metrics": processed.metrics.model_dump(mode="json"),
                            "geometry": (processed.geometry.model_dump(mode="json")
                                         if processed.geometry else None),

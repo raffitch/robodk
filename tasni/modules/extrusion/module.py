@@ -748,6 +748,26 @@ class ExtrusionModule(WorkflowModule):
                 raise HTTPException(
                     503, f"figures need matplotlib (pip install -e .[figures]): {exc}") from exc
 
+        @router.get("/trials/{trial_id}/figures/{name}")
+        def trial_figure(trial_id: str, name: str):
+            """Every layer's latest take in one picture -- plan and oblique."""
+            from fastapi.responses import FileResponse
+            media = FIGURE_TYPES.get(name.rpartition(".")[2])
+            if media is None:
+                raise HTTPException(404, f"not a figure: {name!r}")
+            try:
+                trial = _segment(trial_id, "trial id")
+            except ValueError as exc:
+                raise HTTPException(404, str(exc)) from exc
+            root = self._measure_root().resolve()
+            path = (root / trial).resolve()
+            if root not in path.parents or not (path / "trial.json").is_file():
+                raise HTTPException(404, f"no such trial: {trial_id}")
+            try:
+                return FileResponse(ensure_figure(path, name), media_type=media)
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(404, str(exc)) from exc
+
         @router.get("/trials/{trial_id}/paper-summary")
         def trial_paper_summary(trial_id: str) -> dict:
             try:

@@ -768,3 +768,21 @@ def test_trials_reports_which_takes_have_figures(tmp_path, monkeypatch):
     client.get("/api/modules/extrusion/trials/t1/layers/layer-001/figures/plan.png")
     layer = client.get("/api/modules/extrusion/trials").json()["trials"][0]["layers"][0]
     assert layer["has_figures"] is True
+
+
+def test_the_trial_stack_figure_is_served_for_the_whole_session(tmp_path, monkeypatch):
+    """The stack across layers is the picture that shows an introduced offset."""
+    import test_extrusion_figures as figs
+    root = tmp_path / "runs" / "extrusion"
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    figs.write_take(root, layer_index=1)
+    figs.write_take(root, layer_index=2, measured=figs._ring_xyz(z=12.0))
+    client = TestClient(create_app(AppConfig()))
+
+    found = client.get("/api/modules/extrusion/trials/t1/figures/stack.png")
+
+    assert found.status_code == 200
+    assert found.headers["content-type"] == "image/png"
+    assert (root / "t1" / "figures" / "stack.png").is_file()
+    assert client.get("/api/modules/extrusion/trials/t1/figures/plan.png").status_code == 404
+    assert client.get("/api/modules/extrusion/trials/nope/figures/stack.png").status_code == 404
