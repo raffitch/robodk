@@ -196,11 +196,16 @@ while watching the arm. One cell visit, a few minutes, no material printed.
 5. Then — **without touching the pendant** — right-click → Run the *same* kept program
    (`keep_artifacts` on) and note whether it moves. Record all five.
 
-**B. RoboDK's driver log (0 code).** Open Connect → Connect robot, show the log
-("More options" / "Show log"), and keep it visible during the dispatch. It shows every
-command RoboDK sent to the driver and the driver's replies. Compare with a manual run of
-the same program. This is the single most informative artifact available and it has
-never been looked at.
+**B. What the driver itself reports (0 code).** Still the most informative unread
+artifact. Three routes, best-verified first — detail in
+[live-print-next-session.md](live-print-next-session.md) §3 Rung 3: (1) the app's own new
+`driver …` log line (`driver_state()` reads `ConnectedState()`, the driver's own status
+message); (2) relaunch as `"C:\RoboDK\bin\RoboDK.exe" /DEBUG=<file>` — a documented flag
+(`Notes.txt`, v3.4.2); (3) run `C:\RoboDK\api\robot\apikuka.exe` in a console (the shipped
+`apikuka-start.bat` only sets Qt paths), which shows the traffic and accepts commands on
+stdin with RoboDK out of the loop. The connection panel (double-click the robot, or
+**Connect → Connect robot**) shows driver status live — but the exact GUI labels could NOT
+be verified from the install, so look for the status area, not a named button.
 
 **C. The three numbers the job threw away — ✅ DONE (`RdkIO.dispatch_program`).** Every
 dispatch now logs `RunCode()`'s return value against the program's instruction count,

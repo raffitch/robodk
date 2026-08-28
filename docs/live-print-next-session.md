@@ -70,12 +70,29 @@ Builds a 2-instruction program, dispatches it exactly as the app does, deletes i
 | **Arm moves** | API program dispatch works *from a bare script*. The difference is the **app's** state or timing. | Diff the script's numbers against the app's log for the same program. Suspects, in order: something the app leaves on the `Robolink` connection; the concurrent `/api/rdk` status poll hitting the same connection mid-run; a second RoboDK process (`Get-Process RoboDK` must be exactly 1). |
 | **Arm does not move**, but a manual right-click → Run does | **API-dispatched program execution is broken in this RoboDK build/station**, for any program. | Rung 3 |
 
-### Rung 3: RoboDK's own driver log
+### Rung 3: what the driver itself reports
 
-Connect → Connect robot → show the log, keep it visible, and dispatch once from the app
-and once by right-click. It logs every command RoboDK sends the driver and every reply.
-**This artifact has never been read and is now the highest-value unknown.** It is the only
-place RoboDK records *why* it stopped.
+**This is the highest-value unknown: it has never been read.** Three ways in, ordered by
+how well each is verified (installed version: **RoboDK v6.0.5**, 2026-06-15):
+
+1. **You may already have it.** `driver_state()` (`37d4f18`) reads `ConnectedState()`,
+   which returns the driver's own status message — the same string the connection panel
+   shows. Run the app once and read the new `layer N: driver …` line before touching the
+   GUI.
+2. **`/DEBUG=` — documented** (`C:\RoboDK\Notes.txt`, v3.4.2: "It is possible to pass a
+   specific file for debugging"). Close RoboDK, relaunch as
+   `"C:\RoboDK\bin\RoboDK.exe" /DEBUG=C:\Users\User\Desktop\robodk-debug.txt`, reproduce,
+   read the file. This is general RoboDK debug output, not driver-only.
+3. **Run the driver in a visible console — most direct.** The KUKA driver is a separate
+   process RoboDK spawns: `C:\RoboDK\api\robot\apikuka.exe`. The shipped
+   `apikuka-start.bat` only sets Qt paths and launches it, so it runs fine in a console
+   window where you can see the traffic. It takes commands on **stdin** — that is how
+   RoboDK drives it — so it also lets you command the KUKA with RoboDK out of the loop.
+
+The connection panel (double-click the robot, or **Connect → Connect robot**) shows the
+driver status text live; keep it open during a dispatch. *Caveat: the exact GUI labels
+could not be verified from the install — the binary's strings are packed and the `.qm`
+translations are hashed — so look for the status area, not a specific button name.*
 
 Also re-run the app once and read the **new** line added in `37d4f18`:
 
