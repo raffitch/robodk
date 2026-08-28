@@ -29,11 +29,34 @@ from ..calibration.service import _camera_hold, ensure_real_robot_link
 from .archive import ExtrusionArchive
 from .models import CylinderPlan, LayerManifest
 from .processing import characterize_ring, process_observation
+
+try:                                       # matplotlib is the `figures` extra
+    from .figures import render_layer_figures
+except Exception:                          # pragma: no cover - absent extra
+    render_layer_figures = None
 from .service import (_build_inspection_move, _git_commit, _program_name, _utcnow,
                       _wait_program, _warn_if_stale)
 from .toolpath import points_array
 
 MODE = "MEASURE_ONLY"
+
+
+def _draw_figures(ctx: JobContext, layer_dir) -> None:
+    """Render this take's figures. Never let a drawing problem cost a measurement.
+
+    The operator cannot re-place a ring exactly, so the archived frame is
+    irreplaceable and the figures are not: a failure here is logged and the
+    measurement stands. ``ensure_figure`` re-renders on demand at serve time.
+    """
+    if render_layer_figures is None:
+        ctx.log("figures skipped: matplotlib is absent (pip install -e .[figures])")
+        return
+    try:
+        drawn = render_layer_figures(layer_dir)
+    except Exception as exc:
+        ctx.log(f"figures could not be drawn (the measurement is unaffected): {exc}")
+        return
+    ctx.log(f"figures: {', '.join(sorted({p.stem for p in drawn}))}")
 
 
 def measure_station_requirements(rdk: RdkIO, plan: CylinderPlan, config) -> dict:
@@ -300,7 +323,11 @@ class RingMeasureJob:
                     report={**processed.report,
                             "metrics": processed.metrics.model_dump(mode="json")})
                 summary = {"layer_index": self.layer_index, "take": take,
-                           "layer_dir": str(layer_dir), "annotation": self.annotation,
+                           "layer_dir": str(layer_dir),
+                           # The directory NAME as well as the path: the browser
+                           # addresses figures by it and cannot use an absolute
+                           # server path.
+                           "layer_name": layer_dir.name, "annotation": self.annotation,
                            "metrics": processed.metrics.model_dump(mode="json"),
                            "geometry": (processed.geometry.model_dump(mode="json")
                                         if processed.geometry else None),
@@ -314,6 +341,10 @@ class RingMeasureJob:
                         f"{processed.metrics.center_offset_norm_mm:.2f} mm, RMS "
                         f"{processed.metrics.rms_mm:.2f} mm, "
                         f"{timings['acquisition_to_path_ms']:.0f} ms acquisition->path")
+            # Outside the camera hold: drawing needs no camera, and the Jetson
+            # lease should not be held while matplotlib works.
+            ctx.progress(3, 4, "drawing the figures")
+            _draw_figures(ctx, layer_dir)
             ctx.progress(4, 4, "returning to the start pose")
             self.result = {"kind": "ring_measure", "mode": MODE,
                            "trial_id": self.session.trial_id,

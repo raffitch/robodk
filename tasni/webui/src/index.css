@@ -419,3 +419,25 @@ button.layer-tile.selected .layer-swatch { background: #66a6ff; opacity: 1 !impo
 @keyframes survey-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
 .survey-recaptures { margin-top: 4px; }
 .survey-report { margin-top: 10px; }
+
+/* -- archived-take figures (extrusion measure-only) ---------------------- */
+tr.clickable { cursor: pointer; }
+tr.clickable:hover > td { background: var(--panel-2); }
+tr.clickable.selected > td { background: var(--panel-2); box-shadow: inset 2px 0 0 var(--accent); }
+.figure-gallery {
+  display: grid; gap: 12px; margin: 12px 0 4px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+.figure-card {
+  margin: 0; padding: 8px; background: var(--panel-2);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+/* Figures are rendered on a white ground for print; keep that ground in the
+   dark UI so what the operator sees is what lands in the paper. */
+.figure-card img {
+  width: 100%; height: auto; display: block; border-radius: 5px; background: #fff;
+}
+.figure-card figcaption { font-size: 12px; margin-top: 7px; line-height: 1.5; }
+.figure-card figcaption .hint { display: block; font-size: 11px; }
+.figure-links { display: inline-flex; gap: 10px; margin-top: 4px; }
+.figure-links a { color: var(--accent); font-family: var(--mono); font-size: 11px; }

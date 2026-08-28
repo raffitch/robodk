@@ -225,6 +225,48 @@ in AGENTS.md). The one operator slip was skipping *Apply to recipe & placement* 
 Characterize and Measure, so layer-001's deviation is dominated by a 15 mm centre offset
 against the stale plan.
 
+### Figures (2026-08-28)
+
+`tasni/modules/extrusion/figures.py` renders four figures per take from the archive
+alone — no robot, no RoboDK, no camera — at 300 dpi PNG plus vector PDF:
+
+| figure | what it shows |
+|---|---|
+| `plan` | deposit cloud, extracted centreline, nominal ring, mm axes, scale bar |
+| `heightmap` | bird's-eye relief of the re-projected depth frame with a z colourbar |
+| `iso` | oblique cloud + centreline, vertical exaggeration stated on the axis |
+| `profile` | unrolled height z(θ) and radial deviation Δr(θ) over 360° |
+
+plus `figures/stack.{png,pdf}` per trial: every layer's latest take, plan + oblique.
+This is the successor to the original `PostExtrusionToolpath` `overlay.png` (alpha
+shape → skeletonize → matplotlib) whose 3-D companion was only ever `plt.show()`n.
+
+`RingMeasureJob` draws them after the manifest is written and OUTSIDE the camera
+hold; a drawing failure is logged and the measurement stands. Serving is
+render-if-missing, so takes archived before this existed still produce figures:
+
+```
+GET /api/modules/extrusion/trials/{id}/layers/{dir}/figures/{plan|heightmap|iso|profile}.{png|pdf}
+GET /api/modules/extrusion/trials/{id}/layers/{dir}/files/{color|comparison|segmentation|skeleton}.png
+GET /api/modules/extrusion/trials/{id}/figures/stack.{png|pdf}
+```
+
+In the app, click a take in the measurement table to open its gallery; the
+bird's-eye now draws the measured centrelines (red) over the commanded ones (teal).
+Needs `pip install -e .[figures]` (matplotlib); without it measurements run
+unchanged and only the figures are skipped.
+
+Two things the first real capture forced, both of which would silently corrupt a
+paper figure:
+
+- **The colour range comes from the deposit band**, not the whole frame. D435i
+  dropouts hundreds of mm below the work plane otherwise own the scale and the
+  ring flattens to one colour (measured: a −45…+5 mm scale instead of −1…10 mm).
+- **The nominal centre is FITTED, not averaged.** The archive writes a closed ring,
+  so its first point repeats and the mean is biased by radius/N — 0.33 mm on the
+  cell's 181-point 40 mm ring, which made the plotted RMS (11.45) disagree with the
+  manifest (11.31) a reader checks it against. They now match to 1e-6.
+
 Cell protocol: scan surface applied → Center on scanned surface → Generate → place
 ring 1 → Characterize → Apply → Generate → Measure L1 ×5 (noise floor) → re-place
 ×3 → ring 2 true → Measure L2 → ring 3 true → Measure L3 → shift a ring 10 mm

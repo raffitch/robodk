@@ -31,6 +31,11 @@ scan = ["open3d"]              # Open3D — TSDF integrate + marching-cubes + RA
 # package imports without it and the classical colour engine still works. Weights are NOT
 # shipped in the repo — fetch with `tools/download_sam.py`. `pip install -e .[sam]`.
 sam = ["onnxruntime"]          # ONNXRuntime (CPU) — EdgeSAM / MobileSAM encoder+decoder
+# Publication + in-app figures rendered from an archived take (extrusion module).
+# Imported lazily behind the Agg backend in modules/extrusion/figures.py, so the
+# package imports and every measurement still runs without it — only the figures
+# are skipped. `pip install -e .[figures]`.
+figures = ["matplotlib"]       # plan / height map / oblique / unrolled profile
 
 [project.scripts]
 tasni = "tasni.__main__:main"

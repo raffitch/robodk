@@ -71,6 +71,8 @@ interface Status {
 // -- ring-stack measure-only experiment (no extrusion; camera move only) ----
 interface MeasureTake {
   layer_index: number; take: number; layer_dir: string; valid: boolean; timestamp: string;
+  // Absent on takes archived before figures existed; derived from index+take then.
+  layer_name?: string;
   annotation: { introduced_offset_mm?: [number, number] | null; note?: string };
   metrics: { mean_absolute_mm: number; rms_mm: number; maximum_mm: number;
     center_offset_mm: [number, number]; center_offset_norm_mm: number; shape_rms_mm: number;
@@ -86,6 +88,54 @@ interface Characterization {
 interface MeasureSession {
   trial_id: string; takes: Record<string, number>; records: MeasureTake[];
   characterizations: Characterization[];
+  // layer index -> the measured centreline of its latest take, in work-frame mm.
+  tops?: Record<string, number[][]>;
+}
+
+/** The archive's own naming: take 1 keeps the historical name, repeats get a suffix. */
+function layerDirName(take: MeasureTake): string {
+  if (take.layer_name) return take.layer_name;
+  const layer = `layer-${String(take.layer_index).padStart(3, "0")}`;
+  return take.take === 1 ? layer : `${layer}-take${String(take.take).padStart(2, "0")}`;
+}
+
+const FIGURES: Array<{ stem: string; label: string; hint: string }> = [
+  { stem: "plan", label: "Plan view", hint: "deposit cloud, extracted centreline, nominal ring" },
+  { stem: "heightmap", label: "Height map", hint: "bird's-eye relief of the depth frame" },
+  { stem: "iso", label: "Oblique", hint: "3-D cloud + centreline, vertical exaggeration" },
+  { stem: "profile", label: "Unrolled profile", hint: "height and radial deviation vs angle" },
+];
+
+/** Figures are rendered on first request, so the first load of a take is slow. */
+function TakeFigures({ trialId, take }: { trialId: string; take: MeasureTake }) {
+  const base = `/api/modules/extrusion/trials/${encodeURIComponent(trialId)}`
+    + `/layers/${encodeURIComponent(layerDirName(take))}`;
+  return <div className="figure-gallery">
+    {FIGURES.map(({ stem, label, hint }) => <figure key={stem} className="figure-card">
+      <a href={`${base}/figures/${stem}.png`} target="_blank" rel="noreferrer">
+        <img src={`${base}/figures/${stem}.png`} alt={`${label} of layer ${take.layer_index} take ${take.take}`} loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>{label}</strong> <span className="hint">{hint}</span>
+        <span className="figure-links">
+          <a href={`${base}/figures/${stem}.png`} target="_blank" rel="noreferrer">PNG</a>
+          <a href={`${base}/figures/${stem}.pdf`} target="_blank" rel="noreferrer">PDF</a>
+        </span>
+      </figcaption>
+    </figure>)}
+    <figure className="figure-card">
+      <a href={`${base}/files/color.png`} target="_blank" rel="noreferrer">
+        <img src={`${base}/files/color.png`} alt="Colour frame as captured" loading="lazy" />
+      </a>
+      <figcaption><strong>Colour frame</strong> <span className="hint">what the camera saw</span></figcaption>
+    </figure>
+    <figure className="figure-card">
+      <a href={`${base}/files/comparison.png`} target="_blank" rel="noreferrer">
+        <img src={`${base}/files/comparison.png`} alt="Segmentation with nominal and measured paths" loading="lazy" />
+      </a>
+      <figcaption><strong>Segmentation</strong> <span className="hint">raster the centreline came from</span></figcaption>
+    </figure>
+  </div>;
 }
 
 const recipeFields: Array<{ key: keyof Recipe; label: string; min: number; max: number; step: number; unit: string }> = [
@@ -100,8 +150,11 @@ const recipeFields: Array<{ key: keyof Recipe; label: string; min: number; max: 
   { key: "points_per_circle", label: "Curve samples", min: 24, max: 720, step: 12, unit: "pts" },
 ];
 
-function BirdseyeStack({ plan, selectedLayer, onSelect }: {
+function BirdseyeStack({ plan, selectedLayer, onSelect, measured }: {
   plan: Plan; selectedLayer: number; onSelect: (layer: number) => void;
+  // Measured centrelines by layer index, in work-frame mm: what is actually
+  // on the table, drawn over what was commanded.
+  measured?: Record<string, number[][]>;
 }) {
   const width = 640, height = 440, pad = 38;
   const { radius_mm: radius, layer_height_mm: layerHeight } = plan.recipe;
@@ -130,7 +183,12 @@ function BirdseyeStack({ plan, selectedLayer, onSelect }: {
     item,
     rawPoints: item.points.map((p) => raw(p.x_mm, p.y_mm, p.z_mm)),
   }));
-  const bounds = [...plane, ...projectedLayers.flatMap((entry) => entry.rawPoints)];
+  const projectedMeasured = Object.entries(measured ?? {}).map(([index, points]) => ({
+    layerIndex: Number(index),
+    rawPoints: points.map((p) => raw(p[0], p[1], p[2])),
+  })).filter((entry) => entry.rawPoints.length > 1);
+  const bounds = [...plane, ...projectedLayers.flatMap((entry) => entry.rawPoints),
+                  ...projectedMeasured.flatMap((entry) => entry.rawPoints)];
   const minX = Math.min(...bounds.map((p) => p.x));
   const maxX = Math.max(...bounds.map((p) => p.x));
   const minY = Math.min(...bounds.map((p) => p.y));
@@ -189,6 +247,11 @@ function BirdseyeStack({ plan, selectedLayer, onSelect }: {
         {selected && <circle cx={start.x} cy={start.y} r="5" fill="#f0a45d" />}
       </g>;
     })}
+    {projectedMeasured.map(({ layerIndex, rawPoints }) => <path
+      key={`measured-${layerIndex}`} d={path(rawPoints)} fill="none" stroke="#f0616d"
+      strokeWidth={layerIndex === selectedLayer ? 3.4 : 2.2}
+      strokeOpacity={layerIndex === selectedLayer ? 1 : .72}
+      strokeLinecap="round" strokeLinejoin="round" />)}
     {axes.map((axis) => <g key={axis.label}>
       <line x1={axisOrigin.x} y1={axisOrigin.y} x2={axis.end.x} y2={axis.end.y}
             stroke={axis.color} strokeWidth="1.6" />
@@ -197,6 +260,7 @@ function BirdseyeStack({ plan, selectedLayer, onSelect }: {
     </g>)}
     <text x="14" y={height - 14} className="preview-note">
       OBLIQUE XYZ · Z ×{zExaggeration.toFixed(1)} · ΔZ {layerHeight.toFixed(2)} mm
+      {projectedMeasured.length ? "  ·  teal = commanded, red = measured" : ""}
     </text>
   </svg>;
 }
@@ -236,6 +300,8 @@ export default function Extrusion() {
   const [measureNote, setMeasureNote] = useState("");
   const [confirmMotion, setConfirmMotion] = useState(false);
   const [paper, setPaper] = useState<string | null>(null);
+  const [openTake, setOpenTake] = useState<string | null>(null);
+  const [showStack, setShowStack] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   const refreshStatus = useCallback(() => {
@@ -661,7 +727,8 @@ export default function Extrusion() {
       <div className="birdseye-head"><div><h2>Live bird’s-eye draft</h2><p>Sliders update this analytic preview immediately. It is not an executable robot plan until coordinates are generated below.</p></div>
         {layer && <div className="layer-readout">LAYER {layer.layer_index}<b>Z {layer.nominal_z_mm.toFixed(2)} mm</b></div>}</div>
       {visualPlan && layer ? <div className="birdseye-layout">
-        <BirdseyeStack plan={visualPlan} selectedLayer={visualSelectedLayer} onSelect={setSelectedLayer} />
+        <BirdseyeStack plan={visualPlan} selectedLayer={visualSelectedLayer} onSelect={setSelectedLayer}
+                       measured={measureSession?.tops} />
         <div className="layer-rail">{visualPlan.layers.map((item) => <button key={item.layer_index}
           className={`layer-tile ${item.layer_index === visualSelectedLayer ? "selected" : ""}`}
           onClick={() => setSelectedLayer(item.layer_index)}>
@@ -806,7 +873,10 @@ export default function Extrusion() {
       </div>
       {measureSession?.records?.length ? <table className="metrics">
         <thead><tr><th>Layer</th><th>Take</th><th>Introduced</th><th>Offset dx/dy (|d|)</th><th>Mean |dev|</th><th>RMS</th><th>Max</th><th>Shape RMS</th><th>Height min/mean/max</th><th>Bead</th><th>Acq→path</th><th>Valid</th></tr></thead>
-        <tbody>{measureSession.records.map((r) => <tr key={`${r.layer_index}-${r.take}`}>
+        <tbody>{measureSession.records.map((r) => <tr key={`${r.layer_index}-${r.take}`}
+          className={`clickable${openTake === layerDirName(r) ? " selected" : ""}`}
+          title="Show the figures for this take"
+          onClick={() => setOpenTake(openTake === layerDirName(r) ? null : layerDirName(r))}>
           <td>{r.layer_index}</td><td>{r.take}</td>
           <td>{r.annotation?.introduced_offset_mm ? `(${r.annotation.introduced_offset_mm.join(", ")}) mm` : "—"}</td>
           <td className="num">{r.metrics.center_offset_mm[0].toFixed(1)} / {r.metrics.center_offset_mm[1].toFixed(1)} ({r.metrics.center_offset_norm_mm.toFixed(2)})</td>
@@ -817,9 +887,37 @@ export default function Extrusion() {
           <td className="num">{Math.round(r.timings_ms.acquisition_to_path_ms)} ms</td>
           <td><span className={`badge ${r.valid ? "good" : "bad"}`}>{r.valid ? "VALID" : "INVALID"}</span></td>
         </tr>)}</tbody></table> : null}
+      {measureSession?.records?.length ? <p className="hint">
+        Click a take to see its figures. They are drawn from the archived frame, so a take
+        measured before figures existed renders on its first view — the robot never moves.
+      </p> : null}
+      {openTake && measureSession ? (() => {
+        const take = measureSession.records.find((r) => layerDirName(r) === openTake);
+        return take ? <TakeFigures trialId={measureSession.trial_id} take={take} /> : null;
+      })() : null}
       <div className="btn-row">
         <button className="secondary" disabled={!measureSession} onClick={showPaper}>Paper summary</button>
+        <button className="secondary" disabled={!measureSession}
+                onClick={() => setShowStack(!showStack)}>
+          {showStack ? "Hide" : "Show"} stack figure
+        </button>
       </div>
+      {showStack && measureSession ? <figure className="figure-card" style={{ marginTop: 10 }}>
+        <a href={`/api/modules/extrusion/trials/${encodeURIComponent(measureSession.trial_id)}/figures/stack.png`}
+           target="_blank" rel="noreferrer">
+          <img src={`/api/modules/extrusion/trials/${encodeURIComponent(measureSession.trial_id)}/figures/stack.png`}
+               alt="Every layer's latest measured centreline, plan and oblique" />
+        </a>
+        <figcaption><strong>Ring stack</strong>
+          <span className="hint">every layer's latest take, measured against nominal</span>
+          <span className="figure-links">
+            <a href={`/api/modules/extrusion/trials/${encodeURIComponent(measureSession.trial_id)}/figures/stack.png`}
+               target="_blank" rel="noreferrer">PNG</a>
+            <a href={`/api/modules/extrusion/trials/${encodeURIComponent(measureSession.trial_id)}/figures/stack.pdf`}
+               target="_blank" rel="noreferrer">PDF</a>
+          </span>
+        </figcaption>
+      </figure> : null}
       {paper && <pre className="log" style={{ whiteSpace: "pre-wrap" }}>{paper}</pre>}
     </div>
 

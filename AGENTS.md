@@ -96,6 +96,16 @@ deliberate change.) The optical fit at 135 mm is what the recipe *wants*, not wh
 sensor can measure. Failed characterization now archives raw RGB-D instead of losing the
 only diagnostic frame.
 
+**2026-08-28 — figures per take.** `tasni/modules/extrusion/figures.py` renders `plan`,
+`heightmap`, `iso` and `profile` (300 dpi PNG + vector PDF) plus a per-trial `stack`,
+from the archive alone: no robot, no RoboDK, no camera. Every take draws them
+automatically; serving is render-if-missing, so takes archived earlier — including
+`20260828-192115-47fb78ea` — produce figures with zero cell time. Click a take in the
+measurement table to see them. Needs `pip install -e .[figures]`; without matplotlib the
+measurement is unchanged and only the figures are skipped. Details and the two
+correctness traps (deposit-band colour range; FITTED not averaged nominal centre) are in
+`docs/extrusion-current-handoff.md`.
+
 > **Picking this up? Read [docs/live-print-next-session.md](docs/live-print-next-session.md)**
 > — the continuation handoff: current state, the full decision tree for each bisect
 > outcome, where the code is, and the fallback options with their real costs.
