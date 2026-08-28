@@ -109,11 +109,15 @@ def station_requirements(rdk: RdkIO, plan: CylinderPlan, config) -> dict:
                                      config.valve_active_value)
                   and instructions_match(actual_off, config.valve_outputs,
                                          config.valve_inactive_value))
-    if not mapping_ok:
-        items.append({"role": "valve_instruction_mapping", "name": "AirOn/AirOff",
-                      "type": "program instructions", "present": False,
-                      "expected": {"on": expected_on, "off": expected_off},
-                      "actual": {"on": actual_on, "off": actual_off}})
+    # Always report the ACTUAL instruction text, pass or fail. A named output and
+    # a numeric one render almost alike, so this check cannot tell a station whose
+    # outputs reach the driver as $OUT[0] from a correct one -- but the operator
+    # can, by reading "Set IO_508=1" (broken: a name) versus "Set 508=1" (correct:
+    # an index). Hiding it on success is what made that invisible.
+    items.append({"role": "valve_instruction_mapping", "name": "AirOn/AirOff",
+                  "type": "program instructions", "present": mapping_ok,
+                  "expected": {"on": expected_on, "off": expected_off},
+                  "actual": {"on": actual_on, "off": actual_off}})
     return {"ready": all(item["present"] for item in items), "items": items,
             "valve_mapping_verified": mapping_ok,
             "missing": [item for item in items if not item["present"]]}

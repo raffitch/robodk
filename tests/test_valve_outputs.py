@@ -71,3 +71,32 @@ def test_extra_instructions_are_rejected():
     """An AirOff that also moves the robot is not a fail-safe valve program."""
     assert not instructions_match(["Set 508=0", "Set 601=0", "MoveJ Home"],
                                   ["IO_508", "IO_601"], 0)
+
+
+def test_station_requirements_always_reports_the_actual_valve_instructions():
+    """A named and a numeric output render almost alike, so verification cannot
+    tell a fixed station from a broken one. The operator can -- but only if the
+    actual instruction text is always reported, not just when the check fails.
+    """
+    from tasni.core.config import ExtrusionConfig
+    from tasni.modules.extrusion.service import station_requirements
+    from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup
+    from tasni.modules.extrusion.toolpath import generate_cylinder_plan
+
+    class Rdk:
+        def item_exists_as(self, name, kind): return True
+        def program_instructions(self, name):
+            return (["Set IO_508=1", "Set IO_601=1"] if name == "AirOn"
+                    else ["Set IO_508=0", "Set IO_601=0"])
+
+    plan = generate_cylinder_plan(
+        CylinderRecipe(radius_mm=40, layer_count=1, layer_height_mm=5,
+                       bead_diameter_mm=6, robot_speed_mm_s=75,
+                       extrusion_rate_pct=0, points_per_circle=72),
+        CylinderSetup(print_tool="T", work_frame="F", inspection_tool="C",
+                      inspection_target="I", inspection_auto=False))
+    report = station_requirements(Rdk(), plan, ExtrusionConfig())
+    valve = next(i for i in report["items"]
+                 if i["role"] == "valve_instruction_mapping")
+    assert valve["actual"]["on"] == ["Set IO_508=1", "Set IO_601=1"]
+    assert valve["actual"]["off"] == ["Set IO_508=0", "Set IO_601=0"]
