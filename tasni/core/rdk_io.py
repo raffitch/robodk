@@ -1946,6 +1946,36 @@ class RdkIO:
         """
         return int(self.dispatch_program(name, real_robot=real_robot)["run_code"])
 
+    #: RoboDK's ``ConnectedState()`` codes (robolink ROBOTCOM_*).
+    ROBOTCOM_NAMES = {0: "READY", 1: "WORKING", 2: "WAITING", -1: "NOT_CONNECTED",
+                      -2: "DISCONNECTED", -3: "PROBLEMS", -1000: "UNKNOWN"}
+
+    def driver_state(self) -> dict:
+        """The DRIVER's own view of the controller — and a witness we never used.
+
+        ``program.Busy()`` and ``robot.Busy()`` are both RoboDK-side: they say
+        what RoboDK thinks its own simulation/program executor is doing.
+        ``ConnectedState()`` comes from the driver process talking to the KRC, and
+        it has a state for *executing* — ``ROBOTCOM_WORKING`` — plus a message on
+        ``ROBOTCOM_PROBLEMS``.
+
+        That distinction is the open question on the cell 2026-08-28: RoboDK
+        accepted a 195-instruction program with run mode 6 and every instruction
+        cleared, then nothing ran. If the driver never leaves READY, RoboDK sent
+        the driver nothing and the fault is in RoboDK's program executor; if it
+        goes to WORKING or PROBLEMS, the command did reach the driver and the
+        message says what the controller did with it.
+
+        Never raises: a diagnostic must not be able to break a print.
+        """
+        try:
+            status, message = self.robot().ConnectedState()
+            code = int(status)
+        except Exception as exc:
+            return {"code": None, "name": "UNREADABLE", "message": str(exc)}
+        return {"code": code, "name": self.ROBOTCOM_NAMES.get(code, str(code)),
+                "message": str(message or "")}
+
     def robot_busy(self) -> bool:
         """Is the ROBOT moving? The signal that matters for a driver-run program.
 

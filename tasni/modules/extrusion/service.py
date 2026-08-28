@@ -253,8 +253,33 @@ def program_runtime_fault(*, expected_s: float, actual_s: float,
             "deposited, so measuring this layer would be meaningless.")
 
 
+def describe_driver_states(states: list) -> str:
+    """Summarise the driver states seen across a dispatch.
+
+    ``READY -> WORKING -> READY`` is a program the driver really executed.
+    ``READY`` alone means RoboDK never handed the driver anything: the program was
+    accepted and then never dispatched, which is a RoboDK-side fault and not a
+    controller one. ``PROBLEMS`` carries the controller's own message.
+    """
+    if not states:
+        return "driver state not sampled"
+    names = []
+    for state in states:
+        label = state.get("name", "?")
+        if state.get("message") and state.get("code") != 0:
+            label += f" ({state['message']})"
+        names.append(label)
+    trail = " -> ".join(names)
+    if len(states) == 1 and states[0].get("code") == 0:
+        return (f"driver stayed {trail} throughout — it was never asked to work, "
+                "so RoboDK accepted the program and then dispatched nothing")
+    return f"driver {trail}"
+
+
 def _wait_program(ctx: JobContext, rdk: RdkIO, name: str, *,
                   start_timeout_s: float = 3.0, poll_s: float = 0.05,
+                  fast_poll_s: float = 0.004, fast_polls: int = 125,
+                  on_poll=None,
                   sleep=time.sleep, clock=time.monotonic) -> "tuple[float, bool]":
     """Block until a started program has actually finished.
 
@@ -289,6 +314,23 @@ def _wait_program(ctx: JobContext, rdk: RdkIO, name: str, *,
         except Exception:
             return False
 
+    polls = 0
+
+    def _tick() -> float:
+        # Poll HARD for the first moments. At a flat 50 ms a program that starts
+        # and aborts inside one interval is indistinguishable from one that never
+        # started — and on the cell 2026-08-28 "never observed running" is exactly
+        # the reading we are trying to trust. ~250 Hz for the first ~0.5 s closes
+        # that window; after it, the slow cadence keeps a long print cheap.
+        nonlocal polls
+        polls += 1
+        if on_poll is not None:
+            try:
+                on_poll()
+            except Exception:
+                pass                 # an observer must never break the wait
+        return fast_poll_s if polls <= fast_polls else poll_s
+
     started_at = clock()
     observed_busy = False
     running_since = None
@@ -300,7 +342,7 @@ def _wait_program(ctx: JobContext, rdk: RdkIO, name: str, *,
             break
         if ctx.cancelled:
             ctx.check_cancel()
-        sleep(poll_s)
+        sleep(_tick())
     while _busy():
         observed_busy = True
         if running_since is None:
@@ -308,7 +350,7 @@ def _wait_program(ctx: JobContext, rdk: RdkIO, name: str, *,
         if ctx.cancelled:
             rdk.stop_program(name)
             ctx.check_cancel()
-        sleep(poll_s)
+        sleep(_tick())
     # A cancellation can arrive after the final busy poll. Do not let the
     # caller continue into inspection, capture, or the next layer in that race.
     ctx.check_cancel()
@@ -834,13 +876,31 @@ class CylinderPrintJob:
                         except Exception:
                             return None          # never fail a print over a witness
                     view_before = _witness_frame()
+                    # Sample the DRIVER's own state across the dispatch, not just
+                    # RoboDK's Busy(). Both Busy() probes are RoboDK-side; the
+                    # driver has its own WORKING/PROBLEMS states, and whether it
+                    # ever leaves READY separates "RoboDK dispatched nothing" from
+                    # "the controller refused it" (cell 2026-08-28: 195 of 195
+                    # instructions accepted, run mode 6, and still no motion).
+                    driver_states: list[dict] = [rdk.driver_state()]
+
+                    def _sample_driver() -> None:
+                        state = rdk.driver_state()
+                        if state["code"] != driver_states[-1]["code"]:
+                            driver_states.append(state)
+
                     dispatch = rdk.dispatch_program(name, real_robot=True)
                     ctx.log(f"layer {layer.layer_index}: dispatched — "
                             + describe_dispatch(dispatch))
                     if dispatch["run_code"] < 0:
                         raise RuntimeError(f"layer {layer.layer_index} live program could not start")
                     ran_s, saw_busy = _wait_program(
-                        ctx, rdk, name, start_timeout_s=ecfg.program_start_grace_s)
+                        ctx, rdk, name, start_timeout_s=ecfg.program_start_grace_s,
+                        on_poll=_sample_driver)
+                    _sample_driver()
+                    dispatch["driver_states"] = driver_states
+                    ctx.log(f"layer {layer.layer_index}: "
+                            + describe_driver_states(driver_states))
                     current_program = None
                     arm_moved = view_changed(view_before, _witness_frame())
                     # start_program returning success only means RoboDK ACCEPTED the

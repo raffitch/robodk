@@ -112,6 +112,14 @@ class FakeRdk:
                     "percent_ok": 41.0, "problems": "Collision detected: spindle/Table"}
         return {"instructions_ok": 100, "time_s": 0.5, "distance_mm": 100,
                 "percent_ok": 100.0, "problems": ""}
+    # A healthy dispatch really makes the DRIVER work: READY -> WORKING -> READY.
+    # A fake that sat on READY would model the very fault under investigation and
+    # call it a successful print.
+    driver_polls = 0
+    def driver_state(self):
+        self.driver_polls += 1
+        code = 1 if self.driver_polls == 2 else 0
+        return {"code": code, "name": "WORKING" if code else "READY", "message": ""}
     def _dispatch_report(self, name):
         # Mirror the real RdkIO: a healthy dispatch clears every instruction and
         # the station really is in RUN_ROBOT. A fake that returned None here let

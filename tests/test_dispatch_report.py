@@ -18,7 +18,8 @@ import robolink as rl
 
 from tasni.core.config import RoboDKConfig
 from tasni.core.rdk_io import RdkIO
-from tasni.modules.extrusion.service import describe_dispatch
+from tasni.modules.extrusion.service import (describe_dispatch,
+                                             describe_driver_states)
 
 
 class _Program:
@@ -134,3 +135,72 @@ def test_unreadable_run_mode_is_stated_not_guessed():
     line = describe_dispatch({"run_code": 5, "instruction_count": 5,
                               "run_mode": None, "run_mode_expected": 6})
     assert "unreadable" in line
+
+
+# -- the driver's own state -------------------------------------------------
+
+def test_driver_state_names_the_robotcom_code():
+    io, _ = _io()
+    io.robot = lambda: SimpleNamespace(ConnectedState=lambda: (1, ""))
+    assert io.driver_state() == {"code": 1, "name": "WORKING", "message": ""}
+
+
+def test_driver_state_carries_the_controller_message_on_problems():
+    io, _ = _io()
+    io.robot = lambda: SimpleNamespace(
+        ConnectedState=lambda: (-3, "Emergency stop"))
+    state = io.driver_state()
+    assert state["name"] == "PROBLEMS" and state["message"] == "Emergency stop"
+
+
+def test_driver_state_never_raises():
+    io, _ = _io()
+    io.robot = lambda: (_ for _ in ()).throw(RuntimeError("no driver"))
+    assert io.driver_state()["name"] == "UNREADABLE"
+
+
+def test_a_driver_that_never_left_ready_was_never_asked_to_work():
+    """The decisive reading: RoboDK accepted the program and dispatched nothing."""
+    line = describe_driver_states([{"code": 0, "name": "READY", "message": ""}])
+    assert "never asked to work" in line and "dispatched nothing" in line
+
+
+def test_a_driver_that_worked_is_not_called_out():
+    line = describe_driver_states([
+        {"code": 0, "name": "READY", "message": ""},
+        {"code": 1, "name": "WORKING", "message": ""},
+        {"code": 0, "name": "READY", "message": ""}])
+    assert "never asked" not in line and "WORKING" in line
+
+
+def test_a_driver_problem_surfaces_the_controller_message():
+    line = describe_driver_states([
+        {"code": 0, "name": "READY", "message": ""},
+        {"code": -3, "name": "PROBLEMS", "message": "KSS01234 drives off"}])
+    assert "KSS01234" in line
+
+
+# -- the poll cadence -------------------------------------------------------
+
+def test_the_first_polls_are_fast_enough_to_catch_a_program_that_aborts():
+    """At a flat 50 ms, a run that dies in 20 ms reads as 'never started'.
+
+    That reading is what the whole 2026-08-28 diagnosis rests on, so it has to be
+    trustworthy: poll hard at first, then back off.
+    """
+    from tasni.modules.extrusion.service import _wait_program
+
+    slept: list[float] = []
+
+    class _Ctx:
+        cancelled = False
+        def check_cancel(self): pass
+
+    class _Rdk:
+        def program_busy(self, name): return False
+        def stop_program(self, name): pass
+
+    _wait_program(_Ctx(), _Rdk(), "P", start_timeout_s=0.2,
+                  sleep=slept.append)
+    assert slept, "must have polled at least once"
+    assert max(slept[:10]) <= 0.01, "the first polls must be sub-10 ms"
