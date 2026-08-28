@@ -78,10 +78,15 @@ was a broad ChArUco-board depth residual, not the ring. The new selector uses an
 coverage and radial compactness; offline replay of that exact frame reads radius 39.17
 mm, centre (217.94, 150.44) mm, bead footprint 13.26 mm and top Z 6.14 mm.
 
-**Next action:** restart the backend, then run **Ring stack → Characterize ring 1** at
-300 mm. The second 300 mm cell attempt found no independent ring cluster even though the
-operator confirmed the ring was present; the ring-selector fix (above) is the change to
-retest, not a shorter standoff. **Closer is not available on this cell:** depth streams at
+**2026-08-28 evening — first successful measure-only cell run** (session
+`runs/extrusion/20260828-192115-47fb78ea`, 300 mm, collisions OFF): Characterize picked the
+ring over the board residual (selector candidate 2: coverage 0.97, radial-span ratio 0.39;
+r 40.5 mm, centre (197.5, 152.5), bead 10.4 mm, top Z 6.0 mm) and a separate Measure layer
+1 re-found it at r 39.9, centre (197.0, 152.4) — 0.5 mm apart — shape RMS 1.9 mm, capture
+2.7 s, acquisition→path 3.1 s. Its 10 mm mean |dev| is the ring sitting 15 mm from the
+un-applied plan centre, not measurement error. **Next action:** press **Apply to recipe &
+placement**, re-measure layer 1 as the zero-offset baseline, then run the introduced-offset
+protocol (spec §3) for the paper. **Closer is not available on this cell:** depth streams at
 the D435i's native maximum 1280×720, whose MinZ is ~280 mm, so the existing 300 mm
 `inspection_min_mm` already sits at the sensor floor. (An earlier change clamped
 measure-only to 175 mm on a wrong MinZ reading; `measure_close_range_min_mm` is now 300 mm

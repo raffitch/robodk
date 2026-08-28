@@ -219,6 +219,12 @@ operational need now implemented: raw color/depth/pose archiving even when
 characterization fails. (It also produced a 175 mm close-range option built on a wrong
 MinZ reading; that clamp is back at 300 mm — see the MinZ note above.) The rejected attempt predated that archiving and therefore has no raw frame.
 
+**2026-08-28 evening: the protocol ran end to end on the cell** — see the session
+`runs/extrusion/20260828-192115-47fb78ea` (characterize-01 + layer-001, both valid; numbers
+in AGENTS.md). The one operator slip was skipping *Apply to recipe & placement* between
+Characterize and Measure, so layer-001's deviation is dominated by a 15 mm centre offset
+against the stale plan.
+
 Cell protocol: scan surface applied → Center on scanned surface → Generate → place
 ring 1 → Characterize → Apply → Generate → Measure L1 ×5 (noise floor) → re-place
 ×3 → ring 2 true → Measure L2 → ring 3 true → Measure L3 → shift a ring 10 mm
