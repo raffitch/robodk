@@ -92,3 +92,19 @@ def test_a_missing_robot_busy_probe_is_tolerated():
     rdk = Rdk([True, False])
     elapsed, observed = _wait_program(Ctx(), rdk, "P", sleep=lambda s: None)
     assert observed is True
+
+
+def test_elapsed_excludes_the_start_grace():
+    """The grace must not be counted as execution time.
+
+    Regression, cell 2026-08-28: raising the grace to 5 s made every program
+    "run" for 5.0 s, which exceeded RoboDK's 1.9 s prediction and silently
+    disarmed the runtime guard. Time spent waiting for a program to START is not
+    time spent running it.
+    """
+    clock = iter([0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+    rdk = Rdk([])                      # never busy
+    elapsed, observed = _wait_program(Ctx(), rdk, "P", start_timeout_s=5.0,
+                                      sleep=lambda s: None, clock=lambda: next(clock))
+    assert observed is False
+    assert elapsed == 0.0, "a program never seen running executed for no time"

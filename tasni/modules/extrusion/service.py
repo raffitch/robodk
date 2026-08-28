@@ -200,6 +200,15 @@ def program_runtime_fault(*, expected_s: float, actual_s: float,
     """
     if expected_s <= floor_s:
         return None
+    if arm_moved is False:
+        # Decisive by itself. RoboDK expected real motion and the flange camera
+        # saw an unchanged view, so nothing was deposited — whatever the clock
+        # says. Reporting success here archives a measurement of an empty board.
+        return ("the flange camera saw an unchanged view before and after: the "
+                f"arm did not move, though RoboDK predicted {expected_s:.1f} s of "
+                "motion. Check the pendant: operating mode (AUT/EXT, not T1/T2), "
+                "drives enabled, and no active safety stop. Nothing was "
+                "deposited, so measuring this layer would be meaningless.")
     if actual_s >= expected_s * min_ratio:
         return None
     if arm_moved:
@@ -255,16 +264,20 @@ def _wait_program(ctx: JobContext, rdk: RdkIO, name: str, *,
 
     started_at = clock()
     observed_busy = False
+    running_since = None
     deadline = started_at + start_timeout_s
     while clock() < deadline:
         if _busy():
             observed_busy = True     # seen running, even if it stops immediately
+            running_since = clock()
             break
         if ctx.cancelled:
             ctx.check_cancel()
         sleep(poll_s)
     while _busy():
         observed_busy = True
+        if running_since is None:
+            running_since = clock()
         if ctx.cancelled:
             rdk.stop_program(name)
             ctx.check_cancel()
@@ -272,7 +285,10 @@ def _wait_program(ctx: JobContext, rdk: RdkIO, name: str, *,
     # A cancellation can arrive after the final busy poll. Do not let the
     # caller continue into inspection, capture, or the next layer in that race.
     ctx.check_cancel()
-    return clock() - started_at, observed_busy
+    # EXECUTION time, not wall time: waiting for a program to start is not time
+    # spent running it. Counting the grace made every program appear to outlast
+    # RoboDK's prediction, which silently disarmed program_runtime_fault.
+    return (0.0 if running_since is None else clock() - running_since), observed_busy
 
 
 def _program_valid(report: dict) -> bool:

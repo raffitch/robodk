@@ -70,3 +70,28 @@ def test_without_a_witness_the_wording_stays_a_suspicion():
     msg = program_runtime_fault(expected_s=12.0, actual_s=1.0,
                                 observed_busy=False, arm_moved=None)
     assert msg is not None and "camera" not in msg.lower()
+
+
+def test_camera_saying_the_arm_did_not_move_is_a_fault_on_its_own():
+    """Regression, cell 2026-08-28: a run completed all three layers and archived
+    measurements while the flange camera reported "the arm did NOT move" every
+    time. The witness was only ever used to CLEAR a timing suspicion, so with no
+    shortfall it was ignored -- reporting success for a print that never happened,
+    which is far worse than failing. If the camera says the arm did not move and
+    RoboDK expected real motion, that is decisive by itself.
+    """
+    msg = program_runtime_fault(expected_s=1.9, actual_s=5.0,
+                                observed_busy=False, arm_moved=False)
+    assert msg is not None and "did not move" in msg.lower()
+
+
+def test_a_healthy_runtime_cannot_override_the_camera():
+    msg = program_runtime_fault(expected_s=1.9, actual_s=12.0,
+                                observed_busy=True, arm_moved=False)
+    assert msg is not None
+
+
+def test_a_short_program_is_still_not_policed_by_the_camera():
+    """Below the floor there is no expectation of motion to contradict."""
+    assert program_runtime_fault(expected_s=0.4, actual_s=5.0,
+                                 observed_busy=False, arm_moved=False) is None
