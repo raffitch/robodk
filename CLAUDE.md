@@ -161,7 +161,8 @@ you drive the real cell, not an empty station). Run it on Windows with
 - ✅ **Ring-stack measure-only experiment** (paper evidence): measure hand-placed rings
   through the inspection chain, characterize ring 1, paper summary. Spec + plan in
   docs/superpowers/. First real cell capture succeeded 2026-08-28; the introduced-offset
-  protocol is still to run. **Paper figures** (`modules/extrusion/figures.py`): plan view,
+  protocol is still to run — **[docs/pfh-paper-handoff.md](docs/pfh-paper-handoff.md)**
+  is the task page (deadline 1 Sep 2026). **Paper figures** (`modules/extrusion/figures.py`): plan view,
   bird's-eye height map, oblique and unrolled profile per take + a per-trial stack, all
   rendered from the archive with no robot — `pip install -e .[figures]`.
 - Then integrate the rest into the same app: scan (with **TSDF fusion** — biggest quality

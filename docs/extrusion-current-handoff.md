@@ -189,6 +189,11 @@ Primary code: `tasni/modules/extrusion/inspection.py` (pure numpy),
 
 ## Ring-stack measure-only experiment (paper evidence, 2026-08-27)
 
+> **Doing the paper cell run? Read [pfh-paper-handoff.md](pfh-paper-handoff.md).**
+> It is the task page: what is still missing, the operator order (including the
+> *Apply* step that was missed), and what must not be claimed. This section is the
+> module reference behind it.
+
 Design: `docs/superpowers/specs/2026-08-27-ring-stack-measure-only-design.md`;
 plan: `docs/superpowers/plans/2026-08-27-ring-stack-measure-only.md`.
 

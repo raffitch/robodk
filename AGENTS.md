@@ -110,8 +110,10 @@ correctness traps (deposit-band colour range; FITTED not averaged nominal centre
 > — the continuation handoff: current state, the full decision tree for each bisect
 > outcome, where the code is, and the fallback options with their real costs.
 
-**Also pending:** the PFH paper's ring-stack cell run (deadline 1 Sep 2026) — see
-`docs/superpowers/` and `docs/extrusion-current-handoff.md`. Discard every
+**Also pending:** the PFH paper's ring-stack cell run (deadline 1 Sep 2026) — **read
+[docs/pfh-paper-handoff.md](docs/pfh-paper-handoff.md) first**: it is the single page for
+that task (what the paper still needs, the exact operator order, and the wording
+constraint). Background in `docs/superpowers/` and `docs/extrusion-current-handoff.md`. Discard every
 `runs/extrusion/20260828-*-f088cf48` trial made before the real-ring capture: they are
 measurements of an empty board and must not reach the paper. Trial
 `20260828-171615-f088cf48/characterize-01` does contain the real ring, but its archived
