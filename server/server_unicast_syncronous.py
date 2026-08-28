@@ -2,6 +2,7 @@ import socket
 import struct
 import subprocess
 import threading
+import traceback
 import json
 import os
 import time
@@ -1159,6 +1160,30 @@ def setup_depth_filters():
     hole_filling = rs.hole_filling_filter()
     return [depth_to_disparity, spatial, temporal, disparity_to_depth, hole_filling]
 
+def _serve_client(conn, addr):
+    """Run handle_client for one client and ALWAYS close its socket.
+
+    handle_client's own conn.close() calls sit on its normal-return paths. When
+    the RealSense pipeline wedges, getFrames() raises straight out of the handler
+    ("Frame didn't arrive within 5000"), the thread dies with a traceback and the
+    accepted socket is never closed -- it sits in CLOSE_WAIT forever. Against
+    listen(5) a handful of those stop new clients connecting, so a *recoverable*
+    camera stall turns into a server that must be restarted by hand (seen on the
+    cell 2026-08-28: 10 leaked sockets). The traceback is still printed, because
+    it is what identifies a wedged camera in the journal.
+    """
+    try:
+        handle_client(conn, addr)
+    except Exception:
+        print(f"camera-client {addr[0]}:{addr[1]} failed:")
+        traceback.print_exc()
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
 def main():
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1168,7 +1193,7 @@ def main():
 
     while True:
         conn, addr = server_socket.accept()
-        threading.Thread(target=handle_client, args=(conn, addr),
+        threading.Thread(target=_serve_client, args=(conn, addr),
                          name=f"camera-client-{addr[0]}:{addr[1]}",
                          daemon=True).start()
 
