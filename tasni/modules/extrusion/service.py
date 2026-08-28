@@ -180,6 +180,33 @@ def view_changed(before, after, *, threshold: float = 4.0) -> "bool | None":
     return bool(np.abs(a - b).mean() > float(threshold))
 
 
+def describe_dispatch(report: dict) -> str:
+    """One log line for what RoboDK returned when asked to run a program.
+
+    ``RunCode()`` returns "the number of instructions that can be executed
+    successfully"; the job only ever rejected a negative, so a 0 read as success.
+    Printing it next to the instruction count and the run mode RoboDK actually
+    holds makes "RoboDK declined" and "the controller declined" different-looking
+    log lines instead of the same one (cell 2026-08-28: accepted, never busy, no
+    motion, and none of these three numbers recorded).
+    """
+    code = report.get("run_code")
+    count = report.get("instruction_count")
+    mode, expected = report.get("run_mode"), report.get("run_mode_expected")
+    of_total = f" of {count}" if count is not None else ""
+    if mode is None:
+        where = " (run mode unreadable)"
+    elif expected is not None and mode != expected:
+        where = f" — station run mode is {mode}, NOT the {expected} we set"
+    else:
+        where = f", run mode {mode}"
+    verdict = ""
+    if code == 0 and (count is None or count > 0):
+        verdict = ("  <-- RoboDK cleared ZERO instructions: it accepted the call "
+                   "and refused the program")
+    return f"RunCode returned {code}{of_total} instructions{where}{verdict}"
+
+
 def program_runtime_fault(*, expected_s: float, actual_s: float,
                           observed_busy: bool, arm_moved: "bool | None" = None,
                           min_ratio: float = 0.5,
@@ -716,9 +743,25 @@ class CylinderPrintJob:
                      "confirmed": None}
             valve.append(event)
             try:
-                rdk.run_station_program(ecfg.air_off_program, real_robot=True)
+                report = rdk.run_station_program(ecfg.air_off_program, real_robot=True)
                 event["command_completed"] = True
-                ctx.log(f"valve OFF: {reason}")
+                # The valve programs are the SIMPLE dispatch — a digital output,
+                # no motion — so this line is the control for the layer
+                # program's. Two healthy-looking reports with a silent cell mean
+                # the API never reaches the controller at all; a healthy valve
+                # report beside a refused layer report localises it to the
+                # generated program.
+                #
+                # Guarded: the fail-safe valve command must never fail because a
+                # DIAGNOSTIC could not be formatted. An older RdkIO returns None.
+                detail = ""
+                try:
+                    if isinstance(report, dict):
+                        event["dispatch"] = report
+                        detail = f" — {describe_dispatch(report)}"
+                except Exception:
+                    detail = ""
+                ctx.log(f"valve OFF: {reason}{detail}")
                 return True
             except Exception as exc:
                 event["command_completed"] = False
@@ -791,8 +834,10 @@ class CylinderPrintJob:
                         except Exception:
                             return None          # never fail a print over a witness
                     view_before = _witness_frame()
-                    started = rdk.start_program(name, real_robot=True)
-                    if started < 0:
+                    dispatch = rdk.dispatch_program(name, real_robot=True)
+                    ctx.log(f"layer {layer.layer_index}: dispatched — "
+                            + describe_dispatch(dispatch))
+                    if dispatch["run_code"] < 0:
                         raise RuntimeError(f"layer {layer.layer_index} live program could not start")
                     ran_s, saw_busy = _wait_program(
                         ctx, rdk, name, start_timeout_s=ecfg.program_start_grace_s)
@@ -803,7 +848,8 @@ class CylinderPrintJob:
                     # a layer that should take seconds and returns in a fraction of
                     # one never executed, and printing nothing must not be mistaken
                     # for printing something.
-                    ctx.log(f"layer {layer.layer_index}: program ran {ran_s:.1f} s; "
+                    ctx.log(f"layer {layer.layer_index}: program ran {ran_s:.1f} s "
+                            f"({'seen running' if saw_busy else 'NEVER OBSERVED RUNNING'}); "
                             f"flange camera says the arm "
                             f"{'MOVED' if arm_moved else 'did NOT move' if arm_moved is False else 'motion unknown'}")
                     runtime_fault = program_runtime_fault(
@@ -825,8 +871,11 @@ class CylinderPrintJob:
                     artifacts.extend(inspect["artifacts"])
                     inspection_validation = inspect["validation"]
                     current_program = inspection_name
-                    started = rdk.start_program(inspection_name, real_robot=True)
-                    if started < 0:
+                    inspect_dispatch = rdk.dispatch_program(
+                        inspection_name, real_robot=True)
+                    ctx.log(f"layer {layer.layer_index}: inspection dispatched — "
+                            + describe_dispatch(inspect_dispatch))
+                    if inspect_dispatch["run_code"] < 0:
                         raise RuntimeError(
                             f"layer {layer.layer_index} inspection program could not start")
                     _wait_program(ctx, rdk, inspection_name,
@@ -885,6 +934,8 @@ class CylinderPrintJob:
                         recipe=self.plan.recipe, toolpath_fingerprint=self.plan.fingerprint,
                         color_file="color.png", depth_file="depth.npy",
                         provenance={**provenance, "work_frame": self.plan.setup.work_frame,
+                                    "dispatch": dispatch,
+                                    "inspection_dispatch": inspect_dispatch,
                                     "print_tool": self.plan.setup.print_tool,
                                     "inspection_tool": self.plan.setup.inspection_tool,
                                     "inspection_target": inspect["target"],

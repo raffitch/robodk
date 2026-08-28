@@ -153,34 +153,47 @@ command RoboDK sent to the driver and the driver's replies. Compare with a manua
 the same program. This is the single most informative artifact available and it has
 never been looked at.
 
-**C. Log the three numbers the job throws away (3 lines).** In `start_program` /
-the layer loop: the `RunCode()` return value, `self.rdk.RunMode()` read back right after
-`setRunMode`, and `saw_busy` next to `program ran`. Restart the app (`/api/health`
-`build.stale`) before the run in A. Do not theorise before those exist.
+**C. The three numbers the job threw away — ✅ DONE (`RdkIO.dispatch_program`).** Every
+dispatch now logs `RunCode()`'s return value against the program's instruction count,
+the run mode **read back** after setting it, and `saw_busy`. Both valve programs and
+layer programs report, and both land in `provenance.dispatch`. **Just restart the app
+and press Print & record** — the log now says which of these it is:
 
-**D. `Get-Process RoboDK` (10 s).** Must be exactly one.
+| New log line | Meaning |
+|---|---|
+| `RunCode returned 0 of 12 instructions … <-- RoboDK cleared ZERO instructions` | RoboDK's pre-run check refused the program. The fault is RoboDK-side and the message is in its driver log (B). |
+| `… — station run mode is 1, NOT the 6 we set` | `92f2d1d`'s premise is wrong; the station will not hold RUN_ROBOT. |
+| `RunCode returned 12 of 12 …, run mode 6` **and** `NEVER OBSERVED RUNNING` | RoboDK genuinely dispatched and the controller declined → pendant/driver (A.3–A.4). |
+| valve OFF reports healthy, layer reports 0 | The generated Curve Follow program is the fault, not the dispatch path. |
 
-**E. Standalone bisect (15-line script, ~1 min on the cell).** Outside the app, with the
-kept layer program still in the station:
-```python
-from robodk.robolink import *
-RDK = Robolink()                      # attach to the GUI instance
-r = RDK.Item('KUKA KR150 R2700')      # robot_name from tasni.config.json
-print(r.Connect(''), r.ConnectedState())
-RDK.setRunMode(RUNMODE_RUN_ROBOT); print('RunMode', RDK.RunMode())
-p = RDK.Item('TasniCylinder_LIVE_..._L001', ITEM_TYPE_PROGRAM)
-p.setRunType(PROGRAM_RUN_ON_ROBOT)
-ret = p.RunCode(); print('RunCode ->', ret)
-import time; t0 = time.time()
-while time.time() - t0 < 10: print(round(time.time()-t0, 2), p.Busy(), r.Busy()); time.sleep(0.01)
-# then, separately, the operator watching:
-j = r.Joints().list(); j[5] += 2.0; r.MoveJ(j)   # 2° on A6 via the driver, no program at all
+The valve line is the **control**: AirOff is a two-instruction, no-motion program through
+the identical path. Comparing the two reports splits "the API never reaches the
+controller" from "the layer program specifically is refused" in the log alone.
+
+**D. `Get-Process RoboDK` (10 s).** Must be exactly one. (Likely already excluded: the
+operator right-clicks the app's own kept `TasniCylinder_*` program in their own window,
+which means the app is attached to that instance.)
+
+**E. Standalone bisect — ✅ written (`tools/dispatch_bisect.py`).** Runs outside the app
+against the RoboDK window you have open, four rungs, ~2 min, no printing and no valve:
+
 ```
-Outcomes: script `RunCode` moves the arm → the difference is inside the app (state,
-timing, concurrent calls). Script `RunCode` does not but `MoveJ` does → program-level
-dispatch (then B tells which instruction). Neither → API→driver→KRC path; the GUI
-"manual" run is doing something the API cannot, or was done under different conditions
-— go back to A.4.
+py -3.10 tools/dispatch_bisect.py link              # state only, no motion
+py -3.10 tools/dispatch_bisect.py jog               # MOVES ~2° on A6 via the DRIVER, no program
+py -3.10 tools/dispatch_bisect.py trivial           # MOVES: 2-instruction program it builds+deletes
+py -3.10 tools/dispatch_bisect.py program <NAME>    # MOVES: the kept layer program
+```
+
+| Result | Conclusion |
+|---|---|
+| `jog` does not move the arm | Fault is **below RoboDK** — driver, KUKAVARPROXY, or `RoboDKsync570` not cycling on the pendant. Check the pendant before anything else. |
+| `jog` moves, `trivial` does not | Driver + KRL loop + pendant are **fine**; API *program* execution is the fault. |
+| `trivial` moves, `program` does not | The generated **Curve Follow program** is the fault, not dispatch. |
+| all move | The fault is in the **app's** state/timing, not the API — diff this script's numbers against the app's log for the same program. |
+
+`jog` is the important one and it is the cheapest: it is a direct `MoveJ` through the
+driver (KRL `CASE 2`), so it tests the whole controller path with no program, no
+machining project, and no valve.
 
 **F. Only after A–E: the architectural fallback.** Drive motion through the driver
 (`MoveJ`/`MoveL` per pose) instead of running a generated program per layer. The

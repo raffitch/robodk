@@ -1887,8 +1887,27 @@ class RdkIO:
         """Set RoboDK playback speed; this never changes robot run mode or hardware."""
         self.rdk.setSimulationSpeed(float(ratio))
 
-    def start_program(self, name: str, *, real_robot: bool) -> int:
-        """Start a named program with an explicit simulator/robot run type."""
+    def dispatch_program(self, name: str, *, real_robot: bool) -> dict:
+        """Start a program and report everything RoboDK said about the attempt.
+
+        This used to return only ``RunCode()``'s integer, and every caller
+        rejected just ``< 0``. RoboDK documents that integer as "the number of
+        instructions that can be executed successfully (a quick program check is
+        performed before the program starts)" — so a **0**, meaning the check
+        cleared no instruction at all, passed as success. On the cell 2026-08-28
+        a layer was "accepted", never observed busy, and the arm never moved.
+
+        That integer and the run mode RoboDK *actually holds* (read back, not the
+        one we asked for) are the two cheap numbers that separate "RoboDK declined
+        to run it" from "the controller declined to execute it", and both were
+        being discarded. They are reported, not enforced: what a healthy dispatch
+        returns on this station has never been observed, so a guessed threshold
+        could block a run that would have worked. Log first, then decide.
+
+        Returns ``run_code``, ``instruction_count``, ``run_mode`` and
+        ``run_mode_expected``. Never raises for the diagnostics — a build that
+        cannot report them still dispatches.
+        """
         import robolink
 
         program = self.rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
@@ -1902,9 +1921,30 @@ class RdkIO:
         # collision screening — leaves the station in SIMULATE, and then RunCode()
         # moves only the model: the arm never budges, the program "finishes"
         # instantly, and nothing is deposited (cell 2026-08-28).
-        self.rdk.setRunMode(self.RUNMODE_RUN_ROBOT if real_robot
-                            else self.RUNMODE_SIMULATE)
-        return int(program.RunCode())
+        expected = self.RUNMODE_RUN_ROBOT if real_robot else self.RUNMODE_SIMULATE
+        self.rdk.setRunMode(expected)
+
+        def _safe(fn, default=None):
+            try:
+                return fn()
+            except Exception:
+                return default
+
+        # Read the mode BACK. "We called setRunMode(6)" is not evidence the
+        # station is in mode 6; that assumption is what 92f2d1d rested on.
+        run_mode = _safe(lambda: int(self.rdk.RunMode()))
+        instructions = _safe(lambda: int(program.InstructionCount()))
+        return {"run_code": int(program.RunCode()),
+                "instruction_count": instructions,
+                "run_mode": run_mode, "run_mode_expected": int(expected)}
+
+    def start_program(self, name: str, *, real_robot: bool) -> int:
+        """Start a named program with an explicit simulator/robot run type.
+
+        Thin wrapper over :meth:`dispatch_program` for callers that only branch on
+        the return code. Prefer ``dispatch_program`` where the diagnostics matter.
+        """
+        return int(self.dispatch_program(name, real_robot=real_robot)["run_code"])
 
     def robot_busy(self) -> bool:
         """Is the ROBOT moving? The signal that matters for a driver-run program.
@@ -1932,14 +1972,23 @@ class RdkIO:
         if program.Valid():
             program.Stop()
 
-    def run_station_program(self, name: str, *, real_robot: bool) -> None:
-        """Run a station program to completion with explicit run type."""
-        started = self.start_program(name, real_robot=real_robot)
-        if started < 0:
+    def run_station_program(self, name: str, *, real_robot: bool) -> dict:
+        """Run a station program to completion with explicit run type.
+
+        Returns the :meth:`dispatch_program` report. The valve programs go through
+        here, and they are the *simple* case — a couple of digital-output
+        instructions, no motion — so their report is the control against which a
+        generated layer program's report is read: if AirOff dispatches healthily
+        and a layer program does not, the fault is in the layer program, not in
+        the API-to-controller path.
+        """
+        report = self.dispatch_program(name, real_robot=real_robot)
+        if report["run_code"] < 0:
             raise RuntimeError(f"program {name!r} could not start")
         while self.program_busy(name):
             import time
             time.sleep(0.05)
+        return report
 
     def set_tool_pose(self, tool_name: str, T: np.ndarray) -> None:
         import robolink

@@ -112,7 +112,17 @@ class FakeRdk:
                     "percent_ok": 41.0, "problems": "Collision detected: spindle/Table"}
         return {"instructions_ok": 100, "time_s": 0.5, "distance_mm": 100,
                 "percent_ok": 100.0, "problems": ""}
-    def start_program(self, name, real_robot): self.events.append(("start", name, real_robot)); return 1
+    def _dispatch_report(self, name):
+        # Mirror the real RdkIO: a healthy dispatch clears every instruction and
+        # the station really is in RUN_ROBOT. A fake that returned None here let
+        # the live job's dispatch logging pass tests while breaking on the cell.
+        return {"run_code": 12, "instruction_count": 12,
+                "run_mode": 6, "run_mode_expected": 6}
+    def dispatch_program(self, name, real_robot):
+        self.events.append(("start", name, real_robot))
+        return self._dispatch_report(name)
+    def start_program(self, name, real_robot):
+        return self.dispatch_program(name, real_robot)["run_code"]
     def program_busy(self, name): return False
     def stop_program(self, name): self.events.append(("stop", name))
     def delete_items(self, names): self.deleted.extend(names)
@@ -121,6 +131,7 @@ class FakeRdk:
         self.events.append(("station-program", name, real_robot))
         if self.station_calls == self.fail_station_call:
             raise RuntimeError("controller did not confirm output OFF")
+        return self._dispatch_report(name)
     def use_named_tool_frame(self, tool, frame): self.events.append(("select", tool, frame)); return np.eye(4)
     def camera_pose_T(self): return FAKE_CAMERA_T.copy()
 
