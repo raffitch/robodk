@@ -19,6 +19,8 @@
 - **No page layout changes** in phase 0 (spec §9): pages keep their cards; only connection/event plumbing and the new gate reasons change.
 - Every event carries `module`; every job event carries `job_id` + `kind`; every live-preview event carries `stream_id`; `jobs.start()` returns the `job_id` and every start endpoint echoes `{"job_id": ...}` (spec §4.5).
 - Platform Connect **never** calls `connect_robot` (spec decision 9). Linking happens only via `POST /api/rdk/link` and inside runs.
+- Every cell state transition — connect, link, job start, live-preview start — goes through `services.arbiter` (`CellArbiter.hold`, non-blocking, fails fast). No page auto-connects (spec decision 13).
+- "running" is published before a job's worker thread starts; pages reconcile from their module `/status` right after every start response and whenever the socket (re)connects.
 - Copy rule: `lockReason` strings are one sentence, imperative, no spec vocabulary.
 - Commit after every task; push `ux-overhaul` at the end of every task group (CLAUDE.md working agreement). Phase 0 ships from the branch `ux-phase0` off `ux-overhaul`.
 - Frontend must pass `npm run typecheck && npm run build` (run from `tasni/webui`) before each commit that touches `webui/`.
@@ -108,6 +110,21 @@ def test_start_returns_job_id_and_stamps_every_event():
         assert e.stream_id is None
     assert bus.events[-1].payload["result"] == {"ok": True}
     assert bus.events[-1].payload["name"] == "sim_tour"   # legacy field kept
+
+
+def test_running_event_precedes_a_fast_jobs_result_and_record_is_final():
+    """A job that finishes before start() even returns must still leave a clean
+    trail: status(running) first, result last, record already 'done' — the page
+    reconciles from /status (Task 8b) precisely because of this window."""
+    bus = _FakeBus()
+    r = JobRunner(bus)
+    job_id = r.start(lambda ctx: "fast", kind="sim_tour", module="calibration")
+    _wait(r)
+    types = [e.type for e in bus.events]
+    assert types[0] == "status" and bus.events[0].payload["status"] == "running"
+    assert types[-1] == "result"
+    rec = r.record("calibration", "sim_tour")
+    assert rec.job_id == job_id and rec.status == "done" and rec.result == "fast"
 
 
 def test_two_runs_of_one_kind_get_distinct_ids():
@@ -379,8 +396,10 @@ class JobRunner:
             self._thread = threading.Thread(
                 target=self._run, args=(job, ctx, rec), name=f"{module}:{kind}",
                 daemon=True)
+            # "running" goes out BEFORE the worker starts, so no job event can ever
+            # precede it — a fast job could otherwise publish its result first.
+            self._publish(rec, "status", {"status": "running", "name": kind})
             self._thread.start()
-        self._publish(rec, "status", {"status": "running", "name": kind})
         return job_id
 
     def cancel(self) -> None:
@@ -452,7 +471,7 @@ git commit -m "feat(core): job events carry module/job_id/kind; runner keeps per
 - Test: `tests/test_livepreview.py` (append one test)
 
 **Interfaces:**
-- Produces: `LivePreview.start(analyze, *, owner: str | None = None, ...) -> str` (the `stream_id`; returns the existing id when already running); `LivePreview.stream_id: str | None`; `LivePreview.owner: str | None`. Every `frame`/`gate`/`log` event the loop publishes carries `module=owner, stream_id=<id>`.
+- Produces: `LivePreview.start(analyze, *, owner: str | None = None, stream_id: str | None = None, ...) -> str` — returns the `stream_id`; mints one unless `stream_id` is given (an **internal resume** keeps the id the browser already holds); when already running returns the existing id for the same owner and raises `CameraBusy("live preview is owned by <owner>")` for a different one. `LivePreview.stream_id: str | None`; `LivePreview.owner: str | None`. Every `frame`/`gate`/`log` event the loop publishes carries `module=owner, stream_id=<id>`.
 
 - [ ] **Step 1: Write the failing test** (append to `tests/test_livepreview.py`)
 
@@ -489,7 +508,34 @@ def test_start_mints_stream_id_and_stamps_live_events():
     sid2 = lp.start(lambda f: (b"jpg", {"ok": True}), fps=50.0, owner="calibration")
     lp.stop()
     assert sid2 != sid and lp.owner == "calibration"
+    # Internal resume (scan restarts its preview after a survey capture): keep the id.
+    sid3 = lp.start(lambda f: (b"jpg", {"ok": True}), fps=50.0, owner="scan", stream_id=sid)
+    lp.stop()
+    assert sid3 == sid
+
+
+def test_other_module_cannot_take_a_running_preview():
+    from tasni.core.camera_lease import CameraBusy
+
+    class FakeStream:
+        def read(self, *, with_depth=False, drain=False):
+            return SimpleNamespace(color=0, depth=None, telemetry=None)
+
+    class FakeCamera:
+        @contextmanager
+        def stream(self, **kw):
+            yield FakeStream()
+
+    lp = LivePreview(FakeCamera(), _FakeBus())
+    lp.start(lambda f: (b"", {}), fps=50.0, owner="scan")
+    try:
+        with pytest.raises(CameraBusy) as e:
+            lp.start(lambda f: (b"", {}), owner="calibration")
+        assert "owned by scan" in str(e.value)
+    finally:
+        lp.stop()
 ```
+(add `import pytest` at the top of `tests/test_livepreview.py`)
 
 - [ ] **Step 2: Run it to verify it fails**
 
@@ -506,14 +552,16 @@ In `tasni/core/livepreview.py`:
         self.stream_id: str | None = None   # minted per start(); stamped on every event
         self.owner: str | None = None       # module id that started this preview
 ```
-3. Change the `start` signature to add `owner: str | None = None` (last keyword) and return `str`; replace its body's first lines and the thread creation:
+3. Change the `start` signature to add `owner: str | None = None, stream_id: str | None = None` (last keywords) and return `str`; replace its body's first lines and the thread creation:
 ```python
+        from .camera_lease import CameraBusy
         if self.running:
+            if owner is not None and owner != self.owner:
+                raise CameraBusy(f"live preview is owned by {self.owner}")
             return self.stream_id or ""
         if self.lease is not None and not self.lease.acquire(LEASE_OWNER):
-            from .camera_lease import CameraBusy
             raise CameraBusy(self.lease.owner)
-        self.stream_id = uuid.uuid4().hex
+        self.stream_id = stream_id or uuid.uuid4().hex   # given => internal resume
         self.owner = owner
         self._stop.clear()
         self._thread = threading.Thread(
@@ -698,17 +746,48 @@ Calibration `module.py` `/live/start` (line 209 + 258-266):
             return {"status": "started", "stream_id": stream_id}
 ```
 Calibration `/intrinsics/live/start` (line 465): add `owner="calibration"` to the `services.live.start(` call and return `{"status": "started", "stream_id": stream_id}` the same way.
-Scan `module.py` `/live/start` (line 612 + 795-801):
+Scan `module.py` `/live/start` (line 604 + 612 + 795-801) — the same closure is
+also called internally to **resume** the preview after a five-position capture
+(`:416`, via `self._live_start`); a resume must keep the `stream_id` the browser
+already holds, or every frame after the capture would be discarded:
+```python
+        @router.post("/live/start")
+        def live_start(resume: bool = False) -> dict:
+```
 ```python
             if services.live.running:
                 return {"status": "already running", "stream_id": services.live.stream_id}
 ```
 ```python
             try:
-                stream_id = services.live.start(analyze, owner="scan", **kwargs)
+                stream_id = services.live.start(
+                    analyze, owner="scan",
+                    stream_id=(services.live.stream_id if resume else None), **kwargs)
             except CameraBusy as e:
                 ...
             return {"status": "started", "stream_id": stream_id}
+```
+and the internal restart in `survey_capture`'s `finally` (`:416`) becomes `live_start(resume=True)`.
+The boundary publisher inside that closure (`:634`) must carry the stream id too:
+```python
+            def _publish_boundary(cb):
+                services.bus.scoped("scan").publish(JobEvent("boundary", {
+                    "outline_uv": cb["outline_uv"],
+                    "polygon_uv": cb["polygon_uv"],
+                    "overruns": cb["overruns"],
+                    "contrast": cb["contrast"],
+                }, stream_id=services.live.stream_id))
+```
+(`survey` events, `scan/service.py:1441`, and the locked `frame`/`gate` pair,
+`:724-726`, are request-path publishes — module-scoped, no stream id; pages accept
+id-less events of their own module. The spec's §4.5 wording is corrected to say so.)
+
+Add to `tests/test_event_scoping_lint.py`:
+```python
+def test_boundary_publish_carries_stream_id():
+    src = (MODULES / "scan" / "module.py").read_text(encoding="utf-8")
+    i = src.index('JobEvent("boundary"')
+    assert "stream_id=services.live.stream_id" in src[i:i + 400]
 ```
 
 - [ ] **Step 6: Run the lint + the job tests**
@@ -899,7 +978,165 @@ git add tasni/modules tasni/webui/src/pages tests/test_module_status.py
 git commit -m "feat(modules): /status returns running + per-kind job records + workflow fields"
 ```
 
-### Task 5: Station-only `POST /api/rdk/connect` (409 + lock) and `POST /api/rdk/link`; consolidate the link helper
+### Task 5a: `CellArbiter` — one atomic gate for connect, link, job start and live start
+
+**Files:**
+- Create: `tasni/core/arbiter.py`
+- Modify: `tasni/modules/base.py:30-75` (`ServiceContainer.arbiter` + wiring), `tasni/core/jobrunner.py` (`__init__`, `start`), `tasni/core/livepreview.py` (`__init__`, `start`), `tasni/modules/calibration/module.py:344,361` and `tasni/modules/scan/module.py:355,890` (catch `JobBusy` → 409)
+- Test: `tests/test_arbiter.py` (new)
+
+**Interfaces:**
+- Produces: `CellArbiter.hold(owner)` context manager — non-blocking, raises `CellBusy("cell is busy: <owner>")` when held; `CellArbiter.owner: str | None`. `JobRunner(bus, arbiter=None)` — `start()` raises `JobBusy` while the arbiter is held; `LivePreview(camera, bus, lease=None, arbiter=None)` — `start()` raises `CameraBusy` likewise. `ServiceContainer.arbiter`. Why: Connect's "is anything running?" check and a job/preview start could interleave, letting Connect reset the session under live work (plan review #3); every transition now takes the same gate.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_arbiter.py
+from __future__ import annotations
+
+import threading
+import time
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+import pytest
+
+from tasni.core.arbiter import CellArbiter, CellBusy
+from tasni.core.camera_lease import CameraBusy
+from tasni.core.jobrunner import JobBusy, JobRunner
+from tasni.core.livepreview import LivePreview
+
+
+class _Bus:
+    def __init__(self): self.events = []
+    def publish(self, ev): self.events.append(ev)
+
+
+class _Camera:
+    @contextmanager
+    def stream(self, **kw):
+        yield SimpleNamespace(read=lambda **k: SimpleNamespace(color=0, depth=None, telemetry=None))
+
+
+def test_hold_is_exclusive_and_names_the_owner():
+    a = CellArbiter()
+    with a.hold("connect"):
+        assert a.owner == "connect"
+        with pytest.raises(CellBusy) as e:
+            with a.hold("job:scan:scan"):
+                pass
+        assert str(e.value) == "cell is busy: connect"
+    assert a.owner is None
+    with a.hold("link"):
+        pass
+
+
+def test_job_start_refused_while_connect_holds_the_cell_and_releases_after():
+    a = CellArbiter()
+    r = JobRunner(_Bus(), arbiter=a)
+    with a.hold("connect"):
+        with pytest.raises(JobBusy) as e:
+            r.start(lambda ctx: 1, kind="scan", module="scan")
+        assert "cell is busy: connect" in str(e.value)
+    gate = threading.Event()
+    r.start(lambda ctx: gate.wait(2), kind="scan", module="scan")
+    assert a.owner is None          # a start holds the gate only for the transition
+    gate.set()
+    time.sleep(0.05)
+
+
+def test_live_start_refused_while_connect_holds_the_cell():
+    a = CellArbiter()
+    lp = LivePreview(_Camera(), _Bus(), arbiter=a)
+    with a.hold("connect"):
+        with pytest.raises(CameraBusy):
+            lp.start(lambda f: (b"", {}), owner="scan")
+    sid = lp.start(lambda f: (b"", {}), fps=50.0, owner="scan")
+    lp.stop()
+    assert sid and a.owner is None
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `py -3.10 -m pytest tests/test_arbiter.py -q` → `ModuleNotFoundError: tasni.core.arbiter`.
+
+- [ ] **Step 3: Implement**
+
+`tasni/core/arbiter.py`:
+```python
+"""One non-blocking gate for every transition of the shared cell's state.
+
+Connect (which may reset the RoboDK session), link, job start and live-preview
+start all take it, so "is anything running?" and "start" can no longer
+interleave. Holders are either momentary (a start) or exclusive by nature (a
+connect). Never blocks: a contender fails fast with CellBusy naming the holder.
+"""
+from __future__ import annotations
+
+import threading
+from contextlib import contextmanager
+
+
+class CellBusy(RuntimeError):
+    pass
+
+
+class CellArbiter:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.owner: str | None = None
+
+    @contextmanager
+    def hold(self, owner: str):
+        if not self._lock.acquire(blocking=False):
+            raise CellBusy(f"cell is busy: {self.owner}")
+        self.owner = owner
+        try:
+            yield self
+        finally:
+            self.owner = None
+            self._lock.release()
+```
+`tasni/core/jobrunner.py`: `def __init__(self, bus: EventBus, arbiter=None)` storing `self._arbiter = arbiter`; add `from contextlib import nullcontext` and `from .arbiter import CellBusy`; in `start` wrap the critical section:
+```python
+        kind = name or kind
+        gate = self._arbiter.hold(f"job:{module}:{kind}") if self._arbiter else nullcontext()
+        try:
+            with gate, self._lock:
+                # ... existing body up to and including self._thread.start() ...
+        except CellBusy as e:
+            raise JobBusy(str(e)) from e
+        return job_id
+```
+`tasni/core/livepreview.py`: `def __init__(self, camera, bus, lease=None, arbiter=None)` storing `self.arbiter = arbiter`; in `start` wrap everything from the `if self.running:` check through `self._thread.start()` in
+```python
+        gate = self.arbiter.hold(f"live:{owner}") if self.arbiter else nullcontext()
+        try:
+            with gate:
+                ...
+        except CellBusy as e:
+            raise CameraBusy(str(e)) from e
+        return self.stream_id
+```
+`tasni/modules/base.py`: `from ..core.arbiter import CellArbiter`; add the field `arbiter: CellArbiter` directly before `calib_dry_tour_required`; in `build()`: `arbiter = CellArbiter()` and `jobs=JobRunner(bus, arbiter=arbiter)`, `live=LivePreview(camera, bus, lease=lease, arbiter=arbiter)`, `arbiter=arbiter`.
+Calibration `module.py` (`/poses/simulate`, `/run`) and scan `module.py` (`run()`, `/poses/simulate`): import `JobBusy` from `...core.jobrunner` and wrap each `services.jobs.start(...)`:
+```python
+            try:
+                job_id = services.jobs.start(..., kind=..., module=...)
+            except JobBusy as exc:
+                raise HTTPException(409, str(exc))
+```
+(extrusion already does this at all five sites).
+
+- [ ] **Step 4: Run tests, commit**
+
+Run: `py -3.10 -m pytest tests/test_arbiter.py tests/test_jobrunner_scope.py tests/test_livepreview.py tests/test_module_status.py -q` → PASS.
+```bash
+git add tasni/core/arbiter.py tasni/core/jobrunner.py tasni/core/livepreview.py tasni/modules/base.py tasni/modules/calibration/module.py tasni/modules/scan/module.py tests/test_arbiter.py
+git commit -m "feat(core): CellArbiter makes connect/link/job-start/live-start transitions atomic"
+```
+
+### Task 5: Station-only `POST /api/rdk/connect` (409 + arbiter) and `POST /api/rdk/link`; consolidate the link helper
 
 **Files:**
 - Modify: `tasni/core/rdk_io.py:65-79` (replace `link_real_robot` with `ensure_robot_link` + back-compat wrapper)
@@ -1098,7 +1335,19 @@ def test_ensure_robot_link_strict_raises_with_actionable_message():
     assert link_real_robot(Offline(), SimpleNamespace(connect_robot_on_connect=False)) is None
     assert link_real_robot(FakeRdk(), cfg) == {"connected": True, "message": "ROBOTCOM_READY",
                                                "ip": "10.0.0.5", "configured": True}
+
+
+def test_strict_verifies_a_manual_link_when_auto_link_is_off():
+    manual = SimpleNamespace(connect_robot_on_connect=False, robot_ip="",
+                             robot_connect_timeout_s=0.1)
+    linked = FakeRdk(linked=True)
+    state = ensure_robot_link(linked, manual, strict=True)
+    assert state["connected"] is True and linked.connect_calls == 0   # verified, not attempted
+    with pytest.raises(RuntimeError):
+        ensure_robot_link(FakeRdk(linked=False), manual, strict=True)
+    assert ensure_robot_link(FakeRdk(linked=False), manual)["enabled"] is False  # non-strict: no-op
 ```
+Before running: `tests/test_extrusion_job.py:143` sets `connect_robot_on_connect = False`, so its fake rdk must answer `robot_connected()` — if that fake lacks it, add `def robot_connected(self): return True, "ROBOTCOM_READY"` to it (the print job now verifies the manual link strictly).
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -1118,12 +1367,18 @@ def ensure_robot_link(rdk: "RdkIO", cfg, *, strict: bool = False, log=None) -> d
     ``RuntimeError`` with the actionable message every real run relies on.
     ``{"enabled": False}`` (no attempt) when ``connect_robot_on_connect`` is off,
     so the operator can keep linking by hand."""
-    if not getattr(cfg, "connect_robot_on_connect", False):
+    auto = bool(getattr(cfg, "connect_robot_on_connect", False))
+    if auto:
+        ready, msg = rdk.connect_robot(cfg.robot_ip, timeout_s=cfg.robot_connect_timeout_s)
+    elif strict:
+        # Auto-link off = the operator links by hand. Strict callers (a real run)
+        # still VERIFY that link exists; they never attempt one.
+        ready, msg = rdk.robot_connected()
+    else:
         return {"enabled": False, "connected": False, "message": "auto-link disabled",
                 "ip": "", "configured": False}
-    ready, msg = rdk.connect_robot(cfg.robot_ip, timeout_s=cfg.robot_connect_timeout_s)
     params = rdk.robot_connection_params()
-    state = {"enabled": True, "connected": bool(ready), "message": str(msg or ""),
+    state = {"enabled": auto, "connected": bool(ready), "message": str(msg or ""),
              "ip": params.get("ip", ""), "configured": bool(params.get("ip"))}
     if log is not None:
         log(f"real robot {'ONLINE' if ready else 'OFFLINE'}: {msg or ''}")
@@ -1131,11 +1386,11 @@ def ensure_robot_link(rdk: "RdkIO", cfg, *, strict: bool = False, log=None) -> d
         where = (f" at {params['ip']}" if params.get("ip")
                  else " (no controller IP set on the robot in RoboDK)")
         raise RuntimeError(
-            f"real robot offline — RoboDK could not link to the KUKA "
+            f"real robot offline — RoboDK is not linked to the KUKA "
             f"controller{where}: {msg or 'not ready'}. Check the controller is on, "
             f"the RoboDK robot driver is running, and the network, then run again. "
-            f"(Linking the controller is what moves the arm; opening RoboDK alone "
-            f"does not.)")
+            f"(The link gives RoboDK monitoring and control of the arm; only a run "
+            f"command moves it, and a run needs this link.)")
     return state
 
 
@@ -1171,11 +1426,9 @@ In `tasni/core/config.py:130-138` replace the comment block above `connect_robot
 
 - [ ] **Step 4: Add the two routes to `tasni/webapp/server.py`**
 
-Add `import threading` and `import time` to the imports, `from ..core.rdk_io import ensure_robot_link`, and inside `create_app` after the `rdk_status` route:
+Add `import time` to the imports, `from ..core.arbiter import CellBusy`, `from ..core.rdk_io import ensure_robot_link`, and inside `create_app` after the `rdk_status` route:
 
 ```python
-    connect_lock = threading.Lock()
-
     def _busy_reason() -> str | None:
         if services.jobs.running:
             cur = services.jobs.current
@@ -1187,60 +1440,90 @@ Add `import threading` and `import time` to the imports, `from ..core.rdk_io imp
             return f"the camera is in use by {services.camera_lease.owner}"
         return None
 
+    def _connect_locked() -> dict:
+        c = services.config.robodk
+        deadline = time.monotonic() + float(c.connect_timeout_s)
+        last_err: Exception | None = None
+        while True:
+            try:
+                if services.rdk.robot().Valid():
+                    return rdk_status()
+                last_err = None            # connected; robot not loaded yet
+            except Exception as e:         # socket/timeout while RoboDK loads
+                last_err = e
+                try:
+                    services.session.reset()
+                except Exception:
+                    pass
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(1.0)
+        if last_err is not None:
+            raise HTTPException(503,
+                f"RoboDK didn't become ready within {float(c.connect_timeout_s):.0f}s "
+                f"— it may still be loading the station. Give it a moment and click "
+                f"Connect again. ({last_err})")
+        return rdk_status()
+
     @app.post("/api/rdk/connect")
     def rdk_connect() -> dict:
         """Station-only connect (spec §4.5): open/attach the cell's station, poll
         through the slow first load, report robot + camera tool. Never links the
-        real robot — see /api/rdk/link. 409 while anything owns the robot/camera,
-        and for a second concurrent call; its error path resets the session, which
-        must never happen under a running job."""
-        reason = _busy_reason()
-        if reason:
-            raise HTTPException(409, f"cannot (re)connect while {reason}")
-        if not connect_lock.acquire(blocking=False):
-            raise HTTPException(409, "connect in progress")
+        real robot — see /api/rdk/link. Holds the cell arbiter for the WHOLE
+        connect, so the busy check below is atomic: no job or preview can start
+        after it (they fail fast with 409 "cell is busy: connect") — and its error
+        path resets the session, which must never happen under a running job."""
         try:
-            c = services.config.robodk
-            deadline = time.monotonic() + float(c.connect_timeout_s)
-            last_err: Exception | None = None
-            while True:
-                try:
-                    if services.rdk.robot().Valid():
-                        return rdk_status()
-                    last_err = None            # connected; robot not loaded yet
-                except Exception as e:         # socket/timeout while RoboDK loads
-                    last_err = e
-                    try:
-                        services.session.reset()
-                    except Exception:
-                        pass
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(1.0)
-            if last_err is not None:
-                raise HTTPException(503,
-                    f"RoboDK didn't become ready within {float(c.connect_timeout_s):.0f}s "
-                    f"— it may still be loading the station. Give it a moment and click "
-                    f"Connect again. ({last_err})")
-            return rdk_status()
-        finally:
-            connect_lock.release()
+            with services.arbiter.hold("connect"):
+                reason = _busy_reason()
+                if reason:
+                    raise HTTPException(409, f"cannot (re)connect while {reason}")
+                return _connect_locked()
+        except CellBusy as e:
+            holder = str(e).rsplit(": ", 1)[-1]
+            raise HTTPException(409, "connect in progress" if holder == "connect"
+                                else f"cannot (re)connect while {holder} is starting")
 
     @app.post("/api/rdk/link")
     def rdk_link() -> dict:
         """Best-effort link of RoboDK's driver to the physical controller (starts
         position monitoring; never moves the robot). Called when Aim/Survey starts;
         runs re-check strictly before motion. Allowed while the live preview runs
-        (that is exactly when it is needed); refused while a job runs."""
+        (that is exactly when it is needed); refused while a job runs; serialized
+        against connect through the arbiter (it holds it for up to
+        robot_connect_timeout_s, so start the camera BEFORE linking — Task 8b)."""
         if not services.session.is_open:
             raise HTTPException(409, "connect the cell first")
         if services.jobs.running:
             raise HTTPException(409, "a job is running")
         try:
-            attempt = ensure_robot_link(services.rdk, services.config.robodk)
+            with services.arbiter.hold("link"):
+                attempt = ensure_robot_link(services.rdk, services.config.robodk)
+        except CellBusy as e:
+            raise HTTPException(409, f"cannot link now: {e}")
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(503, f"RoboDK unavailable: {e}")
         return {**rdk_status(), "link_attempt": attempt}
+```
+
+Add to `tests/test_platform_connect.py` (imports: `from tasni.core.camera_lease import CameraBusy`, `from tasni.core.jobrunner import JobBusy`):
+```python
+def test_job_and_live_start_refused_while_connecting():
+    block = threading.Event()
+    client, s = _app(FakeRdk(block=block))
+    t = threading.Thread(target=lambda: client.post("/api/rdk/connect"))
+    t.start()
+    time.sleep(0.1)
+    with pytest.raises(JobBusy) as e:
+        s.jobs.start(lambda ctx: 1, kind="scan", module="scan")
+    assert "cell is busy: connect" in str(e.value)
+    with pytest.raises(CameraBusy):
+        s.live.start(lambda f: (b"", {}), owner="scan")   # refused before any camera I/O
+    block.set()
+    t.join(3)
+    assert s.arbiter.owner is None
 ```
 
 - [ ] **Step 5: Run the tests**
@@ -1793,7 +2076,11 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
   }, [refreshRdk]);
 
   const value: PlatformValue = {
-    health, rdk, ready: rdk?.ready === true, connecting, connectError,
+    health, rdk,
+    // Truthful readiness: a stale-green rdk poll must not outrank a failed
+    // health probe (plan review #5).
+    ready: rdk?.ready === true && health?.robodk.ok !== false,
+    connecting, connectError,
     connect, link, refreshRdk, eventsConnected, subscribe,
   };
   return <PlatformContext.Provider value={value}>{children}</PlatformContext.Provider>;
@@ -1834,7 +2121,9 @@ Delete `src/api/useHealth.ts`.
 `components/Layout.tsx` — replace the imports of `useEvents`/`useHealth` with `import { usePlatform, robotLinkNote } from "../platform/PlatformProvider";`, replace `const { connected } = useEvents(); const health = useHealth();` with
 ```tsx
   const { health, rdk, ready, connecting, connectError, connect, eventsConnected } = usePlatform();
-  const busy = !!health?.job.running;
+  // Job OR camera preview/lease (health reports camera.state "in_use" for both).
+  // Advisory only — the server's arbiter is the real guard (409).
+  const busy = !!health?.job.running || health?.camera.state === "in_use";
   const rdkSummary = ready
     ? `${rdk?.robot} · ${rdk?.tool}${rdk?.robot_link ? " · " + robotLinkNote(rdk.robot_link).replace(/\.$/, "") : ""}`
     : rdk?.connected ? `missing ${rdk.missing.join(", ")}` : "not connected";
@@ -1851,7 +2140,7 @@ and replace the `<div className="pills">…</div>` block with
           <StatusPill label="link" ok={eventsConnected} detail="job event stream" />
           <button className={ready ? "secondary" : ""} onClick={connect}
                   disabled={connecting || busy}
-                  title={busy ? "A job is running — Connect is locked until it ends"
+                  title={busy ? "A job or camera preview is running — Connect is locked until it ends"
                        : connecting ? "Opening the Tasni station…" : "Open / attach the Tasni station"}>
             {connecting ? "Connecting…" : ready ? "Reconnect" : "Connect"}
           </button>
@@ -1931,15 +2220,23 @@ and replace the four lines `const [conn, setConn] = …`, `const [connInfo, setC
 
 - [ ] **Step 2: Rehydrate from the module's own `/status` (running job + solve result)**
 
-Replace `refreshJob` (`:153-158`) with:
+Add above the component:
+```tsx
+interface JobRec { job_id: string; kind: string; status: string; result: any; error: string | null; }
+interface ModuleStatus {
+  running: { module: string; kind: string; job_id: string } | null;
+  status: string; jobs?: Record<string, JobRec>;
+}
+```
+Replace `refreshJob` (`:153-158`) with — it is now the single **reconciler**: it
+hydrates a solve result, follows an own running job, locks on a foreign one, and
+settles a job whose terminal event was missed (fast job, socket reconnect —
+plan review #1/#6), then clears stale running state:
 ```tsx
   const refreshJob = useCallback(async () => {
     try {
-      const s = await api.get<{
-        running: { module: string; kind: string; job_id: string } | null;
-        jobs?: { calibration?: { result: RunResult | null } };
-      }>("/status");
-      const res = s.jobs?.calibration?.result;
+      const s = await api.get<ModuleStatus>("/status");
+      const res = s.jobs?.calibration?.result as RunResult | null | undefined;
       if (res?.can_apply) { setResult(res); setCanApply(true); }
       if (s.running?.module === "calibration") {
         jobIdRef.current = s.running.job_id;
@@ -1947,13 +2244,29 @@ Replace `refreshJob` (`:153-158`) with:
         setRunKind(s.running.kind === "sim_tour" ? "tour" : "run");
         setStatus(`${s.running.kind} running…`);
         setForeignJob(null);
-      } else if (s.running) {
-        setForeignJob({ module: s.running.module, kind: s.running.kind });
-      } else {
-        setForeignJob(null);
+        return;
       }
+      setForeignJob(s.running ? { module: s.running.module, kind: s.running.kind } : null);
+      const mine = jobIdRef.current
+        ? Object.values(s.jobs ?? {}).find((j) => j.job_id === jobIdRef.current) : undefined;
+      if (mine && mine.status !== "running") {
+        if (mine.status === "done") {
+          if (mine.kind === "sim_tour") { setTour(mine.result as TourResult); setStatus("dry run complete"); }
+          else { setResult(mine.result as RunResult); setCanApply(!!mine.result?.can_apply); setStatus("done"); }
+          setPct(100);
+        } else if (mine.status === "error") {
+          addLog(mine.error ?? "job failed", true); setRunError(mine.error ?? "job failed"); setStatus("error");
+        } else { addLog("cancelled."); setStatus("cancelled"); }
+        jobIdRef.current = null;
+      }
+      setRunning(false); setRunKind(null);
     } catch { /* no prior run — fine */ }
   }, []);
+```
+Also destructure `eventsConnected` from `usePlatform()` and add, after the mount effect:
+```tsx
+  // A (re)connected socket may have missed terminal events — reconcile.
+  useEffect(() => { if (eventsConnected) refreshJob(); }, [eventsConnected, refreshJob]);
 ```
 Delete `hydrateConnection` (`:171-182`) and `connect` (`:210-233`). Replace the mount effect (`:199-200`) with:
 ```tsx
@@ -1989,10 +2302,12 @@ and inside it `if (ev.payload.name === "sim_tour") {` → `if (ev.kind === "sim_
     const r = await api.post<{ stream_id?: string }>("/live/start");
     streamIdRef.current = r.stream_id ?? null;
 ```
-`startLive` (`:281-290`): as the first statement inside `try` add
+`startLive` (`:281-290`): directly **after** `await beginLive(true);` add
 ```tsx
-      // Aim needs the model to track the arm (spec §4.5): link the driver now,
-      // best-effort and concurrently — the camera must not wait on a 10 s timeout.
+      // Aim needs the model to track the arm (spec §4.5): link the driver, best-
+      // effort, not awaited, and only AFTER the camera is up — /api/rdk/link holds
+      // the cell arbiter for up to robot_connect_timeout_s, and a live start during
+      // that window would be refused.
       if (ready) link().then((l) => setLinkNote(robotLinkNote(l?.robot_link)));
 ```
 `generateTargets` catch (`:361-366`): replace the two `addLog`/`setRunError` lines with
@@ -2006,11 +2321,13 @@ and inside it `if (ev.payload.name === "sim_tour") {` → `if (ev.kind === "sim_
 ```tsx
       const r = await api.post<{ job_id?: string }>("/poses/simulate");
       jobIdRef.current = r.job_id ?? null;
+      refreshJob();   // events published before this response was known are reconciled from /status
 ```
 `doRun` (`:388`): `await api.post("/run", { holdout_count: holdout, refine });` →
 ```tsx
       const r = await api.post<{ job_id?: string }>("/run", { holdout_count: holdout, refine });
       jobIdRef.current = r.job_id ?? null;
+      refreshJob();
 ```
 Add after `const holdoutInvalid = …` (`:427`):
 ```tsx
@@ -2084,25 +2401,39 @@ Replace `const { subscribe } = useEvents();` with `const { ready, rdk, connect, 
 
 - [ ] **Step 2: Rehydrate + connection effects**
 
-Replace `refreshJob` (`:296-303`) with:
+Add the same `JobRec` / `ModuleStatus` interfaces as 8b above the component. Replace `refreshJob` (`:296-303`) with the reconciler:
 ```tsx
   const refreshJob = useCallback(async () => {
     try {
-      const s = await api.get<{
-        running: { module: string; kind: string; job_id: string } | null;
-        jobs?: { scan?: { result: ScanResult | null } };
-      }>("/status");
-      const res = s.jobs?.scan?.result;
+      const s = await api.get<ModuleStatus>("/status");
+      const res = s.jobs?.scan?.result as ScanResult | null | undefined;
       if (res?.can_insert) { setResult(res); setViewerNonce((n) => n + 1); }
       if (s.running?.module === "scan") {
         jobIdRef.current = s.running.job_id;
         setRunning(true); setRunKind(s.running.kind === "sim_tour" ? "tour" : "run");
         setStatus(`${s.running.kind} running…`); setForeignJob(null);
-      } else if (s.running) {
-        setForeignJob({ module: s.running.module, kind: s.running.kind });
-      } else { setForeignJob(null); }
+        return;
+      }
+      setForeignJob(s.running ? { module: s.running.module, kind: s.running.kind } : null);
+      const mine = jobIdRef.current
+        ? Object.values(s.jobs ?? {}).find((j) => j.job_id === jobIdRef.current) : undefined;
+      if (mine && mine.status !== "running") {
+        if (mine.status === "done") {
+          if (mine.kind === "sim_tour") { setTour(mine.result as TourResult); setStatus("dry run complete"); }
+          else { setResult(mine.result as ScanResult); setViewerNonce((n) => n + 1); setInserted(false); setStatus("done"); }
+          setPct(100);
+        } else if (mine.status === "error") {
+          addLog(mine.error ?? "job failed", true); setRunError(mine.error ?? "job failed"); setStatus("error");
+        } else { addLog("cancelled."); setStatus("cancelled"); }
+        jobIdRef.current = null;
+      }
+      setRunning(false); setRunKind(null);
     } catch { /* no prior scan */ }
   }, []);
+```
+Destructure `eventsConnected` from `usePlatform()` too, and add after the mount effect:
+```tsx
+  useEffect(() => { if (eventsConnected) refreshJob(); }, [eventsConnected, refreshJob]);
 ```
 Delete `hydrateConnection` (`:304-313`) and `connect` (`:389-404`). Replace the mount effect (`:363-365`) with
 ```tsx
@@ -2114,16 +2445,12 @@ Delete `hydrateConnection` (`:304-313`) and `connect` (`:389-404`). Replace the 
     setLinkNote(robotLinkNote(rdk?.robot_link));
   }, [ready]);   // eslint-disable-line react-hooks/exhaustive-deps
 ```
-and the auto-connect effect (`:406-410`) with
-```tsx
-  // Scan auto-connects on entry (today's behaviour) — once the platform has reported
-  // there is no open session. Never while it is still finding out (rdk == null).
-  useEffect(() => {
-    if (rdk == null || ready || rdk.connected || autoConnectRef.current) return;
-    autoConnectRef.current = true;
-    connect();
-  }, [rdk, ready, connect]);
-```
+and **delete** the auto-connect effect (`:406-410`) together with `autoConnectRef`
+(`:220`) and drop `connect` from the `usePlatform()` destructuring: connecting the
+cell is an explicit topbar action (spec decision 13 — a page silently opening the
+117 MB station on navigation undermines the one-Connect model). The camera
+auto-preview (`autoPreviewRef`, `:579-584`) stays — it is camera-only and needs no
+station.
 
 - [ ] **Step 3: Subscription, ids, link, gate errors**
 
@@ -2145,7 +2472,7 @@ and the auto-connect effect (`:406-410`) with
     const r = await api.post<{ stream_id?: string }>("/live/start");
     streamIdRef.current = r.stream_id ?? null;
 ```
-`startLive` (`:573-578`): first statement inside `try`:
+`startLive` (`:573-578`): directly **after** `await beginLive(true);` (camera first — the link holds the arbiter for up to 10 s):
 ```tsx
       if (ready) link().then((l) => setLinkNote(robotLinkNote(l?.robot_link)));
 ```
@@ -2162,6 +2489,7 @@ and the auto-connect effect (`:406-410`) with
     try {
       const r = await api.post<{ job_id?: string }>("/poses/simulate");
       jobIdRef.current = r.job_id ?? null;
+      refreshJob();
     }
 ```
 `doRun` (`:928`): `try { await api.post("/run"); }` → same with `"/run"`.
@@ -2177,7 +2505,8 @@ Delete the `conn-banner` card (`:1009-1025`); in its place:
 ```tsx
       {!ready && (
         <div className="hint" style={{ marginBottom: 12 }}>
-          Connecting the cell (top right)… lock and targets need it; the surface feed does not.
+          Connect the cell (top right) to lock the surface and create targets; the surface
+          feed works without it.
         </div>
       )}
       {foreignJob && (
@@ -2209,20 +2538,33 @@ git commit -m "feat(webui/scan): platform connection, id-filtered events, auto-l
 
 `import { useEvents, type JobEvent } from "../api/events";` → `import { usePlatform, type JobEvent } from "../platform/PlatformProvider";`. `const { subscribe } = useEvents();` → `const { ready, connect: connectCell, subscribe } = usePlatform();` and add `const jobIdRef = useRef<string | null>(null);`. Keep `const [connected, setConnected] = useState(false);` (= station items discovered).
 
-`refreshStatus` (`:235-240`):
+`refreshStatus` (`:235-240`) — also the reconciler for a missed terminal event:
 ```tsx
   const refreshStatus = useCallback(() => {
     api.get<Status>("/status").then((value) => {
       setStatus(value);
       if (value.result?.kind?.startsWith("cylinder_")) setResult(value.result);
+      const mine = jobIdRef.current
+        ? Object.values(value.jobs ?? {}).find((j) => j.job_id === jobIdRef.current) : undefined;
       if (value.running?.module === "extrusion") {
         jobIdRef.current = value.running.job_id; setBusy(true);
+      } else if (mine && mine.status !== "running") {
+        // The job we started has finished but we never saw its terminal event.
+        if (mine.status === "done" && mine.result?.kind?.startsWith("cylinder_")) setResult(mine.result);
+        if (mine.status === "error") setMessage(mine.error ?? "job failed");
+        setBusy(false); setCancelling(false); jobIdRef.current = null;
       } else if (value.running) {
         setMessage(`${value.running.module} job (${value.running.kind}) is running — extrusion is locked until it ends.`);
       }
     }).catch(() => {});
   }, []);
 ```
+Destructure `eventsConnected` from `usePlatform()` and add:
+```tsx
+  useEffect(() => { if (eventsConnected) refreshStatus(); }, [eventsConnected, refreshStatus]);
+```
+(`startJob`, `characterize` and `measure` already call `refreshStatus()` right after
+the start response — keep that; it is the post-start reconcile.)
 Add after the mount effect (`:244-252`):
 ```tsx
   // Station items follow the platform connection (topbar Connect).
@@ -2364,7 +2706,7 @@ export function installFakes(routes: Record<string, Route>) {
     const key = `${init?.method ?? "GET"} ${path}`;
     const route = routes[key] ?? routes[path];
     if (!route) return new Response(JSON.stringify({ detail: `no fake route for ${key}` }), { status: 404 });
-    const out = route(init);
+    const out = await route(init);          // a route may return a Promise (delayed responses)
     if (out instanceof Response) return out;
     return new Response(JSON.stringify(out), { status: 200, headers: { "Content-Type": "application/json" } });
   });
@@ -2440,6 +2782,15 @@ describe("PlatformProvider", () => {
     expect(countCalls("/api/rdk/status")).toBe(1);
     act(() => { FakeWebSocket.last().emit({ type: "result", module: "scan", job_id: "b", kind: "scan", payload: { name: "scan" } }); });
     await waitFor(() => expect(countCalls("/api/rdk/status")).toBe(2));
+  });
+
+  it("stays not-ready while health says RoboDK is down even if /rdk/status is stale-green", async () => {
+    installFakes({ "/api/health": () => ({ ...okHealth(), robodk: { ok: false, detail: "" } }),
+                   "/api/rdk/status": readyRdk });
+    render(<PlatformProvider><Probe module="scan" /></PlatformProvider>);
+    await waitFor(() => expect(countCalls("/api/rdk/status")).toBe(1));
+    await waitFor(() => expect(countCalls("/api/health")).toBe(1));
+    expect(screen.getByTestId("ready").textContent).toBe("false");
   });
 
   it("connect() posts /api/rdk/connect and never /api/rdk/link", async () => {
@@ -2519,16 +2870,145 @@ describe("Calibration page (phase 0)", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /Start camera/ })).toBeTruthy());
     expect(screen.queryByRole("button", { name: /Connect & open Tasni station/ })).toBeNull();
   });
+
+  it("settles a job whose result arrived before the start response (fast job)", async () => {
+    // The tour finishes before POST /poses/simulate returns: its result event is
+    // emitted while jobIdRef is still null (dropped), and /status already holds the
+    // finished record. The post-start reconcile must show "Dry run passed".
+    let release!: () => void;
+    const started = new Promise<void>((r) => { release = r; });
+    let statusBody: unknown = { running: null, status: "idle", jobs: {} };
+    const routes = base(undefined as unknown);
+    routes["/api/modules/calibration/status"] = () => statusBody;
+    routes["/api/modules/calibration/targets"] = () => ({ targets: ["TasniCalib_1", "TasniCalib_2", "TasniCalib_3", "TasniCalib_4"] });
+    routes["POST /api/modules/calibration/poses/simulate"] = () => started.then(() => ({ status: "started", job_id: "t1" }));
+    installFakes(routes);
+    mount();
+    await waitFor(() => expect(screen.getByRole("button", { name: /Dry run/ })).toBeEnabled());
+    act(() => { FakeWebSocket.last().open(); });
+    act(() => { screen.getByRole("button", { name: /Dry run/ }).click(); });
+    const tour = { all_ok: true, passed: 4, total: 4, returned_to_start: true, poses: [] };
+    act(() => { FakeWebSocket.last().emit({ type: "result", module: "calibration", job_id: "t1", kind: "sim_tour",
+                                            payload: { name: "sim_tour", result: tour } }); });
+    statusBody = { running: null, status: "done",
+                   jobs: { sim_tour: { job_id: "t1", kind: "sim_tour", status: "done", result: tour, error: null } } };
+    act(() => { release(); });
+    await waitFor(() => expect(screen.getByText(/Dry run passed/)).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+  });
 });
 ```
 (If `CalibrationGuide` fetches `board.png`, jsdom simply leaves the `<img>` unloaded — no route needed.)
+
+- [ ] **Step 4b: Scan and Extrusion page filtering tests**
+
+`src/test/scan-page.test.tsx`:
+```tsx
+import { act, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { describe, expect, it } from "vitest";
+import { PlatformProvider } from "../platform/PlatformProvider";
+import Scan from "../pages/Scan";
+import { FakeWebSocket, countCalls, installFakes, okHealth, readyRdk } from "./fakes";
+
+const routes = (status: unknown) => ({
+  "/api/health": okHealth, "/api/rdk/status": readyRdk, "POST /api/rdk/link": readyRdk,
+  "/api/modules/scan/config": () => ({
+    robot: "KUKA KR150 R2700", camera: { ip: "10.12.171.70", port: 1024, resolution: "1280x720" },
+    scan: { voxel_size_m: 0.003, pose_count: 14, cone_half_angle_deg: 20 },
+    gate: { ideal_distance_mm: 500, distance_tol_mm: 50, max_tilt_deg: 10 } }),
+  "/api/modules/scan/status": () => status,
+  "/api/modules/scan/targets": () => ({ targets: [] }),
+  "/api/modules/scan/survey/state": () => ({ step: null }),
+  "/api/runs/active?module=calibration": () => ({ active: null }),
+  "/api/modules/scan/collision/status": () => ({ available: false }),
+  "POST /api/modules/scan/live/start": () => ({ status: "started", stream_id: "s1" }),
+  "POST /api/modules/scan/live/stop": () => ({ status: "stopped" }),
+});
+const mount = () => render(<MemoryRouter><PlatformProvider><Scan /></PlatformProvider></MemoryRouter>);
+
+describe("Scan page (phase 0)", () => {
+  it("never auto-connects; starts its camera when ready; keeps only its own stream", async () => {
+    installFakes(routes({ running: null, status: "idle", jobs: {}, locked: false, prepared: false }));
+    mount();
+    await waitFor(() => expect(countCalls("/api/modules/scan/live/start")).toBe(1));
+    expect(countCalls("/api/rdk/connect")).toBe(0);
+    act(() => { FakeWebSocket.last().open(); });
+    act(() => {
+      FakeWebSocket.last().emit({ type: "log", module: "scan", stream_id: "other", payload: { message: "STALE-STREAM" } });
+      FakeWebSocket.last().emit({ type: "log", module: "calibration", payload: { message: "OTHER-MODULE" } });
+      FakeWebSocket.last().emit({ type: "log", module: "scan", payload: { message: "MINE" } });
+    });
+    expect(screen.queryByText(/STALE-STREAM/)).toBeNull();
+    expect(screen.queryByText(/OTHER-MODULE/)).toBeNull();
+    expect(screen.getByText(/MINE/)).toBeTruthy();
+  });
+
+  it("locks its controls while another module's job runs", async () => {
+    installFakes(routes({ running: { module: "extrusion", kind: "extrusion-print", job_id: "p1" },
+                          status: "busy", jobs: {}, locked: false, prepared: false }));
+    mount();
+    await waitFor(() => expect(screen.getByText(/extrusion job \(extrusion-print\) is running/)).toBeTruthy());
+    expect(screen.getByRole("button", { name: /Lock & create targets/ })).toBeDisabled();
+  });
+});
+```
+
+`src/test/extrusion-page.test.tsx`:
+```tsx
+import { act, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { describe, expect, it } from "vitest";
+import { PlatformProvider } from "../platform/PlatformProvider";
+import Extrusion from "../pages/Extrusion";
+import { FakeWebSocket, installFakes, okHealth, readyRdk } from "./fakes";
+
+const recipe = { radius_mm: 40, layer_count: 3, layer_height_mm: 5, bead_diameter_mm: 6,
+  robot_speed_mm_s: 75, travel_speed_mm_s: 150, path_rounding_mm: 2, extrusion_rate_pct: 30,
+  points_per_circle: 72, correction_enabled: false, material: [] };
+const setup = { print_tool: "", work_frame: "", inspection_tool: "", inspection_target: "",
+  inspection_auto: true, center_x_mm: 0, center_y_mm: 0, build_plane_z_mm: 0, scan_run_id: null,
+  orientation_rpy_deg: [180, 0, 90], maximum_tool_axis_spin_deg: 90,
+  approach_clearance_mm: 30, retreat_clearance_mm: 50 };
+const routes = (status: unknown) => ({
+  "/api/health": okHealth, "/api/rdk/status": readyRdk,
+  "/api/modules/extrusion/config": () => ({ defaults: recipe, setup_defaults: setup,
+    integration: { valve_outputs: ["IO_508", "IO_601"], air_on_program: "AirOn", air_off_program: "AirOff" } }),
+  "/api/modules/extrusion/plan": () => new Response(JSON.stringify({ detail: "no plan" }), { status: 404 }),
+  "/api/modules/extrusion/status": () => status,
+  "/api/modules/extrusion/scan-surface": () => ({ applied: false, available: false, note: "" }),
+  "/api/modules/extrusion/measure/session": () => ({ session: null }),
+  "/api/modules/extrusion/station-options": () => ({ tools: ["Nozzle"], frames: ["World"], targets: [], programs: [] }),
+});
+const mount = () => render(<MemoryRouter><PlatformProvider><Extrusion /></PlatformProvider></MemoryRouter>);
+
+describe("Extrusion page (phase 0)", () => {
+  it("rehydrates its running job and ignores other job ids", async () => {
+    const base = { fingerprint: "abc", geometry_preflight_passed: false, quick_sim_passed: false,
+      quick_sim_layers: [], quick_sim_live_approved: false, dry_run_passed: false,
+      hardware_io_test_approved: false, live_print_enabled: false, jobs: {} };
+    installFakes(routes({ ...base, running: { module: "extrusion", kind: "extrusion-print", job_id: "e1" }, status: "running" }));
+    mount();
+    await waitFor(() => expect(screen.getByRole("button", { name: /Cancel safely/ })).toBeTruthy());
+    act(() => { FakeWebSocket.last().open(); });
+    act(() => {
+      FakeWebSocket.last().emit({ type: "progress", module: "extrusion", job_id: "e0", kind: "extrusion-print",
+                                  payload: { step: 1, total: 3, message: "STALE" } });
+      FakeWebSocket.last().emit({ type: "progress", module: "extrusion", job_id: "e1", kind: "extrusion-print",
+                                  payload: { step: 2, total: 3, message: "layer 2" } });
+    });
+    expect(screen.queryByText(/STALE/)).toBeNull();
+    expect(screen.getByText(/layer 2/)).toBeTruthy();
+  });
+});
+```
 
 - [ ] **Step 5: Run, then commit**
 
 Run: `cd tasni/webui && npm test` → all green; `npm run typecheck && npm run build` → clean.
 ```bash
 git add tasni/webui/package.json tasni/webui/package-lock.json tasni/webui/tsconfig.json tasni/webui/vitest.config.ts tasni/webui/src/test
-git commit -m "test(webui): vitest + integration tests for the platform provider and the calibration page"
+git commit -m "test(webui): vitest + integration tests for the provider and the calibration, scan, extrusion pages"
 ```
 
 ### Task 10: Docs, cell validation checklist, merge
@@ -2546,7 +3026,7 @@ Under "Architecture" add to the `core/` list: `jobrunner, events  … every even
 In `CLAUDE.md` roadmap add:
 > - ✅ **UX overhaul phase 0 — platform foundation** (branch `ux-overhaul`): module-scoped job events + per-(module, kind) history, station-only topbar Connect, explicit real-robot link with a server-side live-pose gate, `/api/readiness`, `PlatformProvider`; vitest added. Spec: `docs/superpowers/specs/2026-08-28-ux-workflow-shell-design.md`. Next: phase 1 (workflow shell + Calibration + Dashboard strip).
 
-Spec status line → `Status: **approved 2026-08-28; phase 0 implemented on ux-phase0**`.
+Spec status line → `Status: **approved 2026-08-28 · phase 0 implemented on ux-phase0 — awaiting cell validation (Appendix B phase 0)**`. Only after the operator's checklist passes does a follow-up commit change it to `phase 0 cell-validated <date>`; never before.
 
 - [ ] **Step 2: Backend regression sweep (targeted, never the full suite)**
 
@@ -2568,5 +3048,6 @@ Then use `superpowers:finishing-a-development-branch` to merge `ux-phase0` → `
 ## Self-review (done while writing)
 
 - **Spec coverage (§4.5, §4.7, §7, §8, §9 phase 0):** events + ids → T1–T3; per-(module, kind) history + `/status` → T1, T4; station-only connect with 409/lock → T5; link endpoint + consolidation + config doc → T5; live-pose gate + `pose_live` in the calibration gate + `require_live_pose` → T6; readiness recorded-vs-present → T7; provider refresh rules, filtered `subscribe`, topbar Connect, banners dropped, auto-link on Aim/Survey, gate reasons → T8a–d; integration tests (foreign events, rehydrate, health failure, terminal refresh) + backend scope/connect/readiness tests → T1–T7, T9. **Deferred to phase 1 by design:** `?step=` seeding, the Dashboard readiness *cards* (the endpoint ships here), per-module last-job UI beyond `result`.
-- **Deviations to note:** module `/connect` routes stay until phase 4 (spec); `robotLinkNote` moved into the provider (was in `Calibration.tsx`).
+- **Deviations to note:** module `/connect` routes stay until phase 4 (spec); `robotLinkNote` moved into the provider (was in `Calibration.tsx`); `survey` events are request-path (module-scoped, no `stream_id`) — the spec's §4.5 list is corrected accordingly.
+- **Plan review (2026-08-28, second agent) — all seven findings accepted and folded in:** (1) "running" now precedes the worker + post-start/reconnect reconcile via `/status` + fast-job tests (T1, T8b–d, T9); (2) `LivePreview.start(stream_id=)` resume + scan `live_start(resume=True)` + boundary stamped (T2, T3); (3) `CellArbiter` makes connect/link/job/live transitions atomic (T5a, T5); (4) strict link verifies a manual link when auto-link is off; error text corrected (T5); (5) `ready = rdk.ready && health.robodk.ok !== false`, Connect disabled on camera `in_use` too (T8a); (6) reconciler clears stale `running` (T8b–d); (7) tests for fast job, reconnect racing starts, cross-module preview ownership, Scan/Extrusion filtering, stale-green readiness (T2, T5, T9). Scan no longer auto-connects; the spec status changes only after cell validation (T8c, T10).
 - **Type consistency:** `JobRunner.start(kind=, module=, name=) -> str`, `module_status()` keys `running/status/jobs`, `JobEvent.{module,job_id,kind,stream_id}`, `LivePreview.start(owner=) -> str` / `.stream_id` / `.owner`, `ensure_robot_link(rdk, cfg, *, strict, log) -> {enabled, connected, message, ip, configured}`, `pose_not_live_detail(rdk, cfg)`, `usePlatform()` value keys — used identically across tasks.

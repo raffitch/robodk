@@ -250,17 +250,24 @@ session on a socket error mid-load, check robot + camera tool). Response = the
      keeps its name but its docstring (`config.py:132-138`) is rewritten: it now
      governs auto-linking at Aim/Survey and before motion, not at Connect;
   5. **rechecks immediately before real motion** exactly as today: every run calls
-     `ensure_robot_link(strict=True)` right before moving (`calibration/service.py:1038`,
+     `ensure_robot_link(strict=True)` right before moving — strict mode *verifies*
+     an existing (manual) link even when `connect_robot_on_connect` is off, and
+     never attempts one then (`calibration/service.py:1038`,
      `scan/service.py:3079`, `extrusion/service.py:546`, `extrusion/measure.py:201`)
      and fails clearly if it cannot; the `MotionConfirmDialog` shows the current
      link state as one of its `checks`.
   `/api/rdk/status` keeps reporting the link state via `robot_connected()`, so the
   topbar Link pill stays truthful without linking on its own.
-- **Concurrency.** Connect returns **409** while `jobs.running`, `live.running` or
-  the camera lease is held (its error path resets the session —
-  `calibration/module.py:186` — which must never happen under a running job), and
-  holds a lock so a concurrent second call returns 409 "connect in progress"
-  instead of racing the first.
+- **Concurrency.** One non-blocking `CellArbiter` (`core/arbiter.py`) gates every
+  cell state transition — connect, link, job start, live-preview start — so
+  Connect's busy check and a start can never interleave. Connect holds it for its
+  whole duration and returns **409** while `jobs.running`, `live.running` or the
+  camera lease is held (its error path resets the session —
+  `calibration/module.py:186` — which must never happen under a running job); a
+  concurrent second call gets 409 "connect in progress"; a job or preview start
+  during a connect fails fast with 409 "cell is busy: connect". Link holds the
+  arbiter too (up to `robot_connect_timeout_s`), so pages start the camera
+  *before* linking.
 
 The three module `/connect` routes are deleted in phase 4 once every page uses the
 platform one (the web UI is their only client; `tasni.cli` does not call them).
@@ -289,12 +296,20 @@ fields** (calibration `applied`, scan lock/prepared state, extrusion
 `fingerprint`/`preflight`/`dry_run_passed`/`live_print_enabled`) exactly as today —
 workflow state is never inferred from "the last job". Pages act only on job events
 whose `job_id` matches a job they started or hydrated, so delayed events from two
-consecutive runs of one kind cannot mix.
+consecutive runs of one kind cannot mix. The runner publishes `status: running`
+*before* the worker starts, and a page reconciles from its module `/status` right
+after every start response and whenever its socket (re)connects — so a job that
+finishes before the browser learns its id is still settled, and `running` never
+sticks.
 
 **Live-preview events are not job events.** `live.start(owner=module)` mints a
-`stream_id`, `/live/start` returns it, and `frame`/`gate`/`boundary`/`survey`
-events carry `module` + `stream_id` (no `job_id`); a page accepts only the stream
-it started, which also drops frames from a previous preview after a restart.
+`stream_id` — or keeps one passed in for an *internal resume* (scan restarting its
+preview after a five-position capture) — `/live/start` returns it, and
+`frame`/`gate`/`boundary` events carry `module` + `stream_id` (no `job_id`);
+`survey` and the locked `frame`/`gate` pair are request-path events (module only).
+A page accepts id-less events of its own module and only the stream it started,
+which also drops frames from a previous preview after a restart. A running
+preview is owned by its module: another module's `/live/start` is refused (409).
 **This is what makes the navigation/rehydration promise in §7 true**; it ships in
 phase 0.
 
@@ -486,7 +501,8 @@ module's `/status` route and `jobs.start` / `live.start` calls; no job logic cha
   and `/api/rdk/status`. Because events and status are module-scoped (§4.5), a
   running job is shown running in its own module's step, and another module's page
   shows "Calibration job running — controls locked" instead of adopting its
-  progress.
+  progress. A job whose terminal event was missed (fast job, socket reconnect) is
+  settled from the same `/status` record, so `running` never sticks.
 - **Hard gates preserved verbatim**: print-scale ack, cell-clear ack, `holdoutInvalid`,
   gate-green for target creation (also re-checked server-side), lock freshness,
   `can_prepare_frame`, `can_insert`, `live_print_enabled`, all server-side
@@ -564,6 +580,8 @@ Each phase is a separate branch off `ux-overhaul` merged when its checklist pass
 12. Every job execution has a unique `job_id` (returned by every start endpoint);
     `kind` is separate; the runner keeps history per (module, kind); live previews
     carry a `stream_id` instead and are exempt from job-id filtering.
+13. No page auto-connects: connecting the cell is only the topbar action (Scan's
+    silent auto-connect on entry is removed).
 
 ## 11. Review log
 
@@ -597,6 +615,19 @@ Third round, same day:
 |---|---|---|
 | R12 | one last-job record per module: a later `sim_tour` would erase the Calibration solve, and Extrusion has five job kinds | history per (module, kind) + `/status` returns authoritative workflow fields separately from `running` (§4.5) |
 | — | clarify: `jobs.start()` returns `job_id` and start endpoints echo it; live-preview events need their own id; "never touches hardware" is false once Aim links the driver; decision numbering ran 9, 12, 10, 11 | all four applied (§4.5, §4.3, §10) |
+
+Fourth round, same day — review of the phase 0 implementation plan
+(`docs/superpowers/plans/2026-08-28-ux-phase0-platform-foundation.md`); all accepted:
+
+| # | Finding | Resolution |
+|---|---|---|
+| R13 | job events can precede the browser knowing `job_id` (fast job) → UI stuck | "running" published before the worker; post-start + reconnect reconcile from `/status` (§4.5, §7) |
+| R14 | scan's internal preview restart would mint a new `stream_id`; boundary/survey unstamped | `live.start(stream_id=)` resume; boundary stamped; survey is request-path (§4.5) |
+| R15 | Connect's busy check was not atomic with job/preview starts | `CellArbiter` gates connect/link/job/live transitions (§4.5) |
+| R16 | strict link skipped verification when auto-link is off; error text conflated link with motion | strict verifies a manual link; text corrected (§4.5) |
+| R17 | `ready` could go stale-green after a health failure; Connect ignored preview/lease | `ready = rdk.ready && health.robodk.ok !== false`; Connect disabled while the camera is in use (§4.5) |
+| R18 | rehydration never cleared stale `running` | the module `/status` reconciler settles finished own jobs (§7) |
+| R19 | tests missed the strongest promises; Scan auto-connected silently; spec marked "implemented" before validation | tests added (§8); decision 13; status changes only after cell validation |
 
 ## Appendix A — control mapping (today → new home)
 
