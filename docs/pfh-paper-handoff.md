@@ -45,6 +45,15 @@ RMS 1.39 mm. Do not report sub-millimetre accuracy on top of that.
 residual (r 40.5 mm, centre (197.5, 152.5), bead 10.4 mm) and a separate Measure re-found
 it 0.5 mm away — that repeatability is itself evidence.
 
+**The paper session exists: `runs/extrusion/20260828-204846-5b455377`** (2026-08-28
+evening, Layers 3, New session, Characterize → *Apply* done correctly: r 42.6 mm, bead
+12.8 mm, height 2.8–13.0 mm, centre (214.6, 146.7)). Its layer-001 take 1 failed on
+the cell — ChArUco-board depth noise fused to the ring, fixed in code the same night
+(see *Board noise* below) — and was **reprocessed offline from its archived frame**:
+r 42.31, centre offset 1.28 mm, mean/RMS/max 1.51/1.85/3.91 mm, shape RMS 1.58,
+completeness 0.992. That is the first zero-offset baseline take. Continue in this
+session.
+
 **Figures are done** (`tasni/modules/extrusion/figures.py`, merged `ba8d2b3`). Four per
 take plus one per trial, 300 dpi PNG **and vector PDF**, rendered from the archive with
 no robot. They draw automatically on every take from now on, and older takes render on
@@ -86,6 +95,26 @@ Restart the backend first (it caches imported modules — check `/api/health` �
    Shift the top ring **10 mm** along frame +X → Measure ×3; then **15 mm** → Measure ×3.
    Optional: prop one side for a tilt case.
 8. **Paper summary** → copy the Markdown block.
+
+### Resuming after a backend restart (the code fix needs one)
+
+The plan lives only in memory. After a restart press **Apply to recipe & placement**
+first: it re-applies the characterization stored in the session (`session.json`) and
+regenerates the plan — check the recipe reads **r 42.6 / bead 12.8 / layers 3**
+before pressing Measure. Do **not** press *Center on scanned surface → Generate* again:
+that rebuilds the pre-Apply plan and every take would be measured against it — the
+stale-plan artifact all over again.
+
+### Board depth noise — fixed in code, do not work around it in config
+
+The `branch guard exhausted` on layer-001 take 1 was the board's own depth noise
+(z p99 +4.8 mm on a bare board; 22.7 % of it clears the 2.5 mm floor) joining the ring's
+cluster and dilating into a lobe. Fixed by a radial trim about the fitted ring
+(`extrusion.radial_trim_schedule_mm`, see `docs/extrusion-current-handoff.md`). Do
+**not** raise `deposit_min_height_mm` (a 3 mm floor read r 36.7 for this 42.6 mm ring
+and called it valid) and do not narrow `radial_roi_margin_mm` (it caps the introduced
+offset at ~18 mm). If a take still fails, its raw RGB-D is archived and
+`reprocess_saved_layer` now scores it against the take's own plan.
 
 ### Why displacements go on the top ring, and why three takes
 

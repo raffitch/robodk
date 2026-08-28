@@ -19,6 +19,7 @@ from ...core.rdk_io import RdkIO
 from ..calibration.service import _camera_hold, ensure_real_robot_link
 from .archive import ExtrusionArchive
 from ..scan.survey_contract import refresh_robot_state
+from .comparison import fit_circle_xy
 from .inspection import (aim_point_mm, cylinder_diameter_mm, framing_standoff,
                          inspection_plan, order_candidates_seed_first,
                          pose_candidates, standoff_fault,
@@ -1123,8 +1124,15 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
     manifest = LayerManifest.model_validate_json(
         (layer_dir / "manifest.json").read_text(encoding="utf-8"))
     provenance = manifest.provenance
-    processing_payload = trial.get("provenance", {}).get("processing_config")
-    intrinsics = trial.get("provenance", {}).get("camera_intrinsics", {})
+    # The take's own provenance first: the measure-only job records intrinsics
+    # and the processing config PER TAKE (they are facts about that capture),
+    # and its trial.json carries none. Live-print trials wrote them on the trial;
+    # keep that as the fallback so older archives still reprocess.
+    trial_provenance = trial.get("provenance") or {}
+    processing_payload = (provenance.get("processing_config")
+                          or trial_provenance.get("processing_config"))
+    intrinsics = (provenance.get("camera_intrinsics")
+                  or trial_provenance.get("camera_intrinsics") or {})
     transform = provenance.get("T_work_camera")
     if not processing_payload or "K" not in intrinsics or transform is None:
         raise RuntimeError(
@@ -1138,8 +1146,25 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
     if color is None:
         raise RuntimeError("archived color image could not be decoded")
     depth = np.load(depth_path, allow_pickle=False)
-    recipe = CylinderRecipe.model_validate(trial["recipe"])
+    # Score the take against the plan it was MEASURED against, not the plan the
+    # trial was created with. A measure-only session is created before
+    # Characterize -> Apply, so trial.json carries the pre-Apply recipe and centre
+    # (cell 2026-08-28: r 40 at (212.1, 149.7) for a take measured at r 42.6 about
+    # (214.6, 146.7)); reprocessing from it reproduces the very stale-plan artifact
+    # the paper handoff says must never be cited. The manifest holds the take's
+    # recipe and nominal_path.json holds its nominal ring -- the centre is FITTED
+    # (the archived path is closed, so its mean is biased by radius/N).
+    recipe = manifest.recipe or CylinderRecipe.model_validate(trial["recipe"])
     setup = CylinderSetup.model_validate(trial["setup"])
+    nominal_file = layer_dir / (manifest.nominal_path_file or "nominal_path.json")
+    if nominal_file.is_file():
+        payload = json.loads(nominal_file.read_text(encoding="utf-8"))
+        nominal = np.asarray(payload.get("points") if isinstance(payload, dict) else payload,
+                             dtype=float).reshape(-1, 3)
+        if len(nominal) >= 3:
+            center, _ = fit_circle_xy(nominal)
+            setup = setup.model_copy(update={"center_x_mm": float(center[0]),
+                                             "center_y_mm": float(center[1])})
     plan = generate_cylinder_plan(recipe, setup)
     if layer_index > len(plan.layers):
         raise RuntimeError("archived layer index exceeds the stored recipe")
@@ -1163,6 +1188,10 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
         "pointcloud_file": ("height-or-pointcloud.npy"
                             if processed.filtered_xyz is not None else None),
         "metrics": processed.metrics,
+        # paper_summary reads height/bead from manifest.geometry; leaving it as
+        # the failed take's None would silently drop a reprocessed take from
+        # those statistics while its metrics counted.
+        "geometry": processed.geometry,
         "processing": report,
         "warnings": processed.metrics.warnings,
         "provenance": {**provenance, "last_reprocessed_at": reprocessed_at},

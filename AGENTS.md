@@ -120,6 +120,20 @@ excluded rather than counted as perfect. Figures draw the **ground truth ring** 
 detection error against its "no offset" annotation (the skipped *Apply*), and 0.002 mm
 once re-labelled with the displacement that was really there.
 
+**2026-08-28 night — board depth noise fused to the ring, fixed.** The first paper
+take after a correct Apply (`20260828-204846-5b455377/layer-001`) failed with `branch
+guard exhausted`: 22.7 % of the bare ChArUco board clears the 2.5 mm deposit floor at
+300 mm, joins the ring's cluster, faces up like any flat surface, and dilates into a
+lobe with a 37 mm skeleton arm. Raising the floor is NOT a fix (3 mm read r 36.7 for a
+42.6 mm ring, "valid"). `processing._radial_trim` now keeps only points within a
+tightening band of the FITTED circle (`radial_trim_schedule_mm = [15, 12, 10]`, the only
+schedule that passed every real and synthetic case). `reprocess_saved_layer` now scores
+a take against its own recipe / archived nominal centre / manifest provenance instead of
+the pre-Apply `trial.json`; the failed take reprocessed to r 42.31, offset 1.28 mm —
+the first zero-offset baseline. Fixture: `tests/fixtures/extrusion/ring2/`.
+**After the restart press Apply to recipe & placement first** (the plan is in-memory
+only; Center-on-surface → Generate would rebuild the stale pre-Apply plan).
+
 **Also pending:** the PFH paper's ring-stack cell run (deadline 1 Sep 2026) — **read
 [docs/pfh-paper-handoff.md](docs/pfh-paper-handoff.md) first**: it is the single page for
 that task (what the paper still needs, the exact operator order, and the wording

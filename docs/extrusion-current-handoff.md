@@ -259,6 +259,64 @@ now below the axes, two columns, clear of the x-axis label), and the honesty cap
 **was clipped at both ends** once an introduced offset made it long (it now wraps at
 `CAPTION_WRAP`, without breaking "hand-placed" across lines).
 
+### Board depth noise fused to the ring — the radial trim (2026-08-28 evening)
+
+The first paper-protocol take after *Apply* (`20260828-204846-5b455377/layer-001`)
+failed on the cell with `branch guard exhausted after 3 attempt(s)` while the colour
+frame showed one clean ring. Reproduced offline from the archived frame, exactly
+(mask 5906 / skeleton 302 / 1 branch pixel). Root cause, measured:
+
+- The bare ChArUco board, unfiltered, 80–150 mm from the ring: z p50 **0.8 mm**, p99
+  **+4.8 mm** — so the work frame's Z=0 is right, but **22.7 % of the board clears the
+  2.5 mm deposit floor** (`max(deposit_min_height_mm, plane_distance_threshold_m·1000)`).
+- Board patches touching the ring join its DBSCAN cluster (largest cluster 1680 of
+  1743 points), pass the upward-normal test (a flat board faces straight up), and of
+  the 639 points reaching the raster **136 (21 %) were board** at r 55–72 mm. Dilated by
+  the 12.8 mm bead kernel they form a lobe fused to the ring: a skeleton T-junction at
+  r 48.5 mm with a **37 mm arm**, longer than the 20 mm spur limit, on all three attempts.
+- Characterize passed on the same ring minutes earlier by luck, not robustness: its
+  coarse bead 13.48 vs 12.79 mm meant a 7 px vs 6 px dilation, which closed the gap
+  instead of forming a T.
+
+**Raising the floor is the wrong fix and is dangerous.** The bead's own top is z p25
+1.8 / p50 3.8 mm, so it overlaps the board noise: a 3.0 mm floor read **r 36.7** for the
+42.6 mm ring and called it valid; 5.0 mm read r 24.0, valid. Confidently wrong numbers
+that pass every gate.
+
+**The fix separates bead from board by shape.** `processing._radial_trim` runs after
+the largest cluster is chosen and before the crest is picked: fit a circle, keep points
+within a band of the *fitted* radius, refit, tightening through
+`extrusion.radial_trim_schedule_mm = [15, 12, 10]` (first band wide enough to hold the
+whole bead under a ~5 mm contamination-biased fit; last band ≈ bead half-width + fit
+slack; at 8 the characterization fixture's coarse pass loses its ring). It follows a
+displaced ring because it is about the fitted circle, not the nominal. Sweep evidence
+(scratch, 2026-08-28): `[15,12,10]` was the only schedule that fixed the failed frame
+**and** both synthetic board-lobe scenes without moving the frames that already worked:
+
+| case | before | after |
+|---|---|---|
+| 20:48 real frame (failed on the cell) | branch guard exhausted | r 42.31, offset 1.28 mm, valid |
+| 19:21 real frame (passed on the cell) | r 39.91 | r 40.10 (+0.19; centre +0.35 mm) |
+| synthetic ring + board lobe | r 61.04 (+1.04 bias) | r 60.91 |
+| synthetic clean ring | r 60.77 | r 60.77 (no-op) |
+| ring1 characterization fixture | r 39.17 | r 39.36, centre +0.15 mm — inside its test tolerances |
+
+The failed frame is now `tests/fixtures/extrusion/ring2/` (depth + K + T + applied
+recipe, no colour), and `tests/test_extrusion_measure.py` renders synthetic board
+patches (`_board_bias_patch`) so the failure mode is covered without a cell.
+
+**Offline reprocessing now measures against the take's own plan.** `reprocess_saved_layer`
+rebuilt the plan from `trial.json`, but a measure-only session is created *before*
+Characterize → Apply, so `trial.json` carries the pre-Apply recipe and centre (r 40 at
+(212.1, 149.7) for a take measured at r 42.6 about (214.6, 146.7)) — reprocessing from
+it reproduced the stale-plan artifact. It now uses `manifest.recipe`, the centre fitted
+from the archived `nominal_path.json`, and the take's own provenance (intrinsics and
+processing config live on the manifest for measure-only takes; the trial-level copy is
+the live-print fallback), and it carries `geometry` into the rewritten manifest.
+The 20:48 take reprocessed to **r 42.31, centre offset 1.28 mm, mean/RMS/max
+1.51/1.85/3.91 mm, shape RMS 1.58, completeness 0.992** — the first zero-offset
+baseline take, recovered with no robot time.
+
 ### Figures (2026-08-28)
 
 `tasni/modules/extrusion/figures.py` renders four figures per take from the archive

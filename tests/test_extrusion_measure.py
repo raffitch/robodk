@@ -59,7 +59,7 @@ from tasni.core.config import ExtrusionConfig
 from tasni.modules.extrusion.inspection import aim_point_mm
 from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup
 from tasni.modules.extrusion.processing import process_observation
-from tasni.modules.extrusion.toolpath import generate_cylinder_plan
+from tasni.modules.extrusion.toolpath import generate_cylinder_plan, points_array
 
 CENTER = (200.0, 150.0)
 
@@ -113,6 +113,102 @@ def test_ring_shifted_10mm_reports_the_shift():
     assert m.mean_absolute_mm == pytest.approx(6.36, abs=1.0)
     assert m.rms_mm == pytest.approx(7.06, abs=1.0)
     assert m.shape_rms_mm < 1.0
+
+
+def _board_bias_patch(center, *, r_from: float, r_to: float, half_height_mm: float,
+                      z_mm: float, step_mm: float = 1.0) -> np.ndarray:
+    """A patch of the build plane reading a few mm HIGH, touching the ring's outer flank.
+
+    What the D435i does to the ChArUco board at 300 mm: broad patches biased by
+    2-5 mm (measured 2026-08-28: bare board z p50 0.8 / p99 4.8 mm, 22.7% above the
+    2.5 mm deposit floor). Flat, so its normals face straight up, and fused to the
+    ring, so it lands in the ring's DBSCAN cluster.
+    """
+    xs = np.arange(center[0] + r_from, center[0] + r_to + step_mm, step_mm)
+    ys = np.arange(center[1] - half_height_mm, center[1] + half_height_mm + step_mm, step_mm)
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+    return np.column_stack((X.ravel(), Y.ravel(), np.full(X.size, float(z_mm))))
+
+
+def observe_with_board_bias(plan, layer_index, rings, patch, *, seed=0):
+    layer = plan.layers[layer_index - 1]
+    T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, layer_index), 300.0)
+    centre = (plan.setup.center_x_mm, plan.setup.center_y_mm)
+    parts = [syn.plane_points(center_xy_mm=centre), patch]
+    parts += [ring.surface_points() for ring in rings]
+    depth = syn.render_depth(np.vstack(parts), T, seed=seed)
+    color = np.zeros((syn.SIZE_720P[1], syn.SIZE_720P[0], 3), np.uint8)
+    return process_observation(color=color, depth=depth, T_work_camera=T, K=syn.K_720P,
+                               plan=plan, layer=layer, config=ExtrusionConfig())
+
+
+def test_board_depth_bias_fused_to_the_ring_does_not_break_the_measurement():
+    """Cell 2026-08-28 20:48: a board patch at ~3.5 mm, touching the ring, dilated
+    into a lobe with a 37 mm skeleton arm and exhausted the branch guard.
+
+    The fix has to work by SHAPE -- the patch is inside the bead's own height band
+    (bead z p25 1.8 / p50 3.8 mm), so no floor separates them without also
+    destroying the ring (a 3 mm floor read r 36.7 for a 42.6 mm ring, and passed).
+    """
+    pytest.importorskip("open3d")
+    plan = scene_plan()
+    ring = syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.flat(6.0))
+    patch = _board_bias_patch(CENTER, r_from=62.0, r_to=100.0, half_height_mm=14.0, z_mm=3.5)
+
+    out = observe_with_board_bias(plan, 1, [ring], patch)
+
+    m = out.metrics
+    assert m.valid, m.warnings
+    assert m.measured_radius_mm == pytest.approx(60.0, abs=1.0)
+    assert m.center_offset_norm_mm < 1.0
+    assert m.path_completeness >= 0.95
+    r = np.linalg.norm(np.asarray(out.filtered_xyz)[:, :2] - np.asarray(CENTER), axis=1)
+    assert r.max() < 60.0 + 8.0 + 4.0, "board points beyond the bead must not reach the raster"
+    assert out.report["counts"]["after_radial_trim"] < out.report["counts"]["after_largest_cluster"]
+
+
+def test_radial_trim_follows_a_displaced_ring_not_the_nominal():
+    """The trim is about the FITTED circle: a ring shifted 12 mm must still read 12."""
+    pytest.importorskip("open3d")
+    plan = scene_plan()
+    moved = (CENTER[0] + 12.0, CENTER[1])
+    ring = syn.RingSpec(60.0, 8.0, moved, height_fn=syn.flat(6.0))
+    patch = _board_bias_patch(moved, r_from=62.0, r_to=100.0, half_height_mm=14.0, z_mm=3.5)
+
+    out = observe_with_board_bias(plan, 1, [ring], patch)
+
+    m = out.metrics
+    assert m.valid, m.warnings
+    assert m.center_offset_mm[0] == pytest.approx(12.0, abs=1.0)
+    assert m.measured_radius_mm == pytest.approx(60.0, abs=1.0)
+
+
+def test_real_frame_with_board_noise_measures_the_applied_ring():
+    """The 2026-08-28 20:48 cell frame that failed with `branch guard exhausted`."""
+    pytest.importorskip("open3d")
+    fixture = np.load(Path(__file__).parent / "fixtures" / "extrusion" / "ring2"
+                      / "ring2_board_noise_20260828.npz")
+    centre = tuple(float(v) for v in fixture["nominal_center_mm"])
+    plan = scene_plan(radius=float(fixture["recipe_radius_mm"]),
+                      bead=float(fixture["recipe_bead_mm"]),
+                      layer_height=float(fixture["recipe_layer_height_mm"]),
+                      center=centre)
+    depth = fixture["depth"]
+    color = np.zeros((*depth.shape, 3), np.uint8)
+
+    out = process_observation(color=color, depth=depth, T_work_camera=fixture["T_work_camera"],
+                              K=fixture["K"], plan=plan, layer=plan.layers[0],
+                              config=ExtrusionConfig())
+
+    m = out.metrics
+    assert m.valid, m.warnings
+    # Characterize, minutes earlier on the same ring: r 42.60, centre (214.64, 146.69).
+    assert m.measured_radius_mm == pytest.approx(42.6, abs=1.0)
+    assert m.measured_center_mm == pytest.approx(centre, abs=2.0)
+    assert m.path_completeness >= 0.95
+    assert m.shape_rms_mm < 2.5
+    r = np.linalg.norm(np.asarray(out.filtered_xyz)[:, :2] - np.asarray(centre), axis=1)
+    assert not (r > 55.0).any(), "the board lobe at r 55-72 mm must be gone (was 21% of points)"
 
 
 def test_floor_from_previous_layer_keeps_the_ring_below_out_of_the_measurement():
@@ -584,6 +680,62 @@ def test_apply_characterization_rewrites_recipe_and_placement(tmp_path, monkeypa
     assert after["setup"]["center_x_mm"] == 214.0 and after["setup"]["center_y_mm"] == 141.0
     assert after["setup"]["build_plane_z_mm"] == 0.0
     assert client.get("/api/modules/extrusion/plan").json()["fingerprint"] == after["fingerprint"]
+
+
+# ------------------------------- offline reprocessing measures against the TAKE's plan
+
+def test_reprocessing_uses_the_recipe_and_centre_the_take_was_measured_against(tmp_path):
+    """A measure-only session is created BEFORE Characterize -> Apply, so trial.json
+    carries the pre-Apply plan (cell 2026-08-28: r 40 at (212.1, 149.7) while the
+    take was measured at r 42.6 about (214.6, 146.7)). Reprocessing from trial.json
+    would score the ring against a plan it was never measured against -- the same
+    stale-plan artifact the handoff says must never reach the paper.
+    """
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion.service import reprocess_saved_layer
+
+    root = tmp_path / "runs" / "extrusion"
+    stale = scene_plan(radius=40.0, bead=15.0, layer_height=5.0, center=(212.1, 149.7))
+    applied = scene_plan(radius=60.0, bead=8.0, layer_height=6.0, center=CENTER)
+    archive = ExtrusionArchive(root)
+    # As MeasureSession.create writes it: the trial carries NO processing
+    # provenance -- the measure job puts intrinsics and the processing config on
+    # each take's manifest, because they are per-take facts.
+    archive.create_trial("t-stale", stale, mode="MEASURE_ONLY")
+    layer = applied.layers[0]
+    T = syn.inspection_camera_T(aim_point_mm(applied.recipe, applied.setup, 1), 300.0)
+    depth = syn.render_scene([syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.flat(6.0))], T,
+                             plane_center_xy_mm=CENTER, seed=3)
+    color = np.zeros((*depth.shape, 3), np.uint8)
+    manifest = LayerManifest(
+        trial_id="t-stale", layer_index=1, take=1, mode="MEASURE_ONLY",
+        recipe=applied.recipe, toolpath_fingerprint=applied.fingerprint,
+        color_file="color.png", depth_file="depth.npy",
+        processing={"valid": False, "error": "branch guard exhausted"},
+        provenance={"T_work_camera": np.asarray(T, dtype=float).tolist(),
+                    "camera_intrinsics": {"K": syn.K_720P.tolist()},
+                    "processing_config": ExtrusionConfig().model_dump(mode="json")})
+    nominal = points_array(layer)
+    archive.write_layer(manifest, nominal_xyz=nominal, commanded_xyz=nominal,
+                        color=color, depth=depth, report={"valid": False})
+
+    result = reprocess_saved_layer(root, "t-stale", 1)
+
+    metrics = result["metrics"]
+    assert metrics["valid"], metrics["warnings"]
+    assert metrics["measured_radius_mm"] == pytest.approx(60.0, abs=1.0)
+    assert metrics["center_offset_norm_mm"] < 1.0, (
+        "scored against the stale trial.json plan instead of the take's own nominal")
+    rewritten = json.loads((root / "t-stale" / "layer-001" / "manifest.json").read_text(
+        encoding="utf-8"))
+    assert rewritten["metrics"]["valid"] is True
+    assert rewritten["processing"]["offline_reprocess"] is True
+    assert rewritten["recipe"]["radius_mm"] == 60.0, "the take's recipe must survive"
+    # paper_summary reads height/bead from manifest.geometry: a reprocessed take
+    # that leaves it empty silently drops out of those statistics.
+    assert rewritten["geometry"] is not None
+    assert rewritten["geometry"]["height_mean_mm"] == pytest.approx(6.0, abs=1.5)
+    assert rewritten["geometry"]["bead_width_mean_mm"] > 0
 
 
 # --------------------------------------------------- paper summary (Task 11)

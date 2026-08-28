@@ -319,6 +319,35 @@ def _filter_deposit(points: np.ndarray, config, counts: dict) -> np.ndarray:
     return points
 
 
+def _radial_trim(points: np.ndarray, schedule_mm, counts: dict, *,
+                 minimum: int = 8) -> np.ndarray:
+    """Keep only points within a tightening band of the circle fitted to them.
+
+    One pass per band in ``schedule_mm``: fit on what is kept, select from
+    EVERYTHING, so a point cut by a first fit biased toward the contamination can
+    return once the refit has moved onto the ring. The bead is a narrow annulus;
+    board-plane noise fused to it is not -- and it shares the bead's height band
+    and its upward normals, so this is the only filter in the chain that can see
+    the difference.
+
+    Never empties the set: a band that would leave fewer than ``minimum`` points
+    is skipped and the previous set stands. ``after_radial_trim`` records what
+    survived.
+    """
+    kept = points
+    for band in schedule_mm or ():
+        if len(kept) < minimum or float(band) <= 0:
+            break
+        center, radius = fit_circle_xy(kept)
+        distance = np.abs(np.linalg.norm(points[:, :2] - center, axis=1) - radius)
+        candidate = points[distance <= float(band)]
+        if len(candidate) < minimum:
+            break
+        kept = candidate
+    counts["after_radial_trim"] = len(kept)
+    return kept
+
+
 def _select_ring_cluster(clusters: list[np.ndarray], search_center_xy: np.ndarray,
                          counts: dict) -> tuple[np.ndarray, dict]:
     """Choose a complete annulus, not simply the largest above-plane residual.
@@ -481,6 +510,9 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
 
     mark = time.perf_counter()
     deposit = _filter_deposit(points, config, counts)
+    # Before the crest is picked and before the bead width is read from the
+    # flanks: both must see the bead alone, not the board fused to it.
+    deposit = _radial_trim(deposit, getattr(config, "radial_trim_schedule_mm", ()), counts)
     points = _top_surface(deposit, config, counts)
     timings["filter_ms"] = (time.perf_counter() - mark) * 1000
 

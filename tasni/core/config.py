@@ -837,6 +837,27 @@ class ExtrusionConfig(_Model):
     characterize_search_radius_mm: float = Field(default=150.0, gt=0, le=1000)
     characterize_max_height_mm: float = Field(default=40.0, gt=0, le=200)
     bead_width_bins: int = Field(default=36, ge=4, le=360)
+    # After the largest deposit cluster is chosen, keep only points within a band
+    # of the circle FITTED to that cluster -- fit, trim, refit, one pass per band,
+    # tightening. This is what separates the bead from the ChArUco board's own
+    # depth noise, which at 300 mm sits 2-5 mm high over broad patches (cell
+    # 2026-08-28: 22.7% of the bare board clears the 2.5 mm deposit floor, and the
+    # bead's own top is p25 1.8 / p50 3.8 mm, so NO height floor can tell them
+    # apart -- a 3 mm floor read r 36.7 for a 42.6 mm ring and called it valid).
+    # Board patches touching the ring join its DBSCAN cluster, face straight up
+    # like any flat surface, and dilate into a lobe whose skeleton arm outlives
+    # the spur limit: "branch guard exhausted". Shape, not height, discriminates.
+    #
+    # Why a schedule: the first fit is biased by the very contamination it must
+    # remove (~5 mm on the cell), so the first band has to hold the whole bead
+    # under that bias (bead/2 + bias ~ 12 mm -> 15). The last band is about the
+    # bead half-width plus fit slack (6.4 + 3.5 -> 10); at 8 the characterization
+    # fixture's coarse recipe loses its ring. Sweep evidence, 2026-08-28: [15,12,10]
+    # was the only schedule that fixed the failed cell frame AND both synthetic
+    # board-lobe scenes without moving the frames that already worked.
+    # Empty list disables the trim.
+    radial_trim_schedule_mm: list[float] = Field(
+        default_factory=lambda: [15.0, 12.0, 10.0])
 
 
 class WebConfig(_Model):
