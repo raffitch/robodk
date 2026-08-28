@@ -1,8 +1,8 @@
 # Tasni UX overhaul — workflow shell, cell-level connect, journey dashboard (design)
 
-Date: 2026-08-28. Status: **draft for operator review** — revised the same day after
-a second-agent review (all findings verified in code; resolutions in §11). Branch
-`ux-overhaul`.
+Date: 2026-08-28. Status: **draft for operator review** — revised twice the same day
+after a second-agent review (all findings verified in code; resolutions in §11).
+Branch `ux-overhaul`.
 Audit basis: `tasni/webui` on `main` @ `9101aa1` (every file read; refs below are to
 that revision).
 
@@ -218,15 +218,42 @@ station if RoboDK came up empty, poll up to `robodk.connect_timeout_s`, reset th
 session on a socket error mid-load, check robot + camera tool). Response = the
 `/api/rdk/status` shape. Two deliberate differences from today's module routes:
 
-- **No real-robot linking at connect.** Every real run already links the controller
-  itself right before moving (`ensure_real_robot_link`: `calibration/service.py:1038`,
-  `scan/service.py:3079`, `extrusion/service.py:546`, `extrusion/measure.py:201`),
-  so connect-time linking was only a status convenience — and Extrusion's route
-  deliberately avoided it (`extrusion/module.py:204`). The platform connect adopts
-  that stricter semantics for everyone; `/api/rdk/status` keeps reporting the link
-  state it already reads via `robot_connected()`, so the topbar still shows
-  ONLINE/OFFLINE. `link_real_robot` (`core/rdk_io.py:65`) loses its only callers
-  and is deleted.
+- **Connect is station-only; the real-robot link is a separate, gated concern.**
+  The link is *not* a status convenience: with the driver connected and monitoring,
+  the RoboDK model tracks the physical arm, and that is what makes the seed pose
+  Create-targets reads the arm's ACTUAL pose (`core/config.py:132-138`;
+  calibration seeds from `camera_pose_T()` + `current_joints()`,
+  `calibration/service.py:303-308`; scan's `annotate_pose_liveness` documents the
+  stale-model-pose case, `scan/service.py:2286-2298`). Today the link is attempted
+  at connect (calibration/scan) or never (extrusion), and neither target creation
+  nor surface locking checks it — calibration generates around whatever pose the
+  model holds. The design therefore:
+  1. keeps platform **Connect station-only** (open/attach, robot + tool present);
+  2. adds `POST /api/rdk/link` — `link_real_robot` (`core/rdk_io.py:65`) and the
+     raising `ensure_real_robot_link` (`calibration/service.py:198`) are
+     consolidated into one `core.rdk_io.ensure_robot_link(rdk, cfg, *, strict)`
+     returning `{connected, monitoring, message, ip, configured}`; nothing is
+     deleted;
+  3. **auto-links when the Aim (Calibration) or Survey (Scan) step is entered**:
+     the step calls `/api/rdk/link` and shows a `PrereqChip` "Real robot · ONLINE
+     (monitoring)" / "OFFLINE — power the controller · Retry"; every `gate`
+     reading carries `pose_live` (scan already does; calibration's gate gains it);
+  4. **hard-gates server-side**: `POST /poses/generate` (calibration) and
+     `POST /surface/lock` (scan, every lock — the plane is measured in the camera
+     pose) return 409 unless `pose_live`; the rail's `lockReason` is "Real robot
+     not linked — the model pose may be stale". `robodk.require_live_pose: bool =
+     True` is the explicit escape hatch for bench work without a controller
+     (set together with `connect_robot_on_connect = False`, as
+     `tests/test_extrusion_job.py:143` already does). `connect_robot_on_connect`
+     keeps its name but its docstring (`config.py:132-138`) is rewritten: it now
+     governs auto-linking at Aim/Survey and before motion, not at Connect;
+  5. **rechecks immediately before real motion** exactly as today: every run calls
+     `ensure_robot_link(strict=True)` right before moving (`calibration/service.py:1038`,
+     `scan/service.py:3079`, `extrusion/service.py:546`, `extrusion/measure.py:201`)
+     and fails clearly if it cannot; the `MotionConfirmDialog` shows the current
+     link state as one of its `checks`.
+  `/api/rdk/status` keeps reporting the link state via `robot_connected()`, so the
+  topbar Link pill stays truthful without linking on its own.
 - **Concurrency.** Connect returns **409** while `jobs.running`, `live.running` or
   the camera lease is held (its error path resets the session —
   `calibration/module.py:186` — which must never happen under a running job), and
@@ -236,18 +263,24 @@ session on a socket error mid-load, check robot + camera tool). Response = the
 The three module `/connect` routes are deleted in phase 4 once every page uses the
 platform one (the web UI is their only client; `tasni.cli` does not call them).
 
-**Job events and status are module-scoped.** `JobEvent` gains `module` and `job`
-fields (`core/events.py:16`). `jobs.start(job, name=, module=)` stamps them on
-`status`/`result`/`error` **and**, through the `JobContext`, on `progress`/`log`/
-`frame` (`jobrunner.py:41-49`); `LivePreview.start(..., owner=module)` stamps
-`frame`/`gate`/`boundary`/`survey` (`livepreview.py:118`; the camera lease already
-tracks an owner string, `camera_lease.py:29`). Each module `/status` reports only its
-own job — the runner records `module` with the current/last job, and a foreign job
-reports as `{status: "busy", module: "calibration"}` so the page can say "Calibration
-job running — controls locked". Dry-run job names become module-prefixed
-(`calibration:sim_tour`, `scan:sim_tour`) so the `name` checks both pages do today
-(`Calibration.tsx:257`, `Scan.tsx:475`) cannot cross. **This is what makes the
-navigation/rehydration promise in §7 true**; it ships in phase 0.
+**Job events and status are module-scoped, and every execution has an id.**
+`JobEvent` gains `module`, `job_id` and `kind` (`core/events.py:16`): `job_id` is
+unique per execution (uuid4, minted by `jobs.start`), `kind` is today's name
+(`sim_tour`, `calibration`, `scan`, `extrusion-print`, …). `jobs.start(job, kind=,
+module=)` stamps all three on `status`/`result`/`error` **and**, through the
+`JobContext`, on `progress`/`log`/`frame` (`jobrunner.py:41-49`);
+`LivePreview.start(..., owner=module)` stamps `module` on `frame`/`gate`/`boundary`/
+`survey` (`livepreview.py:118`; the camera lease already tracks an owner string,
+`camera_lease.py:29`). The runner keeps a **per-module last-job record**
+`{job_id, kind, status, result, error, started_at, finished_at}` (today it holds
+one global `status/result/error`, `jobrunner.py:66-69`, so a Scan run would erase
+the Calibration result a page returning later hydrates from). Each module `/status`
+returns its own record plus `busy_with: {module, kind, job_id} | null` when another
+module's job is running, so the page can say "Calibration job running — controls
+locked". Pages act only on events whose `job_id` matches the job they started or
+hydrated — delayed events from two consecutive runs of the same kind cannot mix.
+**This is what makes the navigation/rehydration promise in §7 true**; it ships in
+phase 0.
 
 **Frontend.** `PlatformProvider` exposes
 `{ health, rdk, connect(), connecting, subscribe(module, handler) }`.
@@ -369,7 +402,7 @@ Summaries are what the collapsed step shows. Primary action in **bold**.
 | # | Step | Contents | Primary / done summary |
 |---|---|---|---|
 | 1 | Board | board preview, page select (A4/A3/Letter), Open PDF / Download, measured-square check, **scale ack** (hard gate, unchanged) | **Confirm print scale** · "8×6 @ 30 mm · A4 · scale verified" |
-| 2 | Aim & targets | live frame + `AimHud` + `StreamStats`, lamps + LOCK, jog-frame note (one line; details in guide), `CollisionPanel` as a `PrereqChip` + expandable pairs, `ConeDiagram` in the guide slot | **Create targets** (locked until LOCK) · "15 targets (TasniCalib_*)" — Change → Clear |
+| 2 | Aim & targets | `PrereqChip` real-robot link (auto-linked on entry, §4.5); live frame + `AimHud` + `StreamStats`, lamps + LOCK, jog-frame note (one line; details in guide), `CollisionPanel` as a `PrereqChip` + expandable pairs, `ConeDiagram` in the guide slot | **Create targets** (locked until LOCK **and** `pose_live`) · "15 targets (TasniCalib_*)" — Change → Clear |
 | 3 | Run | kv (robot/tool/camera/board), held-out count + refine toggle, `holdoutInvalid` warning, `RunControls` (Simulate → `TourResult` → Run on robot → dialog), progress, thumbnails | **Run on robot** · "solved 2026-08-28 14:02 · 15 poses" |
 | 4 | Review & apply | `Metrics` + verdict banner | **Apply** · "applied · PASS · 0.9 px val" |
 
@@ -380,7 +413,7 @@ The cell-connected requirement locks step 2 (not step 1 — printing needs no ro
 | # | Step | Contents | Primary / done summary |
 |---|---|---|---|
 | 1 | Intent | goal toggle, scope toggle, region W×H inputs inline when *Declared region* | **Continue** · "Full scan · entire platform" |
-| 2 | Survey | live frame + `AimHud` (coverage dots, live boundary) + `StreamStats`; step-header chip POSITION/HOLD/READY/LOCKED; `SurfaceGuide` chips; lamps (mandatory + advisory); **one Boundary line** replacing `SurfaceModeNotice` + `LargeSurfaceNotice` + the extra survey button: "Boundary: measured (1200 × 800 mm, all edges in view)" / "platform overruns the view → [Survey five positions] [Declare region]" / "declared 1000 × 1000 mm [edit]"; `CollisionPanel` as chip; provenance chip once locked; `SurveyPanel` replaces the controls during a five-position survey (as today) | **Lock surface** · "Locked · 1200 × 800 mm · measured by camera · 12 s ago" — Change → Reposition |
+| 2 | Survey | `PrereqChip` real-robot link (auto-linked on entry, §4.5; lock is 409 without `pose_live`); live frame + `AimHud` (coverage dots, live boundary) + `StreamStats`; step-header chip POSITION/HOLD/READY/LOCKED; `SurfaceGuide` chips; lamps (mandatory + advisory); **one Boundary line** replacing `SurfaceModeNotice` + `LargeSurfaceNotice` + the extra survey button: "Boundary: measured (1200 × 800 mm, all edges in view)" / "platform overruns the view → [Survey five positions] [Declare region]" / "declared 1000 × 1000 mm [edit]"; `CollisionPanel` as chip; provenance chip once locked; `SurveyPanel` replaces the controls during a five-position survey (as today) | **Lock surface** · "Locked · 1200 × 800 mm · measured by camera · 12 s ago" — Change → Reposition |
 | 3a | Targets *(full scan)* | accept region → targets; reference mode auto-completes this step ("Reference surface — rectangle placed directly") and hides step 4 | **Create targets** · "14 targets (TasniScan_*)" |
 | 3b | Prepare frame *(frame only)* | `FramePrepPanel` (provenance chip, quality table, freshness) | **Prepare working frame** |
 | 4 | Run *(full scan)* | kv (robot/camera/fusion), `RunControls` | **Run on robot** · "fused 14 views · 2026-08-28" |
@@ -419,8 +452,9 @@ handlers lifted out of the render: fetches (`/config`, `/status`, `/targets`,
 `/result`, …), the job-event subscription, live-preview handling, and the actions.
 It returns `{ state, actions }`; `Page.tsx` does `const steps = deriveSteps(state)`
 and renders `WorkflowRail` + one `Step` per non-hidden entry. New platform
-endpoints: `POST /api/rdk/connect` (§4.5), `GET /api/readiness` and
-`GET /api/runs/{module}/{stamp}` (§4.7). The module-scoping of events and status
+endpoints: `POST /api/rdk/connect`, `POST /api/rdk/link` (§4.5),
+`GET /api/readiness` and `GET /api/runs/{module}/{stamp}` (§4.7); one new module
+gate on `/poses/generate` and `/surface/lock` (§4.5). The module-scoping of events and status
 (§4.5) touches `core/events.py`, `core/jobrunner.py`, `core/livepreview.py` and each
 module's `/status` route and `jobs.start` / `live.start` calls; no job logic changes.
 
@@ -440,7 +474,8 @@ module's `/status` route and `jobs.start` / `live.start` calls; no job logic cha
 - **Hard gates preserved verbatim**: print-scale ack, cell-clear ack, `holdoutInvalid`,
   gate-green for target creation (also re-checked server-side), lock freshness,
   `can_prepare_frame`, `can_insert`, `live_print_enabled`, all server-side
-  fingerprint invalidation.
+  fingerprint invalidation. **One gate is added** (§4.5): target creation and
+  surface locking require a live pose (driver linked + monitoring), server-side.
 
 ## 8. Testing
 
@@ -458,11 +493,16 @@ module's `/status` route and `jobs.start` / `live.start` calls; no job logic cha
   `rdk`; (e) `?step=` seeding, including a hidden step.
 - **Backend** (`pytest -k`, never the full suite): `test_platform_connect.py`
   (fake rdk: ready / tool missing / timeout / socket error → session reset; 409
-  during a job, during live preview, and for a concurrent call),
-  `test_job_events_scope.py` (every event type carries `module`/`job`; module
-  `/status` isolation), `test_readiness.py` (recorded-vs-present for a deleted
-  frame and a moved tool; `null` while a job runs), `test_runs_api.py` (run detail
-  200 / 404 / rejected segment).
+  during a job, during live preview, and for a concurrent call; Connect never
+  calls `connect_robot`), the existing `tests/test_robot_link.py` extended
+  (`ensure_robot_link` consolidation; `/poses/generate` and `/surface/lock` return
+  409 when the driver is not monitoring and pass when it is;
+  `require_live_pose=False` bypass),
+  `test_job_events_scope.py` (every event type carries `module`/`job_id`/`kind`;
+  two consecutive runs of one kind get distinct ids; per-module last-job records
+  survive another module's run; `busy_with` shape), `test_readiness.py`
+  (recorded-vs-present for a deleted frame and a moved tool; `null` while a job
+  runs), `test_runs_api.py` (run detail 200 / 404 / rejected segment).
 - `npm run typecheck && npm run build` green at the end of every phase.
 - **Cell validation** per phase (Appendix B). No motion code changes, so the checks
   are UI-only walk-throughs of each module.
@@ -471,7 +511,7 @@ module's `/status` route and `jobs.start` / `live.start` calls; no job logic cha
 
 | Phase | Scope | Risk / notes |
 |---|---|---|
-| 0 | Backend: module-scoped events + `/status` (§4.5), `POST /api/rdk/connect` with 409/lock and no linking, `GET /api/readiness`. Frontend: `PlatformProvider` (filtered `subscribe`, rdk refresh rules), topbar Connect + pills; pages switch to `usePlatform()` and the filtered subscription and drop their banners (no other layout change) | Low–medium. Ships alone; it is the foundation every later promise rests on, so it gets the integration tests first. |
+| 0 | Backend: module-scoped events with `job_id`/`kind` + per-module `/status` records (§4.5), station-only `POST /api/rdk/connect` with 409/lock, `POST /api/rdk/link` + the live-pose gate on target creation / surface lock, `GET /api/readiness`. Frontend: `PlatformProvider` (filtered `subscribe`, rdk refresh rules), topbar Connect + pills; pages switch to `usePlatform()` and the filtered subscription and drop their banners (no other layout change) | Low–medium. Ships alone; it is the foundation every later promise rests on, so it gets the integration tests first. |
 | 1 | `components/workflow/*`, `GuidePane`, tokens; **Calibration** rewired as the reference implementation; Dashboard readiness strip | Medium. Calibration is the best-understood page and the reference for the other two. |
 | 2 | **Scan** rewired (largest page); Boundary line merge; `RunDetail` drawer + endpoint | Medium-high: most conditional states. `deriveScanSteps` tests carry it. |
 | 3 | **Extrusion** rewired + Ring-stack tab; module retitled | **Not before the paper's cell run** (deadline 1 Sep 2026): the ring-stack flow is the paper's evidence path and must stay byte-identical until those numbers are captured. |
@@ -496,8 +536,12 @@ Each phase is a separate branch off `ux-overhaul` merged when its checklist pass
    preset.
 8. Scan's `scan-ready` bar and `SurfaceGuide` header are removed in favour of the
    step-header chip; the `SurfaceGuide` axis chips and the lamps stay.
-9. The platform connect never links the real robot; runs link at run time exactly
-   as they already do.
+9. The platform connect is station-only; the real-robot link is established
+   automatically on entering Aim/Survey, hard-gates target creation and surface
+   locking (server-side, `require_live_pose` escape hatch), and is rechecked by
+   every run right before motion as today.
+12. Every job execution has a unique `job_id`; `kind` is separate; the runner
+    keeps a last-job record per module.
 10. Guide checklist items are session-scoped and gate nothing; per-run safety is
     asserted only in the motion dialog.
 11. Readiness cards show *recorded* vs *present* rather than trusting `active.json`.
@@ -511,13 +555,22 @@ against the code and accepted; one remedy was changed (R3).
 |---|---|---|
 | R1 | Events and `/status` are not module-scoped, so a page open during another module's job adopts its progress; the §7 rehydration promise was false | §4.5 *Job events and status are module-scoped*; §2.9; phase 0 |
 | R2 | `rdk` state goes stale: completion publishes `result`/`error`, not `status`; `/api/health` is a TCP probe | §4.5 refresh rules (terminal events, paused slow poll, immediate drop on health failure) |
-| R3 | Connect has no concurrency rules; linking at connect silently changes Extrusion's semantics | 409 + lock; and **no linking at connect at all** — runs already link themselves, so the change is removed rather than approved |
+| R3 | Connect has no concurrency rules; linking at connect silently changes Extrusion's semantics | 409 + lock; Connect is station-only (first revision wrongly dropped linking altogether — see R9) |
 | R4 | `active` mixed derived status with UI selection; flag persistence undefined | §4.2 `StepStatus` + `selectedStepId`; per-module store, physical acks reset on reload |
 | R5 | "simulation is never a step" contradicted Extrusion's Simulate step | rule scoped to advisory vs gating simulation (§4.3, decision 4) |
 | R6 | "links into the right step" was not designed | `/m/{id}?step=` seeds `selectedStepId` (§4.2, §4.7) |
 | R7 | physical checks persisted in `localStorage` could appear ticked in a later session | session-scoped, gate nothing, cell-clear lives only in the dialog (§4.6) |
 | R8 | the surface card trusts `active.json`, which records the last insertion, not station presence | `GET /api/readiness` recorded vs present, for calibration too (§4.7) |
 | — | unit tests do not cover navigation-during-job, stale events, reload, connection loss, reconnect races | integration tests + backend scope/readiness tests (§8) |
+
+Second round, same day — one blocker and two clarifications, all verified and
+accepted:
+
+| # | Finding | Resolution |
+|---|---|---|
+| R9 | "No linking at Connect" rested on a false premise: the link is what makes the model track the arm, so the Create-targets seed is the arm's actual pose (`config.py:132-138`, `calibration/service.py:303`, `scan/service.py:2286`); nothing gates on it today | Connect stays station-only; `POST /api/rdk/link` auto-called on entering Aim/Survey; server-side live-pose gate on `/poses/generate` and `/surface/lock`; recheck before motion unchanged; `link_real_robot` + `ensure_real_robot_link` consolidated, not deleted (§4.5, §5.1, §5.2, §7) |
+| R10 | a single current/last-job record lets a Scan run erase the Calibration result a returning page hydrates from | per-module last-job records + `busy_with` (§4.5) |
+| R11 | `job` as a name lets delayed events from two consecutive runs of one kind mix | unique `job_id` per execution, `kind` separate; pages act only on their own `job_id` (§4.5) |
 
 ## Appendix A — control mapping (today → new home)
 
@@ -552,12 +605,16 @@ Create corrected plan → step 6.
 ## Appendix B — cell validation checklist per phase
 
 - **Phase 0**: Connect from the topbar with RoboDK closed (station opens, pills turn
-  green, link pill reports the driver state without linking); switch between the
-  three modules — none asks to connect again; start a Calibration dry run and
-  switch to Scan — Scan shows "Calibration job running" and no foreign progress,
-  and Connect is disabled until it ends; kill RoboDK mid-session — pill goes red
-  within one health tick, Reconnect works; delete the inserted frame in RoboDK —
-  the Dashboard surface card says "not in the current station".
+  green, the Link pill reports the driver state; Connect itself does not link);
+  switch between the three modules — none asks to connect again; enter Calibration
+  Aim with the controller OFF — the link chip reads OFFLINE and Create targets is
+  locked with "Real robot not linked"; power the controller, Retry — chip ONLINE
+  (monitoring), Create targets unlocks; same for Scan Lock surface; start a
+  Calibration dry run and switch to Scan — Scan shows "Calibration job running"
+  and no foreign progress, and Connect is disabled until it ends; return to
+  Calibration afterwards — its result is still shown; kill RoboDK mid-session —
+  pill goes red within one health tick, Reconnect works; delete the inserted frame
+  in RoboDK — the Dashboard surface card says "not in the current station".
 - **Phase 1**: Calibration end-to-end on the cell (board → aim → targets → simulate →
   run → apply) with the rail advancing on its own; Clear targets sends the rail back
   to step 2; Dashboard shows the new calibration in the strip.
