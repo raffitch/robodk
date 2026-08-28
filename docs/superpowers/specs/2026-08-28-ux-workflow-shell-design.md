@@ -1,6 +1,8 @@
 # Tasni UX overhaul — workflow shell, cell-level connect, journey dashboard (design)
 
-Date: 2026-08-28. Status: **draft for operator review**. Branch `ux-overhaul`.
+Date: 2026-08-28. Status: **draft for operator review** — revised the same day after
+a second-agent review (all findings verified in code; resolutions in §11). Branch
+`ux-overhaul`.
 Audit basis: `tasni/webui` on `main` @ `9101aa1` (every file read; refs below are to
 that revision).
 
@@ -13,8 +15,9 @@ After this work:
   primary action per step — built from the **same components** for connect,
   simulate, run, confirm-motion, errors and log;
 - the cell is **connected once, from the topbar**, and every module reads that state;
-- the **Dashboard shows the journey** (calibrated → work surface → print plan) with
-  links into the right module step;
+- the **Dashboard shows the journey** (calibrated → work surface → print plan),
+  distinguishes what is *recorded* from what is *present in the open station*, and
+  links into a named module step (`/m/{id}?step=`);
 - explanatory prose leaves the step bodies and lives in a **per-module guide pane**;
 - **nothing the cell can do today is lost** — Appendix A maps every existing control
   to its new home.
@@ -67,6 +70,15 @@ only, §9).
 8. **No settings surface.** The UI tells the operator to hand-edit
    `tasni.config.json` (`Calibration.tsx:490` jog inversion; camera IP, board,
    tolerances).
+9. **Job events and status are not module-scoped** (found in review). `JobEvent`
+   is `type` + `payload` (`core/events.py:16`); only `status`/`result`/`error`
+   carry a job `name` (`core/jobrunner.py:88-104`), while `progress`/`log`/`frame`
+   (`:41-49`) and `gate` (`core/livepreview.py:118`) carry nothing, and
+   Calibration/Scan consume them unfiltered (`Calibration.tsx:241-247`,
+   `Scan.tsx:414-420`). Both modules name their dry run `sim_tour`, so each page's
+   `name` check would accept the other's tour result. Every module `/status`
+   returns the shared runner's job (`calibration/module.py:409`). A Scan page open
+   during a Calibration run shows calibration progress as its own.
 
 ## 3. Approaches considered
 
@@ -122,25 +134,34 @@ re-expressed as steps. Sub-components already extracted (`SurveyPanel`,
 ### 4.2 The step model (pure, testable)
 
 ```ts
-type StepState = "hidden" | "locked" | "ready" | "active" | "done";
+type StepStatus = "hidden" | "locked" | "ready" | "done";   // derived, pure
 interface Step {
-  id: string; title: string; state: StepState;
+  id: string; title: string; status: StepStatus;
   summary?: string;      // one line shown when collapsed/done
   lockReason?: string;   // shown in the rail tooltip and the step body when locked
   attention?: boolean;   // a dismissible error is pending in this step
 }
 deriveSteps(state: ModuleState): Step[]   // one per module, in steps.ts
+// UI selection is separate state, never derived:
+selectedStepId: string | null            // null => the current step
 ```
 
 - `deriveSteps` is a pure function of the state the page already fetches (rdk
   ready, config, targets, gate, tour, job status, result, applied). **Rendering
   never computes gating itself**; every disabled primary action has a `lockReason`.
-- The current step is the first step that is neither `done` nor `hidden`, unless
-  the operator has pinned another by clicking it (the pin clears when the derived
-  current step advances).
+- **Workflow status and UI selection are separate.** The *current* step is the
+  first step whose status is `ready`; the rail highlights it while
+  `selectedStepId` is null. Clicking a step sets `selectedStepId` (locked steps
+  open read-only with their reason); it clears when the current step advances past
+  it, and it is seeded from `/m/{id}?step=<stepId>` on entry (ignored if that step
+  is hidden).
 - Steps with no server action (Board, Intent, Placement) complete on their
-  Confirm/Continue button, recorded as a flag in the module state that clears
-  whenever that step's inputs change (the scale ack already works this way).
+  Confirm/Continue button. Those flags and the other client-only inputs live in a
+  per-module store inside `PlatformProvider`, so they survive navigation between
+  modules within a session. **Physical assertions (print-scale ack, placement
+  confirmation) reset on reload on purpose** — today's `scaleOk` behaviour — and
+  clear whenever the step's inputs change. Non-safety inputs (held-out count,
+  refine, selected layer, intent toggles) persist in `sessionStorage`.
 - `hidden` steps are not rendered at all (Scan "Run" under *Working frame only*).
 - State changes that invalidate later steps (clearing targets, repositioning a lock,
   changing intent, editing a generated plan) are already enforced server-side; the
@@ -150,21 +171,24 @@ deriveSteps(state: ModuleState): Step[]   // one per module, in steps.ts
 ### 4.3 Rail and step behaviour
 
 - **Rail**: horizontal at the top of the main column; `n · title · state glyph`
-  (`○ locked · ● ready · ◉ active · ✓ done`, plus `⚠` when `attention`). Click
-  selects; locked steps open read-only with the reason. Under 760 px the rail
-  stacks vertically.
-- **One step expanded at a time.** A `done` step collapses to its summary line with a
-  *Change* affordance that re-expands it (e.g. Aim: "15 targets (TasniCalib_*)
-  — Change").
+  (`○ locked · ● ready · ✓ done`, plus `⚠` when `attention`); the current step is
+  highlighted and the selected one outlined. Click selects; locked steps open
+  read-only with the reason. Under 760 px the rail stacks vertically.
+- **Only the selected step is expanded.** A `done` step collapses to its summary
+  line with a *Change* affordance that selects it (e.g. Aim: "15 targets
+  (TasniCalib_*) — Change").
 - **Expanding/collapsing never touches hardware.** The camera-live state is shown in
   the Aim/Survey step header ("● camera live · Stop") even when collapsed; Run stops
   the live preview exactly as today (`Calibration.tsx:299`).
 - **Exactly one primary action per step**, right-aligned in the step footer;
   secondary actions sit left of it. The primary action's disabled state always
   carries a reason (footer text = `lockReason`).
-- **Simulate is never a step of its own** (decision 10.4): it is the secondary
-  action of the Run step, and running without it surfaces in the confirm dialog as
-  "No dry run performed" — exactly today's nag.
+- **Advisory simulation is not a step; gating simulation is** (decision 10.4). The
+  tour dry run in Calibration and Scan is advisory (the operator may run without
+  it), so it is the Run step's secondary action and skipping it surfaces in the
+  confirm dialog as "No dry run performed" — exactly today's nag. Extrusion's layer
+  simulation is a hard gate for `live_print_enabled` (`extrusion/module.py:626`),
+  so it is its own step (§5.3).
 
 ### 4.4 Shared workflow components (contracts)
 
@@ -189,26 +213,58 @@ button; `"motion"` is the amber tour dialog.
 ### 4.5 Cell-level connect
 
 **Backend.** `POST /api/rdk/connect` in `webapp/server.py`, next to
-`/api/rdk/status`: the calibration/scan polling implementation lifted verbatim
-(open the station if RoboDK came up empty, poll up to `robodk.connect_timeout_s`,
-reset the session on a socket error mid-load, check robot + camera tool,
-best-effort `link_real_robot` — never blocks readiness, never moves the robot).
-Response = the `/api/rdk/status` shape. `link_real_robot` already lives in
-`core/rdk_io.py:65` (imported by both calibration and scan), so nothing moves.
-Extrusion's variant ("without linking") is subsumed: linking is a driver connect on
-the same shared session that the other two modules already perform.
+`/api/rdk/status`: the calibration/scan polling implementation lifted (open the
+station if RoboDK came up empty, poll up to `robodk.connect_timeout_s`, reset the
+session on a socket error mid-load, check robot + camera tool). Response = the
+`/api/rdk/status` shape. Two deliberate differences from today's module routes:
+
+- **No real-robot linking at connect.** Every real run already links the controller
+  itself right before moving (`ensure_real_robot_link`: `calibration/service.py:1038`,
+  `scan/service.py:3079`, `extrusion/service.py:546`, `extrusion/measure.py:201`),
+  so connect-time linking was only a status convenience — and Extrusion's route
+  deliberately avoided it (`extrusion/module.py:204`). The platform connect adopts
+  that stricter semantics for everyone; `/api/rdk/status` keeps reporting the link
+  state it already reads via `robot_connected()`, so the topbar still shows
+  ONLINE/OFFLINE. `link_real_robot` (`core/rdk_io.py:65`) loses its only callers
+  and is deleted.
+- **Concurrency.** Connect returns **409** while `jobs.running`, `live.running` or
+  the camera lease is held (its error path resets the session —
+  `calibration/module.py:186` — which must never happen under a running job), and
+  holds a lock so a concurrent second call returns 409 "connect in progress"
+  instead of racing the first.
+
 The three module `/connect` routes are deleted in phase 4 once every page uses the
 platform one (the web UI is their only client; `tasni.cli` does not call them).
 
+**Job events and status are module-scoped.** `JobEvent` gains `module` and `job`
+fields (`core/events.py:16`). `jobs.start(job, name=, module=)` stamps them on
+`status`/`result`/`error` **and**, through the `JobContext`, on `progress`/`log`/
+`frame` (`jobrunner.py:41-49`); `LivePreview.start(..., owner=module)` stamps
+`frame`/`gate`/`boundary`/`survey` (`livepreview.py:118`; the camera lease already
+tracks an owner string, `camera_lease.py:29`). Each module `/status` reports only its
+own job — the runner records `module` with the current/last job, and a foreign job
+reports as `{status: "busy", module: "calibration"}` so the page can say "Calibration
+job running — controls locked". Dry-run job names become module-prefixed
+(`calibration:sim_tour`, `scan:sim_tour`) so the `name` checks both pages do today
+(`Calibration.tsx:257`, `Scan.tsx:475`) cannot cross. **This is what makes the
+navigation/rehydration promise in §7 true**; it ships in phase 0.
+
 **Frontend.** `PlatformProvider` exposes
-`{ health, rdk, connect(), connecting, subscribe }`. `health` polls `/api/health`
-every 4 s as now; `rdk` is hydrated on mount, after `connect()`, and on every job
-`status` event. **Topbar** = brand · RoboDK pill ("connected — KR150 · Realsense
-tool · real robot ONLINE (10.x)") · Camera pill · Link pill · **Connect** button
-(label *Reconnect* when ready, disabled while connecting; errors shown as a topbar
-toast, not a page banner). Pages call `usePlatform()`; a step that needs the cell is
-`locked` with `lockReason: "Connect the cell (top right)"`. **No per-page banner, no
-per-page Connect button.**
+`{ health, rdk, connect(), connecting, subscribe(module, handler) }`.
+`subscribe(module, …)` delivers a module only its own events (the topbar's Link
+pill subscribes to all). `health` polls `/api/health` every 4 s as now. `rdk`
+(`/api/rdk/status`) is refreshed: on mount; after `connect()`; on **every terminal
+job event** (`result`, `error`, `status: cancelled` — completion does not publish
+`status`, `jobrunner.py:97-104`); and by a slow poll (10 s) **that pauses while a
+job is running** (its four RoboDK API calls must not contend with the job). When
+`health.robodk.ok` turns false, `rdk.ready` drops immediately without waiting for
+the poll. **Topbar** = brand · RoboDK pill ("connected — KR150 · Realsense tool ·
+real robot ONLINE (10.x)") · Camera pill · Link pill · **Connect** button (label
+*Reconnect* when ready; disabled while connecting or while a job/live preview runs,
+with the reason as tooltip; errors shown as a topbar toast, not a page banner).
+Pages call `usePlatform()`; a step that needs the cell is `locked` with
+`lockReason: "Connect the cell (top right)"`. **No per-page banner, no per-page
+Connect button.**
 
 Module-specific prerequisites stay module-side and render as `PrereqChip`s in the
 step that needs them: Scan — "Calibration on file · 2026-08-14 · PASS" (warn when
@@ -228,14 +284,17 @@ interface GuideSpec {
   steps: Record<string, {              // keyed by step id
     what: string;                      // what to do
     why?: string;                      // the explanation moved out of the step body
-    physical?: string[];               // manual checkboxes (persisted per module in localStorage)
+    physical?: string[];               // manual checkboxes: session-scoped, gate nothing
     slot?: ComponentType;              // module-specific widget (board print tools)
   }>;
 }
 ```
 
 The pane opens on the current step's section (others collapsed). Manual checkboxes
-are for the physical world only ("Mount the board rigidly", "Clear the cell"); app
+are for setup-only physical facts ("Board mounted rigidly, no glare", "Ring
+placed"); they are session-scoped (in memory), reset on reload, and gate nothing.
+Per-run safety assertions — cell clear, hands out — are **not** checklist items:
+the `MotionConfirmDialog` ack is the only place they are asserted, every time. App
 steps are not checkboxes — the rail is their state. Every paragraph currently inline
 in a card (`Scan.tsx:1212-1217`, `:1029-1071` hints, `Calibration.tsx:465-472`,
 `:545-561`, `Extrusion.tsx:626-633`, …) moves into `why`. **Step bodies keep at most
@@ -245,17 +304,29 @@ its *Board* step and are also linked from the guide.
 ### 4.7 Dashboard
 
 1. **Readiness strip** — three linked cards in journey order, replacing the "Cell
-   status" card (the topbar owns cell status now):
-   - *Calibration*: `GET /api/runs/active?module=calibration` (exists) →
-     "Calibrated 2026-08-14 10:22 · PASS · 0.9 px val · tool Realsense" /
-     "Not calibrated — Calibrate →". Links `/m/calibration`.
-   - *Work surface*: `GET /api/runs/active?module=scan` (scan writes it on insert,
-     `scan/service.py:3435`) → "Frame_x · 1200 × 800 mm · measured by camera ·
-     inserted 2026-08-27" / "No surface — Scan →". Links `/m/scan`.
-   - *Print plan*: `GET /api/modules/extrusion/status` (the current session's plan —
-     it is in-memory module state and resets with the app, which is the truth the
-     card should show) → "Plan a1b2c3… · preflight ✓ · simulated ✓ · dry run ✓ ·
-     live print enabled" / "No plan — Extrusion →". Links `/m/extrusion`.
+   status" card (the topbar owns cell status now). They are fed by one new
+   `GET /api/readiness` that distinguishes **recorded** (what `active.json` says)
+   from **present** (what the open station contains now; `null` when no session is
+   open or a job is running, so the check never contends with a run):
+   - *Calibration*: recorded = `read_active("calibration")` (date, verdict, val px,
+     tool); present = the camera tool exists **and** its pose matches the applied
+     run's `X_cam2gripper` (an unsaved station reload silently loses an applied
+     calibration while `active.json` still claims it). "Calibrated 2026-08-14 10:22
+     · PASS · 0.9 px val" / "Not calibrated — Calibrate →". Links
+     `/m/calibration?step=review`.
+   - *Work surface*: recorded = `read_active("scan")` (frame, size, provenance,
+     inserted date — scan writes it on insert, `scan/service.py:3435`); present =
+     the frame and rectangle items exist in the station (`item_exists_as`, as
+     extrusion's preflight already checks, `extrusion/service.py:94`). "Frame_x ·
+     1200 × 800 mm · measured by camera · inserted 2026-08-27" / "No surface —
+     Scan →". Links `/m/scan?step=review`.
+   - *Print plan*: `GET /api/modules/extrusion/status` (in-memory module state that
+     resets with the app — which is the truth the card should show) → "Plan a1b2c3…
+     · preflight ✓ · simulated ✓ · dry run ✓ · live print enabled" / "No plan —
+     Extrusion →". Links `/m/extrusion`.
+
+   A card whose `present` is false says so ("recorded 2026-08-27 · **not in the
+   current station** — re-insert"); `null` renders as "connect to verify".
 2. **Modules grid** — unchanged (registry-driven).
 3. **Recent runs** — rows become clickable and open a `RunDetail` drawer from a new
    `GET /api/runs/{module}/{stamp}` (`core/runs.load_meta` + `load_report`) showing
@@ -347,21 +418,25 @@ Each module's `use<Module>State.ts` is the page's existing hooks, effects and
 handlers lifted out of the render: fetches (`/config`, `/status`, `/targets`,
 `/result`, …), the job-event subscription, live-preview handling, and the actions.
 It returns `{ state, actions }`; `Page.tsx` does `const steps = deriveSteps(state)`
-and renders `WorkflowRail` + one `Step` per non-hidden entry. No new module
-endpoints; new platform endpoints are only `POST /api/rdk/connect` (§4.5) and
-`GET /api/runs/{module}/{stamp}` (§4.7).
+and renders `WorkflowRail` + one `Step` per non-hidden entry. New platform
+endpoints: `POST /api/rdk/connect` (§4.5), `GET /api/readiness` and
+`GET /api/runs/{module}/{stamp}` (§4.7). The module-scoping of events and status
+(§4.5) touches `core/events.py`, `core/jobrunner.py`, `core/livepreview.py` and each
+module's `/status` route and `jobs.start` / `live.start` calls; no job logic changes.
 
 ## 7. Error handling
 
 - API/job errors render as `RunError` inside the step that issued the action
   (dismissible), are appended to `LogPanel` (which auto-expands), and set
   `attention` on that rail step until dismissed.
-- Connection lost mid-job: the topbar RoboDK pill goes red; the active step keeps its
-  frozen progress and the Cancel button; reconnect + job `status` events restore
-  state (today's behaviour, now in one place).
-- Navigating away and back re-hydrates from `/status`, `/targets`,
-  `/api/rdk/status` (today's `hydrateConnection`, now via the shared hook), so a
-  running job is shown running in its step.
+- Connection lost mid-job: `health.robodk` fails → `rdk.ready` drops immediately
+  (§4.5), the topbar pill goes red, the active step keeps its frozen progress and
+  the Cancel button; the job's terminal event or the resumed poll restores state.
+- Navigating away and back re-hydrates from the module's own `/status`, `/targets`
+  and `/api/rdk/status`. Because events and status are module-scoped (§4.5), a
+  running job is shown running in its own module's step, and another module's page
+  shows "Calibration job running — controls locked" instead of adopting its
+  progress.
 - **Hard gates preserved verbatim**: print-scale ack, cell-clear ack, `holdoutInvalid`,
   gate-green for target creation (also re-checked server-side), lock freshness,
   `can_prepare_frame`, `can_insert`, `live_print_enabled`, all server-side
@@ -374,9 +449,20 @@ endpoints; new platform endpoints are only `POST /api/rdk/connect` (§4.5) and
   state → expected rail, including hidden/locked reasons and intent changes);
   `MotionConfirmDialog` (Cancel focused, Enter does not confirm, ack required,
   "none" tour wording); `RunControls` gating; `WorkflowRail` state glyphs.
+- **Integration tests** (vitest + testing-library with a fake `WebSocket` and
+  mocked `fetch`), because the riskiest behaviour is between the pages and the
+  platform, not inside a component: (a) events from another module are ignored and
+  the page shows "other job running"; (b) reload/navigation during a job
+  rehydrates the running step from `/status`; (c) a `health.robodk` failure drops
+  readiness before the next rdk poll; (d) a terminal `result`/`error` refreshes
+  `rdk`; (e) `?step=` seeding, including a hidden step.
 - **Backend** (`pytest -k`, never the full suite): `test_platform_connect.py`
-  (fake rdk: ready / tool missing / timeout / socket error → session reset),
-  `test_runs_api.py` (run detail 200 / 404 / rejected segment).
+  (fake rdk: ready / tool missing / timeout / socket error → session reset; 409
+  during a job, during live preview, and for a concurrent call),
+  `test_job_events_scope.py` (every event type carries `module`/`job`; module
+  `/status` isolation), `test_readiness.py` (recorded-vs-present for a deleted
+  frame and a moved tool; `null` while a job runs), `test_runs_api.py` (run detail
+  200 / 404 / rejected segment).
 - `npm run typecheck && npm run build` green at the end of every phase.
 - **Cell validation** per phase (Appendix B). No motion code changes, so the checks
   are UI-only walk-throughs of each module.
@@ -385,7 +471,7 @@ endpoints; new platform endpoints are only `POST /api/rdk/connect` (§4.5) and
 
 | Phase | Scope | Risk / notes |
 |---|---|---|
-| 0 | `POST /api/rdk/connect`, `PlatformProvider`, topbar Connect + pills; pages switch to `usePlatform()` for `ready` and drop their banners (no other layout change) | Low. Ships alone; visible win immediately. |
+| 0 | Backend: module-scoped events + `/status` (§4.5), `POST /api/rdk/connect` with 409/lock and no linking, `GET /api/readiness`. Frontend: `PlatformProvider` (filtered `subscribe`, rdk refresh rules), topbar Connect + pills; pages switch to `usePlatform()` and the filtered subscription and drop their banners (no other layout change) | Low–medium. Ships alone; it is the foundation every later promise rests on, so it gets the integration tests first. |
 | 1 | `components/workflow/*`, `GuidePane`, tokens; **Calibration** rewired as the reference implementation; Dashboard readiness strip | Medium. Calibration is the best-understood page and the reference for the other two. |
 | 2 | **Scan** rewired (largest page); Boundary line merge; `RunDetail` drawer + endpoint | Medium-high: most conditional states. `deriveScanSteps` tests carry it. |
 | 3 | **Extrusion** rewired + Ring-stack tab; module retitled | **Not before the paper's cell run** (deadline 1 Sep 2026): the ring-stack flow is the paper's evidence path and must stay byte-identical until those numbers are captured. |
@@ -396,12 +482,13 @@ Each phase is a separate branch off `ux-overhaul` merged when its checklist pass
 ## 10. Decisions taken (defaults; override at review)
 
 1. Rail is horizontal above the steps (vertical would compete with the sidebar).
-2. One step expanded at a time (an accordion invites the old "everything visible"
-   page back).
-3. Guide pane is always present on desktop (a help drawer hides the
-   physical-checklist items that matter for safety).
-4. Dry run/simulate lives inside the Run step as the secondary action, not as its
-   own step; the confirm dialog nags when it was skipped.
+2. Only the selected step is expanded (an accordion invites the old "everything
+   visible" page back).
+3. Guide pane is always present on desktop (a help drawer would hide the setup
+   checklist).
+4. Advisory tour simulation (Calibration, Scan) lives inside the Run step as the
+   secondary action, with the confirm dialog nagging when it was skipped; gating
+   simulation (Extrusion) is its own step.
 5. Module `/connect` routes are removed in phase 4 rather than kept as aliases.
 6. The ring-stack experiment stays inside Extrusion as a tab rather than becoming a
    module.
@@ -409,6 +496,28 @@ Each phase is a separate branch off `ux-overhaul` merged when its checklist pass
    preset.
 8. Scan's `scan-ready` bar and `SurfaceGuide` header are removed in favour of the
    step-header chip; the `SurfaceGuide` axis chips and the lamps stay.
+9. The platform connect never links the real robot; runs link at run time exactly
+   as they already do.
+10. Guide checklist items are session-scoped and gate nothing; per-run safety is
+    asserted only in the motion dialog.
+11. Readiness cards show *recorded* vs *present* rather than trusting `active.json`.
+
+## 11. Review log
+
+2026-08-28 — second-agent review of the first draft. Every finding was verified
+against the code and accepted; one remedy was changed (R3).
+
+| # | Finding | Resolution |
+|---|---|---|
+| R1 | Events and `/status` are not module-scoped, so a page open during another module's job adopts its progress; the §7 rehydration promise was false | §4.5 *Job events and status are module-scoped*; §2.9; phase 0 |
+| R2 | `rdk` state goes stale: completion publishes `result`/`error`, not `status`; `/api/health` is a TCP probe | §4.5 refresh rules (terminal events, paused slow poll, immediate drop on health failure) |
+| R3 | Connect has no concurrency rules; linking at connect silently changes Extrusion's semantics | 409 + lock; and **no linking at connect at all** — runs already link themselves, so the change is removed rather than approved |
+| R4 | `active` mixed derived status with UI selection; flag persistence undefined | §4.2 `StepStatus` + `selectedStepId`; per-module store, physical acks reset on reload |
+| R5 | "simulation is never a step" contradicted Extrusion's Simulate step | rule scoped to advisory vs gating simulation (§4.3, decision 4) |
+| R6 | "links into the right step" was not designed | `/m/{id}?step=` seeds `selectedStepId` (§4.2, §4.7) |
+| R7 | physical checks persisted in `localStorage` could appear ticked in a later session | session-scoped, gate nothing, cell-clear lives only in the dialog (§4.6) |
+| R8 | the surface card trusts `active.json`, which records the last insertion, not station presence | `GET /api/readiness` recorded vs present, for calibration too (§4.7) |
+| — | unit tests do not cover navigation-during-job, stale events, reload, connection loss, reconnect races | integration tests + backend scope/readiness tests (§8) |
 
 ## Appendix A — control mapping (today → new home)
 
@@ -443,8 +552,12 @@ Create corrected plan → step 6.
 ## Appendix B — cell validation checklist per phase
 
 - **Phase 0**: Connect from the topbar with RoboDK closed (station opens, pills turn
-  green, real-robot link note appears); switch between the three modules — none asks
-  to connect again; kill RoboDK mid-session — pill goes red, Reconnect works.
+  green, link pill reports the driver state without linking); switch between the
+  three modules — none asks to connect again; start a Calibration dry run and
+  switch to Scan — Scan shows "Calibration job running" and no foreign progress,
+  and Connect is disabled until it ends; kill RoboDK mid-session — pill goes red
+  within one health tick, Reconnect works; delete the inserted frame in RoboDK —
+  the Dashboard surface card says "not in the current station".
 - **Phase 1**: Calibration end-to-end on the cell (board → aim → targets → simulate →
   run → apply) with the rail advancing on its own; Clear targets sends the rail back
   to step 2; Dashboard shows the new calibration in the strip.
