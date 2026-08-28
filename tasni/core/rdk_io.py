@@ -1896,6 +1896,14 @@ class RdkIO:
             raise RuntimeError(f"program {name!r} not found")
         program.setRunType(robolink.PROGRAM_RUN_ON_ROBOT if real_robot
                            else robolink.PROGRAM_RUN_ON_SIMULATOR)
+        # setRunType governs the GUI's "Run on robot"; an API RunCode() follows the
+        # STATION run mode. Assert it here, immediately before running, because
+        # anything that simulates in between — Program.Update() validation,
+        # collision screening — leaves the station in SIMULATE, and then RunCode()
+        # moves only the model: the arm never budges, the program "finishes"
+        # instantly, and nothing is deposited (cell 2026-08-28).
+        self.rdk.setRunMode(self.RUNMODE_RUN_ROBOT if real_robot
+                            else self.RUNMODE_SIMULATE)
         return int(program.RunCode())
 
     def program_busy(self, name: str) -> bool:
