@@ -200,6 +200,62 @@ def test_characterize_recovers_a_ring_the_recipe_got_wrong():
     assert found.measured_xyz.shape[1] == 3
 
 
+def test_characterize_selects_ring_instead_of_larger_raised_patch():
+    pytest.importorskip("open3d")
+    true_center = (CENTER[0] + 8.0, CENTER[1] - 5.0)
+    T = syn.inspection_camera_T([CENTER[0], CENTER[1], 6.0], 300.0)
+    ring = syn.RingSpec(40.0, 14.0, true_center, height_fn=syn.flat(8.0))
+    # A broad 3 mm-high residual, separated from the ring, models the real
+    # checkerboard depth bias that used to win solely because it was largest.
+    patch_x = np.arange(CENTER[0] + 80.0, CENTER[0] + 151.0, 1.0)
+    patch_y = np.arange(CENTER[1] - 110.0, CENTER[1] + 111.0, 1.0)
+    X, Y = np.meshgrid(patch_x, patch_y, indexing="ij")
+    patch = np.column_stack((X.ravel(), Y.ravel(), np.full(X.size, 3.0)))
+    scene = np.vstack((
+        syn.plane_points(center_xy_mm=CENTER), ring.surface_points(), patch))
+    depth = syn.render_depth(scene, T)
+    color = np.zeros((720, 1280, 3), np.uint8)
+
+    found = characterize_ring(
+        color=color, depth=depth, T_work_camera=T, K=syn.K_720P,
+        search_center_mm=CENTER, work_frame="Tasni Work Frame",
+        config=ExtrusionConfig())
+
+    assert found.radius_mm == pytest.approx(40.0, abs=1.5)
+    assert found.center_mm == pytest.approx(true_center, abs=1.5)
+    candidates = found.report["ring_selector"]["candidates"]
+    selected = next(candidate for candidate in candidates if candidate.get("selected"))
+    assert selected["points"] < max(candidate["points"] for candidate in candidates)
+    assert selected["angular_coverage"] >= 0.95
+    assert selected["radial_span_ratio"] < 0.8
+
+
+def test_characterize_real_checkerboard_capture_selects_the_visible_ring():
+    pytest.importorskip("open3d")
+    fixture = np.load(Path(__file__).parent / "fixtures" / "extrusion" / "ring1"
+                      / "ring1_checkerboard_20260828.npz")
+    depth = fixture["depth"]
+    color = np.zeros((*depth.shape, 3), np.uint8)
+
+    found = characterize_ring(
+        color=color, depth=depth, T_work_camera=fixture["T_work_camera"],
+        K=fixture["K"], search_center_mm=fixture["search_center_mm"],
+        work_frame="Tasni Work Frame", config=ExtrusionConfig())
+
+    assert found.radius_mm == pytest.approx(39.17, abs=0.5)
+    assert found.center_mm == pytest.approx((217.94, 150.44), abs=0.5)
+    assert found.bead_width_mm == pytest.approx(13.26, abs=0.75)
+    assert found.top_z_mean_mm == pytest.approx(6.14, abs=0.75)
+    selector = found.report["ring_selector"]
+    selected = next(candidate for candidate in selector["candidates"]
+                    if candidate.get("selected"))
+    largest = max(selector["candidates"], key=lambda candidate: candidate["points"])
+    assert selected["points"] < largest["points"]
+    assert selected["radius_mm"] == pytest.approx(41.12, abs=0.5)
+    assert selected["angular_coverage"] >= 0.95
+    assert not largest["eligible"]
+
+
 # ------------------------------------------------------------- archive (Task 7)
 
 from tasni.modules.extrusion.archive import ExtrusionArchive

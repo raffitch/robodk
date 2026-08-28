@@ -41,15 +41,15 @@ strand the robot on old code. Say which commit hashes you pushed in your summary
 1. **[docs/agent-debug-map.md](docs/agent-debug-map.md)** — the index. Fast orientation
    before opening any long handoff doc. Start here.
 2. **[docs/live-print-dispatch-handoff-2026-08-28.md](docs/live-print-dispatch-handoff-2026-08-28.md)**
-   — the **currently open blocker** (see §4).
+   — the resolved API-dispatch blocker and cell evidence (see §4).
 3. **[tasni/README.md](tasni/README.md)** — the app's architecture.
 4. `docs/extrusion-current-handoff.md`, `docs/jetson-scanner.md`,
    `docs/scan-workframe-two-path-plan.md` — per-area depth.
 
 ## 4. What is open right now (2026-08-28)
 
-**Live print: RoboDK's `RunCode()` API path dispatches nothing; fix implemented, cell
-validation pending.** The app dispatches a
+**Live print: RoboDK's `RunCode()` API path dispatches nothing; the item-Start fix is
+cell-validated through a complete Characterize motion/capture/return.** The old path dispatches a
 layer program, RoboDK accepts it, the cell clicks once, the arm does not move — and
 right-clicking the *same* program in RoboDK afterwards *does* move it.
 
@@ -68,12 +68,17 @@ Measured and therefore **dead** — do not re-chase:
 - Also dead: stale work frame/centre, wrong inspection tool, a bad scan, the
   `RoboDKsync570.src` driver version (the two copies are byte-identical), `$OUT[0]`.
 
-**Next action:** restart Tasni and cell-test **Ring stack → Characterize ring 1 first**.
 The bare item-Start bisect physically moved the arm, and the app now uses that path for
-real-robot programs while retaining `RunCode()` for simulation. Characterize is the
-safest end-to-end proof because it moves only the inspection camera and never calls a
-valve. If it succeeds, archive the real ring frame and then separately re-run live print
-with normal valve/material safety checks. Python `robodk>=6.0.1` is now required.
+real-robot programs while retaining `RunCode()` for simulation. On the first app retry,
+Characterize moved to the overhead pose, captured RGB-D, archived it, and returned; this
+validates app dispatch without involving a valve. Python `robodk>=6.0.1` is required.
+
+**Next action:** after restarting onto the ring-selector fix, run **Ring stack →
+Characterize ring 1** once more. The first archived frame exposed a separate processing
+bug: the largest DBSCAN cluster was a broad ChArUco-board depth residual, not the ring.
+The new selector uses angular coverage and radial compactness; offline replay of that
+exact frame reads radius 39.17 mm, centre (217.94, 150.44) mm, bead footprint 13.26 mm
+and top Z 6.14 mm. Confirm the new `characterize-02` mask is annular before Apply.
 
 > **Picking this up? Read [docs/live-print-next-session.md](docs/live-print-next-session.md)**
 > — the continuation handoff: current state, the full decision tree for each bisect
@@ -81,10 +86,11 @@ with normal valve/material safety checks. Python `robodk>=6.0.1` is now required
 
 **Also pending:** the PFH paper's ring-stack cell run (deadline 1 Sep 2026) — see
 `docs/superpowers/` and `docs/extrusion-current-handoff.md`. Discard every
-`runs/extrusion/20260828-*-f088cf48` trial: they are measurements of an empty board and
-must not reach the paper. The first real-ring characterization attempt
-`20260828-171615-f088cf48` also failed before archiving raw RGB-D because its inspection
-program used the broken `RunCode()` path; it is not paper evidence.
+`runs/extrusion/20260828-*-f088cf48` trial made before the real-ring capture: they are
+measurements of an empty board and must not reach the paper. Trial
+`20260828-171615-f088cf48/characterize-01` does contain the real ring, but its archived
+52.77 mm radius / 51.12 mm bead result selected the board residual and is invalid. Keep
+the raw frame as regression evidence; do not use its metrics in the paper.
 
 ## 5. How to work here
 

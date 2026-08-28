@@ -20,9 +20,17 @@ driver, controller, program content, or Tasni app state.
 The documented program item command `program.setParam("Start", 0)` was then tested on
 the same bare one-MoveJ fixture: it returned `"OK"`, RoboDK reported the robot busy, and
 the operator confirmed the physical arm moved. The narrow fix is implemented:
-real-robot programs use item Start; simulation retains `RunCode()`. Next cell test is
-Ring stack → Characterize ring 1 (inspection motion only, no valve), followed by a
-separate guarded live-print test if characterization succeeds.
+real-robot programs use item Start; simulation retains `RunCode()`. A complete app
+Characterize job then physically moved to the inspection pose, captured, archived and
+returned, validating the dispatch fix without a valve.
+
+That first real frame exposed a second, processing-only issue: the broad ChArUco-board
+depth residual was the largest DBSCAN cluster, so the old rule reported a nonsensical
+52.77 mm radius and 51.12 mm bead. Ring characterization now scores every cluster for
+angular coverage and radial compactness. Offline replay selects the visible ring and
+returns radius 39.17 mm, centre (217.94, 150.44) mm, bead footprint 13.26 mm and top Z
+6.14 mm. **Next cell test:** restart, Characterize once more, verify the archived mask is
+annular, then Apply. Live print remains a separate guarded test after measurement.
 
 ---
 
@@ -45,8 +53,9 @@ layer 1: program ran 0.0 s (NEVER OBSERVED RUNNING); flange camera says the arm 
   `test_extrusion_runtime`, `test_extrusion_motion_witness`, `test_extrusion_standoff`,
   `test_valve_outputs`. (Do **not** run the whole suite — it is too slow and has been
   interrupted repeatedly. Run the files you touch.)
-- The item-Start fix is implemented and 153 focused extrusion/measurement tests pass.
-  End-to-end cell validation is pending after an app restart.
+- The item-Start fix is implemented and app-level Characterize motion/capture/return is
+  cell-validated. A fresh characterization is pending only to validate the new geometric
+  ring selector before Apply.
 - Cell bisect measured 2026-08-28: direct `MoveJ` physically moved; API-created one-MoveJ
   program was accepted but never busy and did not move. One RoboDK process was running;
   RoboDK `6.0.5.26883`; station run mode 6; program run type 2. The external Python API

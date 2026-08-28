@@ -278,13 +278,8 @@ def ring_geometry(measured_xyz, cluster_xyz, center_xy, *, floor_profile=None,
         bead_width_max_mm=width["max_mm"], bead_width_bins=bins)
 
 
-def _filter_deposit(points: np.ndarray, config, counts: dict) -> np.ndarray:
-    """Voxel -> statistical -> radius outliers -> largest DBSCAN cluster (Open3D).
-
-    Everything the deposit IS, flanks included -- the bead's full footprint. The
-    upward-facing crest is a further selection made by :func:`_top_surface`; bead
-    width has to be measured before that selection throws the flanks away.
-    """
+def _deposit_clusters(points: np.ndarray, config, counts: dict) -> list[np.ndarray]:
+    """Voxel/outlier filter, then return every non-noise DBSCAN cluster by size."""
     try:
         import open3d as o3d
     except ImportError as exc:
@@ -303,9 +298,90 @@ def _filter_deposit(points: np.ndarray, config, counts: dict) -> np.ndarray:
     labels = np.asarray(cloud.cluster_dbscan(
         eps=config.cluster_eps_m * 1000.0, min_points=config.cluster_min_points,
         print_progress=False))
-    points = _largest_label(np.asarray(cloud.points), labels)
+    filtered = np.asarray(cloud.points)
+    clusters = [filtered[labels == label] for label in np.unique(labels) if label >= 0]
+    clusters.sort(key=len, reverse=True)
+    counts["dbscan_cluster_count"] = len(clusters)
+    if not clusters:
+        raise RuntimeError("no deposited cluster survived DBSCAN filtering")
+    return clusters
+
+
+def _filter_deposit(points: np.ndarray, config, counts: dict) -> np.ndarray:
+    """Voxel -> statistical -> radius outliers -> largest DBSCAN cluster (Open3D).
+
+    Everything the deposit IS, flanks included -- the bead's full footprint. The
+    upward-facing crest is a further selection made by :func:`_top_surface`; bead
+    width has to be measured before that selection throws the flanks away.
+    """
+    points = _deposit_clusters(points, config, counts)[0]
     counts["after_largest_cluster"] = len(points)
     return points
+
+
+def _select_ring_cluster(clusters: list[np.ndarray], search_center_xy: np.ndarray,
+                         counts: dict) -> tuple[np.ndarray, dict]:
+    """Choose a complete annulus, not simply the largest above-plane residual.
+
+    The real checkerboard has millimetre-scale depth bias over broad patches. Such
+    a patch can contain more points than the deposited ring, but it has a much
+    larger radial spread after a circle fit. A ring must cover most angular bins
+    and keep its central 95% radial span below 80% of its fitted radius.
+    """
+    angular_bins = 72
+    min_coverage = 0.70
+    max_span_ratio = 0.80
+    min_radius_mm = 5.0
+    diagnostics: list[dict] = []
+    eligible: list[tuple[float, int, np.ndarray]] = []
+    for index, cluster in enumerate(clusters):
+        record: dict = {"candidate": index + 1, "points": int(len(cluster))}
+        try:
+            center, radius = fit_circle_xy(cluster)
+            radii = np.linalg.norm(cluster[:, :2] - center, axis=1)
+            theta = np.mod(np.arctan2(cluster[:, 1] - center[1],
+                                      cluster[:, 0] - center[0]), 2 * math.pi)
+            occupied = len(np.unique(np.floor(theta / (2 * math.pi) * angular_bins).astype(int)))
+            coverage = occupied / angular_bins
+            radial_span = float(np.percentile(radii, 97.5) - np.percentile(radii, 2.5))
+            span_ratio = radial_span / max(float(radius), 1e-9)
+            center_offset = float(np.linalg.norm(center - search_center_xy))
+            is_eligible = (radius >= min_radius_mm and coverage >= min_coverage
+                           and span_ratio <= max_span_ratio)
+            score = math.sqrt(len(cluster)) * coverage / max(span_ratio, 0.05)
+            record.update({
+                "center_mm": [float(center[0]), float(center[1])],
+                "center_offset_mm": center_offset,
+                "radius_mm": float(radius),
+                "angular_bins_occupied": int(occupied),
+                "angular_coverage": float(coverage),
+                "radial_span_95_mm": radial_span,
+                "radial_span_ratio": float(span_ratio),
+                "eligible": bool(is_eligible),
+                "score": float(score),
+            })
+            if is_eligible:
+                eligible.append((score, index, cluster))
+        except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+            record.update({"eligible": False, "rejection": str(exc)})
+        diagnostics.append(record)
+
+    selector = {
+        "angular_bins": angular_bins,
+        "minimum_angular_coverage": min_coverage,
+        "maximum_radial_span_ratio": max_span_ratio,
+        "minimum_radius_mm": min_radius_mm,
+        "candidates": diagnostics,
+    }
+    if not eligible:
+        raise RuntimeError(
+            "deposited geometry was found, but no complete ring-like cluster passed "
+            f"the characterization shape gate: {json.dumps(selector)}")
+    _, selected_index, selected = max(eligible, key=lambda item: item[0])
+    selector["selected_candidate"] = selected_index + 1
+    diagnostics[selected_index]["selected"] = True
+    counts["after_ring_selection"] = len(selected)
+    return selected, selector
 
 
 def _top_surface(points: np.ndarray, config, counts: dict) -> np.ndarray:
@@ -536,7 +612,8 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, T_work_camera: np
     counts["after_search_roi"] = len(points)
     if len(points) < config.cluster_min_points:
         raise RuntimeError("no deposited geometry inside the characterization search region")
-    deposit = _filter_deposit(points, config, counts)
+    clusters = _deposit_clusters(points, config, counts)
+    deposit, selector = _select_ring_cluster(clusters, center, counts)
     coarse_center, coarse_radius = fit_circle_xy(deposit)
     width = bead_width_profile(deposit, coarse_center, bins=config.bead_width_bins)
     top = _top_surface(deposit, config, counts)
@@ -560,6 +637,7 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, T_work_camera: np
                                   K=K, plan=plan, layer=plan.layers[0], config=config)
     geometry = refined.geometry
     report = {**refined.report, "coarse": coarse, "counts_coarse": counts,
+              "ring_selector": selector,
               "kind": "characterization",
               "total_ms": (time.perf_counter() - started) * 1000}
     return CharacterizationResult(

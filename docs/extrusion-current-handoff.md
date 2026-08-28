@@ -186,6 +186,16 @@ ring 1 so the recipe comes from the physical ring, not a caliper.
 and reports deviation, timing (`acquisition_to_path_ms`), height and bead numbers
 with a ready-to-paste Markdown block.
 
+First real-ring evidence (2026-08-28): `20260828-171615-f088cf48/characterize-01`
+proved item-Start motion, capture, archive and return, but the original
+largest-DBSCAN-cluster rule selected a broad ChArUco-board residual (4,134 points)
+instead of the visible ring (1,609 points). Its 52.77 mm radius / 51.12 mm bead
+result is invalid. Characterization now selects a complete, radially compact ring
+cluster. Offline replay of the exact frame returns radius 39.17 mm, centre
+(217.94, 150.44) mm, bead footprint 13.26 mm and top Z 6.14 mm; the real depth
+fixture is in `tests/fixtures/extrusion/ring1/`. A fresh cell characterization is
+still required before Apply or paper measurements.
+
 Cell protocol: scan surface applied → Center on scanned surface → Generate → place
 ring 1 → Characterize → Apply → Generate → Measure L1 ×5 (noise floor) → re-place
 ×3 → ring 2 true → Measure L2 → ring 3 true → Measure L3 → shift a ring 10 mm
@@ -200,9 +210,10 @@ derives): a true 60 mm ring reads mean 0.80 / RMS 0.92 mm; the same ring shifted
 shifted 10 mm over a true ring 1 reads 10.17 mm WITH the per-layer floor and
 exhausts the branch guard without it.
 
-After the first real capture, copy `color.png` + `depth.npy` + `manifest.json` from
-the take into `tests/fixtures/extrusion/ring1/` (npz-compressed) and add a
-regression test that reprocesses it to the archived metrics.
+The first real depth capture and its transforms are stored (npz-compressed) in
+`tests/fixtures/extrusion/ring1/`; the regression test reprocesses it to the
+corrected metrics above. Colour is intentionally omitted because this selector is
+geometric and must not depend on material colour.
 
 ## Exact operator retry sequence
 
