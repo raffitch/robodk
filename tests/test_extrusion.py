@@ -72,6 +72,7 @@ def test_camera_route_labels_tailscale_lan_and_public_addresses():
 def test_global_health_reports_camera_route_and_exact_endpoint(monkeypatch):
     cfg = AppConfig()
     cfg.camera.ip = "100.123.63.127"
+    cfg.camera.lan_ip = ""      # only the Tailscale route configured (no direct path)
     monkeypatch.setattr("tasni.webapp.server.tcp_probe", lambda host, port: True)
     status = TestClient(create_app(cfg)).get("/api/health").json()["camera"]
     assert status == {

@@ -74,6 +74,27 @@ class CameraClient:
         ordered = [self.config.lan_ip, self.config.ip]
         return list(dict.fromkeys(h for h in ordered if h))   # dedup, keep order
 
+    def resolve_via(self, probe) -> "tuple[str, bool]":
+        """Walk the ladder with an injected ``probe(host, port) -> bool`` and cache
+        the winner. Returns ``(host, reachable)``.
+
+        This is how the *dashboard* learns the route: a capture resolves the host
+        as a side effect, but the health poll must not wait for one — otherwise the
+        UI reports the configured fallback until the operator happens to start a
+        preview. The probe is injected so the caller owns the timeout and the
+        "don't touch the camera mid-capture" rule."""
+        for host in self._candidates():
+            if probe(host, self.config.port):
+                self._host = host
+                return host, True
+        if self._host:                         # cached host is gone — re-ladder
+            self._host = None
+            for host in self._candidates():
+                if probe(host, self.config.port):
+                    self._host = host
+                    return host, True
+        return self.active_host, False
+
     def _connect(self, timeout: float | None = None) -> "tuple[socket.socket, str]":
         """Connect to the first reachable candidate; cache and return it.
 

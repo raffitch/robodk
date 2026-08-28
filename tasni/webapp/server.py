@@ -48,44 +48,39 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @app.get("/api/health")
     def health() -> dict:
         cam = services.config.camera
-        # The host actually in use, not the configured fallback: the client
-        # prefers the direct LAN path and silently falls back to Tailscale, so
-        # reporting cam.ip would claim a route we may not be on.
-        cam_host = services.camera.active_host
-        camera_route = connection_route(cam_host)
-        camera_endpoint = f"{cam_host}:{cam.port}"
-        camera_base = {"route": camera_route, "endpoint": camera_endpoint}
         robodk_ok = tcp_probe("127.0.0.1", ROBODK_API_PORT)
         # Don't probe the camera mid-capture — the unicast server serves one
         # client and a probe would steal the frame the lease holder expects. The
         # lease's owner label gives the precise holder ("live-preview",
         # "calibration-run", ...); fall back to the coarse job/live flags.
         if services.camera_lease.held:
-            camera = {
-                **camera_base, "ok": None, "state": "in_use",
-                "detail": f"in use by {services.camera_lease.owner} via "
-                          f"{camera_route} · {camera_endpoint}",
-            }
+            busy = f"in use by {services.camera_lease.owner}"
         elif services.jobs.running:
-            camera = {
-                **camera_base, "ok": None, "state": "in_use",
-                "detail": f"in use by running job via {camera_route} · "
-                          f"{camera_endpoint}",
-            }
+            busy = "in use by running job"
         elif services.live.running:
-            camera = {
-                **camera_base, "ok": None, "state": "in_use",
-                "detail": f"in use by live preview via {camera_route} · "
-                          f"{camera_endpoint}",
-            }
+            busy = "in use by live preview"
         else:
-            camera_ok = tcp_probe(cam_host, cam.port)
-            camera = {
-                **camera_base, "ok": camera_ok,
-                "state": "connected" if camera_ok else "offline",
-                "detail": f"{'connected' if camera_ok else 'offline/unreachable'} "
-                          f"via {camera_route} · {camera_endpoint}",
-            }
+            busy = ""
+        if busy:
+            # Mid-capture the running client has already resolved the host, so
+            # report it rather than opening a competing probe.
+            cam_host, camera_ok, state, lead = (
+                services.camera.active_host, None, "in_use", busy)
+        else:
+            # Idle: walk the ladder here. The client only resolves the host as a
+            # side effect of a capture, so without this the dashboard would echo
+            # the configured fallback ("Tailscale") until the operator happened
+            # to start a preview — reporting a route we are not actually on.
+            cam_host, camera_ok = services.camera.resolve_via(tcp_probe)
+            state = "connected" if camera_ok else "offline"
+            lead = "connected" if camera_ok else "offline/unreachable"
+        camera_route = connection_route(cam_host)
+        camera_endpoint = f"{cam_host}:{cam.port}"
+        camera = {
+            "route": camera_route, "endpoint": camera_endpoint,
+            "ok": camera_ok, "state": state,
+            "detail": f"{lead} via {camera_route} · {camera_endpoint}",
+        }
         return {
             "robodk": {"ok": robodk_ok, "detail": f"API :{ROBODK_API_PORT}"},
             "camera": camera,

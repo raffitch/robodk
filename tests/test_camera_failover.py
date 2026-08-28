@@ -27,8 +27,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from fastapi.testclient import TestClient  # noqa: E402
+
 from tasni.core.camera import CameraClient, CameraError  # noqa: E402
-from tasni.core.config import CameraConfig  # noqa: E402
+from tasni.core.config import AppConfig, CameraConfig  # noqa: E402
+from tasni.webapp.server import create_app  # noqa: E402
 
 DEAD = "192.0.2.1"          # RFC 5737 TEST-NET-1: guaranteed unroutable
 DEAD2 = "192.0.2.2"
@@ -117,6 +120,43 @@ def test_error_names_every_host_tried_when_all_are_down():
 def test_active_host_defaults_to_configured_ip_before_first_connect():
     client = CameraClient(_cfg(lan_ip="10.12.171.70", ip="100.123.63.127"))
     assert client.active_host == "100.123.63.127"
+
+
+# --- the dashboard resolves the route without a capture --------------------
+
+def test_resolve_via_picks_the_first_reachable_candidate_and_caches_it():
+    client = CameraClient(_cfg(lan_ip="10.12.171.70", ip="100.123.63.127"))
+    reachable = {"100.123.63.127"}
+    host, ok = client.resolve_via(lambda h, p: h in reachable)
+    assert (host, ok) == ("100.123.63.127", True)
+    assert client.active_host == "100.123.63.127"
+
+
+def test_resolve_via_drops_a_stale_cached_host_and_reladders():
+    client = CameraClient(_cfg(lan_ip="10.12.171.70", ip="100.123.63.127"))
+    client._host = "10.12.171.70"                    # cached from the cell LAN
+    host, ok = client.resolve_via(lambda h, p: h == "100.123.63.127")
+    assert (host, ok) == ("100.123.63.127", True)
+
+
+def test_resolve_via_reports_unreachable_without_caching_a_winner():
+    client = CameraClient(_cfg(lan_ip="10.12.171.70", ip="100.123.63.127"))
+    host, ok = client.resolve_via(lambda h, p: False)
+    assert ok is False
+    assert host == "100.123.63.127"                  # the configured fallback
+
+
+def test_health_reports_the_direct_path_before_any_capture(listener):
+    """The dashboard is what the operator reads. It must walk the ladder itself
+    rather than echo the configured fallback until something happens to capture."""
+    cfg = AppConfig()
+    cfg.camera.lan_ip = "127.0.0.1"
+    cfg.camera.ip = DEAD
+    cfg.camera.port = listener
+    status = TestClient(create_app(cfg)).get("/api/health").json()["camera"]
+    assert status["route"] == "Direct/LAN"
+    assert status["endpoint"] == f"127.0.0.1:{listener}"
+    assert status["ok"] is True
 
 
 # --- the real capture paths go through the ladder --------------------------
