@@ -776,7 +776,9 @@ export default function Extrusion() {
       <div className="btn-row">
         <input placeholder="session / ring note" value={measureNote} onChange={(e) => setMeasureNote(e.target.value)} />
         <button className="secondary" disabled={!plan || busy || status?.running} onClick={newMeasureSession}>New session</button>
-        <span className="hint">{measureSession ? `session ${measureSession.trial_id}` : "no session yet (one is created on first measure)"}</span>
+        <span className="hint">{measureSession ? `session ${measureSession.trial_id}`
+          : plan ? "no session yet (one is created on first measure)"
+            : "New session needs a plan: run Generate coordinates & fingerprint above — a session records the plan it measures against"}</span>
       </div>
       <label><input type="checkbox" checked={confirmMotion} onChange={(e) => setConfirmMotion(e.target.checked)} />
         I confirm the robot may move the camera to the inspection pose with collision validation off
