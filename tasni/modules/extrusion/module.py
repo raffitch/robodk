@@ -64,18 +64,22 @@ class MeasureSessionBody(BaseModel):
     note: str = ""
 
 
+# Measure-only defaults collisions OFF (unlike every print/dry-run path, which defaults
+# ON): the hand-placed ring stack is not in the station model, so RoboDK's check can only
+# speak about cell furniture, and it was rejecting otherwise good camera-only inspection
+# poses. IK/reachability screening still runs. Pass true to opt back in.
 class MeasureLayerBody(FingerprintBody):
     layer_index: int = Field(ge=1)
     annotation: dict = Field(default_factory=dict)
     confirm_robot_motion: bool = False
     confirm_close_range_tool_clear: bool = False
-    collision_check_enabled: bool = True
+    collision_check_enabled: bool = False
 
 
 class CharacterizeBody(BaseModel):
     confirm_robot_motion: bool = False
     confirm_close_range_tool_clear: bool = False
-    collision_check_enabled: bool = True
+    collision_check_enabled: bool = False
 
 
 class SurfaceCenterBody(BaseModel):

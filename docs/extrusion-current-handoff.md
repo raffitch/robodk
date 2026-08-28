@@ -161,13 +161,20 @@ on, and a **joint** target is created per layer.
   not a run failure. The accepted joints and their dA4/dA5/dA6 vs start are
   recorded in the pose block, and the inspection program gets the same
   interpolated wrist check the layer path uses.
-- **Same authoritative gate.** Each candidate is created, given an inspection
-  program, and put through `update_program(collisions=True)`; the first to pass is
-  used. If none does, the run fails with every rejection listed. Nothing backs off,
-  tilts past the configured cone, or drops collision checking to obtain a pass —
-  straight down at 300 mm over a fresh print remains the tightest live-print
-  clearance, and the spindle shares the flange with the camera. The separately
-  confirmed measure-only close-range mode assumes that tool is physically clear.
+- **Same authoritative gate for printing.** Each candidate is created, given an
+  inspection program, and put through `update_program(collisions=...)`; the first to
+  pass is used. If none does, the run fails with every rejection listed. On the
+  live-print paths that check stays ON: nothing backs off, tilts past the configured
+  cone, or drops collision checking to obtain a pass — straight down at 300 mm over a
+  fresh print is the tightest clearance, and the spindle shares the flange with the
+  camera.
+- **Measure-only is the one exception (collisions OFF).** The hand-placed ring stack
+  is not in the station model, so the check can only speak about cell furniture, and it
+  was rejecting otherwise good camera-only poses. `MeasureLayerBody` and
+  `CharacterizeBody` therefore default `collision_check_enabled=False`; candidates are
+  still IK-, reachability- and wrist-screened, and the pose block records
+  `"reachable, feasible"` rather than `"reachable, collision-free"`. Pass true in the
+  request body to opt back in.
 - Targets are named `<program>_Inspect_Target`, i.e. inside the existing
   `TasniCylinder_` namespace, so **Reset** and the normal artifact lifecycle already
   clean them. The chosen pose (and every rejected candidate) is logged in the dry-run

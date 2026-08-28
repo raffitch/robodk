@@ -448,9 +448,9 @@ export default function Extrusion() {
     try {
       await api.post("/measure/characterize", {
         confirm_robot_motion: confirmMotion,
-        collision_check_enabled: true,
+        collision_check_enabled: false,
       });
-      setMessage("CHARACTERIZE started — the robot moves the camera over ring 1, measures it and returns.");
+      setMessage("CHARACTERIZE started — collision validation OFF; the robot moves the camera over ring 1, measures it and returns.");
       refreshStatus();
     } catch (e: any) { setBusy(false); setMessage(e.message); }
   };
@@ -473,9 +473,9 @@ export default function Extrusion() {
         fingerprint: plan.fingerprint, layer_index: measureLayer,
         annotation: { introduced_offset_mm: shifted ? [offsetX, offsetY] : null, note: measureNote },
         confirm_robot_motion: confirmMotion,
-        collision_check_enabled: true,
+        collision_check_enabled: false,
       });
-      setMessage(`MEASURE layer ${measureLayer} started — camera move only; no extrusion, no valve.`);
+      setMessage(`MEASURE layer ${measureLayer} started — collision validation OFF; camera move only, no extrusion, no valve.`);
       refreshStatus();
     } catch (e: any) { setBusy(false); setMessage(e.message); }
   };
@@ -766,17 +766,23 @@ export default function Extrusion() {
     <div className="card">
       <h2>Ring stack — measure only (no extrusion)</h2>
       <p className="hint">Hand-placed dried rings. Each press moves ONLY the camera to the derived
-        inspection pose (collision-checked), takes one RGB-D frame, measures it and returns.
-        No layer program, no valve. Archived as <code>MEASURE_ONLY</code>, never counted as a print.</p>
+        inspection pose, takes one RGB-D frame, measures it and returns. No layer program, no valve.
+        Archived as <code>MEASURE_ONLY</code>, never counted as a print.</p>
+      <div className="io-note warn-text">Collision validation is OFF for these moves: the hand-placed
+        ring stack is not in the station model, so RoboDK's check only reports the cell furniture and
+        was rejecting otherwise good inspection poses. The pose is still IK-checked and reachable, and
+        the camera stops ≥300 mm above the ring — but nothing screens the path against the real cell.
+        Keep hands clear and watch the first move.</div>
       <div className="btn-row">
         <input placeholder="session / ring note" value={measureNote} onChange={(e) => setMeasureNote(e.target.value)} />
         <button className="secondary" disabled={!plan || busy || status?.running} onClick={newMeasureSession}>New session</button>
         <span className="hint">{measureSession ? `session ${measureSession.trial_id}` : "no session yet (one is created on first measure)"}</span>
       </div>
       <label><input type="checkbox" checked={confirmMotion} onChange={(e) => setConfirmMotion(e.target.checked)} />
-        I confirm the robot may move the camera to the inspection pose (hands clear of the cell).</label>
+        I confirm the robot may move the camera to the inspection pose with collision validation off
+        (hands clear of the cell).</label>
       <div className="btn-row">
-        <button disabled={!plan || !connected || !confirmMotion || busy || status?.running} onClick={characterize}>Characterize ring 1 — ROBOT MOVES</button>
+        <button disabled={!plan || !connected || !confirmMotion || busy || status?.running} onClick={characterize}>Characterize ring 1 — ROBOT MOVES · collisions OFF</button>
         {measureSession?.characterizations?.length ? (() => {
           const c = measureSession.characterizations[measureSession.characterizations.length - 1];
           return <>
@@ -793,7 +799,7 @@ export default function Extrusion() {
         </select></label>
         <label>Introduced offset X <input type="number" step={1} value={offsetX} onChange={(e) => setOffsetX(Number(e.target.value))} /> mm</label>
         <label>Y <input type="number" step={1} value={offsetY} onChange={(e) => setOffsetY(Number(e.target.value))} /> mm</label>
-        <button disabled={!plan || !connected || !confirmMotion || busy || status?.running} onClick={measure}>Measure layer {measureLayer} — ROBOT MOVES</button>
+        <button disabled={!plan || !connected || !confirmMotion || busy || status?.running} onClick={measure}>Measure layer {measureLayer} — ROBOT MOVES · collisions OFF</button>
         {(busy || status?.running) && <button className="secondary" onClick={cancel}>Cancel</button>}
       </div>
       {measureSession?.records?.length ? <table className="metrics">

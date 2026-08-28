@@ -658,3 +658,12 @@ def test_empty_roi_error_reports_which_band_rejected_the_points():
     assert "not enough deposited-geometry points" in msg
     assert "height" in msg and "radial" in msg          # both bands named
     assert "in_height_band" in msg and "in_radial_band" in msg
+
+
+def test_measure_only_requests_default_to_collisions_off():
+    """The ring stack is not modelled in the station, so measure-only camera moves
+    ship with RoboDK collision validation off; the print paths are unaffected."""
+    from tasni.modules.extrusion.module import CharacterizeBody, MeasureLayerBody
+
+    assert CharacterizeBody().collision_check_enabled is False
+    assert MeasureLayerBody(fingerprint="f", layer_index=1).collision_check_enabled is False
