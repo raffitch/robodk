@@ -177,9 +177,11 @@ selectedStepId: string | null            // null => the current step
 - **Only the selected step is expanded.** A `done` step collapses to its summary
   line with a *Change* affordance that selects it (e.g. Aim: "15 targets
   (TasniCalib_*) — Change").
-- **Expanding/collapsing never touches hardware.** The camera-live state is shown in
-  the Aim/Survey step header ("● camera live · Stop") even when collapsed; Run stops
-  the live preview exactly as today (`Calibration.tsx:299`).
+- **Expanding/collapsing never moves hardware.** Entering Aim/Survey does establish
+  the real-robot monitoring link (§4.5) — a driver connection, not motion — and Scan
+  starts its surface feed as today; collapsing stops nothing. The camera-live state
+  is shown in the step header ("● camera live · Stop") even when collapsed; Run
+  stops the live preview exactly as today (`Calibration.tsx:299`).
 - **Exactly one primary action per step**, right-aligned in the step footer;
   secondary actions sit left of it. The primary action's disabled state always
   carries a reason (footer text = `lockReason`).
@@ -271,14 +273,28 @@ module=)` stamps all three on `status`/`result`/`error` **and**, through the
 `JobContext`, on `progress`/`log`/`frame` (`jobrunner.py:41-49`);
 `LivePreview.start(..., owner=module)` stamps `module` on `frame`/`gate`/`boundary`/
 `survey` (`livepreview.py:118`; the camera lease already tracks an owner string,
-`camera_lease.py:29`). The runner keeps a **per-module last-job record**
-`{job_id, kind, status, result, error, started_at, finished_at}` (today it holds
-one global `status/result/error`, `jobrunner.py:66-69`, so a Scan run would erase
-the Calibration result a page returning later hydrates from). Each module `/status`
-returns its own record plus `busy_with: {module, kind, job_id} | null` when another
-module's job is running, so the page can say "Calibration job running — controls
-locked". Pages act only on events whose `job_id` matches the job they started or
-hydrated — delayed events from two consecutive runs of the same kind cannot mix.
+`camera_lease.py:29`). `jobs.start()` **returns the `job_id`**, and every start
+endpoint (`/run`, `/poses/simulate`, `/quick-sim`, `/dry-run`, `/print`,
+`/measure/characterize`, `/measure/layer`) returns it to the browser as
+`{job_id}`. The runner keeps **history per (module, kind)** —
+`last_jobs[module][kind] = {job_id, kind, status, result, error, started_at,
+finished_at}` — because a module has several kinds (calibration: solve + tour;
+extrusion: quick-sim, dry-run, print, characterize, measure) and today's single
+global `status/result/error` (`jobrunner.py:66-69`) lets a later `sim_tour` erase
+the Calibration solve a returning page hydrates its Apply button from. Each module
+`/status` returns `running: {module, kind, job_id} | null` (whoever's job it is,
+so a foreign one renders "Calibration job running — controls locked"),
+`jobs: {kind: record}` for its own kinds, and its **authoritative workflow
+fields** (calibration `applied`, scan lock/prepared state, extrusion
+`fingerprint`/`preflight`/`dry_run_passed`/`live_print_enabled`) exactly as today —
+workflow state is never inferred from "the last job". Pages act only on job events
+whose `job_id` matches a job they started or hydrated, so delayed events from two
+consecutive runs of one kind cannot mix.
+
+**Live-preview events are not job events.** `live.start(owner=module)` mints a
+`stream_id`, `/live/start` returns it, and `frame`/`gate`/`boundary`/`survey`
+events carry `module` + `stream_id` (no `job_id`); a page accepts only the stream
+it started, which also drops frames from a previous preview after a restart.
 **This is what makes the navigation/rehydration promise in §7 true**; it ships in
 phase 0.
 
@@ -498,9 +514,11 @@ module's `/status` route and `jobs.start` / `live.start` calls; no job logic cha
   (`ensure_robot_link` consolidation; `/poses/generate` and `/surface/lock` return
   409 when the driver is not monitoring and pass when it is;
   `require_live_pose=False` bypass),
-  `test_job_events_scope.py` (every event type carries `module`/`job_id`/`kind`;
-  two consecutive runs of one kind get distinct ids; per-module last-job records
-  survive another module's run; `busy_with` shape), `test_readiness.py`
+  `test_job_events_scope.py` (every job event carries `module`/`job_id`/`kind`, every
+  live event `module`/`stream_id`; `jobs.start` returns the id every start endpoint
+  echoes; two consecutive runs of one kind get distinct ids; the calibration solve
+  record survives a later `sim_tour` and another module's run; `running` shape),
+  `test_readiness.py`
   (recorded-vs-present for a deleted frame and a moved tool; `null` while a job
   runs), `test_runs_api.py` (run detail 200 / 404 / rejected segment).
 - `npm run typecheck && npm run build` green at the end of every phase.
@@ -540,11 +558,12 @@ Each phase is a separate branch off `ux-overhaul` merged when its checklist pass
    automatically on entering Aim/Survey, hard-gates target creation and surface
    locking (server-side, `require_live_pose` escape hatch), and is rechecked by
    every run right before motion as today.
-12. Every job execution has a unique `job_id`; `kind` is separate; the runner
-    keeps a last-job record per module.
 10. Guide checklist items are session-scoped and gate nothing; per-run safety is
     asserted only in the motion dialog.
 11. Readiness cards show *recorded* vs *present* rather than trusting `active.json`.
+12. Every job execution has a unique `job_id` (returned by every start endpoint);
+    `kind` is separate; the runner keeps history per (module, kind); live previews
+    carry a `stream_id` instead and are exempt from job-id filtering.
 
 ## 11. Review log
 
@@ -569,8 +588,15 @@ accepted:
 | # | Finding | Resolution |
 |---|---|---|
 | R9 | "No linking at Connect" rested on a false premise: the link is what makes the model track the arm, so the Create-targets seed is the arm's actual pose (`config.py:132-138`, `calibration/service.py:303`, `scan/service.py:2286`); nothing gates on it today | Connect stays station-only; `POST /api/rdk/link` auto-called on entering Aim/Survey; server-side live-pose gate on `/poses/generate` and `/surface/lock`; recheck before motion unchanged; `link_real_robot` + `ensure_real_robot_link` consolidated, not deleted (§4.5, §5.1, §5.2, §7) |
-| R10 | a single current/last-job record lets a Scan run erase the Calibration result a returning page hydrates from | per-module last-job records + `busy_with` (§4.5) |
+| R10 | a single current/last-job record lets a Scan run erase the Calibration result a returning page hydrates from | per-module records (superseded by R12: per (module, kind), and `running` instead of `busy_with`) |
 | R11 | `job` as a name lets delayed events from two consecutive runs of one kind mix | unique `job_id` per execution, `kind` separate; pages act only on their own `job_id` (§4.5) |
+
+Third round, same day:
+
+| # | Finding | Resolution |
+|---|---|---|
+| R12 | one last-job record per module: a later `sim_tour` would erase the Calibration solve, and Extrusion has five job kinds | history per (module, kind) + `/status` returns authoritative workflow fields separately from `running` (§4.5) |
+| — | clarify: `jobs.start()` returns `job_id` and start endpoints echo it; live-preview events need their own id; "never touches hardware" is false once Aim links the driver; decision numbering ran 9, 12, 10, 11 | all four applied (§4.5, §4.3, §10) |
 
 ## Appendix A — control mapping (today → new home)
 
@@ -612,7 +638,8 @@ Create corrected plan → step 6.
   (monitoring), Create targets unlocks; same for Scan Lock surface; start a
   Calibration dry run and switch to Scan — Scan shows "Calibration job running"
   and no foreign progress, and Connect is disabled until it ends; return to
-  Calibration afterwards — its result is still shown; kill RoboDK mid-session —
+  Calibration afterwards — its solve result and Apply are still shown, and they
+  survive a further dry run too; kill RoboDK mid-session —
   pill goes red within one health tick, Reconnect works; delete the inserted frame
   in RoboDK — the Dashboard surface card says "not in the current station".
 - **Phase 1**: Calibration end-to-end on the cell (board → aim → targets → simulate →
