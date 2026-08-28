@@ -449,6 +449,20 @@ class ExtrusionModule(WorkflowModule):
             if self._plan is None or body.fingerprint != self._plan.fingerprint:
                 raise HTTPException(
                     409, "toolpath changed; generate and visually simulate it again")
+            if (not body.collision_check_enabled
+                    and self._dry_run_fingerprint != body.fingerprint):
+                # Re-validating collisions per layer against a 117 MB station is the
+                # slow step of a live run, and skipping it is legitimate when
+                # something has ALREADY checked collisions for this exact geometry.
+                # The live gate is the quick simulation, which is explicitly the
+                # collisions-OFF preview — so only a passed dry run earns the skip.
+                # Without it, nothing would ever check collisions before real motion
+                # over a fresh print.
+                raise HTTPException(
+                    409, "live collision checking can only be skipped after a dry run "
+                         "has passed for this exact toolpath — the quick visual "
+                         "simulation runs with collisions OFF, so it cannot stand in "
+                         "for one. Run the dry run, or leave collision checking on.")
             if (self._quick_sim_fingerprint != body.fingerprint
                     or not self._quick_sim_approves_full_plan):
                 raise HTTPException(

@@ -627,3 +627,26 @@ def test_the_plan_labels_which_reference_its_rolls_are_measured_from():
     np.testing.assert_allclose(frame_referenced["roll_reference_x"], [1.0, 0.0, 0.0])
     assert robot_referenced["roll_reference"] == "camera_at_start"
     np.testing.assert_allclose(robot_referenced["roll_reference_x"], [-1.0, 0.0, 0.0])
+
+
+def test_live_collision_check_may_only_be_skipped_after_a_dry_run(tmp_path, monkeypatch):
+    """Skipping live collision validation is safe only when something already
+    checked collisions for THIS geometry.
+
+    The live gate is the QUICK SIM, which is explicitly the collisions-off visual
+    preview; the collision-checked run is the separate dry run. So "the simulation
+    already checked collisions" holds only if the dry run passed for this exact
+    fingerprint. Without it, disabling the live check would mean nothing ever
+    checked collisions before real motion over a fresh print.
+    """
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    cfg = AppConfig()
+    cfg.extrusion.hardware_io_test_approved = True
+    client = TestClient(create_app(cfg))
+    plan = client.post("/api/modules/extrusion/generate", json=generate_payload()).json()
+    response = client.post("/api/modules/extrusion/print",
+                           json={"fingerprint": plan["fingerprint"], "confirm_live": True,
+                                 "collision_check_enabled": False})
+    assert response.status_code == 409
+    detail = response.json()["detail"].lower()
+    assert "dry run" in detail and "collision" in detail

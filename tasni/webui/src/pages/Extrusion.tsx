@@ -221,6 +221,13 @@ export default function Extrusion() {
   const [quickLayers, setQuickLayers] = useState<number[]>([1]);
   const [approveRepresentativeLayers, setApproveRepresentativeLayers] = useState(false);
   const [liveCollisionCheck, setLiveCollisionCheck] = useState(true);
+  // A passed dry run has already checked collisions for this exact geometry, so
+  // re-validating per layer during the live run is redundant (and it is the slow
+  // step). Follow the dry run automatically rather than making the operator
+  // remember to untick it; if the dry run is invalidated, validation returns.
+  useEffect(() => {
+    setLiveCollisionCheck(!status?.dry_run_passed);
+  }, [status?.dry_run_passed]);
   const [surface, setSurface] = useState<ScanSurface | null>(null);
   const [inspection, setInspection] = useState<InspectionPreview | null>(null);
   const [measureSession, setMeasureSession] = useState<MeasureSession | null>(null);
@@ -730,11 +737,17 @@ export default function Extrusion() {
         {(busy || status?.running) && <button className="secondary" onClick={cancel}
           disabled={cancelling}>{cancelling ? "Cancellation requested…" : "Cancel safely"}</button>}</div>
       <label className="live-confirm"><input type="checkbox" checked={liveCollisionCheck}
-        onChange={(e) => setLiveCollisionCheck(e.target.checked)} disabled={!status?.quick_sim_live_approved || status?.running} />
-        Validate collisions before each physical layer (slower).
+        onChange={(e) => setLiveCollisionCheck(e.target.checked)}
+        disabled={!status?.quick_sim_live_approved || status?.running || !status?.dry_run_passed} />
+        Validate collisions before each physical layer (slow: RoboDK re-checks the whole station per layer).
       </label>
-      {!liveCollisionCheck && status?.quick_sim_live_approved && <div className="io-note warn-text">
-        Live collision validation is disabled. The physical run will rely on the visual simulation, preflight IK sampling, and your cell-clearance confirmation.
+      {!status?.dry_run_passed && status?.quick_sim_live_approved && <div className="io-note">
+        Run the dry run to skip this. The quick visual simulation runs with collisions OFF, so it cannot
+        stand in for a collision check — until a dry run passes for this exact toolpath, live validation stays on.
+      </div>}
+      {!liveCollisionCheck && status?.dry_run_passed && <div className="io-note warn-text">
+        Live collision validation is disabled: the dry run already checked collisions for this toolpath.
+        The physical run relies on that, preflight IK sampling, and your cell-clearance confirmation.
       </div>}
       <label className="live-confirm"><input type="checkbox" checked={confirmLive} onChange={(e) => setConfirmLive(e.target.checked)} disabled={!status?.live_print_enabled || status?.running} />
         I confirm the selected tool/frame/orientation, cell clearance, material system, and live extrusion run.</label>
