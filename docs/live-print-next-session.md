@@ -1,0 +1,168 @@
+# Live print blocker — continuation handoff (written 2026-08-28)
+
+**For the next agent, whichever tool.** Read [AGENTS.md](../AGENTS.md) first (5 min: working
+agreement + environment traps). This file is *where we are and what to do next*. The deep
+investigation record is
+[live-print-dispatch-handoff-2026-08-28.md](live-print-dispatch-handoff-2026-08-28.md) —
+read that only when you need the evidence behind a claim here.
+
+---
+
+## TL;DR — do this first
+
+```
+py -3.10 tools/dispatch_bisect.py jog
+```
+
+It moves the arm 2° on A6 through the **driver**, with no program, no machining project
+and no valve. It needs RoboDK open with the station loaded, and it prompts before moving.
+That single result splits the remaining hypothesis space in half (§3).
+
+Do **not** write a fix before running it. Every wrong turn on this bug so far came from
+reasoning past an unmeasured step.
+
+---
+
+## 1. The symptom (unchanged)
+
+Clicking **Print & record** in the Tasni app: RoboDK accepts the layer program, the cell
+makes one audible click, the arm does not move. Right-clicking the *same* program in
+RoboDK afterwards **does** move it. `AirOn`/`AirOff` also work by hand.
+
+```
+layer 1: dispatched — RunCode returned 195 of 195 instructions, run mode 6
+layer 1: program ran 0.0 s (NEVER OBSERVED RUNNING); flange camera says the arm did NOT move
+```
+
+## 2. State as of this handoff
+
+- Branch **`main`**, HEAD **`2b7d901`**, working tree clean, everything pushed.
+- 23 commits since `9101aa1` (the pre-blocker baseline).
+- Targeted tests green: 126 across `test_dispatch_report`, `test_extrusion_job`,
+  `test_extrusion_wait`, `test_extrusion`, `test_rdk_io_run_mode`,
+  `test_extrusion_runtime`, `test_extrusion_motion_witness`, `test_extrusion_standoff`,
+  `test_valve_outputs`. (Do **not** run the whole suite — it is too slow and has been
+  interrupted repeatedly. Run the files you touch.)
+- Last two functional commits are **instrumentation only**. No guessed fix has been
+  applied, deliberately: nothing is known well enough yet to fix.
+
+## 3. The decision tree — this is the actual work
+
+### Rung 1: `py -3.10 tools/dispatch_bisect.py jog`
+
+| Outcome | Meaning | Next |
+|---|---|---|
+| **Arm moves** | Driver + KUKAVARPROXY + `RoboDKsync570` KRL loop + pendant are all fine. The fault is **RoboDK's program executor**. | Rung 2 |
+| **Arm does not move** | The fault is **below RoboDK**, and `ConnectedState() == READY` only ever meant the TCP socket was up. | Go to the pendant: is `RoboDKsync570` *selected and running*, with its pointer cycling in `WHILE COM_ACTION >= 0`? What is `$OV_PRO` (program override)? Any unacknowledged `KSS…` message? Nothing in this repo can fix that; report it to the operator. |
+
+> Why `jog` is the right first cut: the live job's `finally` block already calls
+> `rdk.move_j_joints(start_joints)` on every failed run (`service.py:1078`) — a direct
+> driver move. Nobody has ever seen it move the arm, but that proves nothing, because the
+> arm is already at `start_joints`, so it is a zero-length move. `jog` is the first real
+> test of that path.
+
+### Rung 2: `py -3.10 tools/dispatch_bisect.py trivial`
+
+Builds a 2-instruction program, dispatches it exactly as the app does, deletes it after.
+
+| Outcome | Meaning | Next |
+|---|---|---|
+| **Arm moves** | API program dispatch works *from a bare script*. The difference is the **app's** state or timing. | Diff the script's numbers against the app's log for the same program. Suspects, in order: something the app leaves on the `Robolink` connection; the concurrent `/api/rdk` status poll hitting the same connection mid-run; a second RoboDK process (`Get-Process RoboDK` must be exactly 1). |
+| **Arm does not move**, but a manual right-click → Run does | **API-dispatched program execution is broken in this RoboDK build/station**, for any program. | Rung 3 |
+
+### Rung 3: RoboDK's own driver log
+
+Connect → Connect robot → show the log, keep it visible, and dispatch once from the app
+and once by right-click. It logs every command RoboDK sends the driver and every reply.
+**This artifact has never been read and is now the highest-value unknown.** It is the only
+place RoboDK records *why* it stopped.
+
+Also re-run the app once and read the **new** line added in `37d4f18`:
+
+```
+layer 1: driver READY -> WORKING -> READY          <- RoboDK did dispatch; controller-side fault
+layer 1: driver stayed READY throughout — it was never asked to work, so RoboDK
+         accepted the program and then dispatched nothing   <- RoboDK-side fault
+layer 1: driver READY -> PROBLEMS (…message…)      <- the controller says why
+```
+
+## 4. Measured dead — do not re-chase any of these
+
+| Claim | Killed by |
+|---|---|
+| `RunCode()` refused the program | Returns **195 of 195** instructions |
+| Station not in `RUN_ROBOT` | Run mode reads back **6** every dispatch |
+| The layer program / Curve Follow project is malformed | The **2-instruction valve program** dispatches identically (`2 of 2`, mode 6) and is equally silent |
+| The valve mapping (`$OUT[0]`, `KSS014444`) | Fixed in `deaad43`; IOs renamed to bare numbers; AirOn/AirOff run by hand |
+| Wrong driver `.src` version | The two copies in `Downloads` are **byte-identical** (`cmp`) |
+| Stale work frame / stale scan / wrong inspection tool / bad scan / 140 mm offset | All measured on the cell — see the investigation doc §8 |
+| Camera / depth / hand-eye | Verified: TCP says 471.1 mm, camera measures 467.5 mm |
+
+**The single most important reframe:** the trivial no-motion valve program fails the same
+way as the 195-instruction layer program. This is **not** about what the program contains.
+Stop looking at the toolpath, the machining project, the seed, the orientation, the valve
+mapping.
+
+## 5. Where the code is
+
+| What | Where |
+|---|---|
+| Dispatch + all its diagnostics | `tasni/core/rdk_io.py:1890` `dispatch_program()` |
+| Driver's own state (`READY`/`WORKING`/`PROBLEMS`) | `tasni/core/rdk_io.py:1953` `driver_state()` |
+| Thin int wrapper for old callers | `tasni/core/rdk_io.py:1941` `start_program()` |
+| Valve programs (the simple-case control) | `tasni/core/rdk_io.py:2005` `run_station_program()` |
+| Direct driver move — the fallback primitive | `tasni/core/rdk_io.py:250` `move_j_joints()` |
+| Busy-wait, fast polling, `on_poll` hook | `tasni/modules/extrusion/service.py:279` `_wait_program()` |
+| Log-line formatters | `service.py:183` `describe_dispatch()`, `service.py:256` `describe_driver_states()` |
+| Flange-camera motion witness | `service.py:156` `view_changed()` |
+| Live layer dispatch (the loop under investigation) | `service.py:892` |
+| Bisect ladder | `tools/dispatch_bisect.py` |
+| Tests for all of the above | `tests/test_dispatch_report.py` |
+
+## 6. If dispatch cannot be fixed — the fallback, with honest costs
+
+Only after rungs 1–3. Two options, both real:
+
+**A. Drive the path directly through the driver** (no generated program). `move_j_joints`
+/ `move_j_pose` already exist. Removes this entire class of problem.
+*Cost:* the driver is blocking per command (`$ADVANCE = 0` in `RoboDKsync570.src`), so
+every point is a round trip and you lose RoboDK's blending/rounding — a dense extrusion
+path would print jerkily, or slowly, or both. Acceptable for **inspection** (one pose, no
+path), which is the natural place to start. Probably not acceptable for the print itself.
+
+**B. Post-process to a native KUKA `.src` and run it on the controller**
+(`RUNMODE_MAKE_ROBOTPROG_AND_START`). Preserves blending and runs at full speed with no
+PC in the motion loop.
+*Cost:* a file has to get onto the controller, and a previous attempt at `.src` import was
+blocked by a modal dialog in RoboDK (see the `extrusion-a4-wrist-flip-fix` history). Needs
+the operator at the pendant.
+
+Do not start either without telling the operator — B especially changes how the cell is
+operated.
+
+## 7. Ground rules for this repo
+
+Full list in [AGENTS.md](../AGENTS.md). The four that bite hardest:
+
+1. **`py -3.10`** — there is no `python` on PATH.
+2. **Never run the full pytest suite** — run the files you touched.
+3. **Restart the app after backend edits** and check `/api/health` `build.stale` *before*
+   asking for a cell test. Two cell runs were wasted on stale code.
+4. **Commit and push everything.** The operator reviews from pushed history; the Jetson
+   deploys from it. Report the hashes.
+
+Plus, specific to this bug: **measure before theorising**, and keep test fakes physically
+coherent — a fake whose driver never leaves `READY` models the exact fault under
+investigation and will pass the guard meant to catch it (that happened; see `37d4f18`).
+
+## 8. What to write back
+
+Update, in this order:
+
+1. This file — the decision-tree outcome you got, with the actual log lines.
+2. The investigation doc's §3 table — move whatever you measured from *inferred* to
+   *measured*, or add a new dead row.
+3. `AGENTS.md` §4 — if the "what's open" summary changed.
+
+And say plainly which of the two branches at Rung 1 you landed in. That one fact is worth
+more to the next person than any amount of narrative.

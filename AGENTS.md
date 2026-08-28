@@ -65,7 +65,11 @@ Measured and therefore **dead** — do not re-chase:
 **Next action:** `py -3.10 tools/dispatch_bisect.py jog` — a direct driver `MoveJ`, no
 program at all. If the arm moves, the fault is RoboDK's program executor; if it does not,
 the fault is below RoboDK and `ConnectedState() == READY` only ever meant the socket was
-up. Full reasoning in the handoff doc.
+up.
+
+> **Picking this up? Read [docs/live-print-next-session.md](docs/live-print-next-session.md)**
+> — the continuation handoff: current state, the full decision tree for each bisect
+> outcome, where the code is, and the fallback options with their real costs.
 
 **Also pending:** the PFH paper's ring-stack cell run (deadline 1 Sep 2026) — see
 `docs/superpowers/` and `docs/extrusion-current-handoff.md`. Discard every

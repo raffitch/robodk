@@ -15,6 +15,9 @@ never been looked at. This version separates **measured** from **inferred**, dec
 latest log against the code, and orders the next steps by cost × decisiveness. Nothing
 in the code changed for this revision.
 
+**Continuing this work? Start with [live-print-next-session.md](live-print-next-session.md)**
+— what to run next and what each outcome means. This file is the evidence behind it.
+
 Read with [docs/agent-debug-map.md](agent-debug-map.md). The extrusion module's
 background is [docs/extrusion-current-handoff.md](extrusion-current-handoff.md).
 

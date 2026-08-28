@@ -3,7 +3,13 @@
 Current purpose: give future agents a low-token entry point into the Tasni app,
 scan/calibration logic, RoboDK connection, and Jetson camera server.
 
-Last updated: 2026-08-13. Active branch: `calibration-improvements`.
+Last updated: 2026-08-28. Active branch: `main` (`calibration-improvements` merged in
+`51849b1`, 2026-08-25).
+
+> **OPEN BLOCKER — live print, the arm does not move.** If you are picking that up, read
+> **[live-print-next-session.md](live-print-next-session.md)** first; the evidence is in
+> [live-print-dispatch-handoff-2026-08-28.md](live-print-dispatch-handoff-2026-08-28.md).
+> New agents: start at [../AGENTS.md](../AGENTS.md).
 
 ## Two-path workframe survey (2026-08-13)
 
@@ -190,7 +196,10 @@ Use this file before reading the long handoff docs.
 
 | Need | Read / edit |
 |---|---|
-| Global agent rules and app overview | `CLAUDE.md` |
+| Global agent rules and app overview | `AGENTS.md` (any tool), then `CLAUDE.md` |
+| **Live print blocker — what to run next** | `docs/live-print-next-session.md` |
+| Live print blocker — the evidence | `docs/live-print-dispatch-handoff-2026-08-28.md` |
+| Dispatch diagnostics / bisect ladder | `tasni/core/rdk_io.py` `dispatch_program`, `tools/dispatch_bisect.py` |
 | Tasni app architecture | `tasni/README.md` |
 | Cylinder/extrusion current state and status -5 diagnosis | `docs/extrusion-current-handoff.md` |
 | Cylinder original requirements (historical) | `docs/HANDOFF_EXTRUSION_CYLINDER.md` |
