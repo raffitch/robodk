@@ -31,9 +31,9 @@ angular coverage and radial compactness. Offline replay selects the visible ring
 returns radius 39.17 mm, centre (217.94, 150.44) mm, bead footprint 13.26 mm and top Z
 6.14 mm. A second 300 mm attempt was correctly rejected but saw no independent ring
 cluster although the operator confirmed the ring was present. Depth is already native
-1280×720; the limiting factor is the 300 mm clamp. **Next cell test:** restart, enable
-the explicit close-range confirmation (extrusion tool detached/clear), Characterize at
-the 175 mm MinZ clamp, verify the archived mask is annular, then Apply. Failed attempts
+1280×720, whose MinZ is ~280 mm, so the 300 mm clamp is the sensor floor, not a tunable
+margin — the ring-selector fix is what the next run tests. **Next cell test:** restart,
+Characterize at 300 mm, verify the archived mask is annular, then Apply. Failed attempts
 now archive raw RGB-D. Live print remains a separate guarded test after measurement and
 continues to use 300 mm.
 

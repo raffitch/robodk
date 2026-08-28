@@ -235,7 +235,6 @@ export default function Extrusion() {
   const [offsetY, setOffsetY] = useState(0);
   const [measureNote, setMeasureNote] = useState("");
   const [confirmMotion, setConfirmMotion] = useState(false);
-  const [closeRangeToolClear, setCloseRangeToolClear] = useState(false);
   const [paper, setPaper] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
 
@@ -449,7 +448,6 @@ export default function Extrusion() {
     try {
       await api.post("/measure/characterize", {
         confirm_robot_motion: confirmMotion,
-        confirm_close_range_tool_clear: closeRangeToolClear,
         collision_check_enabled: true,
       });
       setMessage("CHARACTERIZE started — the robot moves the camera over ring 1, measures it and returns.");
@@ -475,7 +473,6 @@ export default function Extrusion() {
         fingerprint: plan.fingerprint, layer_index: measureLayer,
         annotation: { introduced_offset_mm: shifted ? [offsetX, offsetY] : null, note: measureNote },
         confirm_robot_motion: confirmMotion,
-        confirm_close_range_tool_clear: closeRangeToolClear,
         collision_check_enabled: true,
       });
       setMessage(`MEASURE layer ${measureLayer} started — camera move only; no extrusion, no valve.`);
@@ -778,10 +775,6 @@ export default function Extrusion() {
       </div>
       <label><input type="checkbox" checked={confirmMotion} onChange={(e) => setConfirmMotion(e.target.checked)} />
         I confirm the robot may move the camera to the inspection pose (hands clear of the cell).</label>
-      <label className="live-confirm"><input type="checkbox" checked={closeRangeToolClear}
-        onChange={(e) => setCloseRangeToolClear(e.target.checked)} disabled={status?.running} />
-        Close-range measurement ({config?.measure_close_range_min_mm ?? 175} mm minimum): I confirm the extrusion tool is detached or
-        otherwise cannot contact the ring. Collision validation remains enabled.</label>
       <div className="btn-row">
         <button disabled={!plan || !connected || !confirmMotion || busy || status?.running} onClick={characterize}>Characterize ring 1 — ROBOT MOVES</button>
         {measureSession?.characterizations?.length ? (() => {

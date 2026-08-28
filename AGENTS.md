@@ -78,14 +78,18 @@ was a broad ChArUco-board depth residual, not the ring. The new selector uses an
 coverage and radial compactness; offline replay of that exact frame reads radius 39.17
 mm, centre (217.94, 150.44) mm, bead footprint 13.26 mm and top Z 6.14 mm.
 
-**Next action:** restart onto the close-range measure-only change, enable its explicit
-"extrusion tool detached/clear" confirmation, then run **Ring stack → Characterize ring
-1**. The second 300 mm cell attempt found no independent ring cluster even though the
-operator confirmed the ring was present. Depth is already the D435i's native maximum
-1280×720; the current recipe optically fits at 135 mm but was clamped to 300 mm. The
-opt-in measure-only path clamps at the 1280×720 MinZ of 175 mm (~67% frame height), while
-live-print inspection stays at 300 mm and all collision/wrist gates remain. Failed
-characterization now archives raw RGB-D instead of losing the only diagnostic frame.
+**Next action:** restart the backend, then run **Ring stack → Characterize ring 1** at
+300 mm. The second 300 mm cell attempt found no independent ring cluster even though the
+operator confirmed the ring was present; the ring-selector fix (above) is the change to
+retest, not a shorter standoff. **Closer is not available on this cell:** depth streams at
+the D435i's native maximum 1280×720, whose MinZ is ~280 mm, so the existing 300 mm
+`inspection_min_mm` already sits at the sensor floor. (An earlier change clamped
+measure-only to 175 mm on a wrong MinZ reading; `measure_close_range_min_mm` is now 300 mm
+and the operator checkbox is gone. Real close-range headroom needs a LOWER depth profile
+in `server_unicast_syncronous.py` — MinZ scales with depth width — which is a separate,
+deliberate change.) The optical fit at 135 mm is what the recipe *wants*, not what the
+sensor can measure. Failed characterization now archives raw RGB-D instead of losing the
+only diagnostic frame.
 
 > **Picking this up? Read [docs/live-print-next-session.md](docs/live-print-next-session.md)**
 > — the continuation handoff: current state, the full decision tree for each bisect

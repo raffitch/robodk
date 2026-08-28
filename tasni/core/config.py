@@ -824,10 +824,12 @@ class ExtrusionConfig(_Model):
 
     # -- ring-stack measure-only experiment (modules/extrusion/measure.py) ----
     # Close-range measurement is opt-in per request and requires the operator to
-    # confirm that the extrusion tool is detached or otherwise clear. 175 mm is
-    # the D435i MinZ used by this cell at the native 1280x720 depth profile; live
-    # printing continues to use inspection_min_mm (300 mm).
-    measure_close_range_min_mm: float = Field(default=175.0, gt=0, le=2000)
+    # confirm that the extrusion tool is detached or otherwise clear. It buys
+    # nothing at the depth profile this cell streams: the D435i MinZ is ~280 mm at
+    # 1280x720 (MinZ scales with depth width, so only a LOWER profile would open
+    # real headroom), so the clamp stays at the 300 mm inspection_min_mm floor.
+    # Do not lower it without lowering server_unicast_syncronous.py's depth width.
+    measure_close_range_min_mm: float = Field(default=300.0, gt=0, le=2000)
     # Layer N keeps only points above the PREVIOUS layer's measured top at the
     # nearest XY sample plus this margin, so a displaced ring cannot drag the
     # exposed crescent of the ring beneath it into the skeleton.

@@ -470,15 +470,18 @@ def test_measure_only_close_range_requires_explicit_job_option(tmp_path, monkeyp
     plan = auto_plan()
     session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
 
+    # The shipped default sits at the 1280x720 MinZ-bounded 300 mm floor; use a
+    # distinct value here so the test proves the clamp is wired, not a coincidence.
+    svc.config.extrusion.measure_close_range_min_mm = 200.0
     out = RingCharacterizeJob(
         svc, plan, session, check_collisions=True,
         close_range_tool_clear=True)(Ctx())
 
     pose = out["characterization"]["inspection_pose"]
-    assert pose["near_mm"] == 175.0
-    assert pose["standoff_mm"] == 175.0
+    assert pose["near_mm"] == 200.0
+    assert pose["standoff_mm"] == 200.0
     assert pose["d_fit_mm"] < pose["standoff_mm"]
-    assert pose["fill_fraction"]["height"] > 0.6
+    assert pose["fill_fraction"]["height"] > 0.5
 
 
 def test_characterize_archives_raw_frame_when_ring_processing_fails(tmp_path, monkeypatch):
