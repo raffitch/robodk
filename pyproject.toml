@@ -11,7 +11,7 @@ dependencies = [
     "numpy",
     "opencv-contrib-python",   # cv2.aruco (ChArUco) lives in contrib
     "scipy",                   # post-solve reprojection refinement
-    "robodk",                  # RoboDK Python API (robolink + robomath)
+    "robodk>=6.0.1",           # RoboDK Python API (item Start dispatch; cell-proven)
     "fastapi",
     "uvicorn[standard]",
     "lz4",                     # depth frame decompression (scan module)

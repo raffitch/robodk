@@ -8,18 +8,21 @@ read that only when you need the evidence behind a claim here.
 
 ---
 
-## TL;DR — do this first
+## TL;DR — measured outcome and next cut
 
-```
-py -3.10 tools/dispatch_bisect.py jog
-```
+On the cell, `jog` physically moved A6 by 2 deg; immediately afterwards `trivial`
+returned 1/1 accepted but never became busy and did not physically move. There was one
+RoboDK process, run mode read 6, the kept layer program's run type read 2 (run on robot),
+and the driver stayed READY. Right-click Run on the kept layer program still moved the
+arm. The fault is therefore **RoboDK v6.0.5's API program-execution path**, not the
+driver, controller, program content, or Tasni app state.
 
-It moves the arm 2° on A6 through the **driver**, with no program, no machining project
-and no valve. It needs RoboDK open with the station loaded, and it prompts before moving.
-That single result splits the remaining hypothesis space in half (§3).
-
-Do **not** write a fix before running it. Every wrong turn on this bug so far came from
-reasoning past an unmeasured step.
+The documented program item command `program.setParam("Start", 0)` was then tested on
+the same bare one-MoveJ fixture: it returned `"OK"`, RoboDK reported the robot busy, and
+the operator confirmed the physical arm moved. The narrow fix is implemented:
+real-robot programs use item Start; simulation retains `RunCode()`. Next cell test is
+Ring stack → Characterize ring 1 (inspection motion only, no valve), followed by a
+separate guarded live-print test if characterization succeeds.
 
 ---
 
@@ -36,19 +39,26 @@ layer 1: program ran 0.0 s (NEVER OBSERVED RUNNING); flange camera says the arm 
 
 ## 2. State as of this handoff
 
-- Branch **`main`**, HEAD **`2b7d901`**, working tree clean, everything pushed.
-- 23 commits since `9101aa1` (the pre-blocker baseline).
+- Branch **`main`**, working tree clean before this handoff update; push every update.
 - Targeted tests green: 126 across `test_dispatch_report`, `test_extrusion_job`,
   `test_extrusion_wait`, `test_extrusion`, `test_rdk_io_run_mode`,
   `test_extrusion_runtime`, `test_extrusion_motion_witness`, `test_extrusion_standoff`,
   `test_valve_outputs`. (Do **not** run the whole suite — it is too slow and has been
   interrupted repeatedly. Run the files you touch.)
-- Last two functional commits are **instrumentation only**. No guessed fix has been
-  applied, deliberately: nothing is known well enough yet to fix.
+- The item-Start fix is implemented and 153 focused extrusion/measurement tests pass.
+  End-to-end cell validation is pending after an app restart.
+- Cell bisect measured 2026-08-28: direct `MoveJ` physically moved; API-created one-MoveJ
+  program was accepted but never busy and did not move. One RoboDK process was running;
+  RoboDK `6.0.5.26883`; station run mode 6; program run type 2. The external Python API
+  package was upgraded from `robodk 5.6.4` to `6.0.1`; `RunCode()` still failed
+  identically, eliminating the version mismatch. `pyproject.toml` now requires 6.0.1+.
 
 ## 3. The decision tree — this is the actual work
 
 ### Rung 1: `py -3.10 tools/dispatch_bisect.py jog`
+
+**Measured outcome: ARM MOVED physically by 2 deg on A6.** Continue to Rung 2; do not
+re-check the controller path.
 
 | Outcome | Meaning | Next |
 |---|---|---|
@@ -65,6 +75,11 @@ layer 1: program ran 0.0 s (NEVER OBSERVED RUNNING); flange camera says the arm 
 
 Builds a 2-instruction program, dispatches it exactly as the app does, deletes it after.
 
+**Measured outcome: ARM DID NOT MOVE.** `RunCode()` returned 1 for the one-instruction
+program; `program.Busy()` and `robot.Busy()` remained false for 10 seconds; model joints
+did not change; the operator directly confirmed no physical motion. This eliminates
+app-specific state/timing and all layer-program content.
+
 | Outcome | Meaning | Next |
 |---|---|---|
 | **Arm moves** | API program dispatch works *from a bare script*. The difference is the **app's** state or timing. | Diff the script's numbers against the app's log for the same program. Suspects, in order: something the app leaves on the `Robolink` connection; the concurrent `/api/rdk` status poll hitting the same connection mid-run; a second RoboDK process (`Get-Process RoboDK` must be exactly 1). |
@@ -72,18 +87,18 @@ Builds a 2-instruction program, dispatches it exactly as the app does, deletes i
 
 ### Rung 3: what the driver itself reports
 
-**This is the highest-value unknown: it has never been read.** Three ways in, ordered by
-how well each is verified (installed version: **RoboDK v6.0.5**, 2026-06-15):
+The cheapest driver witness has now been read: it stayed READY during both the app layer
+dispatch and the bare-program dispatch. Combined with a successful direct-driver jog,
+that means RoboDK's RunProg executor never sent the driver a command. The alternate
+`setParam("Start", 0)` command returned `"OK"` and physically moved A6; production
+real-robot dispatch now uses it. The routes below remain useful only if the app-level
+cell validation differs (installed version: **RoboDK v6.0.5**, 2026-06-15):
 
-1. **You may already have it.** `driver_state()` (`37d4f18`) reads `ConnectedState()`,
-   which returns the driver's own status message — the same string the connection panel
-   shows. Run the app once and read the new `layer N: driver …` line before touching the
-   GUI.
-2. **`/DEBUG=` — documented** (`C:\RoboDK\Notes.txt`, v3.4.2: "It is possible to pass a
+1. **`/DEBUG=` — documented** (`C:\RoboDK\Notes.txt`, v3.4.2: "It is possible to pass a
    specific file for debugging"). Close RoboDK, relaunch as
    `"C:\RoboDK\bin\RoboDK.exe" /DEBUG=C:\Users\User\Desktop\robodk-debug.txt`, reproduce,
    read the file. This is general RoboDK debug output, not driver-only.
-3. **Run the driver in a visible console — most direct.** The KUKA driver is a separate
+2. **Run the driver in a visible console — most direct.** The KUKA driver is a separate
    process RoboDK spawns: `C:\RoboDK\api\robot\apikuka.exe`. The shipped
    `apikuka-start.bat` only sets Qt paths and launches it, so it runs fine in a console
    window where you can see the traffic. It takes commands on **stdin** — that is how

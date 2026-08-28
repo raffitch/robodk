@@ -1,17 +1,10 @@
-"""API-driven RunCode() follows the STATION run mode, not the program's run type.
+"""Program dispatch asserts station mode before either supported start command.
 
-RoboDK's own docs draw the line:
-
-  setRunType  -- "specify if a program made using the GUI will be run in
-                  simulation mode or on the real robot"
-  setRunMode(RUNMODE_RUN_ROBOT) -- "moves the real robot from the PC"
-
-So right-clicking Run in the GUI honours the run TYPE (which is why that worked
-on the cell), while our RunCode() honours the run MODE. Anything that simulates
-in between -- Program.Update() validation, collision screening -- can leave the
-station in RUNMODE_SIMULATE, and then RunCode() moves only the model: the arm
-never budges, the program "finishes" in a fraction of a second, and nothing is
-deposited. Observed on the cell 2026-08-28.
+Both the run type and station run mode are asserted immediately before execution.
+Cell measurement on 2026-08-28 proved that mode 6 and run type 2 were necessary but
+not sufficient for ``RunCode`` on RoboDK 6.0.5: it accepted the program and dispatched
+nothing. The alternate item ``Start`` command moved the physical arm under the same
+state, so real execution now uses Start while simulation keeps RunCode.
 
     py -3.10 -m pytest tests/test_rdk_io_run_mode.py
 """
@@ -30,6 +23,7 @@ class _Program:
     def Valid(self): return True
     def setRunType(self, t): self.calls.append(("setRunType", t))
     def RunCode(self): self.calls.append(("RunCode",)); return 0
+    def setParam(self, name, value): self.calls.append(("setParam", name, value)); return "OK"
 
 
 class _Rdk:
@@ -50,8 +44,9 @@ def test_real_robot_run_forces_run_robot_mode_before_running():
     io.start_program("P", real_robot=True)
     assert ("setRunMode", rl.RUNMODE_RUN_ROBOT) in rdk.calls
     modes = [i for i, c in enumerate(rdk.calls) if c[0] == "setRunMode"]
-    runs = [i for i, c in enumerate(rdk.calls) if c[0] == "RunCode"]
-    assert modes and runs and modes[-1] < runs[0], "run mode must be set BEFORE RunCode"
+    starts = [i for i, c in enumerate(rdk.calls) if c[0] == "setParam"]
+    assert modes and starts and modes[-1] < starts[0], "run mode must be set BEFORE Start"
+    assert ("RunCode",) not in rdk.calls
 
 
 def test_simulated_run_forces_simulate_mode():
@@ -59,6 +54,7 @@ def test_simulated_run_forces_simulate_mode():
     io.start_program("P", real_robot=False)
     assert ("setRunMode", rl.RUNMODE_SIMULATE) in rdk.calls
     assert ("setRunType", rl.PROGRAM_RUN_ON_SIMULATOR) in rdk.calls
+    assert ("RunCode",) in rdk.calls
 
 
 def test_run_type_is_still_set_so_the_gui_agrees_with_the_api():

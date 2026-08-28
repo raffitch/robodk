@@ -48,9 +48,10 @@ strand the robot on old code. Say which commit hashes you pushed in your summary
 
 ## 4. What is open right now (2026-08-28)
 
-**Live print: the arm does not move.** The app dispatches a layer program, RoboDK accepts
-it, the cell clicks once, the arm does not move — and right-clicking the *same* program in
-RoboDK afterwards *does* move it.
+**Live print: RoboDK's `RunCode()` API path dispatches nothing; fix implemented, cell
+validation pending.** The app dispatches a
+layer program, RoboDK accepts it, the cell clicks once, the arm does not move — and
+right-clicking the *same* program in RoboDK afterwards *does* move it.
 
 Measured and therefore **dead** — do not re-chase:
 
@@ -59,13 +60,20 @@ Measured and therefore **dead** — do not re-chase:
 - The trivial **2-instruction valve program dispatches identically** and is equally
   silent, so this is **not** about the layer program's contents. Stop looking at the
   toolpath, the Curve Follow machining project, and the valve mapping.
+- The direct-driver bisect `dispatch_bisect.py jog` **physically moved A6 by 2 deg**.
+  Immediately afterwards the bare one-MoveJ `trivial` program returned 1/1 accepted,
+  never became busy, left the driver READY, and did not move the physical arm. This
+  measures the fault inside RoboDK's API program-execution path; the driver,
+  KUKAVARPROXY, KRL loop, pendant state, and app-specific timing are not the cause.
 - Also dead: stale work frame/centre, wrong inspection tool, a bad scan, the
   `RoboDKsync570.src` driver version (the two copies are byte-identical), `$OUT[0]`.
 
-**Next action:** `py -3.10 tools/dispatch_bisect.py jog` — a direct driver `MoveJ`, no
-program at all. If the arm moves, the fault is RoboDK's program executor; if it does not,
-the fault is below RoboDK and `ConnectedState() == READY` only ever meant the socket was
-up.
+**Next action:** restart Tasni and cell-test **Ring stack → Characterize ring 1 first**.
+The bare item-Start bisect physically moved the arm, and the app now uses that path for
+real-robot programs while retaining `RunCode()` for simulation. Characterize is the
+safest end-to-end proof because it moves only the inspection camera and never calls a
+valve. If it succeeds, archive the real ring frame and then separately re-run live print
+with normal valve/material safety checks. Python `robodk>=6.0.1` is now required.
 
 > **Picking this up? Read [docs/live-print-next-session.md](docs/live-print-next-session.md)**
 > — the continuation handoff: current state, the full decision tree for each bisect
@@ -74,7 +82,9 @@ up.
 **Also pending:** the PFH paper's ring-stack cell run (deadline 1 Sep 2026) — see
 `docs/superpowers/` and `docs/extrusion-current-handoff.md`. Discard every
 `runs/extrusion/20260828-*-f088cf48` trial: they are measurements of an empty board and
-must not reach the paper.
+must not reach the paper. The first real-ring characterization attempt
+`20260828-171615-f088cf48` also failed before archiving raw RGB-D because its inspection
+program used the broken `RunCode()` path; it is not paper evidence.
 
 ## 5. How to work here
 

@@ -190,6 +190,8 @@ def describe_dispatch(report: dict) -> str:
     log lines instead of the same one (cell 2026-08-28: accepted, never busy, no
     motion, and none of these three numbers recorded).
     """
+    method = report.get("start_method", "run_code")
+    started = report.get("started")
     code = report.get("run_code")
     count = report.get("instruction_count")
     mode, expected = report.get("run_mode"), report.get("run_mode_expected")
@@ -200,11 +202,24 @@ def describe_dispatch(report: dict) -> str:
         where = f" — station run mode is {mode}, NOT the {expected} we set"
     else:
         where = f", run mode {mode}"
+    if method == "item_start":
+        result = report.get("start_result")
+        verdict = "" if started is not False else "  <-- RoboDK did not confirm start"
+        return (f"item Start returned {result!r} for {count if count is not None else '?'} "
+                f"instructions{where}{verdict}")
     verdict = ""
     if code == 0 and (count is None or count > 0):
         verdict = ("  <-- RoboDK cleared ZERO instructions: it accepted the call "
                    "and refused the program")
     return f"RunCode returned {code}{of_total} instructions{where}{verdict}"
+
+
+def dispatch_started(report: dict) -> bool:
+    """Compatibility-safe success predicate for old and new dispatch reports."""
+    if "started" in report:
+        return bool(report["started"])
+    code = report.get("run_code")
+    return code is not None and code >= 0
 
 
 def program_runtime_fault(*, expected_s: float, actual_s: float,
@@ -892,7 +907,7 @@ class CylinderPrintJob:
                     dispatch = rdk.dispatch_program(name, real_robot=True)
                     ctx.log(f"layer {layer.layer_index}: dispatched — "
                             + describe_dispatch(dispatch))
-                    if dispatch["run_code"] < 0:
+                    if not dispatch_started(dispatch):
                         raise RuntimeError(f"layer {layer.layer_index} live program could not start")
                     ran_s, saw_busy = _wait_program(
                         ctx, rdk, name, start_timeout_s=ecfg.program_start_grace_s,
@@ -935,7 +950,7 @@ class CylinderPrintJob:
                         inspection_name, real_robot=True)
                     ctx.log(f"layer {layer.layer_index}: inspection dispatched — "
                             + describe_dispatch(inspect_dispatch))
-                    if inspect_dispatch["run_code"] < 0:
+                    if not dispatch_started(inspect_dispatch):
                         raise RuntimeError(
                             f"layer {layer.layer_index} inspection program could not start")
                     _wait_program(ctx, rdk, inspection_name,

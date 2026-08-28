@@ -124,13 +124,15 @@ class FakeRdk:
         # Mirror the real RdkIO: a healthy dispatch clears every instruction and
         # the station really is in RUN_ROBOT. A fake that returned None here let
         # the live job's dispatch logging pass tests while breaking on the cell.
-        return {"run_code": 12, "instruction_count": 12,
-                "run_mode": 6, "run_mode_expected": 6}
+        return {"started": True, "start_method": "item_start",
+                "start_result": "OK", "run_code": None,
+                "instruction_count": 12, "run_mode": 6,
+                "run_mode_expected": 6}
     def dispatch_program(self, name, real_robot):
         self.events.append(("start", name, real_robot))
         return self._dispatch_report(name)
     def start_program(self, name, real_robot):
-        return self.dispatch_program(name, real_robot)["run_code"]
+        return 0 if self.dispatch_program(name, real_robot)["started"] else -1
     def program_busy(self, name): return False
     def stop_program(self, name): self.events.append(("stop", name))
     def delete_items(self, names): self.deleted.extend(names)

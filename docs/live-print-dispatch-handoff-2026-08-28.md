@@ -1,10 +1,14 @@
 # Live print: the arm does not move — handoff (2026-08-28, revised)
 
-**Status: UNRESOLVED**, but narrowed by measurement. Clicking **Print & record** makes the
-controller click once and the arm never moves. Running the same program by hand in RoboDK
-moves it. As of the instrumented run in §0b, *every RoboDK-side explanation is dead*: the
-program is fully accepted (195/195 instructions), the run mode is really 6, and the
-trivial valve program behaves the same way. Next: `tools/dispatch_bisect.py jog`.
+**Status: FIX IMPLEMENTED; end-to-end cell validation pending.** Clicking **Print &
+record** makes the controller click once and the arm never moves. Running the same program
+by hand in RoboDK moves it. The direct-driver `jog` bisect physically moved A6 by 2 deg;
+the immediately following API-created one-MoveJ `trivial` program returned 1/1 accepted,
+never became busy, left the driver READY, and did not physically move. The controller
+path works; RoboDK v6.0.5's API `RunProg` path dispatches nothing. The alternate
+documented item command `setParam("Start", 0)` returned `"OK"`, made RoboDK report the
+robot busy, and physically moved the arm. Production real-robot dispatch now uses item
+Start; simulation retains RunCode.
 
 **Revision note.** The first version of this handoff (commit `c02838a`) was written at the
 end of the day that produced 16 fixes; re-reading it against the code and against the
@@ -130,10 +134,10 @@ That is one of three readings, and they point in different directions:
 | KUKA driver module version | **Measured** | `RoboDKsync570.src` (Nov 2024) and `RoboDKsync570 (1).src` (Jun 2026) in the operator's `Downloads` are byte-identical (`cmp`, re-verified in this revision). |
 | `$OUT[0]` valve fault (`KSS014444`, module line 152) | **Measured** | Pendant message; fixed by renaming station IOs `IO_508`→`508` (`deaad43`); AirOn/AirOff clean by hand. |
 | Camera / depth / work frame / hand-eye / tool TCPs | **Measured** | §7. |
-| Pendant mode / drives / safety stop | **Inferred only** | From "a manual run moves it". Holds *only if* the manual run was done in the same session, seconds after the app failure, with no pendant interaction in between — record whether that was the case. Note the app's own error text tells the operator to check exactly these; the doc and the app currently disagree. **Never checked:** whether `RoboDKsync570` is *selected and running* (program pointer cycling in the `WHILE COM_ACTION >= 0` loop) at the moment of the app's dispatch. That KRL loop executes every driver command; KUKAVARPROXY accepts writes whether or not it runs, and RoboDK's "Ready" reflects only the socket. After the earlier `KSS014444` runtime error the pointer stopped at line 152 and needs acknowledge + Start to re-enter the loop. Also never checked: `$OV_PRO` (program override — the driver module does not set it; 0 % gives exactly "brakes click, no motion"). |
-| Station run mode at `RunCode()` | **Inferred** | `92f2d1d` asserts it before every `RunCode()`; `RunMode()` has never been read back to confirm RoboDK honoured it. The commit's premise that `Program.Update()` "leaves the station in SIMULATE" is a hypothesis, not an observation. |
-| Two RoboDK processes | **Not checked** | The app runs in `attach` mode and binds to whatever answers on the API port first. A leftover headless `-NEWINSTANCE -NOUI` process (from `rdk_extract.py` / `rdk_sync.py`) is invisible. `Get-Process RoboDK` must report exactly one. If the operator right-clicked the app's own `TasniCylinder_LIVE_*` program in their window for the manual run, this is excluded — record that. |
-| API dispatch reaching the KRC at all | **Not checked** | The only evidence is the click (§2). Watch the valve at `valve OFF: job startup before motion`. |
+| Pendant mode / drives / safety stop | **Measured healthy** | Direct driver `MoveJ` physically moved A6 by 2 deg immediately before the bare-program failure. This also proves `RoboDKsync570` was cycling and `$OV_PRO` was nonzero. |
+| Station run mode at `RunCode()` | **Measured** | Read back as 6 for the app layer dispatch and bare one-MoveJ dispatch. |
+| Two RoboDK processes | **Measured** | `Get-Process RoboDK` reported exactly one process during the bisect. |
+| API dispatch reaching the KRC at all | **Measured: NO** | Driver stayed READY; program and robot never became busy; no model or physical joint change. Direct `MoveJ` through the same driver moved immediately. |
 
 ### Dead ends already chased (do not repeat)
 
@@ -235,6 +239,7 @@ against the RoboDK window you have open, four rungs, ~2 min, no printing and no 
 py -3.10 tools/dispatch_bisect.py link              # state only, no motion
 py -3.10 tools/dispatch_bisect.py jog               # MOVES ~2° on A6 via the DRIVER, no program
 py -3.10 tools/dispatch_bisect.py trivial           # MOVES: 2-instruction program it builds+deletes
+py -3.10 tools/dispatch_bisect.py start             # MOVES: same fixture via item Start, not RunCode
 py -3.10 tools/dispatch_bisect.py program <NAME>    # MOVES: the kept layer program
 ```
 
@@ -248,6 +253,16 @@ py -3.10 tools/dispatch_bisect.py program <NAME>    # MOVES: the kept layer prog
 `jog` is the important one and it is the cheapest: it is a direct `MoveJ` through the
 driver (KRL `CASE 2`), so it tests the whole controller path with no program, no
 machining project, and no valve.
+
+**Measured cell outcome (2026-08-28): `jog` moved; `trivial` did not.** The trivial
+program returned 1/1 accepted, both Busy flags stayed false for 10 seconds, and the
+operator confirmed no physical motion. The kept layer program had run type 2, station
+mode was 6, driver state stayed READY, and only one RoboDK process existed. The alternate
+`program.setParam("Start", 0)` item command then returned `"OK"`, made RoboDK report the
+robot busy, and physically moved A6 by 2 deg. The external Python API was upgraded
+5.6.4 → 6.0.1; RunCode failed identically before and after, so package mismatch was not
+the cause. Next: restart the app, verify `build.stale == false`, and run Ring stack →
+Characterize ring 1 as the no-valve end-to-end test.
 
 **F. Only after A–E: the architectural fallback.** Drive motion through the driver
 (`MoveJ`/`MoveL` per pose) instead of running a generated program per layer. The

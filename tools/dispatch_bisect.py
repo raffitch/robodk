@@ -12,12 +12,15 @@ first that fails: that rung names the layer the fault lives in.
     py -3.10 tools/dispatch_bisect.py link                 # no motion
     py -3.10 tools/dispatch_bisect.py jog                  # MOVES the arm ~2 deg on A6
     py -3.10 tools/dispatch_bisect.py trivial              # MOVES: 2-instruction program
+    py -3.10 tools/dispatch_bisect.py start                # MOVES: same program via item Start
     py -3.10 tools/dispatch_bisect.py program <NAME>       # MOVES: the kept layer program
 
 How to read the result:
 
     jog moves, trivial does not      -> the driver + KRL loop + pendant are FINE.
                                         API *program* execution is the fault.
+    trivial does not, start moves    -> RoboDK's RunProg API command is the fault;
+                                        item Start is a viable narrow replacement.
     jog does not move                -> the fault is below RoboDK: driver, KUKAVARPROXY,
                                         or RoboDKsync570 not running on the pendant.
                                         (Check the pendant NOW, before anything else.)
@@ -27,8 +30,9 @@ How to read the result:
                                         API. Compare this script's numbers with the
                                         app's log for the same program.
 
-Nothing here prints material: no valve program is ever called. ``jog`` and ``trivial``
-DO move the arm — stand clear, keep the e-stop in hand, and make sure the path is free.
+Nothing here prints material: no valve program is ever called. ``jog``, ``trivial`` and
+``start`` DO move the arm — stand clear, keep the e-stop in hand, and make sure the path
+is free.
 """
 from __future__ import annotations
 
@@ -73,25 +77,40 @@ def _report_link(rdk, robot) -> None:
     print(f"  joints           : {[round(v, 2) for v in robot.Joints().list()]}")
 
 
-def _watch(robot, program=None, seconds: float = WATCH_S) -> bool:
+def _watch(robot, program=None, seconds: float = WATCH_S,
+           start_joints=None) -> bool:
     """Poll Busy() and joints. Returns True if the joints ever changed.
 
     The joints are the point: RoboDK's model can advance while the controller does
     nothing, but if the joints never change even in the MODEL, RoboDK never ran it.
     """
-    start = robot.Joints().list()
+    start = list(start_joints) if start_joints is not None else robot.Joints().list()
     moved = False
     seen_busy = False
     t0 = time.time()
     while time.time() - t0 < seconds:
-        now = robot.Joints().list()
-        delta = max(abs(a - b) for a, b in zip(now, start))
-        busy_p = bool(program.Busy()) if program is not None else False
-        busy_r = bool(robot.Busy())
+        try:
+            now = robot.Joints().list()
+            delta = max(abs(a - b) for a, b in zip(now, start))
+            delta_text = f"{delta:7.3f} deg"
+        except Exception as exc:
+            # RoboDK 6.0.5 legitimately rejects Joints() while item Start is
+            # driving the robot. That is evidence of execution, not a reason for
+            # the diagnostic itself to abort before the operator can observe it.
+            delta = 0.0
+            delta_text = f"unreadable ({exc})"
+        try:
+            busy_p = bool(program.Busy()) if program is not None else False
+        except Exception:
+            busy_p = False
+        try:
+            busy_r = bool(robot.Busy())
+        except Exception:
+            busy_r = False
         seen_busy = seen_busy or busy_p or busy_r
         moved = moved or delta > 0.01
         print(f"    t={time.time() - t0:5.2f}s  prog.Busy={int(busy_p)}  "
-              f"robot.Busy={int(busy_r)}  max|dJ|={delta:7.3f} deg")
+              f"robot.Busy={int(busy_r)}  max|dJ|={delta_text}")
         if moved and not (busy_p or busy_r) and time.time() - t0 > 1.0:
             break
         time.sleep(0.25)
@@ -185,6 +204,46 @@ def cmd_trivial(rdk, robot, _args) -> None:
     print("  program execution is the fault, for every program.")
 
 
+def cmd_start(rdk, robot, _args) -> None:
+    """Same one-MoveJ fixture, started through Item.setParam('Start', 0)."""
+    import robolink as rl
+
+    print("[start] MOVES the arm via the documented item Start command, bypassing "
+          "RunCode/RunProg.")
+    _report_link(rdk, robot)
+    input("  Path clear, e-stop in hand? ENTER to build and run, Ctrl-C to abort: ")
+    joints = robot.Joints().list()
+    start_joints = list(joints)
+    joints[JOG_AXIS - 1] += JOG_DEG
+    target_name = BISECT_PREFIX + "StartTarget"
+    program_name = BISECT_PREFIX + "StartProgram"
+    for name in (program_name, target_name):
+        old = rdk.Item(name)
+        if old.Valid():
+            old.Delete()
+    target = rdk.AddTarget(target_name, 0, robot)
+    target.setAsJointTarget()
+    target.setJoints(joints)
+    program = rdk.AddProgram(program_name, robot)
+    program.MoveJ(target)
+    try:
+        program.setRunType(rl.PROGRAM_RUN_ON_ROBOT)
+        rdk.setRunMode(rl.RUNMODE_RUN_ROBOT)
+        print(f"    setRunMode -> read back {rdk.RunMode()}")
+        result = program.setParam("Start", 0)
+        print(f"    setParam('Start', 0) -> {result!r}")
+        _watch(robot, program, start_joints=start_joints)
+    finally:
+        for name in (program_name, target_name):
+            item = rdk.Item(name)
+            if item.Valid():
+                item.Delete()
+        print(f"    cleaned up {program_name} / {target_name}")
+    print("  Arm moved here but not for 'trivial' -> RunCode/RunProg is the fault;")
+    print("  the item Start command is a candidate replacement. No move here ->")
+    print("  both API program-start commands fail; capture RoboDK /DEBUG output.")
+
+
 def cmd_program(rdk, robot, args) -> None:
     """Run an EXISTING program (the layer the app left in the station)."""
     import robolink as rl
@@ -211,8 +270,8 @@ def cmd_program(rdk, robot, args) -> None:
     print("  (Connect > Connect robot > show log) across both attempts.")
 
 
-COMMANDS = {"link": cmd_link, "jog": cmd_jog,
-            "trivial": cmd_trivial, "program": cmd_program}
+COMMANDS = {"link": cmd_link, "jog": cmd_jog, "trivial": cmd_trivial,
+            "start": cmd_start, "program": cmd_program}
 
 
 def main(argv: list[str]) -> int:

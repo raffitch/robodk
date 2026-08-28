@@ -1904,9 +1904,20 @@ class RdkIO:
         returns on this station has never been observed, so a guessed threshold
         could block a run that would have worked. Log first, then decide.
 
-        Returns ``run_code``, ``instruction_count``, ``run_mode`` and
-        ``run_mode_expected``. Never raises for the diagnostics — a build that
-        cannot report them still dispatches.
+        Real-robot execution deliberately uses the documented item command
+        ``setParam("Start", 0)`` instead of :meth:`Item.RunCode`. Cell bisect on
+        2026-08-28 proved the distinction on RoboDK 6.0.5: direct driver MoveJ
+        worked and the item Start command moved the physical arm, while RunCode's
+        ``RunProg`` command returned every instruction as accepted but left the
+        program, robot and driver idle. Right-click Run also worked.
+
+        Simulation keeps ``RunCode`` because it works there and returns the useful
+        quick-check instruction count. The report always includes ``started`` and
+        ``start_method``; ``run_code`` is ``None`` for the item-Start path and
+        ``start_result`` carries RoboDK's response (measured: ``"OK"``).
+
+        Never raises for the read-only diagnostics — a build that cannot report
+        them still reaches the selected start command.
         """
         import robolink
 
@@ -1934,17 +1945,32 @@ class RdkIO:
         # station is in mode 6; that assumption is what 92f2d1d rested on.
         run_mode = _safe(lambda: int(self.rdk.RunMode()))
         instructions = _safe(lambda: int(program.InstructionCount()))
-        return {"run_code": int(program.RunCode()),
+        if real_robot:
+            start_result = str(program.setParam("Start", 0) or "")
+            started = start_result.strip().upper() == "OK"
+            run_code = None
+            start_method = "item_start"
+        else:
+            run_code = int(program.RunCode())
+            started = run_code >= 0
+            start_result = None
+            start_method = "run_code"
+        return {"started": started, "start_method": start_method,
+                "start_result": start_result, "run_code": run_code,
                 "instruction_count": instructions,
                 "run_mode": run_mode, "run_mode_expected": int(expected)}
 
     def start_program(self, name: str, *, real_robot: bool) -> int:
         """Start a named program with an explicit simulator/robot run type.
 
-        Thin wrapper over :meth:`dispatch_program` for callers that only branch on
-        the return code. Prefer ``dispatch_program`` where the diagnostics matter.
+        Thin integer wrapper for callers that only branch on ``< 0``. A confirmed
+        item-Start returns 0; simulation preserves RunCode's integer. Prefer
+        ``dispatch_program`` where the diagnostics matter.
         """
-        return int(self.dispatch_program(name, real_robot=real_robot)["run_code"])
+        report = self.dispatch_program(name, real_robot=real_robot)
+        if not report["started"]:
+            return -1
+        return int(report["run_code"] if report["run_code"] is not None else 0)
 
     #: RoboDK's ``ConnectedState()`` codes (robolink ROBOTCOM_*).
     ROBOTCOM_NAMES = {0: "READY", 1: "WORKING", 2: "WAITING", -1: "NOT_CONNECTED",
@@ -2013,7 +2039,7 @@ class RdkIO:
         the API-to-controller path.
         """
         report = self.dispatch_program(name, real_robot=real_robot)
-        if report["run_code"] < 0:
+        if not report["started"]:
             raise RuntimeError(f"program {name!r} could not start")
         while self.program_busy(name):
             import time
