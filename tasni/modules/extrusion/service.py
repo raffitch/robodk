@@ -144,8 +144,36 @@ def _program_name(plan: CylinderPlan, layer_index: int, mode: str) -> str:
     return f"TasniCylinder_{mode}_{plan.fingerprint[:10]}_L{layer_index:03d}"
 
 
+def view_changed(before, after, *, threshold: float = 4.0) -> "bool | None":
+    """Did the flange-mounted camera's view change? ``None`` = could not tell.
+
+    RoboDK's model cannot witness its own error — on the cell it advanced to the
+    target while the controller never executed the motion, so joints and poses
+    both "moved". The camera is bolted to the flange, so if the arm moves the view
+    must change. That makes it the one independent witness available without
+    asking the operator to drive the robot by hand.
+
+    Compared on a small greyscale downsample of the mean absolute difference, so
+    sensor noise and lighting flicker stay well under ``threshold`` while any real
+    displacement clears it easily. Returns ``None`` rather than False when a frame
+    is missing or the shapes differ: never claim the arm stayed still merely
+    because we failed to look.
+    """
+    if before is None or after is None:
+        return None
+    a, b = np.asarray(before), np.asarray(after)
+    if a.shape != b.shape or a.size == 0:
+        return None
+    if a.ndim == 3:
+        a, b = a.mean(axis=2), b.mean(axis=2)
+    step = max(1, min(a.shape) // 48)          # ~48 px on the short side
+    a, b = a[::step, ::step].astype(float), b[::step, ::step].astype(float)
+    return bool(np.abs(a - b).mean() > float(threshold))
+
+
 def program_runtime_fault(*, expected_s: float, actual_s: float,
-                          observed_busy: bool, min_ratio: float = 0.5,
+                          observed_busy: bool, arm_moved: "bool | None" = None,
+                          min_ratio: float = 0.5,
                           floor_s: float = 1.0) -> "str | None":
     """Flag a program that reported success but cannot have executed.
 
@@ -165,12 +193,19 @@ def program_runtime_fault(*, expected_s: float, actual_s: float,
         return None
     if actual_s >= expected_s * min_ratio:
         return None
+    if arm_moved:
+        # The flange camera saw the scene change, so the arm really did move and
+        # the duration was simply mispredicted. Not a fault.
+        return None
     seen = "" if observed_busy else " and it was never observed running"
+    witness = (" The flange camera saw an unchanged view before and after, "
+               "confirming the arm did not move."
+               if arm_moved is False else "")
     return (f"program finished in {actual_s:.1f} s but RoboDK predicted "
             f"{expected_s:.1f} s{seen} — the controller did not execute the "
-            "motion. Check the pendant: operating mode (AUT/EXT, not T1/T2), "
-            "drives enabled, and no active safety stop. Nothing was deposited, "
-            "so measuring this layer would be meaningless.")
+            f"motion.{witness} Check the pendant: operating mode (AUT/EXT, not "
+            "T1/T2), drives enabled, and no active safety stop. Nothing was "
+            "deposited, so measuring this layer would be meaningless.")
 
 
 def _wait_program(ctx: JobContext, rdk: RdkIO, name: str, *,
@@ -697,20 +732,34 @@ class CylinderPrintJob:
                          "requested_state": "OFF", "program": ecfg.air_off_program,
                          "source": "path-finish program event", "confirmed": None},
                     ])
+                    # The camera rides on the flange, so its view is an independent
+                    # witness of REAL motion — RoboDK's model is not, since it can
+                    # advance to the target while the controller executes nothing.
+                    def _witness_frame():
+                        try:
+                            return services.camera.grab(
+                                color_only=True, timeout=ecfg.grab_timeout_s).color
+                        except Exception:
+                            return None          # never fail a print over a witness
+                    view_before = _witness_frame()
                     started = rdk.start_program(name, real_robot=True)
                     if started < 0:
                         raise RuntimeError(f"layer {layer.layer_index} live program could not start")
                     ran_s, saw_busy = _wait_program(
                         ctx, rdk, name, start_timeout_s=ecfg.program_start_grace_s)
                     current_program = None
+                    arm_moved = view_changed(view_before, _witness_frame())
                     # start_program returning success only means RoboDK ACCEPTED the
                     # program. Compare against the duration RoboDK predicted for it:
                     # a layer that should take seconds and returns in a fraction of
                     # one never executed, and printing nothing must not be mistaken
                     # for printing something.
+                    ctx.log(f"layer {layer.layer_index}: program ran {ran_s:.1f} s; "
+                            f"flange camera says the arm "
+                            f"{'MOVED' if arm_moved else 'did NOT move' if arm_moved is False else 'motion unknown'}")
                     runtime_fault = program_runtime_fault(
                         expected_s=float(validation.get("time_s") or 0.0),
-                        actual_s=ran_s, observed_busy=saw_busy)
+                        actual_s=ran_s, observed_busy=saw_busy, arm_moved=arm_moved)
                     if runtime_fault:
                         raise RuntimeError(f"layer {layer.layer_index} {runtime_fault}")
                     valve_off(f"layer {layer.layer_index} completion/inspection confirmation",

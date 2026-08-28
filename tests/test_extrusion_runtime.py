@@ -49,3 +49,24 @@ def test_message_points_at_the_controller_not_the_software():
     msg = program_runtime_fault(expected_s=20.0, actual_s=0.8, observed_busy=False)
     assert "did not execute" in msg.lower() or "did not run" in msg.lower()
     assert "drives" in msg.lower() or "mode" in msg.lower()
+
+
+def test_camera_confirming_motion_clears_a_timing_suspicion():
+    """RoboDK's duration is an estimate. If the flange camera saw the view change,
+    the arm moved and a short runtime is just a bad prediction -- not a fault."""
+    assert program_runtime_fault(expected_s=12.0, actual_s=1.0,
+                                 observed_busy=False, arm_moved=True) is None
+
+
+def test_camera_confirming_no_motion_is_stated_as_fact():
+    msg = program_runtime_fault(expected_s=12.0, actual_s=1.0,
+                                observed_busy=False, arm_moved=False)
+    assert msg is not None
+    assert "camera" in msg.lower()
+    assert "did not move" in msg.lower()
+
+
+def test_without_a_witness_the_wording_stays_a_suspicion():
+    msg = program_runtime_fault(expected_s=12.0, actual_s=1.0,
+                                observed_busy=False, arm_moved=None)
+    assert msg is not None and "camera" not in msg.lower()

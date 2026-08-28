@@ -126,9 +126,17 @@ class FakeRdk:
 
 
 class FakeCamera:
-    def __init__(self): self.grabs = 0
+    def __init__(self): self.grabs = 0; self.depth_grabs = 0; self.witness_grabs = 0
     def grab(self, **kwargs):
         self.grabs += 1
+        # Colour-only grabs are the flange-camera motion witness taken either side
+        # of a layer program; the depth grab is the ONE authoritative measurement
+        # capture per layer. They are counted apart so the unicast-camera
+        # discipline stays asserted on the capture that matters.
+        if kwargs.get("color_only"):
+            self.witness_grabs += 1
+        else:
+            self.depth_grabs += 1
         return Frame(color=np.zeros((16, 16, 3), np.uint8),
                      depth=np.full((16, 16), 500, np.uint16), timestamp=1.0)
 
@@ -304,7 +312,8 @@ def test_live_print_forces_off_captures_once_and_archives(tmp_path, monkeypatch)
     assert output["collision_check_enabled"] is False
     assert output["correction_available"] and not output["correction_executed"]
     # One readiness frame before any robot command, then one measurement/layer.
-    assert camera.grabs == 3
+    assert camera.depth_grabs == 3          # exactly one measurement per layer
+    assert camera.witness_grabs == 4        # 2 layers x witness either side of the program
     # First real-cell action after mode/link setup is fail-safe AirOff, before create/motion.
     first_off = next(i for i, e in enumerate(rdk.events) if e[0] == "station-program")
     first_create = next(i for i, e in enumerate(rdk.events) if e[0] == "create")
