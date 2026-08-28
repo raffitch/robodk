@@ -1,0 +1,225 @@
+"""Paper/app figures rendered from an archived take.
+
+The renderer reads only what the archive holds, so these tests build a REAL
+trial directory with the real writer and then render it -- the file format is
+the contract under test, not the processing chain.
+"""
+from __future__ import annotations
+
+import json
+
+import numpy as np
+import pytest
+
+import extrusion_synthetic as syn
+from tasni.modules.extrusion.archive import ExtrusionArchive
+from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup, LayerManifest
+from tasni.modules.extrusion.toolpath import generate_cylinder_plan
+
+CENTER = (200.0, 150.0)
+RADIUS = 60.0
+
+
+def _plan(*, layers: int = 1, layer_height: float = 6.0):
+    recipe = CylinderRecipe(radius_mm=RADIUS, layer_count=layers,
+                            layer_height_mm=layer_height, bead_diameter_mm=8.0,
+                            robot_speed_mm_s=75, extrusion_rate_pct=0,
+                            points_per_circle=180)
+    setup = CylinderSetup(print_tool="LongCalibTool", work_frame="Tasni Work Frame",
+                          inspection_tool="Realsense", inspection_auto=True,
+                          center_x_mm=CENTER[0], center_y_mm=CENTER[1])
+    return generate_cylinder_plan(recipe, setup)
+
+
+def _ring_xyz(*, radius=RADIUS, center=CENTER, z=6.0, wave=0.0, count=181):
+    theta = np.linspace(0, 2 * np.pi, count)
+    return np.column_stack((center[0] + radius * np.cos(theta),
+                            center[1] + radius * np.sin(theta),
+                            np.full_like(theta, z) + wave * np.sin(2 * theta)))
+
+
+def _cloud_xyz(*, radius=RADIUS, center=CENTER, z=6.0, bead=8.0, seed=0):
+    rng = np.random.default_rng(seed)
+    theta = rng.uniform(0, 2 * np.pi, 900)
+    r = radius + rng.uniform(-bead / 2, bead / 2, theta.size)
+    return np.column_stack((center[0] + r * np.cos(theta),
+                            center[1] + r * np.sin(theta),
+                            z + rng.normal(0, 0.4, theta.size)))
+
+
+def write_take(root, *, trial_id="t1", layer_index=1, take=1, measured=None,
+               cloud=None, depth=True, mode="MEASURE_ONLY", annotation=None,
+               geometry=None, metrics=None):
+    """One archived take, written exactly the way the measure job writes it."""
+    plan = _plan(layers=max(layer_index, 1))
+    archive = ExtrusionArchive(root)
+    if not (root / trial_id / "trial.json").is_file():
+        archive.create_trial(trial_id, plan, mode=mode,
+                             provenance={"camera_intrinsics": {"K": syn.K_720P.tolist()}})
+    layer = plan.layers[layer_index - 1]
+    T = syn.inspection_camera_T((CENTER[0], CENTER[1], layer.nominal_z_mm), 300.0)
+    nominal = _ring_xyz(z=layer.nominal_z_mm)
+    measured = _ring_xyz(center=(CENTER[0] + 10.0, CENTER[1]), wave=2.0) \
+        if measured is None else measured
+    cloud = _cloud_xyz() if cloud is None else cloud
+    frame = None
+    if depth:
+        frame = syn.render_scene([syn.RingSpec(RADIUS, 8.0, CENTER, height_fn=syn.flat(6.0))],
+                                 T, plane_center_xy_mm=CENTER, seed=1)
+    manifest = LayerManifest(
+        trial_id=trial_id, layer_index=layer_index, take=take, mode=mode,
+        recipe=plan.recipe, toolpath_fingerprint=plan.fingerprint,
+        annotation=annotation or {}, color_file=None,
+        depth_file="depth.npy" if depth else None,
+        measured_path_file="measured_path.json",
+        pointcloud_file="height-or-pointcloud.npy",
+        metrics=metrics or {"mean_absolute_mm": 6.4, "rms_mm": 7.1, "maximum_mm": 10.0,
+                            "measured_center_mm": [CENTER[0] + 10.0, CENTER[1]],
+                            "measured_radius_mm": RADIUS, "path_completeness": 1.0,
+                            "maximum_angular_gap_deg": 2.0, "valid": True,
+                            "center_offset_mm": [10.0, 0.0], "center_offset_norm_mm": 10.0,
+                            "shape_rms_mm": 0.4, "shape_max_mm": 0.9},
+        geometry=geometry or {"top_z_mean_mm": 6.0, "top_z_min_mm": 4.0,
+                              "top_z_max_mm": 8.0, "top_z_std_mm": 1.4,
+                              "height_mean_mm": 6.0, "height_min_mm": 4.0,
+                              "height_max_mm": 8.0, "height_reference": "build_plane",
+                              "bead_width_mean_mm": 8.0, "bead_width_min_mm": 6.0,
+                              "bead_width_max_mm": 10.0, "bead_width_bins": 36},
+        processing={"valid": True, "timings_ms": {"total_ms": 900.0, "capture_ms": 2200.0,
+                                                  "acquisition_to_path_ms": 3100.0}},
+        provenance={"T_work_camera": np.asarray(T, dtype=float).tolist(),
+                    "camera_intrinsics": {"K": syn.K_720P.tolist()},
+                    "work_frame": "Tasni Work Frame"})
+    return archive.write_layer(manifest, nominal_xyz=nominal, commanded_xyz=nominal,
+                               measured_xyz=measured, pointcloud_xyz=cloud, depth=frame)
+
+
+def test_rendering_a_take_writes_every_figure_in_both_formats(tmp_path):
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_take(tmp_path)
+    written = figures.render_layer_figures(layer_dir)
+
+    names = {path.name for path in written}
+    assert names == {f"{stem}.{ext}" for stem in figures.LAYER_FIGURES
+                     for ext in ("png", "pdf")}
+    for path in written:
+        assert path.parent == layer_dir / "figures"
+        assert path.stat().st_size > 1000, f"{path.name} is suspiciously small"
+    assert (layer_dir / "figures" / "plan.png").read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    assert (layer_dir / "figures" / "plan.pdf").read_bytes()[:5] == b"%PDF-"
+
+
+def test_profile_curves_are_the_series_behind_the_manifest_metrics(tmp_path):
+    """A reader must be able to check the deviation table against the plot."""
+    from tasni.modules.extrusion import figures
+    from tasni.modules.extrusion.comparison import compare_circle
+
+    measured = _ring_xyz(center=(CENTER[0] + 10.0, CENTER[1]), wave=2.0)
+    profile = figures.unrolled_profile(measured, CENTER, RADIUS)
+    expected = compare_circle(measured, RADIUS, nominal_center_mm=CENTER)
+
+    assert profile["rms_mm"] == pytest.approx(expected.rms_mm, abs=1e-9)
+    assert profile["maximum_mm"] == pytest.approx(expected.maximum_mm, abs=1e-9)
+    assert profile["mean_absolute_mm"] == pytest.approx(expected.mean_absolute_mm, abs=1e-9)
+    assert np.all(np.diff(profile["angle_deg"]) >= 0), "angle must sweep 0..360 in order"
+    assert profile["deviation_mm"].max() == pytest.approx(10.0, abs=.2)
+
+
+def test_heightmap_falls_back_to_the_archived_cloud_when_the_take_has_no_depth(tmp_path):
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_take(tmp_path, depth=False)
+    written = figures.render_layer_figures(layer_dir, formats=("png",))
+
+    assert {p.name for p in written} == {f"{s}.png" for s in figures.LAYER_FIGURES}
+
+
+def test_a_take_whose_processing_failed_still_renders_what_it_has(tmp_path):
+    """The raw frame is all a failed measurement leaves; it must still be drawable."""
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_take(tmp_path)
+    (layer_dir / "measured_path.json").unlink()
+    (layer_dir / "height-or-pointcloud.npy").unlink()
+
+    written = figures.render_layer_figures(layer_dir, formats=("png",))
+
+    names = {p.name for p in written}
+    assert "heightmap.png" in names, "the depth frame is still there"
+    assert "profile.png" not in names, "no centreline means no profile, not an empty plot"
+
+
+def test_ensure_figure_renders_on_demand_then_reuses_the_file(tmp_path):
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_take(tmp_path)
+    assert not (layer_dir / "figures").exists()
+
+    path = figures.ensure_figure(layer_dir, "plan.png")
+    assert path.is_file()
+    stamp = path.stat().st_mtime_ns
+
+    assert figures.ensure_figure(layer_dir, "plan.png").stat().st_mtime_ns == stamp
+
+
+def test_ensure_figure_refuses_a_name_outside_the_allowlist(tmp_path):
+    """The name reaches this from a URL path segment."""
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_take(tmp_path)
+    for name in ("../../trial.json", "plan.svg", "manifest.json", r"..\secrets.env"):
+        with pytest.raises(ValueError):
+            figures.ensure_figure(layer_dir, name)
+
+
+def test_stack_figure_draws_the_latest_take_of_every_layer(tmp_path):
+    from tasni.modules.extrusion import figures
+
+    write_take(tmp_path, layer_index=1, take=1)
+    write_take(tmp_path, layer_index=1, take=2,
+               measured=_ring_xyz(center=(CENTER[0] + 15.0, CENTER[1])))
+    write_take(tmp_path, layer_index=2, take=1, measured=_ring_xyz(z=12.0))
+
+    takes = figures.latest_takes(tmp_path / "t1")
+    assert [(t.manifest["layer_index"], t.manifest["take"]) for t in takes] == [(1, 2), (2, 1)]
+
+    written = figures.render_trial_figures(tmp_path / "t1", formats=("png",))
+    assert [p.name for p in written] == ["stack.png"]
+    assert written[0].parent == tmp_path / "t1" / "figures"
+
+
+def test_height_colour_range_is_set_by_the_deposit_not_by_depth_dropouts(tmp_path):
+    """Dropouts far below the plane flatten the ring to one colour if they count."""
+    from tasni.modules.extrusion import figures
+
+    ring = _cloud_xyz(z=6.0)
+    dropouts = np.column_stack((np.full(40, CENTER[0]), np.full(40, CENTER[1]),
+                                np.full(40, -250.0)))
+    layer_dir = write_take(tmp_path, depth=False,
+                           cloud=np.vstack((ring, dropouts)))
+
+    data = figures.heightmap_data(figures.load_take(layer_dir))
+
+    assert data["vmin"] > -15.0, "a dropout at -250 mm must not set the bottom of the scale"
+    assert data["vmax"] - data["vmin"] < 30.0, "the scale must be tight enough to show relief"
+    assert data["vmax"] > 4.0, "the ring must still set the top of the scale"
+
+
+def test_profile_uses_the_true_nominal_centre_of_a_CLOSED_nominal_path(tmp_path):
+    """The archive closes the nominal ring, so its first point is repeated.
+
+    Averaging those points biases the centre by radius/N and the plotted RMS
+    then disagrees with the manifest a reader is checking it against.
+    """
+    from tasni.modules.extrusion import figures
+    from tasni.modules.extrusion.comparison import compare_circle
+
+    layer_dir = write_take(tmp_path)
+    take = figures.load_take(layer_dir)
+    assert np.allclose(take.nominal[0], take.nominal[-1]), "fixture must close the ring"
+
+    assert take.center == pytest.approx(CENTER, abs=1e-6)
+    profile = figures.unrolled_profile(take.measured, take.center, take.radius)
+    expected = compare_circle(take.measured, take.radius, nominal_center_mm=CENTER)
+    assert profile["rms_mm"] == pytest.approx(expected.rms_mm, abs=1e-6)
