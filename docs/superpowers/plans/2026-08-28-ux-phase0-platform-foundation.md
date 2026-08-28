@@ -4,7 +4,7 @@
 
 **Goal:** Make the platform's shared state truthful before any page is re-laid-out: module-scoped job events with unique execution ids, per-(module, kind) job history, a station-only cell-level Connect, an explicit real-robot link with a server-side live-pose gate, a recorded-vs-present readiness endpoint, and one frontend `PlatformProvider` + topbar Connect that every page reads.
 
-**Architecture:** Backend changes are confined to `tasni/core/{events,jobrunner,livepreview,rdk_io,config}.py`, `tasni/webapp/server.py`, and each module's `module.py` (call-site stamping, `/status` shape, one new gate). No job logic in `service.py` changes except the link-helper consolidation. Frontend: `api/events.tsx` + `api/useHealth.ts` become `platform/PlatformProvider.tsx`; `Layout.tsx` gains the Connect button; the three pages drop their banners and filter events by `module` + `job_id`/`stream_id`. Layout of the pages is otherwise unchanged (phase 1 does the stepper).
+**Architecture:** Backend changes are confined to `tasni/core/{events,jobrunner,livepreview,arbiter,camera_lease,rdk_io,config}.py`, `tasni/modules/base.py` (service wiring), `tasni/webapp/{server,readiness}.py`, and each module's `module.py` (call-site stamping, `/status` shape, one new gate). No job logic in `service.py` changes except the link-helper consolidation. Frontend: `api/events.tsx` + `api/useHealth.ts` become `platform/PlatformProvider.tsx`; `Layout.tsx` gains the Connect button; the three pages drop their banners and filter events by `module` + `job_id`/`stream_id`. Layout of the pages is otherwise unchanged (phase 1 does the stepper).
 
 **Tech Stack:** Python 3.10, FastAPI, pytest (`py -3.10 -m pytest`), React 18 + Vite + TypeScript, new: vitest + @testing-library/react + jsdom.
 
@@ -31,14 +31,17 @@
 |---|---|
 | `tasni/core/events.py` | `JobEvent` (+ `module`, `job_id`, `kind`, `stream_id`), `EventBus.scoped(module)` |
 | `tasni/core/jobrunner.py` | `JobRecord`, per-(module, kind) history, `start() -> job_id`, `module_status()` |
-| `tasni/core/livepreview.py` | `start(owner=) -> stream_id`, stamps live events |
-| `tasni/core/rdk_io.py` | `ensure_robot_link(rdk, cfg, *, strict)` (consolidated) |
+| `tasni/core/livepreview.py` | `start(owner=, stream_id=) -> stream_id`, stamps live events, owner check |
+| `tasni/core/arbiter.py` | `CellArbiter` — re-entrant, non-blocking gate for connect/link/job/live/lease transitions |
+| `tasni/core/camera_lease.py` | `CameraLease(arbiter=)` — acquisition passes through the arbiter |
+| `tasni/modules/base.py` | `ServiceContainer.arbiter`; wires arbiter into runner, preview, lease |
+| `tasni/core/rdk_io.py` | `ensure_robot_link(rdk, cfg, *, strict)` (consolidated), `pose_not_live_detail` |
 | `tasni/core/config.py` | `RoboDKConfig.require_live_pose`, rewritten `connect_robot_on_connect` doc |
 | `tasni/webapp/server.py` | `POST /api/rdk/connect`, `POST /api/rdk/link`, `GET /api/readiness` |
 | `tasni/webapp/readiness.py` | pure readiness composition (recorded vs present) |
 | `tasni/modules/{calibration,scan,extrusion}/module.py` | scoped publishes, `kind=/module=` starts, `job_id` echo, new `/status`, live-pose gate |
 | `tasni/modules/calibration/service.py` | `ensure_real_robot_link` delegates to core |
-| `tests/test_jobrunner_scope.py`, `tests/test_livepreview.py`, `tests/test_platform_connect.py`, `tests/test_robot_link.py`, `tests/test_readiness.py`, `tests/test_module_status.py` | backend tests |
+| `tests/test_jobrunner_scope.py`, `tests/test_livepreview.py`, `tests/test_arbiter.py`, `tests/test_event_scoping_lint.py`, `tests/test_module_status.py`, `tests/test_platform_connect.py`, `tests/test_live_pose_gate.py`, `tests/test_readiness.py` | backend tests |
 | `tasni/webui/src/platform/PlatformProvider.tsx` | health poll, rdk status, `connect()`, `link()`, `subscribe(module, h)` |
 | `tasni/webui/src/components/Layout.tsx` | topbar pills + Connect button |
 | `tasni/webui/src/pages/{Calibration,Scan,Extrusion}.tsx` | use provider; drop banners; filter by id |
@@ -2339,7 +2342,7 @@ State, next to `foreignJob`:
   const [applied, setApplied] = useState<AppliedCalibration | null>(null);
   const [presence, setPresence] = useState<{ present: boolean | null; reason: string } | null>(null);
 ```
-and in `refreshJob`, as the first line after `const s = await api.get<ModuleStatus>("/status");`: `setApplied(s.applied ?? null);`.
+(`refreshJob` above already calls `setApplied(s.applied ?? null)` first thing.)
 Replace `refreshJob` (`:153-158`) with — it is now the single **reconciler**: it
 hydrates a solve result, follows an own running job, locks on a foreign one, and
 settles a job whose terminal event was missed (fast job, socket reconnect —
@@ -2348,6 +2351,7 @@ plan review #1/#6), then clears stale running state:
   const refreshJob = useCallback(async () => {
     try {
       const s = await api.get<ModuleStatus>("/status");
+      setApplied(s.applied ?? null);          // active.json — survives a backend restart
       const res = s.jobs?.calibration?.result as RunResult | null | undefined;
       if (res?.can_apply) { setResult(res); setCanApply(true); }
       if (s.running?.module === "calibration") {
@@ -2550,7 +2554,7 @@ git commit -m "feat(webui/calibration): platform connection, id-filtered events,
 **Files:**
 - Modify: `tasni/webui/src/pages/Scan.tsx` (imports `:1-10`, state `:204-212`, `refreshJob` `:296-303`, `hydrateConnection` `:304-313`, mount/auto-connect effects `:363-410`, subscription `:412-490`, `beginLive`/`startLive` `:558-578`, `generateTargets` catch `:709-724`, `lockSurface` catch `:791-810`, `dryRun`/`doRun` `:914-933`, JSX banner `:1009-1025`, Survey-card buttons `:1174-1204`, Run buttons `:1272-1278`)
 
-**Interfaces:** same as 8b. Scan keeps its today's behaviour of auto-connecting on entry — it now calls the platform `connect()` once when the backend reports no session.
+**Interfaces:** same as 8b. Scan's silent auto-connect on entry is **removed** (spec decision 13): connecting the cell is only the topbar action; the camera auto-preview stays.
 
 - [ ] **Step 1: Imports and state**
 
@@ -3224,7 +3228,7 @@ Spec status line → `Status: **approved 2026-08-28 · phase 0 implemented on ux
 
 - [ ] **Step 2: Backend regression sweep (targeted, never the full suite)**
 
-Run: `py -3.10 -m pytest tests/test_jobrunner_scope.py tests/test_livepreview.py tests/test_event_scoping_lint.py tests/test_module_status.py tests/test_platform_connect.py tests/test_live_pose_gate.py tests/test_readiness.py tests/test_robot_link.py tests/test_calibration_job.py tests/test_scan_job.py tests/test_extrusion.py tests/test_extrusion_job.py tests/test_extrusion_measure.py tests/test_sim_tour.py tests/test_runs.py -q` → all PASS.
+Run: `py -3.10 -m pytest tests/test_jobrunner_scope.py tests/test_livepreview.py tests/test_arbiter.py tests/test_camera_lease.py tests/test_event_scoping_lint.py tests/test_module_status.py tests/test_platform_connect.py tests/test_live_pose_gate.py tests/test_readiness.py tests/test_robot_link.py tests/test_calibration_job.py tests/test_scan_job.py tests/test_extrusion.py tests/test_extrusion_job.py tests/test_extrusion_measure.py tests/test_sim_tour.py tests/test_runs.py -q` → all PASS.
 
 - [ ] **Step 3: Commit, push, cell validation (operator), merge**
 
@@ -3233,7 +3237,7 @@ git add tasni/README.md CLAUDE.md docs/superpowers/specs/2026-08-28-ux-workflow-
 git commit -m "docs: phase 0 platform foundation — connect/link/readiness + event scoping"
 git push origin ux-phase0
 ```
-Restart `.\start.ps1` (the backend caches imports) and walk **Appendix B, Phase 0** of the spec on the cell: topbar Connect with RoboDK closed; module switching without re-connect; Aim with the controller OFF → link chip OFFLINE + Create targets locked with "Real robot not linked"; controller on → Link → unlocks; same for Scan Lock; Calibration dry run then switch to Scan → "calibration job (sim_tour) is running" + Connect disabled; back to Calibration → solve result + Apply still shown after a further dry run; kill RoboDK → pill red within 4 s, Reconnect works; delete the inserted frame → `GET /api/readiness` reports `present: false` (Dashboard card lands in phase 1). Record the outcome in the commit message of the merge.
+Restart `.\start.ps1` (the backend caches imports) and walk **Appendix B, Phase 0** of the spec on the cell: topbar Connect with RoboDK closed; module switching without re-connect; Aim with the controller OFF → link chip OFFLINE + Create targets locked with "Real robot not linked"; controller on → Link → unlocks; same for Scan Lock; Calibration dry run then switch to Scan → "calibration job (sim_tour) is running" + Connect disabled; back to Calibration → solve result + Apply still shown after a further dry run; kill RoboDK → pill red within 4 s, Reconnect works; delete the inserted frame → `GET /api/readiness` reports `present: false` (Dashboard card lands in phase 1); **restart the backend with an existing calibration** → the Calibration page shows "Calibration on file · date · verdict" with no job history, then nudge the Realsense tool pose in RoboDK → readiness reads "tool pose differs" and **Re-apply saved calibration** is offered → click it → readiness becomes `present: true`, and Scan (survey → lock) never asks for a recalibration. Record the outcome in the commit message of the merge.
 
 Then use `superpowers:finishing-a-development-branch` to merge `ux-phase0` → `ux-overhaul` and push.
 

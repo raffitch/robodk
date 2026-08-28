@@ -695,7 +695,12 @@ Create corrected plan → step 6.
   Calibration afterwards — its solve result and Apply are still shown, and they
   survive a further dry run too; kill RoboDK mid-session —
   pill goes red within one health tick, Reconnect works; delete the inserted frame
-  in RoboDK — the Dashboard surface card says "not in the current station".
+  in RoboDK — the Dashboard surface card says "not in the current station";
+  restart the backend with an existing calibration — the Calibration page shows
+  "Calibration on file · date · verdict" with no job history; nudge the Realsense
+  tool pose in RoboDK — readiness reads "tool pose differs", Re-apply saved
+  calibration is offered, and after clicking it readiness is present again; Scan
+  never asks for a recalibration.
 - **Phase 1**: Calibration end-to-end on the cell (board → aim → targets → simulate →
   run → apply) with the rail advancing on its own; Clear targets sends the rail back
   to step 2; Dashboard shows the new calibration in the strip.
