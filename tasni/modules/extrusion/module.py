@@ -50,6 +50,9 @@ class RestoreQuickSimBody(FingerprintBody):
 class PrintBody(FingerprintBody):
     confirm_live: bool = False
     collision_check_enabled: bool = True
+    # Keep the generated curve/project/programs/targets in the station after the
+    # run instead of cleaning them up, so a run can be examined afterwards.
+    keep_artifacts: bool = False
 
 
 class TcpSeedBody(BaseModel):
@@ -462,13 +465,15 @@ class ExtrusionModule(WorkflowModule):
                 raise HTTPException(409, "a job is already running")
             self._active_print_job = CylinderPrintJob(
                 services, self._plan,
-                check_collisions=body.collision_check_enabled)
+                check_collisions=body.collision_check_enabled,
+                keep_artifacts=body.keep_artifacts)
             try:
                 services.jobs.start(self._active_print_job, name="extrusion-print")
             except JobBusy as exc:
                 raise HTTPException(409, str(exc))
             return {"status": "started", "mode": "LIVE_PRINT",
                     "collision_check_enabled": body.collision_check_enabled,
+                    "keep_artifacts": body.keep_artifacts,
                     "fingerprint": self._plan.fingerprint}
 
         @router.post("/correction/apply")

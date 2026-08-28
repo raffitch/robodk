@@ -223,6 +223,9 @@ export default function Extrusion() {
   // The operator's decision, not a derived one: the quick visual simulation is
   // where they see collisions, and per-layer re-validation is the slow step.
   const [liveCollisionCheck, setLiveCollisionCheck] = useState(false);
+  // Generated programs/targets are the only record of what the robot was told
+  // to do, so the operator decides whether the run cleans them up.
+  const [keepArtifacts, setKeepArtifacts] = useState(false);
   const [surface, setSurface] = useState<ScanSurface | null>(null);
   const [inspection, setInspection] = useState<InspectionPreview | null>(null);
   const [measureSession, setMeasureSession] = useState<MeasureSession | null>(null);
@@ -406,7 +409,7 @@ export default function Extrusion() {
     try {
       await api.post(`/${kind}`, kind === "print"
         ? { fingerprint: plan.fingerprint, confirm_live: confirmLive,
-            collision_check_enabled: liveCollisionCheck }
+            collision_check_enabled: liveCollisionCheck, keep_artifacts: keepArtifacts }
         : kind === "quick-sim"
           ? { fingerprint: plan.fingerprint, layer_indices: quickLayers,
               approve_full_plan: approveRepresentativeLayers }
@@ -740,6 +743,14 @@ export default function Extrusion() {
         Live collision validation is OFF. The physical run relies on what you saw in the quick visual
         simulation, preflight IK sampling, and your cell-clearance confirmation.
         {status?.dry_run_passed ? " The dry run has also passed for this toolpath." : ""}
+      </div>}
+      <label className="live-confirm"><input type="checkbox" checked={keepArtifacts}
+        onChange={(e) => setKeepArtifacts(e.target.checked)} disabled={status?.running} />
+        Keep the generated RoboDK programs and targets after the run (for inspecting what was commanded).
+      </label>
+      {keepArtifacts && <div className="io-note">
+        The curve, machining project, layer programs and inspection targets will be left in the station.
+        Reset / clean RoboDK path removes them.
       </div>}
       <label className="live-confirm"><input type="checkbox" checked={confirmLive} onChange={(e) => setConfirmLive(e.target.checked)} disabled={!status?.live_print_enabled || status?.running} />
         I confirm the selected tool/frame/orientation, cell clearance, material system, and live extrusion run.</label>

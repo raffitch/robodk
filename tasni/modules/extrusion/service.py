@@ -601,10 +601,16 @@ class CylinderDryRunJob:
 class CylinderPrintJob:
     """Print, capture one RGB-D frame, process, and archive each cylinder layer."""
 
-    def __init__(self, services, plan: CylinderPlan, *, check_collisions: bool = True):
+    def __init__(self, services, plan: CylinderPlan, *, check_collisions: bool = True,
+                 keep_artifacts: bool = False):
         self.services = services
         self.plan = plan.model_copy(deep=True)
         self.check_collisions = bool(check_collisions)
+        # The generated curve/project/programs/targets are the only record of what
+        # the robot was actually TOLD to do. Cleaning them up keeps the station
+        # tidy, but it also makes a failed run unexaminable, so the operator can
+        # ask to keep them.
+        self.keep_artifacts = bool(keep_artifacts)
         self.result: dict | None = None
         self.corrected_reference_xyz: np.ndarray | None = None
 
@@ -899,6 +905,8 @@ class CylinderPrintJob:
                       "fingerprint": self.plan.fingerprint, "trial_id": trial_id,
                       "trial_dir": str(trial_dir), "layers": summaries,
                       "collision_check_enabled": self.check_collisions,
+                      "artifacts_kept": self.keep_artifacts,
+                      "artifacts": list(dict.fromkeys(artifacts)) if self.keep_artifacts else [],
                       "correction_available": self.corrected_reference_xyz is not None,
                       "correction_executed": False}
             (trial_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -918,10 +926,17 @@ class CylinderPrintJob:
                     pass
             else:
                 ctx.log("FAULT: valve OFF could not be established; return motion inhibited")
-            try:
-                rdk.delete_items(list(dict.fromkeys(reversed(artifacts))))
-            except Exception:
-                pass
+            if self.keep_artifacts:
+                if artifacts:
+                    ctx.log(f"kept {len(artifacts)} generated RoboDK item(s) for "
+                            f"inspection: {', '.join(artifacts[:6])}"
+                            f"{' …' if len(artifacts) > 6 else ''}. "
+                            "Reset / clean RoboDK path removes them.")
+            else:
+                try:
+                    rdk.delete_items(list(dict.fromkeys(reversed(artifacts))))
+                except Exception:
+                    pass
 
 
 def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,

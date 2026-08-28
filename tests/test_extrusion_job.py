@@ -528,3 +528,32 @@ def test_an_inspection_path_that_flips_mid_move_rejects_that_candidate(
     assert len(chosen["rejected"]) == 1
     assert "turns axis 4" in chosen["rejected"][0]["reason"]
     assert (chosen["tilt_deg"], chosen["azimuth_deg"], chosen["roll_deg"]) != (0.0, 0.0, 0.0)
+
+
+def test_live_print_deletes_its_robodk_artifacts_by_default(tmp_path, monkeypatch):
+    svc, rdk, camera = services(tmp_path)
+    monkeypatch.setattr(service_mod, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(service_mod, "process_observation", fake_processing)
+    monkeypatch.setattr(service_mod, "_git_commit", lambda: "abc123")
+    monkeypatch.setattr(service_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(service_mod.runs, "read_active", lambda module: {"run_id": "cal-1"})
+    CylinderPrintJob(svc, plan(), check_collisions=False)(Ctx())
+    assert rdk.deleted, "generated programs/targets should be cleaned up by default"
+
+
+def test_live_print_can_keep_its_robodk_artifacts(tmp_path, monkeypatch):
+    """The generated programs are the only record of what the robot was actually
+    told to do. Deleting them unconditionally makes a failed run unexaminable --
+    the operator must be able to keep them and inspect the station afterwards.
+    """
+    svc, rdk, camera = services(tmp_path)
+    monkeypatch.setattr(service_mod, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(service_mod, "process_observation", fake_processing)
+    monkeypatch.setattr(service_mod, "_git_commit", lambda: "abc123")
+    monkeypatch.setattr(service_mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(service_mod.runs, "read_active", lambda module: {"run_id": "cal-1"})
+    output = CylinderPrintJob(svc, plan(), check_collisions=False,
+                              keep_artifacts=True)(Ctx())
+    assert rdk.deleted == [], "artifacts must survive when the operator asked to keep them"
+    assert output["artifacts_kept"] is True
+    assert output["artifacts"], "the run must name what it left in the station"
