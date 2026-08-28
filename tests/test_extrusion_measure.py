@@ -667,3 +667,104 @@ def test_measure_only_requests_default_to_collisions_off():
 
     assert CharacterizeBody().collision_check_enabled is False
     assert MeasureLayerBody(fingerprint="f", layer_index=1).collision_check_enabled is False
+
+
+def test_a_measured_take_leaves_its_figures_next_to_the_frame(tmp_path, monkeypatch):
+    """The operator should not have to run a tool to see what was measured."""
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    out = RingMeasureJob(svc, plan, session, 1, check_collisions=False)(Ctx())
+
+    figures = Path(out["layer_dir"]) / "figures"
+    assert figures.is_dir(), "the take archived no figures"
+    assert {p.name for p in figures.glob("*.png")} >= {"plan.png", "profile.png"}
+
+
+def test_a_figure_that_cannot_be_drawn_never_fails_the_measurement(tmp_path, monkeypatch):
+    """A drawing problem must not cost the operator a ring placement."""
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    monkeypatch.setattr(measure_mod, "render_layer_figures",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no matplotlib")))
+
+    out = RingMeasureJob(svc, plan, session, 1, check_collisions=False)(Ctx())
+
+    assert out["valid"] is True
+    assert Path(out["layer_dir"], "manifest.json").is_file()
+
+
+def archived_take(root, monkeypatch):
+    """One real MEASURE_ONLY take on disk, with no figures rendered yet."""
+    import test_extrusion_figures as figs
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", root.parent.parent)
+    return figs.write_take(root)
+
+
+def test_layer_figures_are_served_and_rendered_on_first_request(tmp_path, monkeypatch):
+    """Takes archived before figures existed must still produce them, robot-free."""
+    layer_dir = archived_take(tmp_path / "runs" / "extrusion", monkeypatch)
+    client = TestClient(create_app(AppConfig()))
+    base = "/api/modules/extrusion/trials/t1/layers/layer-001"
+    assert not (layer_dir / "figures").exists()
+
+    found = client.get(f"{base}/figures/plan.png")
+
+    assert found.status_code == 200
+    assert found.headers["content-type"] == "image/png"
+    assert found.content[:8] == b"\x89PNG\r\n\x1a\n"
+    assert (layer_dir / "figures" / "plan.png").is_file()
+    assert client.get(f"{base}/figures/profile.pdf").status_code == 200
+
+
+def test_archived_frames_are_served_from_the_allowlist_only(tmp_path, monkeypatch):
+    archived_take(tmp_path / "runs" / "extrusion", monkeypatch)
+    client = TestClient(create_app(AppConfig()))
+    base = "/api/modules/extrusion/trials/t1/layers/layer-001"
+
+    assert client.get(f"{base}/files/depth.npy").status_code == 404
+    assert client.get(f"{base}/files/manifest.json").status_code == 404
+    assert client.get(f"{base}/figures/plan.svg").status_code == 404
+
+
+def test_a_layer_directory_outside_the_trial_is_refused(tmp_path, monkeypatch):
+    """The directory name is a URL segment, so it must not be able to escape.
+
+    A literal ``..`` is normalised away by the client and never reaches the
+    handler; a percent-encoded one does, which is the case worth pinning.
+    """
+    archived_take(tmp_path / "runs" / "extrusion", monkeypatch)
+    client = TestClient(create_app(AppConfig()))
+    base = "/api/modules/extrusion/trials/t1/layers"
+
+    for segment in ("%2e%2e", "%2e", "characterize-01", "figures"):
+        found = client.get(f"{base}/{segment}/figures/plan.png")
+        assert found.status_code == 404, f"{segment} was served"
+    for trial in ("%2e%2e", "%2e"):
+        found = client.get(f"/api/modules/extrusion/trials/{trial}"
+                           f"/layers/layer-001/figures/plan.png")
+        assert found.status_code == 404, f"trial {trial} was served"
+    # A separator inside a segment is normalised by the router into some other
+    # path entirely; whatever that lands on, it is never an archived file.
+    for escaping in (f"{base}/../figures/plan.png",
+                     f"{base}/layer-001%2f..%2f../figures/plan.png",
+                     "/api/modules/extrusion/trials/t1%2f..%2f../layers/layer-001"
+                     "/figures/plan.png"):
+        found = client.get(escaping)
+        assert "image" not in found.headers["content-type"], f"{escaping} served an image"
+        assert "pdf" not in found.headers["content-type"], f"{escaping} served a pdf"
+
+
+def test_trials_reports_which_takes_have_figures(tmp_path, monkeypatch):
+    layer_dir = archived_take(tmp_path / "runs" / "extrusion", monkeypatch)
+    client = TestClient(create_app(AppConfig()))
+
+    layer = client.get("/api/modules/extrusion/trials").json()["trials"][0]["layers"][0]
+    assert layer["layer_dir"] == "layer-001"
+    assert layer["has_figures"] is False
+
+    client.get("/api/modules/extrusion/trials/t1/layers/layer-001/figures/plan.png")
+    layer = client.get("/api/modules/extrusion/trials").json()["trials"][0]["layers"][0]
+    assert layer["has_figures"] is True

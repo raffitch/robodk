@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 from ...core.jobrunner import JobBusy
 from ...core.logging import REPO_ROOT
 from ..base import ServiceContainer, WorkflowModule
+from .archive import _segment
+from .figures import ensure_figure
 from .inspection import inspection_plan
 from .measure import (MODE as MEASURE_MODE, MeasureSession, RingCharacterizeJob,
                       RingMeasureJob, paper_summary)
@@ -672,7 +674,9 @@ class ExtrusionModule(WorkflowModule):
                                     "metrics": manifest.get("metrics"),
                                     "geometry": manifest.get("geometry"),
                                     "valid": bool((manifest.get("metrics") or {}).get("valid")),
+                                    "layer_dir": manifest_path.parent.name,
                                     "has_comparison": (manifest_path.parent / "comparison.png").is_file(),
+                                    "has_figures": (manifest_path.parent / "figures").is_dir(),
                                 })
                             except (OSError, ValueError, json.JSONDecodeError):
                                 continue
@@ -694,6 +698,55 @@ class ExtrusionModule(WorkflowModule):
                                 "measure_only_trials": measure_only_trials,
                                 "measure_only_takes": measure_only_takes},
                     "trials": items}
+
+        # Raw frames and derived rasters the processing chain already writes.
+        # Deliberately narrow: depth.npy and manifest.json are data, not pictures,
+        # and reach the UI through /trials instead.
+        SERVED_FILES = {"color.png": "image/png", "comparison.png": "image/png",
+                        "segmentation.png": "image/png", "skeleton.png": "image/png"}
+        FIGURE_TYPES = {"png": "image/png", "pdf": "application/pdf"}
+
+        def _layer_directory(trial_id: str, layer_dir: str):
+            """Resolve one take's directory, or 404. The segments come from a URL."""
+            try:
+                trial = _segment(trial_id, "trial id")
+                name = _segment(layer_dir, "layer directory")
+            except ValueError as exc:
+                raise HTTPException(404, str(exc)) from exc
+            if not name.startswith("layer-"):
+                raise HTTPException(404, f"not a layer directory: {layer_dir!r}")
+            root = self._measure_root().resolve()
+            path = (root / trial / name).resolve()
+            if root not in path.parents or not (path / "manifest.json").is_file():
+                raise HTTPException(404, f"no archived take at {trial_id}/{layer_dir}")
+            return path
+
+        @router.get("/trials/{trial_id}/layers/{layer_dir}/files/{name}")
+        def layer_file(trial_id: str, layer_dir: str, name: str):
+            from fastapi.responses import FileResponse
+            media = SERVED_FILES.get(name)
+            if media is None:
+                raise HTTPException(404, f"not a served file: {name!r}")
+            path = _layer_directory(trial_id, layer_dir) / name
+            if not path.is_file():
+                raise HTTPException(404, f"{name} was not archived for this take")
+            return FileResponse(path, media_type=media)
+
+        @router.get("/trials/{trial_id}/layers/{layer_dir}/figures/{name}")
+        def layer_figure(trial_id: str, layer_dir: str, name: str):
+            """Render on first request, then serve. Never touches the robot."""
+            from fastapi.responses import FileResponse
+            media = FIGURE_TYPES.get(name.rpartition(".")[2])
+            if media is None:
+                raise HTTPException(404, f"not a figure: {name!r}")
+            path = _layer_directory(trial_id, layer_dir)
+            try:
+                return FileResponse(ensure_figure(path, name), media_type=media)
+            except (ValueError, FileNotFoundError) as exc:
+                raise HTTPException(404, str(exc)) from exc
+            except ImportError as exc:                       # the `figures` extra
+                raise HTTPException(
+                    503, f"figures need matplotlib (pip install -e .[figures]): {exc}") from exc
 
         @router.get("/trials/{trial_id}/paper-summary")
         def trial_paper_summary(trial_id: str) -> dict:
