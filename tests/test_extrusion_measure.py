@@ -537,3 +537,21 @@ def test_paper_summary_endpoint(tmp_path, monkeypatch):
     got = client.get(f"/api/modules/extrusion/trials/{trial_id}/paper-summary").json()
     assert got["takes"] == 1 and "markdown" in got
     assert client.get("/api/modules/extrusion/trials/nope/paper-summary").status_code == 404
+
+
+def test_empty_roi_error_reports_which_band_rejected_the_points():
+    """A bare "not enough points" cannot be acted on in the cell. The message must
+    say how many points each band admitted and what the observed spread was, so an
+    operator can tell a Z-offset (wrong build plane) from a radial miss (wrong
+    centre) without re-running the print."""
+    pytest.importorskip("open3d")
+    plan = scene_plan()
+    # A real ring, but sitting 250 mm away from the configured centre: the radial
+    # band rejects everything while the height band is perfectly happy.
+    far = (CENTER[0] + 250.0, CENTER[1])
+    with pytest.raises(RuntimeError) as excinfo:
+        observe(plan, 1, [syn.RingSpec(60.0, 8.0, far, height_fn=syn.flat(6.0))])
+    msg = str(excinfo.value)
+    assert "not enough deposited-geometry points" in msg
+    assert "height" in msg and "radial" in msg          # both bands named
+    assert "in_height_band" in msg and "in_radial_band" in msg

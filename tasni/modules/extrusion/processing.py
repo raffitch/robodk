@@ -7,6 +7,7 @@ be archived and the rest of Tasni imported even when the scan extra is absent.
 from __future__ import annotations
 
 import math
+import json
 import time
 from dataclasses import dataclass
 
@@ -358,9 +359,34 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     # height subtraction is more reproducible than fitting a new plane per frame.
     min_z = max(config.deposit_min_height_mm,
                 config.plane_distance_threshold_m * 1000.0)
-    roi = ((points[:, 2] >= min_z) & (points[:, 2] <= max_z) &
-           (radius >= recipe.radius_mm - config.radial_roi_margin_mm) &
-           (radius <= recipe.radius_mm + config.radial_roi_margin_mm))
+    in_height = (points[:, 2] >= min_z) & (points[:, 2] <= max_z)
+    r_lo = recipe.radius_mm - config.radial_roi_margin_mm
+    r_hi = recipe.radius_mm + config.radial_roi_margin_mm
+    in_radial = (radius >= r_lo) & (radius <= r_hi)
+    roi = in_height & in_radial
+    # Keep the per-band tallies: when the ROI comes back empty the operator needs
+    # to know WHICH band rejected the geometry (a wrong build plane and a wrong
+    # centre look identical from the point count alone).
+    roi_diag = {
+        "height_band_mm": [round(float(min_z), 2), round(float(max_z), 2)],
+        "radial_band_mm": [round(float(r_lo), 2), round(float(r_hi), 2)],
+        "center_xy_mm": [round(float(setup.center_x_mm), 2),
+                         round(float(setup.center_y_mm), 2)],
+        "backprojected": int(len(points)),
+        "in_height_band": int(in_height.sum()),
+        "in_radial_band": int(in_radial.sum()),
+        "in_both": int(roi.sum()),
+    }
+    if len(points):
+        pct = lambda a, q: round(float(np.percentile(a, q)), 1)  # noqa: E731
+        roi_diag["observed_z_mm"] = [pct(points[:, 2], 1), pct(points[:, 2], 50),
+                                     pct(points[:, 2], 99)]
+        roi_diag["observed_radius_mm"] = [pct(radius, 1), pct(radius, 50),
+                                          pct(radius, 99)]
+        if in_radial.any():     # what heights show up where the ring should be
+            zr = points[in_radial][:, 2]
+            roi_diag["z_within_radial_band_mm"] = [pct(zr, 1), pct(zr, 50), pct(zr, 99)]
+    counts.update({k: v for k, v in roi_diag.items() if isinstance(v, int)})
     points = points[roi]
     floor = {"source": "build_plane", "margin_mm": 0.0, "mean_mm": float(min_z)}
     if floor_profile is not None and len(points):
@@ -373,7 +399,9 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
                  "mean_mm": float(local.mean())}
     counts["after_work_roi"] = len(points)
     if len(points) < config.cluster_min_points:
-        raise RuntimeError("not enough deposited-geometry points inside the configured work ROI")
+        raise RuntimeError(
+            "not enough deposited-geometry points inside the configured work ROI "
+            f"(need {config.cluster_min_points}); {json.dumps(roi_diag)}")
 
     mark = time.perf_counter()
     deposit = _filter_deposit(points, config, counts)
