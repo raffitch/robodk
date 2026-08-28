@@ -132,8 +132,9 @@ build-plane offset (that was the *unsettled pose*, fixed in `b55ef5c`); an older
 
 ## 5. Next steps, ordered by cost × decisiveness
 
-Do A–D before writing any code beyond the three log lines in C. Together they take one
-cell visit of a few minutes and will almost certainly name the cause.
+C and E are now built, so the whole ladder is: restart the app, press Print & record,
+read the new log lines, and — if they do not settle it — run `tools/dispatch_bisect.py`
+while watching the arm. One cell visit, a few minutes, no material printed.
 
 **A. One dispatch, observed (0 code).** Start Print & record and, for that one run:
 1. At `valve OFF: job startup before motion` — does the **physical valve** respond
@@ -244,8 +245,12 @@ New test files: `test_valve_outputs`, `test_rdk_io_run_mode`, `test_extrusion_wa
   `time_s`.
 - **Offline replay** — every layer archives `depth.npy`, `color.png`,
   `provenance.T_work_camera`.
-- **Not yet used**: `RunCode()` return value, `RunMode()` read-back, RoboDK's connection
-  log, the pendant message window.
+- **Dispatch report** — `RdkIO.dispatch_program()` / `service.describe_dispatch()`.
+  `RunCode()`'s return value vs the instruction count, the run mode read **back**, and
+  `saw_busy`. Logged for valve and layer programs, archived in `provenance.dispatch`.
+- **Bisect ladder** — `tools/dispatch_bisect.py` (`link` / `jog` / `trivial` / `program`).
+- **Still not used**: RoboDK's driver/connection log, the pendant message window,
+  `$OV_PRO`, whether `RoboDKsync570` is cycling. None of these live in software.
 
 ---
 
