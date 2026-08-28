@@ -12,7 +12,8 @@ scripts below extract that Python to `macros/*.py` (editable here) and push edit
 After finishing a change, **always `git commit` and `git push`** — do not leave work
 sitting uncommitted. The user reviews progress from the pushed history (and the Jetson
 deploys from it), so unpushed local commits are invisible to them. Concretely:
-- Commit + push the working branch (today: `calibration-improvements`).
+- Commit + push the working branch (today: `main` — `calibration-improvements` was
+  merged in `51849b1` on 2026-08-25 and the Jetson re-pointed at `main`).
 - If the change touches **`server/`**, push and deploy/restart the Jetson camera
   service. The Jetson now follows the branch checked out in `/home/jetson/robodk`
   (falling back to `main` only if that branch has no remote), and
@@ -22,6 +23,11 @@ deploys from it), so unpushed local commits are invisible to them. Concretely:
 
 For fast orientation before opening long handoff docs, read
 **[docs/agent-debug-map.md](docs/agent-debug-map.md)**.
+
+**[AGENTS.md](AGENTS.md)** is the tool-agnostic entry point (Codex, Cursor, a fresh
+Claude): the working agreement, the environment traps, and what is currently open.
+Keep it in sync when any of those change — it is the only copy of that knowledge that
+is not inside one assistant's private memory.
 
 ## The editing loop
 
