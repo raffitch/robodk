@@ -21,6 +21,16 @@ from tasni.modules.extrusion.service import (CylinderDryRunJob, CylinderPrintJob
 from tasni.modules.extrusion.toolpath import generate_cylinder_plan
 
 
+# The fake robot's joint vector. Real joints (not a string sentinel) because the
+# job now takes a SETTLED pose reading, which parses them numerically.
+START_JOINTS = (11.0, 22.0, 33.0, 44.0, 55.0, 66.0)
+
+# Camera 500 mm above the layer-1 aim point (which sits at z=6 mm), so the
+# fake pose and the fake 500 mm depth frame describe the same geometry.
+FAKE_CAMERA_T = np.eye(4)
+FAKE_CAMERA_T[:3, 3] = [0.0, 0.0, 506.0]
+
+
 class Ctx:
     def __init__(self): self.logs = []; self.progresses = []; self.frames = []; self._cancelled = False
     def progress(self, *args): self.progresses.append(args)
@@ -45,7 +55,7 @@ class FakeRdk:
     def current_run_mode(self): return self.mode
     def set_run_mode_raw(self, value): self.mode = value; self.events.append(("restore-mode", value))
     def apply_run_mode(self, mode): self.mode = 1 if mode == "simulate" else 6; self.events.append(("mode", mode)); return mode
-    def current_joints(self): return "START"
+    def current_joints(self): return START_JOINTS
     def move_j_joints(self, joints): self.events.append(("move-joints", joints))
     def set_collision_checking(self, active):
         self.events.append(("global-collisions", active)); return True
@@ -112,7 +122,7 @@ class FakeRdk:
         if self.station_calls == self.fail_station_call:
             raise RuntimeError("controller did not confirm output OFF")
     def use_named_tool_frame(self, tool, frame): self.events.append(("select", tool, frame)); return np.eye(4)
-    def camera_pose_T(self): return np.eye(4)
+    def camera_pose_T(self): return FAKE_CAMERA_T.copy()
 
 
 class FakeCamera:
@@ -469,7 +479,7 @@ def test_auto_inspection_rolls_relative_to_the_camera_not_the_work_frame(
     assert pose["roll_reference_x"] == [-1.0, 0.0, 0.0]
     chosen = rdk.targets[0]["T"]
     np.testing.assert_allclose(np.asarray(chosen)[:3, 0], [-1.0, 0.0, 0.0], atol=1e-9)
-    assert ("camera-axes", "SelectedCamera", "SelectedFrame", "START") in rdk.events
+    assert ("camera-axes", "SelectedCamera", "SelectedFrame", START_JOINTS) in rdk.events
 
 
 def test_auto_inspection_records_the_joints_it_actually_locked(tmp_path, monkeypatch):

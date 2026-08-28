@@ -743,6 +743,10 @@ class ExtrusionConfig(_Model):
     center_x_mm: float = 0.0
     center_y_mm: float = 0.0
     build_plane_z_mm: float = 0.0
+    # Pose-vs-depth agreement at the inspection capture. Comfortably
+    # larger than aim/tilt geometry error, far smaller than the 142 mm
+    # model-vs-arm displacement seen on the cell 2026-08-28.
+    inspection_standoff_tolerance_mm: float = 25.0
     orientation_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
     # Keep the wrist near the operator's neutral starting configuration. The
     # generated curve uses fixed TCP orientation, but redundant IK/interpolation

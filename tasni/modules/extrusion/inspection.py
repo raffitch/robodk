@@ -252,3 +252,49 @@ def order_candidates_seed_first(candidates: list[dict], seed: dict | None) -> li
                 float(candidate["roll_deg"])) == key:
             return [candidate] + candidates[:index] + candidates[index + 1:]
     return candidates
+
+
+def standoff_report(T_work_camera, aim_point_xyz_mm, depth, *,
+                    patch_frac: float = 0.06) -> dict:
+    """Distance the pose says vs the distance the camera sees, to the aim point.
+
+    The inspection pose is commanded to put the camera a known distance from the
+    layer's aim point. If the arm is not actually there -- an unsettled read, a
+    model that has drifted from the real controller -- then EVERY back-projected
+    point is displaced by the difference, silently, because the depth frame itself
+    is perfectly good. On the cell (2026-08-28) that displaced the ring 142 mm
+    below the deposit height band and produced five identical "not enough
+    deposited-geometry points" failures with no hint of the cause.
+
+    ``measured_mm`` is the median of the valid depth in a central patch (the pose
+    aims the optical axis at the aim point, so the frame centre is that point).
+    Zero/invalid depth pixels are excluded; a patch with none yields NaN, which
+    :func:`standoff_fault` treats as a fault rather than a pass.
+    """
+    T = np.asarray(T_work_camera, dtype=float)
+    camera = T[:3, 3]
+    expected = float(np.linalg.norm(camera - np.asarray(aim_point_xyz_mm, dtype=float)))
+    d = np.asarray(depth, dtype=float)
+    h, w = d.shape
+    ph, pw = max(1, int(h * patch_frac)), max(1, int(w * patch_frac))
+    patch = d[h // 2 - ph:h // 2 + ph, w // 2 - pw:w // 2 + pw]
+    valid = patch[np.isfinite(patch) & (patch > 0)]
+    measured = float(np.median(valid)) if valid.size else float("nan")
+    return {"expected_mm": round(expected, 1), "measured_mm": round(measured, 1),
+            "delta_mm": round(measured - expected, 1), "samples": int(valid.size)}
+
+
+def standoff_fault(report: dict, tolerance_mm: float) -> "str | None":
+    """An operator-actionable message when pose and depth disagree, else None."""
+    measured, delta = report["measured_mm"], report["delta_mm"]
+    if not np.isfinite(measured):
+        return ("inspection depth frame has no valid samples at the aim point — "
+                "cannot confirm the camera reached the commanded standoff")
+    if abs(delta) > float(tolerance_mm):
+        return (f"camera is {delta:+.0f} mm from where it was commanded "
+                f"(commanded {report['expected_mm']:.0f} mm to the aim point, "
+                f"camera sees {measured:.0f} mm; tolerance {tolerance_mm:.0f} mm). "
+                "The robot is not where RoboDK thinks it is — check that the arm "
+                "settled at the inspection pose and that the work frame is correct. "
+                "Measuring now would displace every point by this amount.")
+    return None

@@ -242,7 +242,8 @@ def test_archive_writes_a_characterization_directory(tmp_path):
 
 # ------------------------------------------------- MEASURE_ONLY job (Task 8)
 
-from test_extrusion_job import Ctx, FakeCamera, FakeRdk, services  # noqa: F401
+from test_extrusion_job import (Ctx, FakeCamera, FakeRdk, START_JOINTS,  # noqa: F401
+                                services)
 from tasni.modules.extrusion import measure as measure_mod
 from tasni.modules.extrusion.measure import MeasureSession, RingMeasureJob
 from tasni.modules.extrusion.models import DeviationMetrics, RingGeometry
@@ -304,7 +305,7 @@ def test_measure_moves_only_the_camera_and_never_touches_the_valve(tmp_path, mon
     assert "station-program" not in kinds and "create" not in kinds     # no valve, no layer program
     assert "create-target" in kinds and "create-inspection" in kinds
     assert ("start", "TasniCylinder_MEASURE_%s_L001_Inspect" % plan.fingerprint[:10], True) in rdk.events
-    assert rdk.events[-1] == ("move-joints", "START")
+    assert rdk.events[-1] == ("move-joints", START_JOINTS)
     assert any(name.endswith("_Inspect") for name in rdk.deleted)
     assert camera.grabs == 2                                             # readiness + one measurement
     assert out["kind"] == "ring_measure" and out["mode"] == "MEASURE_ONLY"
@@ -351,7 +352,7 @@ def test_measure_archives_the_raw_frame_when_processing_fails(tmp_path, monkeypa
         RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True)(Ctx())
     layer = session.trial_dir / "layer-001"
     assert (layer / "depth.npy").is_file() and "bad skeleton" in (layer / "report.json").read_text()
-    assert rdk.events[-1] == ("move-joints", "START")                     # still returns home
+    assert rdk.events[-1] == ("move-joints", START_JOINTS)                     # still returns home
 
 
 def test_measure_blocks_before_motion_when_the_camera_is_offline(tmp_path, monkeypatch):
@@ -402,7 +403,7 @@ def test_characterize_job_measures_the_ring_and_stores_it_in_the_session(tmp_pat
     assert (Path(out["capture_dir"]) / "depth.npy").is_file()
     kinds = [e[0] for e in rdk.events]
     assert "station-program" not in kinds and "create" not in kinds
-    assert rdk.events[-1] == ("move-joints", "START")
+    assert rdk.events[-1] == ("move-joints", START_JOINTS)
     assert MeasureSession.load(root, session.trial_id).characterizations[-1]["radius_mm"] == 61.2
 
 

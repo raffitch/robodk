@@ -18,9 +18,11 @@ from ...core.logging import REPO_ROOT, new_run_dir
 from ...core.rdk_io import RdkIO
 from ..calibration.service import _camera_hold, ensure_real_robot_link
 from .archive import ExtrusionArchive
+from ..scan.survey_contract import refresh_robot_state
 from .inspection import (aim_point_mm, cylinder_diameter_mm, framing_standoff,
                          inspection_plan, order_candidates_seed_first,
-                         pose_candidates)
+                         pose_candidates, standoff_fault,
+                         standoff_report)
 from .models import CylinderPlan, CylinderRecipe, CylinderSetup, LayerManifest
 from .processing import process_observation
 from .surface import surface_check
@@ -659,7 +661,18 @@ class CylinderPrintJob:
                     # instructions do not update RdkIO's cached tool transform.
                     rdk.use_named_tool_frame(self.plan.setup.inspection_tool,
                                              self.plan.setup.work_frame)
-                    T_work_camera = rdk.camera_pose_T()
+                    # Take the pose the way the scan module does: fetch the real
+                    # robot state twice and require the joints to agree. A bare
+                    # read after settle_s can catch the arm still moving (or a
+                    # model that has not caught up with the controller), and the
+                    # resulting pose error displaces every measured point.
+                    snapshot = refresh_robot_state(rdk)
+                    if not snapshot.stationary:
+                        raise RuntimeError(
+                            f"layer {layer.layer_index}: the arm was still moving when the "
+                            "inspection pose was read — refusing to measure from a pose "
+                            "that does not match the robot")
+                    T_work_camera = snapshot.camera_T_np()
                     frame = services.camera.grab(with_depth=True, timeout=ecfg.grab_timeout_s)
                     if frame.depth is None:
                         raise RuntimeError(f"layer {layer.layer_index}: RGB-D capture returned no depth")
@@ -682,6 +695,20 @@ class CylinderPrintJob:
                         valve_transitions=[v for v in valve if v.get("layer_index") in
                                            (None, layer.layer_index)])
                     try:
+                        # Pose vs depth BEFORE trusting the geometry: if the arm is
+                        # not where the model says, the frame is still perfectly
+                        # good and every point is displaced by the difference —
+                        # which reads downstream as an empty ROI with no clue why.
+                        standoff = standoff_report(
+                            T_work_camera,
+                            aim_point_mm(self.plan.recipe, self.plan.setup,
+                                         layer.layer_index),
+                            frame.depth)
+                        base_manifest["provenance"]["standoff"] = standoff
+                        fault = standoff_fault(
+                            standoff, ecfg.inspection_standoff_tolerance_mm)
+                        if fault:
+                            raise RuntimeError(fault)
                         processed = process_observation(
                             color=frame.color, depth=frame.depth,
                             T_work_camera=T_work_camera, K=services.config.camera.K,
