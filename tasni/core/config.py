@@ -48,7 +48,18 @@ class CameraConfig(_Model):
     # this is just whichever Jetson IP the workstation can reach. Tailscale is
     # the stable default because the cell's direct LAN address is not routable
     # from every workstation; override per-machine if the network changes.
+    #
+    # ``ip`` is the ALWAYS-ROUTABLE fallback; ``lan_ip`` is tried first because
+    # the direct path avoids the Tailscale relay (materially faster for live
+    # preview). ``lan_ip`` is DHCP-assigned by the cell's Wi-Fi, so it can move —
+    # when it does we silently fall back to ``ip``, which is why the dashboard
+    # surfaces the host actually in use. Set ``lan_ip=""`` to disable the direct
+    # path on a workstation that can never reach the cell LAN.
     ip: str = "100.123.63.127"
+    lan_ip: str = "10.12.171.70"
+    # Patience for a non-final candidate. Short: the point is to fail over fast
+    # when off-LAN, not to wait out a full connect timeout on every attempt.
+    connect_probe_timeout_s: float = 1.5
     port: int = 1024
     # The server streams color at 1280x720 (server_unicast_syncronous.py), so the
     # intrinsics must be the 720p K — a 1080p setting would skew distance/tilt.

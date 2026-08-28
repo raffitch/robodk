@@ -54,6 +54,58 @@ class CameraClient:
     def __init__(self, config: CameraConfig):
         self.config = config
         self._jpeg = None
+        self._host: str | None = None      # last host that actually connected
+
+    # -- host selection -----------------------------------------------------
+    @property
+    def active_host(self) -> str:
+        """The host we are actually talking to (``config.ip`` before we know).
+
+        The dashboard reports this rather than ``config.ip`` so a silently
+        degraded direct path — a moved DHCP lease — is visible instead of the
+        UI claiming a route it is not using."""
+        return self._host or self.config.ip
+
+    def _candidates(self) -> "list[str]":
+        """Hosts to try, in order. A resolved host short-circuits the ladder so a
+        per-pose ``grab()`` loop does not re-probe the LAN on every frame."""
+        if self._host:
+            return [self._host]
+        ordered = [self.config.lan_ip, self.config.ip]
+        return list(dict.fromkeys(h for h in ordered if h))   # dedup, keep order
+
+    def _connect(self, timeout: float | None = None) -> "tuple[socket.socket, str]":
+        """Connect to the first reachable candidate; cache and return it.
+
+        The connection attempt *is* the probe — the camera server is unicast, so
+        a separate reachability check would open a second connection and risk
+        disturbing a capture. Non-final candidates get the short probe timeout;
+        the last one gets the full budget so a slow-but-working relay is not cut
+        off. A cached host that has since died is dropped and the full ladder
+        re-runs once, so moving between networks recovers without a restart."""
+        cfg = self.config
+        full = cfg.timeout_s if timeout is None else timeout
+        hosts = self._candidates()
+        errors: "list[str]" = []
+        for attempt, host in enumerate(hosts):
+            last = attempt == len(hosts) - 1
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(full if last else min(cfg.connect_probe_timeout_s, full))
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            _set_nodelay(s)
+            try:
+                s.connect((host, cfg.port))
+            except (socket.timeout, OSError) as e:
+                s.close()
+                errors.append(f"{host}:{cfg.port} ({e})")
+                continue
+            s.settimeout(full)                 # probe budget was only for connect
+            self._host = host
+            return s, host
+        if self._host:                         # cached host is stale — re-ladder
+            self._host = None
+            return self._connect(timeout)
+        raise CameraError("camera unreachable: " + "; ".join(errors))
 
     # -- decode helpers -----------------------------------------------------
     def _decode_color(self, data: bytes) -> np.ndarray:
@@ -103,7 +155,7 @@ class CameraClient:
             depth_raw = self._recv_exact(sock, depth_len)
             color_raw = self._recv_exact(sock, color_len)
         except socket.timeout as e:
-            raise CameraError(f"camera timeout ({cfg.ip}:{cfg.port})") from e
+            raise CameraError(f"camera timeout ({self.active_host}:{cfg.port})") from e
         except OSError as e:
             raise CameraError(f"camera socket error: {e}") from e
         return depth_raw, color_raw, timestamp
@@ -152,17 +204,7 @@ class CameraClient:
         ``timeout`` overrides the configured socket timeout. ``color_only`` asks
         the server to skip the (unused-for-calibration) depth payload. For
         continuous live preview use :meth:`stream` — re-connecting per frame is slow."""
-        cfg = self.config
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(cfg.timeout_s if timeout is None else timeout)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            _set_nodelay(s)
-            try:
-                s.connect((cfg.ip, cfg.port))
-            except socket.timeout as e:
-                raise CameraError(f"camera timeout ({cfg.ip}:{cfg.port})") from e
-            except OSError as e:
-                raise CameraError(f"camera socket error: {e}") from e
+        with self._connect(timeout)[0] as s:
             if color_only:
                 self._request_color_only(s, quality)
             try:
@@ -191,21 +233,12 @@ class CameraClient:
         first (the platform stops the live preview before one-shot grabs)."""
         cfg = self.config
         h264 = codec == "h264"
+        # Resolve the host FIRST so the telemetry side-channel dials the same
+        # box the frame stream is on (they must not straddle two routes).
+        s, host = self._connect(timeout)
         telemetry_reader = None
         if scan_telemetry:
-            telemetry_reader = _TelemetryReader(cfg.ip, cfg.port, timeout_s=timeout)
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(cfg.timeout_s if timeout is None else timeout)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        _set_nodelay(s)
-        try:
-            s.connect((cfg.ip, cfg.port))
-        except socket.timeout as e:
-            s.close()
-            raise CameraError(f"camera timeout ({cfg.ip}:{cfg.port})") from e
-        except OSError as e:
-            s.close()
-            raise CameraError(f"camera socket error: {e}") from e
+            telemetry_reader = _TelemetryReader(host, cfg.port, timeout_s=timeout)
         if color_only or h264:                       # h264 is inherently color-only
             self._request_color_only(
                 s, quality, codec=codec, bitrate=bitrate,
@@ -239,16 +272,7 @@ class CameraClient:
         A server that predates burst would instead start a full stream, so the ack
         check fails and we raise :class:`CameraError` — letting the caller fall back
         to per-pose :meth:`grab`. Unicast: stop any other camera user first."""
-        cfg = self.config
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(cfg.timeout_s if timeout is None else timeout)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        _set_nodelay(s)
-        try:
-            s.connect((cfg.ip, cfg.port))
-        except (socket.timeout, OSError) as e:
-            s.close()
-            raise CameraError(f"camera socket error: {e}") from e
+        s = self._connect(timeout)[0]
         ready = b""
         try:
             s.sendall(b"MODE BURST\n")

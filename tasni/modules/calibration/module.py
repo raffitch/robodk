@@ -81,6 +81,8 @@ class CalibrationModule(WorkflowModule):
                 "camera_tool": c.robodk.camera_tool,
                 "board": c.board.model_dump(),
                 "camera": {"ip": c.camera.ip, "port": c.camera.port,
+                           "lan_ip": c.camera.lan_ip,
+                           "active_host": services.camera.active_host,
                            "resolution": c.camera.resolution},
                 "calibration": cc.model_dump(),
                 "gate": {"ideal_distance_mm": cc.ideal_distance_mm,

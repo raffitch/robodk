@@ -518,6 +518,8 @@ class ScanModule(WorkflowModule):
                 "robot": c.robodk.robot_name,
                 "camera_tool": c.robodk.camera_tool,
                 "camera": {"ip": c.camera.ip, "port": c.camera.port,
+                           "lan_ip": c.camera.lan_ip,
+                           "active_host": services.camera.active_host,
                            "resolution": c.camera.resolution},
                 "scan": sc.model_dump(),
                 "gate": {"ideal_distance_mm": sc.ideal_distance_mm,

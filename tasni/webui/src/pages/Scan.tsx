@@ -44,7 +44,8 @@ const GATE_GRACE_MS = 1000;
 interface ScanConfig {
   robot: string;
   camera_tool: string;
-  camera: { ip: string; port: number; resolution: string };
+  camera: { ip: string; port: number; resolution: string;
+            lan_ip?: string; active_host?: string };
   scan: { pose_count: number; cone_half_angle_deg: number; voxel_size_m: number;
           collision_self_pairs: boolean };
   gate: { ideal_distance_mm: number; distance_tol_mm: number; max_tilt_deg: number };
@@ -1260,7 +1261,7 @@ export default function Scan() {
               <div className="kv">
                 <div className="k">Robot</div><div className="v">{config.robot}</div>
                 <div className="k">Camera</div>
-                <div className="v">{config.camera.ip}:{config.camera.port} @ {config.camera.resolution}</div>
+                <div className="v">{config.camera.active_host ?? config.camera.ip}:{config.camera.port} @ {config.camera.resolution}</div>
                 <div className="k">Fusion</div>
                 <div className="v">TSDF · {Math.round(config.scan.voxel_size_m * 1000)} mm voxel ·
                   {config.scan.pose_count} views · cone ±{config.scan.cone_half_angle_deg}°</div>

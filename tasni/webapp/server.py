@@ -48,8 +48,12 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     @app.get("/api/health")
     def health() -> dict:
         cam = services.config.camera
-        camera_route = connection_route(cam.ip)
-        camera_endpoint = f"{cam.ip}:{cam.port}"
+        # The host actually in use, not the configured fallback: the client
+        # prefers the direct LAN path and silently falls back to Tailscale, so
+        # reporting cam.ip would claim a route we may not be on.
+        cam_host = services.camera.active_host
+        camera_route = connection_route(cam_host)
+        camera_endpoint = f"{cam_host}:{cam.port}"
         camera_base = {"route": camera_route, "endpoint": camera_endpoint}
         robodk_ok = tcp_probe("127.0.0.1", ROBODK_API_PORT)
         # Don't probe the camera mid-capture — the unicast server serves one
@@ -75,7 +79,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                           f"{camera_endpoint}",
             }
         else:
-            camera_ok = tcp_probe(cam.ip, cam.port)
+            camera_ok = tcp_probe(cam_host, cam.port)
             camera = {
                 **camera_base, "ok": camera_ok,
                 "state": "connected" if camera_ok else "offline",

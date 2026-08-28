@@ -28,7 +28,8 @@ interface CalibConfig {
   camera_tool: string;
   board: { squares_x: number; squares_y: number; square_size_mm: number; marker_size_mm: number;
            dictionary: string; paper_size: string };
-  camera: { ip: string; port: number; resolution: string };
+  camera: { ip: string; port: number; resolution: string;
+            lan_ip?: string; active_host?: string };
   calibration: { holdout_count: number; refine: boolean; pose_count: number;
                  cone_half_angle_deg: number; roll_max_deg: number; distance_jitter: number;
                  jog_invert_x: boolean; jog_invert_y: boolean; jog_invert_z: boolean;
@@ -570,7 +571,7 @@ export default function Calibration() {
             <div className="k">Camera tool</div>
             <div className="v">{config.camera_tool} <span className="hint">(RealSense, fixed)</span></div>
             <div className="k">Camera</div>
-            <div className="v">{config.camera.ip}:{config.camera.port} @ {config.camera.resolution}</div>
+            <div className="v">{config.camera.active_host ?? config.camera.ip}:{config.camera.port} @ {config.camera.resolution}</div>
             <div className="k">Board</div>
             <div className="v">
               {config.board.squares_x}×{config.board.squares_y}, {config.board.square_size_mm}/
