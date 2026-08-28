@@ -134,6 +134,24 @@ the first zero-offset baseline. Fixture: `tests/fixtures/extrusion/ring2/`.
 **After the restart press Apply to recipe & placement first** (the plan is in-memory
 only; Center-on-surface → Generate would rebuild the stale pre-Apply plan).
 
+**2026-08-28 — the measure-only journey now defends itself** (`8ed25fd`, `b7c746b`,
+pushed to `main`; 140 extrusion tests green). Reprocessing a take rejoins the session
+(`session.json` gains the record and `tops[N]`, so the next layer keeps its floor —
+the paper trial had a valid layer-001 and an empty session); offline runs keep the
+capture time they were measured with, never claim an acquisition-to-path they did not
+produce, and are excluded from the cycle statistic; a session is **bound** to the plan
+it applied, and measuring against any other is refused by name; that plan is **restored
+after a backend restart** (and Apply now applies onto the session's own trial rather
+than config defaults, which do not name a tool here — the documented "press Apply
+first" used to raise a validation error); layer N refuses until layer N−1 has a
+measured top; invalid takes stay visible with a **Reprocess** button and are never
+averaged; conditions group by **layer + phase + offset**, so the noise floor is not
+pooled with placement repeatability. The Extrusion page carries a live **Run guide**.
+**Trap corrected:** the ChArUco square pitch is NOT a usable ruler for the introduced
+offset on this cell — the board is A3 8×6 at **40 mm** squares and 40 mm is past the
+25 mm cap (the ring leaves the ±30 mm search band and the take is invalid). Use a steel
+rule along a board edge and type what was actually achieved.
+
 **Also pending:** the PFH paper's ring-stack cell run (deadline 1 Sep 2026) — **read
 [docs/pfh-paper-handoff.md](docs/pfh-paper-handoff.md) first**: it is the single page for
 that task (what the paper still needs, the exact operator order, and the wording
