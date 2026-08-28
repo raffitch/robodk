@@ -110,6 +110,16 @@ correctness traps (deposit-band colour range; FITTED not averaged nominal centre
 > — the continuation handoff: current state, the full decision tree for each bisect
 > outcome, where the code is, and the fallback options with their real costs.
 
+**2026-08-28 — the summary is scored against ground truth.** `paper_summary` now reports
+**detection error** (`|measured centre offset − the offset the operator typed|`) per
+condition and machine-checks the pure-shift relation (`max = d`, `mean = 2d/pi`,
+`RMS = d/sqrt(2)`), printing a `WARNING` naming any statistic that disagrees instead of
+averaging a bad condition in. A take archived before the offset *vector* existed is
+excluded rather than counted as perfect. Figures draw the **ground truth ring** (nominal
++ introduced offset) in `plan` and `stack`. Replaying the 2026-08-28 capture: 15.38 mm
+detection error against its "no offset" annotation (the skipped *Apply*), and 0.002 mm
+once re-labelled with the displacement that was really there.
+
 **Also pending:** the PFH paper's ring-stack cell run (deadline 1 Sep 2026) — **read
 [docs/pfh-paper-handoff.md](docs/pfh-paper-handoff.md) first**: it is the single page for
 that task (what the paper still needs, the exact operator order, and the wording

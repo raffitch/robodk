@@ -14,6 +14,7 @@ put the live print at risk for no gain.
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 
@@ -492,6 +493,81 @@ def _stat(values) -> dict:
             "max": float(arr.max()) if arr.size else None}
 
 
+# The relation a bodily translation MUST satisfy, and the band it is checked in.
+# A ring of radius R shifted by d << R from the nominal centre has radial
+# deviation d*cos(theta) about that centre, so max = d, mean|dev| = 2d/pi and
+# RMS = d/sqrt(2). The handoff calls this the built-in sanity check: readings
+# that do not obey it mean the chain measured something other than the shift.
+#
+# The tolerance is this cell's own error floor -- hand-eye board consistency
+# 1.26 mm, work-plane RMS 1.39 mm -- rounded to 1.5 mm, plus a proportional term
+# so a larger introduced offset is not held to an absolute band it never claimed.
+SHIFT_CHECK_FLOOR_MM = 1.5
+SHIFT_CHECK_FRACTION = 0.15
+
+
+def pure_shift_expectation(introduced_norm_mm: float) -> dict:
+    """Deviation triple a pure translation of ``d`` produces (first order in d/R)."""
+    d = float(introduced_norm_mm)
+    return {"mean_absolute_mm": 2.0 * d / math.pi,
+            "rms_mm": d / math.sqrt(2.0),
+            "maximum_mm": d}
+
+
+def shift_consistency(observed: dict, introduced_norm_mm: float, *,
+                      floor_mm: float = SHIFT_CHECK_FLOOR_MM,
+                      fraction: float = SHIFT_CHECK_FRACTION) -> "dict | None":
+    """Do these deviations look like the translation the operator introduced?
+
+    ``None`` when no offset was introduced -- there is no relation to check, and
+    a zero-offset group must not be reported as passing one. Otherwise every
+    disagreeing statistic is named, so a failure says WHICH number is wrong
+    rather than only that something is.
+    """
+    d = float(introduced_norm_mm or 0.0)
+    if d <= 0.0:
+        return None
+    expected = pure_shift_expectation(d)
+    tolerance = max(float(floor_mm), float(fraction) * d)
+    delta: dict[str, float] = {}
+    disagreements: list[str] = []
+    for key, want in expected.items():
+        got = observed.get(key)
+        if got is None:
+            continue
+        delta[key] = float(got) - want
+        if abs(delta[key]) > tolerance:
+            disagreements.append(key)
+    return {"expected_mm": expected,
+            "observed_mm": {key: (None if observed.get(key) is None else float(observed[key]))
+                            for key in expected},
+            "delta_mm": delta, "tolerance_mm": tolerance,
+            "consistent": not disagreements, "disagreements": disagreements}
+
+
+def introduced_offset_mm(manifest: dict) -> "tuple[float, float]":
+    """The ground truth the operator typed before pressing Measure; absent = none."""
+    offset = (manifest.get("annotation") or {}).get("introduced_offset_mm")
+    if not offset or len(offset) != 2:
+        return (0.0, 0.0)
+    return (float(offset[0]), float(offset[1]))
+
+
+def detection_error_mm(manifest: dict) -> "float | None":
+    """How far the MEASURED centre offset lands from the one the operator typed.
+
+    This is the number the paper actually claims: not where the ring sat, but
+    how well the sensing-and-comparison chain recovered a displacement it was
+    told about. ``None`` when the take predates the measured offset VECTOR --
+    missing is not zero, and averaging it in would read as a perfect measurement.
+    """
+    measured = (manifest.get("metrics") or {}).get("center_offset_mm")
+    if measured is None or len(measured) != 2:
+        return None
+    truth = introduced_offset_mm(manifest)
+    return float(math.hypot(float(measured[0]) - truth[0], float(measured[1]) - truth[1]))
+
+
 def _condition_name(manifest: dict) -> str:
     offset = (manifest.get("annotation") or {}).get("introduced_offset_mm")
     if not offset or not any(float(v) for v in offset):
@@ -527,14 +603,22 @@ def paper_summary(root: Path, trial_id: str) -> dict:
     conditions = []
     for name, items in groups.items():
         metrics = [m["metrics"] for m in items if m.get("metrics")]
+        introduced = introduced_offset_mm(items[0])
+        introduced_norm = float(math.hypot(*introduced))
+        deviation = {"mean_absolute_mm": _stat(x.get("mean_absolute_mm") for x in metrics),
+                     "rms_mm": _stat(x.get("rms_mm") for x in metrics),
+                     "maximum_mm": _stat(x.get("maximum_mm") for x in metrics)}
         conditions.append({
             "condition": name, "takes": len(items),
             "valid": sum(1 for x in metrics if x.get("valid")),
+            "introduced_offset_mm": list(introduced),
+            "introduced_norm_mm": introduced_norm,
             "center_offset_norm_mm": _stat(x.get("center_offset_norm_mm") for x in metrics),
-            "mean_absolute_mm": _stat(x.get("mean_absolute_mm") for x in metrics),
-            "rms_mm": _stat(x.get("rms_mm") for x in metrics),
-            "maximum_mm": _stat(x.get("maximum_mm") for x in metrics),
-            "shape_rms_mm": _stat(x.get("shape_rms_mm") for x in metrics)})
+            "detection_error_mm": _stat(detection_error_mm(m) for m in items),
+            **deviation,
+            "shape_rms_mm": _stat(x.get("shape_rms_mm") for x in metrics),
+            "shift_consistency": shift_consistency(
+                {key: stat["mean"] for key, stat in deviation.items()}, introduced_norm)})
     timings = [(m.get("processing") or {}).get("timings_ms") or {} for m in takes]
     timing = {key: _stat(t.get(key) for t in timings)
               for key in ("capture_ms", "total_ms", "acquisition_to_path_ms")}
@@ -554,12 +638,34 @@ def paper_summary(root: Path, trial_id: str) -> dict:
              f"hand-placed dried beads with a known introduced offset (not a printed-cylinder "
              f"deposition deviation). {valid}/{len(takes)} measurements produced a valid, "
              f"branch-free path.", "",
-             "| Condition | n | centre offset (mm) | mean abs dev (mm) | RMS (mm) | max (mm) | shape RMS (mm) |",
-             "|---|---|---|---|---|---|---|"]
+             "| Condition | n | centre offset (mm) | detection error (mm) | "
+             "mean abs dev (mm) | RMS (mm) | max (mm) | shape RMS (mm) |",
+             "|---|---|---|---|---|---|---|---|"]
     for c in conditions:
         lines.append(f"| {c['condition']} | {c['takes']} | {_fmt(c['center_offset_norm_mm'])} | "
+                     f"{_fmt(c['detection_error_mm'])} | "
                      f"{_fmt(c['mean_absolute_mm'])} | {_fmt(c['rms_mm'])} | "
                      f"{_fmt(c['maximum_mm'])} | {_fmt(c['shape_rms_mm'])} |")
+    # The claim itself, in words: not where the ring sat, but how well a
+    # displacement the chain was TOLD about was recovered.
+    for c in conditions:
+        if c["introduced_norm_mm"] > 0:
+            lines += ["", f"A {c['introduced_norm_mm']:.1f} mm introduced offset was recovered "
+                          f"as {_fmt(c['center_offset_norm_mm'])} mm over {c['takes']} take(s); "
+                          f"detection error {_fmt(c['detection_error_mm'])} mm."]
+        else:
+            lines += ["", f"With no offset introduced the chain read a centre offset of "
+                          f"{_fmt(c['center_offset_norm_mm'])} mm over {c['takes']} take(s) - "
+                          f"the baseline this comparison is read against."]
+        check = c["shift_consistency"]
+        if check and not check["consistent"]:
+            named = ", ".join(f"{key} {check['observed_mm'][key]:.2f} vs "
+                              f"{check['expected_mm'][key]:.2f} expected"
+                              for key in check["disagreements"])
+            lines += ["", f"WARNING - {c['condition']}: the deviation profile does not match a "
+                          f"pure translation of {c['introduced_norm_mm']:.1f} mm "
+                          f"(tolerance {check['tolerance_mm']:.2f} mm): {named}. "
+                          "Investigate before citing this condition."]
     acq = timing["acquisition_to_path_ms"]
     if acq["n"]:
         lines += ["", f"Across {acq['n']} processing cycles, RGB-D acquisition to reconstructed "

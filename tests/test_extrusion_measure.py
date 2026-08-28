@@ -591,8 +591,12 @@ def test_apply_characterization_rewrites_recipe_and_placement(tmp_path, monkeypa
 from tasni.modules.extrusion.measure import paper_summary
 
 
-def _write_take(root, trial_id, layer_index, take, *, offset, offset_norm, rms, mean_abs, maximum,
-                acq_ms, valid=True):
+def _write_take(root, trial_id, layer_index, take, *, offset, rms, mean_abs, maximum,
+                acq_ms, valid=True, offset_norm=None, measured_offset=None):
+    if measured_offset is None:
+        measured_offset = (float(offset_norm or 0.0), 0.0)
+    if offset_norm is None:
+        offset_norm = float(np.hypot(*measured_offset))
     manifest = LayerManifest(
         trial_id=trial_id, layer_index=layer_index, take=take, mode="MEASURE_ONLY",
         recipe=auto_plan().recipe, toolpath_fingerprint="f" * 64,
@@ -600,6 +604,7 @@ def _write_take(root, trial_id, layer_index, take, *, offset, offset_norm, rms, 
         metrics=DeviationMetrics(mean_absolute_mm=mean_abs, rms_mm=rms, maximum_mm=maximum,
                                  measured_center_mm=(0, 0), measured_radius_mm=40,
                                  path_completeness=0.99, maximum_angular_gap_deg=4, valid=valid,
+                                 center_offset_mm=tuple(float(v) for v in measured_offset),
                                  center_offset_norm_mm=offset_norm, shape_rms_mm=0.4),
         geometry=RingGeometry(top_z_mean_mm=6, top_z_min_mm=5, top_z_max_mm=9, top_z_std_mm=1,
                               height_mean_mm=6, height_min_mm=5, height_max_mm=9,
@@ -640,6 +645,107 @@ def test_paper_summary_endpoint(tmp_path, monkeypatch):
     got = client.get(f"/api/modules/extrusion/trials/{trial_id}/paper-summary").json()
     assert got["takes"] == 1 and "markdown" in got
     assert client.get("/api/modules/extrusion/trials/nope/paper-summary").status_code == 404
+
+
+# ---------------------------------- detection error vs the operator's ground truth
+
+def test_paper_summary_scores_the_measurement_against_the_offset_the_operator_typed(tmp_path):
+    """The paper's claim is "a 10 mm shift READ AS 10.x mm", not "offset 10.x mm".
+
+    Without the typed offset subtracted, the table only says where the ring was,
+    never how well the chain found it -- which is the whole controlled-validation
+    claim.
+    """
+    root = tmp_path / "runs" / "extrusion"
+    t = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    _write_take(root, t, 2, 1, offset=[10, 0], measured_offset=[10.4, 0.3],
+                rms=7.0, mean_abs=6.3, maximum=9.9, acq_ms=1000)
+    _write_take(root, t, 2, 2, offset=[10, 0], measured_offset=[9.6, -0.3],
+                rms=7.1, mean_abs=6.4, maximum=10.1, acq_ms=1000)
+
+    shifted = {c["condition"]: c for c in paper_summary(root, t)["conditions"]}[
+        "introduced offset (10, 0) mm"]
+
+    assert shifted["introduced_norm_mm"] == pytest.approx(10.0)
+    # |(10.4, 0.3) - (10, 0)| and |(9.6, -0.3) - (10, 0)| are both exactly 0.5 mm
+    assert shifted["detection_error_mm"]["mean"] == pytest.approx(0.5, abs=1e-9)
+    assert shifted["detection_error_mm"]["max"] == pytest.approx(0.5, abs=1e-9)
+    assert shifted["detection_error_mm"]["n"] == 2
+
+
+def test_a_take_with_no_introduced_offset_is_scored_against_zero(tmp_path):
+    """The zero-offset group IS the baseline: how far off it reads when nothing moved."""
+    root = tmp_path / "runs" / "extrusion"
+    t = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    _write_take(root, t, 1, 1, offset=None, measured_offset=[0.3, 0.4],
+                rms=0.5, mean_abs=0.4, maximum=1.1, acq_ms=900)
+
+    baseline = paper_summary(root, t)["conditions"][0]
+
+    assert baseline["introduced_norm_mm"] == 0.0
+    assert baseline["detection_error_mm"]["mean"] == pytest.approx(0.5, abs=1e-9)
+    assert baseline["shift_consistency"] is None, "no shift to check the relation against"
+
+
+def test_deviations_that_look_like_the_introduced_shift_pass_the_built_in_relation(tmp_path):
+    """A pure translation d must read max = d, mean = 2d/pi, RMS = d/sqrt(2)."""
+    root = tmp_path / "runs" / "extrusion"
+    t = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    _write_take(root, t, 2, 1, offset=[10, 0], measured_offset=[10.0, 0.0],
+                rms=7.07, mean_abs=6.37, maximum=10.0, acq_ms=1000)
+
+    check = paper_summary(root, t)["conditions"][0]["shift_consistency"]
+
+    assert check["consistent"] is True
+    assert check["expected_mm"]["mean_absolute_mm"] == pytest.approx(6.366, abs=1e-3)
+    assert check["expected_mm"]["rms_mm"] == pytest.approx(7.071, abs=1e-3)
+    assert check["disagreements"] == []
+
+
+def test_deviations_that_do_not_look_like_a_pure_shift_are_flagged_not_averaged(tmp_path):
+    """The sanity check the handoff calls "stop and investigate" must be machine-checked."""
+    root = tmp_path / "runs" / "extrusion"
+    t = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    _write_take(root, t, 2, 1, offset=[10, 0], measured_offset=[3.0, 0.0],
+                rms=2.4, mean_abs=2.0, maximum=4.0, acq_ms=1000)
+
+    summary = paper_summary(root, t)
+    check = summary["conditions"][0]["shift_consistency"]
+
+    assert check["consistent"] is False
+    assert set(check["disagreements"]) == {"mean_absolute_mm", "rms_mm", "maximum_mm"}
+    assert "does not match a pure" in summary["markdown"]
+
+
+def test_the_markdown_states_the_recovered_shift_for_every_offset_condition(tmp_path):
+    root = tmp_path / "runs" / "extrusion"
+    t = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    _write_take(root, t, 2, 1, offset=[10, 0], measured_offset=[10.2, 0.0],
+                rms=7.1, mean_abs=6.4, maximum=10.2, acq_ms=1000)
+    _write_take(root, t, 2, 2, offset=[10, 0], measured_offset=[9.8, 0.0],
+                rms=7.0, mean_abs=6.3, maximum=9.8, acq_ms=1000)
+
+    markdown = paper_summary(root, t)["markdown"]
+
+    assert "10.0 mm introduced offset was recovered as 10.00 +/- 0.28 mm" in markdown
+    assert "detection error" in markdown
+
+
+def test_a_take_archived_before_the_offset_vector_existed_is_left_out_of_the_score(tmp_path):
+    """Missing is not zero: an old manifest must not read as a perfect measurement."""
+    root = tmp_path / "runs" / "extrusion"
+    t = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    _write_take(root, t, 2, 1, offset=[10, 0], measured_offset=[10.4, 0.3],
+                rms=7.0, mean_abs=6.3, maximum=9.9, acq_ms=1000)
+    stale = root / t / "layer-002" / "manifest.json"
+    payload = json.loads(stale.read_text(encoding="utf-8"))
+    payload["metrics"].pop("center_offset_mm")
+    stale.write_text(json.dumps(payload), encoding="utf-8")
+
+    condition = paper_summary(root, t)["conditions"][0]
+
+    assert condition["detection_error_mm"]["n"] == 0
+    assert condition["detection_error_mm"]["mean"] is None
 
 
 def test_empty_roi_error_reports_which_band_rejected_the_points():

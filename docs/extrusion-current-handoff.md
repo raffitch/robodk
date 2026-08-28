@@ -230,6 +230,35 @@ in AGENTS.md). The one operator slip was skipping *Apply to recipe & placement* 
 Characterize and Measure, so layer-001's deviation is dominated by a 15 mm centre offset
 against the stale plan.
 
+### Scoring against the operator's ground truth (2026-08-28)
+
+`paper_summary` grades every take against the offset the operator typed, not just
+against nominal:
+
+- `detection_error_mm` per condition = `|measured center_offset_mm − annotation.introduced_offset_mm|`.
+  A take whose manifest predates the measured offset *vector* returns `None` and is
+  excluded — missing is not zero, and averaging it in would read as a perfect measurement.
+- `shift_consistency` machine-checks the relation a pure translation must satisfy
+  (`max = d`, `mean = 2d/pi`, `RMS = d/sqrt(2)`) against the condition's means, inside a
+  band of `max(1.5 mm, 15% of d)` — 1.5 mm being this cell's own floor (board consistency
+  1.26 mm, work-plane RMS 1.39 mm). Every disagreeing statistic is named, and the
+  Markdown block prints a `WARNING` line rather than letting a bad condition average in.
+- The zero-offset group is scored against `(0, 0)`, which makes it the baseline and makes
+  a skipped *Apply* impossible to miss: replaying the 2026-08-28 take reports a 15.38 mm
+  detection error against its "no offset introduced" annotation. Re-labelled with the
+  displacement that was actually there, the same frame scores **0.002 mm**.
+
+`figures.expected_ring(take)` returns the nominal ring translated by the introduced
+offset — the ground truth — and `plan` and `stack` draw it (teal dash-dot) whenever a
+non-zero offset was recorded. A take with no introduced offset gets no such line: a
+duplicate of the nominal circle would read as evidence of something.
+
+Adding that sixth legend entry exposed two layout defects that were already there and
+are now regression-tested: the in-axes legend **covered the measured centreline** (it is
+now below the axes, two columns, clear of the x-axis label), and the honesty caption
+**was clipped at both ends** once an introduced offset made it long (it now wraps at
+`CAPTION_WRAP`, without breaking "hand-placed" across lines).
+
 ### Figures (2026-08-28)
 
 `tasni/modules/extrusion/figures.py` renders four figures per take from the archive

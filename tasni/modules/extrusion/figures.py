@@ -20,6 +20,7 @@ not require a display, and ``tasni`` must still import when matplotlib is absent
 from __future__ import annotations
 
 import json
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,7 +39,13 @@ CLOUD = "#98a2b3"
 MEASURED = "#c1121f"
 NOMINAL = "#2b6cb0"
 ACCENT = "#b45309"
+GROUND_TRUTH = "#0f766e"   # where a DISPLACED ring should be; not the nominal ring
 CMAP = "viridis"           # perceptually uniform, colour-blind safe, prints well
+# The honesty caption ("hand-placed bead, not printed") is the sentence that
+# stops a figure being read as a printed-cylinder result, and with an introduced
+# offset recorded it outruns the figure width. Wrap it rather than let the ends
+# be cut off: 92 characters at 7.5 pt fits a 6 in figure with margin to spare.
+CAPTION_WRAP = 92
 
 
 def _pyplot():
@@ -54,6 +61,15 @@ def _colormap(name: str):
     cmap = matplotlib.colormaps[name].copy()
     cmap.set_bad("#f3f4f6")
     return cmap
+
+
+def wrap_caption(caption: str, width: int = CAPTION_WRAP) -> str:
+    """Break a caption onto as many lines as it needs. Short ones stay on one."""
+    # break_on_hyphens would split "hand-placed bead" across two lines, which is
+    # exactly the phrase a reader must not have to reassemble.
+    lines = textwrap.wrap(caption, width=width, break_on_hyphens=False,
+                          break_long_words=False)
+    return "\n".join(lines) or caption
 
 
 def _points(path: Path) -> np.ndarray | None:
@@ -135,6 +151,30 @@ class TakeData:
         if self.manifest.get("mode") == "MEASURE_ONLY":
             parts.append("hand-placed bead, not printed")
         return " · ".join(parts)
+
+
+def expected_ring(take: TakeData) -> np.ndarray | None:
+    """Where this take's ring SHOULD sit: the nominal circle moved by the offset
+    the operator typed in before pressing Measure.
+
+    This is the ground truth the controlled validation is scored against, so the
+    figure can show the extracted centreline landing ON it rather than merely
+    near the nominal ring it was deliberately moved away from.
+
+    ``None`` unless a non-zero offset was actually introduced: a take with no
+    displacement must not get a second line identical to the nominal circle,
+    which a reader would take for evidence of something.
+    """
+    offset = (take.manifest.get("annotation") or {}).get("introduced_offset_mm")
+    if take.nominal is None or not offset or len(offset) != 2:
+        return None
+    dx, dy = float(offset[0]), float(offset[1])
+    if dx == 0.0 and dy == 0.0:
+        return None
+    moved = np.array(take.nominal, dtype=float, copy=True)
+    moved[:, 0] += dx
+    moved[:, 1] += dy
+    return moved
 
 
 def _intrinsics(manifest: dict, layer_dir: Path) -> np.ndarray | None:
@@ -230,13 +270,21 @@ def _z_exaggeration(radius: float, z_span: float) -> float:
 # -- the four layer figures --------------------------------------------------
 
 def _figure_plan(plt, take: TakeData):
-    fig, ax = plt.subplots(figsize=(6.0, 6.0))
+    # Taller than it is wide: the ring is framed to fill the axes, so the legend
+    # has to live BELOW them (an in-axes legend covers the measured centreline,
+    # which is the evidence the figure exists to show).
+    fig, ax = plt.subplots(figsize=(6.0, 7.0))
     if take.cloud is not None and len(take.cloud):
         ax.scatter(take.cloud[:, 0], take.cloud[:, 1], s=3, c=CLOUD, linewidths=0,
                    label=f"deposit surface ({len(take.cloud)} pts)", zorder=2)
     if take.nominal is not None:
         ax.plot(take.nominal[:, 0], take.nominal[:, 1], color=NOMINAL, linewidth=1.6,
                 linestyle="--", label="nominal circle", zorder=3)
+    truth = expected_ring(take)
+    if truth is not None:
+        ax.plot(truth[:, 0], truth[:, 1], color=GROUND_TRUTH, linewidth=1.7,
+                linestyle="-.", label="ground truth (nominal + introduced offset)",
+                zorder=3)
     if take.measured is not None:
         ax.plot(take.measured[:, 0], take.measured[:, 1], color=MEASURED, linewidth=2.0,
                 label="extracted centreline", zorder=4)
@@ -249,9 +297,13 @@ def _figure_plan(plt, take: TakeData):
             linestyle="none", label="nominal centre", zorder=5)
     _finish_plan_axes(ax, take, title=f"Plan view — {take.label}")
     _scale_bar(ax)
-    ax.legend(loc="upper right", fontsize=8, framealpha=.92)
-    fig.text(.5, .015, take.caption, ha="center", fontsize=7.5, color="#4b5563")
-    fig.tight_layout(rect=(0, .035, 1, 1))
+    fig.tight_layout(rect=(0, .155, 1, 1))
+    # Far enough below the axes to clear the x-axis label, high enough to leave
+    # the caption its own band at the foot of the figure.
+    ax.legend(loc="upper center", bbox_to_anchor=(.5, -.11), ncol=2, fontsize=8,
+              framealpha=.92, borderaxespad=0.)
+    fig.text(.5, .015, wrap_caption(take.caption), ha="center", va="bottom",
+             fontsize=7.5, color="#4b5563")
     return fig
 
 
@@ -427,11 +479,20 @@ def _figure_stack(plt, takes: list[TakeData], trial_id: str):
     span = float(np.ptp(np.concatenate(zs))) if zs else 0.0
     radius = takes[0].radius
     factor = _z_exaggeration(radius, span)
+    labelled_truth = False
     for colour, take in zip(colours, takes):
         index = take.manifest.get("layer_index")
         if take.nominal is not None:
             flat.plot(take.nominal[:, 0], take.nominal[:, 1], color=NOMINAL, linewidth=1.0,
                       linestyle="--", zorder=2)
+        truth = expected_ring(take)
+        if truth is not None:
+            # Labelled once: one legend entry, however many layers were displaced.
+            flat.plot(truth[:, 0], truth[:, 1], color=GROUND_TRUTH, linewidth=1.2,
+                      linestyle="-.", zorder=2,
+                      label=None if labelled_truth
+                      else "ground truth (nominal + introduced offset)")
+            labelled_truth = True
         if take.measured is None:
             continue
         flat.plot(take.measured[:, 0], take.measured[:, 1], color=colour, linewidth=1.9,
@@ -441,7 +502,9 @@ def _figure_stack(plt, takes: list[TakeData], trial_id: str):
     flat.set_aspect("equal", adjustable="datalim")
     flat.set_xlabel("X (mm)")
     flat.set_ylabel("Y (mm)")
-    flat.set_title("Measured centrelines (dashed = nominal)", fontsize=10)
+    flat.set_title("Measured centrelines (dashed = nominal"
+                   + ("; dash-dot = ground truth)" if labelled_truth else ")"),
+                   fontsize=10)
     flat.grid(True, color="#e5e7eb", linewidth=.6)
     flat.set_axisbelow(True)
     _scale_bar(flat)

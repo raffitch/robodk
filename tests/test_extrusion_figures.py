@@ -189,6 +189,158 @@ def test_stack_figure_draws_the_latest_take_of_every_layer(tmp_path):
     assert written[0].parent == tmp_path / "t1" / "figures"
 
 
+# ------------------------------- the ring the operator MEANT to place (ground truth)
+
+def _plan_line_labels(figures, take):
+    plt = figures._pyplot()
+    fig = figures._figure_plan(plt, take)
+    try:
+        return [str(line.get_label()) for line in fig.axes[0].get_lines()]
+    finally:
+        plt.close(fig)
+
+
+def test_the_expected_ring_is_the_nominal_circle_moved_by_the_operators_offset(tmp_path):
+    """Ground truth for a displaced take is the nominal ring plus the typed offset."""
+    from tasni.modules.extrusion import figures
+
+    take = figures.load_take(write_take(
+        tmp_path, annotation={"introduced_offset_mm": [10.0, -4.0]}))
+    expected = figures.expected_ring(take)
+
+    assert expected is not None
+    assert np.allclose(expected[:, 0], take.nominal[:, 0] + 10.0)
+    assert np.allclose(expected[:, 1], take.nominal[:, 1] - 4.0)
+    assert np.allclose(expected[:, 2], take.nominal[:, 2]), "a shift in XY moves no height"
+
+
+def test_a_take_with_no_introduced_offset_has_no_expected_ring(tmp_path):
+    """Nothing was introduced, so there is no second truth to draw -- not a copy of nominal."""
+    from tasni.modules.extrusion import figures
+
+    assert figures.expected_ring(figures.load_take(write_take(tmp_path))) is None
+    zero = figures.load_take(write_take(tmp_path, trial_id="t-zero",
+                                        annotation={"introduced_offset_mm": [0.0, 0.0]}))
+    assert figures.expected_ring(zero) is None
+
+
+def test_the_plan_view_draws_where_the_ring_was_moved_to(tmp_path):
+    """The paper's figure has to show the measured centreline ON the ground truth."""
+    from tasni.modules.extrusion import figures
+
+    take = figures.load_take(write_take(
+        tmp_path, annotation={"introduced_offset_mm": [10.0, 0.0]}))
+
+    labels = _plan_line_labels(figures, take)
+
+    assert any("ground truth" in label for label in labels), labels
+
+
+def test_the_plan_view_draws_no_ground_truth_when_nothing_was_introduced(tmp_path):
+    from tasni.modules.extrusion import figures
+
+    labels = _plan_line_labels(figures, figures.load_take(write_take(tmp_path)))
+
+    assert not any("ground truth" in label for label in labels), labels
+
+
+def test_the_stack_figure_draws_the_ground_truth_of_a_displaced_layer(tmp_path):
+    from tasni.modules.extrusion import figures
+
+    write_take(tmp_path, layer_index=1, take=1)
+    write_take(tmp_path, layer_index=2, take=1,
+               annotation={"introduced_offset_mm": [10.0, 0.0]},
+               measured=_ring_xyz(center=(CENTER[0] + 10.0, CENTER[1]), z=12.0))
+
+    plt = figures._pyplot()
+    fig = figures._figure_stack(plt, figures.latest_takes(tmp_path / "t1"), "t1")
+    try:
+        labels = [str(line.get_label()) for line in fig.axes[0].get_lines()]
+    finally:
+        plt.close(fig)
+
+    assert any("ground truth" in label for label in labels), labels
+
+
+# ------------------------------------------- the figure has to stay READABLE
+
+def _drawn_plan(figures, take):
+    plt = figures._pyplot()
+    fig = figures._figure_plan(plt, take)
+    fig.canvas.draw()
+    return plt, fig
+
+
+def test_the_plan_legend_never_sits_on_top_of_the_measured_ring(tmp_path):
+    """A legend over the ring hides the very thing the figure is evidence for.
+
+    The ring fills the axes by construction (the view is framed on it), so an
+    in-axes legend has nowhere to go that is not data.
+    """
+    from tasni.modules.extrusion import figures
+
+    take = figures.load_take(write_take(
+        tmp_path, annotation={"introduced_offset_mm": [10.0, 0.0]}))
+    plt, fig = _drawn_plan(figures, take)
+    try:
+        axes = fig.axes[0]
+        legend = axes.get_legend().get_window_extent()
+        data = axes.get_window_extent()
+        assert legend.y1 <= data.y0 + 1.0, (
+            f"legend {legend} overlaps the plotted data {data}")
+    finally:
+        plt.close(fig)
+
+
+def test_the_plan_legend_clears_the_axis_label_it_sits_under(tmp_path):
+    """Moving the legend out of the data must not park it on the x-axis label."""
+    from tasni.modules.extrusion import figures
+
+    take = figures.load_take(write_take(
+        tmp_path, annotation={"introduced_offset_mm": [10.0, 0.0]}))
+    plt, fig = _drawn_plan(figures, take)
+    try:
+        axes = fig.axes[0]
+        legend = axes.get_legend().get_window_extent()
+        label = axes.xaxis.label.get_window_extent()
+        assert legend.y1 <= label.y0 + 1.0, (
+            f"legend {legend} overlaps the axis label {label}")
+        caption = fig.texts[-1].get_window_extent()
+        assert caption.y1 <= legend.y0 + 1.0, "caption must clear the legend too"
+    finally:
+        plt.close(fig)
+
+
+def test_a_long_honesty_caption_is_wrapped_rather_than_clipped(tmp_path):
+    """The caption is what stops a figure being read as a printed-cylinder result.
+
+    With an introduced offset recorded it runs past the width of the figure and
+    was silently cut off at BOTH ends -- taking the wording constraint with it.
+    """
+    from tasni.modules.extrusion import figures
+
+    take = figures.load_take(write_take(
+        tmp_path, annotation={"introduced_offset_mm": [-15.13, 2.74]}))
+    assert len(take.caption) > figures.CAPTION_WRAP, "fixture must produce a long caption"
+
+    plt, fig = _drawn_plan(figures, take)
+    try:
+        caption = fig.texts[-1]
+        drawn = caption.get_text()
+        assert "hand-placed bead" in drawn, "the honesty clause must survive"
+        assert max(len(line) for line in drawn.split("\n")) <= figures.CAPTION_WRAP
+        assert caption.get_window_extent().x0 >= -1.0, "caption runs off the left edge"
+        assert caption.get_window_extent().x1 <= fig.bbox.x1 + 1.0, "caption runs off the right"
+    finally:
+        plt.close(fig)
+
+
+def test_a_short_caption_is_left_on_one_line(tmp_path):
+    from tasni.modules.extrusion import figures
+
+    assert "\n" not in figures.wrap_caption("no introduced offset - RMS 0.50 mm")
+
+
 def test_height_colour_range_is_set_by_the_deposit_not_by_depth_dropouts(tmp_path):
     """Dropouts far below the plane flatten the ring to one colour if they count."""
     from tasni.modules.extrusion import figures
