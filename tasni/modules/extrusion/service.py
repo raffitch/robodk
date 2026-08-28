@@ -144,12 +144,33 @@ def _program_name(plan: CylinderPlan, layer_index: int, mode: str) -> str:
     return f"TasniCylinder_{mode}_{plan.fingerprint[:10]}_L{layer_index:03d}"
 
 
-def _wait_program(ctx: JobContext, rdk: RdkIO, name: str) -> None:
+def _wait_program(ctx: JobContext, rdk: RdkIO, name: str, *,
+                  start_timeout_s: float = 3.0, poll_s: float = 0.05,
+                  sleep=time.sleep, clock=time.monotonic) -> None:
+    """Block until a started program has actually finished.
+
+    A bare ``while program_busy(name)`` loses a start race: RunCode() dispatches
+    the program and returns, and if the first poll lands before RoboDK marks the
+    item busy the loop body never runs. The caller then reads a pose from the
+    model while the arm has not moved. A long print program wins that race; a
+    short inspection move dispatched with PROGRAM_RUN_ON_ROBOT can lose it — on
+    the cell 2026-08-28 that left the model 155 mm from the arm and displaced
+    every measured point, with no error until the ROI came back empty.
+
+    So: first give the program a bounded chance to *become* busy, then wait for
+    it to clear. The bound matters because a genuinely instantaneous program may
+    finish before we ever observe it busy — that must not hang the job.
+    """
+    deadline = clock() + start_timeout_s
+    while not rdk.program_busy(name) and clock() < deadline:
+        if ctx.cancelled:
+            ctx.check_cancel()
+        sleep(poll_s)
     while rdk.program_busy(name):
         if ctx.cancelled:
             rdk.stop_program(name)
             ctx.check_cancel()
-        time.sleep(0.05)
+        sleep(poll_s)
     # A cancellation can arrive after the final busy poll. Do not let the
     # caller continue into inspection, capture, or the next layer in that race.
     ctx.check_cancel()
@@ -404,7 +425,7 @@ class CylinderDryRunJob:
                 started = rdk.start_program(name, real_robot=False)
                 if started < 0:
                     raise RuntimeError(f"layer {layer.layer_index} simulation could not start")
-                _wait_program(ctx, rdk, name)
+                _wait_program(ctx, rdk, name, start_timeout_s=ecfg.program_start_grace_s)
                 current_program = None
                 inspection_name = name + "_Inspect"
                 inspect = _build_inspection_move(
@@ -422,7 +443,8 @@ class CylinderDryRunJob:
                 if started < 0:
                     raise RuntimeError(
                         f"layer {layer.layer_index} inspection simulation could not start")
-                _wait_program(ctx, rdk, inspection_name)
+                _wait_program(ctx, rdk, inspection_name,
+                                  start_timeout_s=ecfg.program_start_grace_s)
                 current_program = None
                 reports.append({"layer_index": layer.layer_index,
                                 "path": validation, "inspection": inspection_validation,
@@ -633,7 +655,7 @@ class CylinderPrintJob:
                     started = rdk.start_program(name, real_robot=True)
                     if started < 0:
                         raise RuntimeError(f"layer {layer.layer_index} live program could not start")
-                    _wait_program(ctx, rdk, name)
+                    _wait_program(ctx, rdk, name, start_timeout_s=ecfg.program_start_grace_s)
                     current_program = None
                     valve_off(f"layer {layer.layer_index} completion/inspection confirmation",
                               required=True)
@@ -653,7 +675,8 @@ class CylinderPrintJob:
                     if started < 0:
                         raise RuntimeError(
                             f"layer {layer.layer_index} inspection program could not start")
-                    _wait_program(ctx, rdk, inspection_name)
+                    _wait_program(ctx, rdk, inspection_name,
+                                  start_timeout_s=ecfg.program_start_grace_s)
                     current_program = None
                     time.sleep(ecfg.settle_s)
                     # Re-select the inspection TCP and chosen work frame in the API
@@ -666,16 +689,38 @@ class CylinderPrintJob:
                     # read after settle_s can catch the arm still moving (or a
                     # model that has not caught up with the controller), and the
                     # resulting pose error displaces every measured point.
-                    snapshot = refresh_robot_state(rdk)
-                    if not snapshot.stationary:
-                        raise RuntimeError(
-                            f"layer {layer.layer_index}: the arm was still moving when the "
-                            "inspection pose was read — refusing to measure from a pose "
-                            "that does not match the robot")
-                    T_work_camera = snapshot.camera_T_np()
-                    frame = services.camera.grab(with_depth=True, timeout=ecfg.grab_timeout_s)
-                    if frame.depth is None:
-                        raise RuntimeError(f"layer {layer.layer_index}: RGB-D capture returned no depth")
+                    # Confirm the arm is REALLY at the inspection pose before
+                    # measuring. The joints come from the same model that may be
+                    # ahead of the controller, so they cannot witness their own
+                    # error — the camera can: compare the distance the pose implies
+                    # against the distance the camera reports. If they disagree the
+                    # arm is most likely still travelling, so re-read and re-measure
+                    # rather than failing a run that would have been fine a second
+                    # later. Persisting past the attempts is a hard error.
+                    aim = aim_point_mm(self.plan.recipe, self.plan.setup,
+                                       layer.layer_index)
+                    attempts = max(1, ecfg.inspection_arrival_attempts)
+                    for attempt in range(1, attempts + 1):
+                        snapshot = refresh_robot_state(rdk)
+                        T_work_camera = snapshot.camera_T_np()
+                        frame = services.camera.grab(
+                            with_depth=True, timeout=ecfg.grab_timeout_s)
+                        if frame.depth is None:
+                            raise RuntimeError(
+                                f"layer {layer.layer_index}: RGB-D capture returned no depth")
+                        standoff = standoff_report(T_work_camera, aim, frame.depth)
+                        arrival_fault = standoff_fault(
+                            standoff, ecfg.inspection_standoff_tolerance_mm)
+                        if arrival_fault is None and not snapshot.stationary:
+                            arrival_fault = ("the arm was still moving when the inspection "
+                                             "pose was read")
+                        standoff["attempts"] = attempt
+                        if arrival_fault is None:
+                            break
+                        if attempt < attempts:
+                            ctx.log(f"layer {layer.layer_index}: inspection pose not "
+                                    f"confirmed (attempt {attempt}/{attempts}): {arrival_fault}")
+                            time.sleep(ecfg.inspection_arrival_retry_s)
                     ok, jpeg = __import__("cv2").imencode(".jpg", frame.color)
                     if ok:
                         ctx.frame(jpeg.tobytes())
@@ -695,20 +740,11 @@ class CylinderPrintJob:
                         valve_transitions=[v for v in valve if v.get("layer_index") in
                                            (None, layer.layer_index)])
                     try:
-                        # Pose vs depth BEFORE trusting the geometry: if the arm is
-                        # not where the model says, the frame is still perfectly
-                        # good and every point is displaced by the difference —
-                        # which reads downstream as an empty ROI with no clue why.
-                        standoff = standoff_report(
-                            T_work_camera,
-                            aim_point_mm(self.plan.recipe, self.plan.setup,
-                                         layer.layer_index),
-                            frame.depth)
+                        # Raised in here so a pose fault archives the raw RGB-D too
+                        # — that frame is the evidence for diagnosing it.
                         base_manifest["provenance"]["standoff"] = standoff
-                        fault = standoff_fault(
-                            standoff, ecfg.inspection_standoff_tolerance_mm)
-                        if fault:
-                            raise RuntimeError(fault)
+                        if arrival_fault:
+                            raise RuntimeError(arrival_fault)
                         processed = process_observation(
                             color=frame.color, depth=frame.depth,
                             T_work_camera=T_work_camera, K=services.config.camera.K,

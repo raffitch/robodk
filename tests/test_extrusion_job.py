@@ -150,6 +150,11 @@ def plan(*, layers=2, correction=True, auto_inspection=False):
 def services(tmp_path):
     cfg = AppConfig()
     cfg.extrusion.hardware_io_test_approved = True
+    # FakeRdk.program_busy is always False, so the real grace would be paid
+    # in full for every program. The grace itself is covered by
+    # tests/test_extrusion_wait.py against a scripted busy sequence.
+    cfg.extrusion.program_start_grace_s = 0.0
+    cfg.extrusion.inspection_arrival_retry_s = 0.0
     cfg.robodk.connect_robot_on_connect = False
     rdk = FakeRdk(); camera = FakeCamera()
     return SimpleNamespace(config=cfg, rdk=rdk, camera=camera,

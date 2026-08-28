@@ -747,6 +747,15 @@ class ExtrusionConfig(_Model):
     # larger than aim/tilt geometry error, far smaller than the 142 mm
     # model-vs-arm displacement seen on the cell 2026-08-28.
     inspection_standoff_tolerance_mm: float = 25.0
+    # A pose that disagrees with the camera is usually an arm still in
+    # transit, so re-read and re-measure before calling it a fault.
+    inspection_arrival_attempts: int = 3
+    inspection_arrival_retry_s: float = 1.5
+    # Grace for a dispatched program to register as busy, so a poll that
+    # lands before RoboDK marks it running does not skip the wait. A real
+    # dispatch registers in milliseconds; this only bounds the pathological
+    # case where it never does.
+    program_start_grace_s: float = 0.5
     orientation_rpy_deg: tuple[float, float, float] = (0.0, 0.0, 0.0)
     # Keep the wrist near the operator's neutral starting configuration. The
     # generated curve uses fixed TCP orientation, but redundant IK/interpolation
