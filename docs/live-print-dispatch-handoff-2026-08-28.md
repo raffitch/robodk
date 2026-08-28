@@ -1,7 +1,10 @@
 # Live print: the arm does not move — handoff (2026-08-28, revised)
 
-**Status: UNRESOLVED.** Clicking **Print & record** makes the controller click once and
-the arm never moves. Running the same program by hand in RoboDK moves it.
+**Status: UNRESOLVED**, but narrowed by measurement. Clicking **Print & record** makes the
+controller click once and the arm never moves. Running the same program by hand in RoboDK
+moves it. As of the instrumented run in §0b, *every RoboDK-side explanation is dead*: the
+program is fully accepted (195/195 instructions), the run mode is really 6, and the
+trivial valve program behaves the same way. Next: `tools/dispatch_bisect.py jog`.
 
 **Revision note.** The first version of this handoff (commit `c02838a`) was written at the
 end of the day that produced 16 fixes; re-reading it against the code and against the
@@ -43,6 +46,48 @@ Decoded against `tasni/modules/extrusion/service.py` and `tasni/core/rdk_io.py`:
 | `valve OFF: …` (×3) | **Not evidence the controller did anything.** `run_station_program` logs after RoboDK *accepts* the program (`RunCode() >= 0`), and its `while program_busy()` has the same start race. Nobody has confirmed the physical valve responds to an API-dispatched AirOff. `hardware_io_test_approved` is an operator attestation in config — the app dispatches no I/O test. |
 | `real robot linked (Ready)` | `ConnectedState() == ROBOTCOM_READY`: the driver process has its KUKAVARPROXY socket. It does **not** prove `RoboDKsync570` is selected and running on the pendant (§2). |
 | `validated in 0.0 s` | Normal since live collision validation defaults off (`46a7770`); the "slow step" wording is stale. Not a lead. |
+
+---
+
+## 0b. Instrumented run — both software hypotheses ELIMINATED
+
+Second cell run, with the dispatch report live:
+
+```
+valve OFF: job startup before motion — RunCode returned 2 of 2 instructions, run mode 6
+valve OFF: before layer 1 approach — RunCode returned 2 of 2 instructions, run mode 6
+layer 1: validated in 0.0 s (RoboDK predicts 1.9 s of robot motion)
+layer 1: dispatched — RunCode returned 195 of 195 instructions, run mode 6
+layer 1: program ran 0.0 s (NEVER OBSERVED RUNNING); flange camera says the arm did NOT move
+```
+
+**Dead, by measurement:**
+
+| Hypothesis | Killed by |
+|---|---|
+| `RunCode()` returned 0 — RoboDK's pre-run check refused the program | It returned **195 of 195**. Every instruction cleared. |
+| The station was not really in `RUN_ROBOT` | Read back as **6** on every dispatch. `92f2d1d` works. |
+| The layer program is special / the machining program is malformed | The 2-instruction valve program dispatches **identically** (2 of 2, mode 6) and is equally silent. |
+| The camera hold, validation, or collision screening corrupts state | The very first dispatch of the run — the startup AirOff, before any program is built — already looks like this. |
+
+**What this leaves.** RoboDK fully accepted the program, in the right mode, and then
+either sent the driver nothing, or sent it something the driver dropped inside 50 ms.
+The log could not tell those apart, because *both* busy probes are RoboDK-side.
+Two instruments were added for exactly this (`37d4f18`):
+
+- **`driver_state()`** — `ConnectedState()` is the **driver's** view: `ROBOTCOM_WORKING`
+  while executing, `ROBOTCOM_PROBLEMS` with the controller's message. Sampled across the
+  whole wait. If it never leaves `READY`, **RoboDK dispatched nothing to the driver** and
+  the fault is in RoboDK's program executor, not the cell. If it goes `WORKING` or
+  `PROBLEMS`, the command reached the driver and the message says what happened.
+- **~250 Hz polling for the first 0.5 s** — a flat 50 ms poll cannot distinguish "never
+  started" from "started and died in 20 ms", and that reading is what the diagnosis rests on.
+
+**Note the asymmetry that now dominates:** the *valve* programs are dispatched exactly
+like the layer program and are equally never-observed-running — yet `AirOn`/`AirOff` are
+confirmed to work when run by hand, just like the layer program. So this is **not** about
+what the program contains. It is about API-dispatched execution as such, in this station.
+Stop looking at the toolpath, the machining project, and the valve mapping.
 
 ---
 
