@@ -755,7 +755,7 @@ export default function Extrusion() {
       done: countPhase(2, "stacked true") >= 3 && countPhase(3, "stacked true") >= 3 },
     { title: "Introduced offsets — TOP ring only, 10 mm then 15 mm, three takes each",
       detail: "Type the offset BEFORE pressing Measure so the ground truth is archived "
-        + "beside the result. Slide the ring by ChArUco square pitches along a board edge.",
+        + "beside the result — and type what you ACTUALLY moved: 12 mm scores as well as 10.",
       progress: `10 mm ${countOffset(10)}/3 · 15 mm ${countOffset(15)}/3`,
       done: countOffset(10) >= 3 && countOffset(15) >= 3 },
     { title: "Paper summary → copy the Markdown block",
@@ -981,9 +981,12 @@ export default function Extrusion() {
           <b>Placing the rings.</b> Displace only the <b>TOP</b> ring: layer N is measured
           above layer N−1's latest take, so moving a ring underneath corrupts everything
           stacked on it. Keep every offset ≤ 25 mm (the search band is ±30 mm). The work
-          frame's axes run along the board edges, so the ChArUco square pitch is your
-          ruler — slide the ring by whole squares and type that number. Take one throwaway
-          measurement first to learn which edge is +X: the reported offset tells you the sign.
+          frame's axes run along the board edges, so a steel rule laid along an edge IS the
+          frame axis: mark where the ring sits, slide it along the rule, and type the distance
+          you actually achieved. Do <b>not</b> count ChArUco squares — this board's are 40 mm,
+          past the 25 mm cap, and the ring would fall outside the search band. Take one
+          throwaway measurement first to learn which edge is +X: the reported offset tells you
+          the sign.
         </div>
         <div className="io-note">
           <b>What the numbers mean.</b> A pure shift of d reads centre offset ≈ d, max ≈ d,

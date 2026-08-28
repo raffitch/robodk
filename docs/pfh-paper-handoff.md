@@ -163,11 +163,22 @@ introduced offset at ~18 mm). If a take still fails, its raw RGB-D is archived a
 
 "Shift it 10 mm" done by eye is the least trustworthy number in the experiment, and
 every detection-error figure is measured against it. The work frame came from the
-board rectangle, so **its axes are parallel to the board edges and the ChArUco
-squares are a ruler**: slide the ring by exactly one square pitch along an edge and
-type that pitch. Take one throwaway measurement first to learn which edge is frame
-**+X** and its sign (the reported `center_offset_mm` tells you), then re-take with
-the annotation right — the summary groups by what you typed, so a sign error puts
+board rectangle, so **its axes are parallel to the board edges** — a steel rule laid
+along an edge IS the frame axis. Mark where the ring sits (two pencil ticks against
+its outer edge), slide it along the rule, and **type the distance you actually
+achieved**: 12 mm scores exactly as well as 10 mm, because the summary compares the
+measurement against what you typed, not against a round number.
+
+**Do not use the ChArUco square pitch as the ruler on this cell.** The board in
+`tasni.config.json` is A3, 8×6 at **40 mm** squares, and one square exceeds the
+25 mm cap — at 40 mm the displaced ring falls outside the ±30 mm radial search band
+and the take comes back invalid. (The 30 mm A4 board would be just as unusable.)
+There is no printed feature at a usable pitch: the markers are 29.3 mm inside their
+40 mm squares, so the only printed intervals are 5.35, 29.3 and 40 mm.
+
+Take one throwaway measurement first to learn which edge is frame **+X** and its
+sign (the reported `center_offset_mm` tells you), then re-take with the annotation
+right — the summary groups by what you typed, so a sign error puts
 good data in a mislabelled group. The offset fields are **sticky between presses**:
 the card echoes *"This press records: layer 2 · top ring shifted · introduced offset
 (10, 0) mm"* above the button, and there is a **Clear offset** button — read that
