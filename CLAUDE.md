@@ -160,7 +160,10 @@ you drive the real cell, not an empty station). Run it on Windows with
     bump the physical board is auto-filtered, not just tool↔arm); live 3D viewport.
 - ✅ **Ring-stack measure-only experiment** (paper evidence): measure hand-placed rings
   through the inspection chain, characterize ring 1, paper summary. Spec + plan in
-  docs/superpowers/. Cell run pending.
+  docs/superpowers/. First real cell capture succeeded 2026-08-28; the introduced-offset
+  protocol is still to run. **Paper figures** (`modules/extrusion/figures.py`): plan view,
+  bird's-eye height map, oblique and unrolled profile per take + a per-trial stack, all
+  rendered from the archive with no robot — `pip install -e .[figures]`.
 - Then integrate the rest into the same app: scan (with **TSDF fusion** — biggest quality
   win), ArUco-to-plane, target generation. RealSense High-Accuracy preset + filter order
   live in `server/server_unicast_syncronous.py`. Tailscale (off-LAN) deferred.
