@@ -55,8 +55,11 @@ def test_config_keeps_verified_mapping_separate_from_hardware_approval():
     assert config.valve_mapping_verified is True
     assert config.hardware_io_test_approved is False
     assert config.default_print_tool == "" and config.default_work_frame == ""
-    assert expected_instructions(config.valve_outputs, 1) == ["Set IO_508=1", "Set IO_601=1"]
-    assert expected_instructions(config.valve_outputs, 0) == ["Set IO_508=0", "Set IO_601=0"]
+    # The KUKA driver writes $OUT[<index>], so the instructions must carry the
+    # NUMBER, not the readable name (a name it cannot resolve becomes $OUT[0] ->
+    # KSS014444 on the controller, which aborts the program before any motion).
+    assert expected_instructions(config.valve_outputs, 1) == ["Set 508=1", "Set 601=1"]
+    assert expected_instructions(config.valve_outputs, 0) == ["Set 508=0", "Set 601=0"]
     assert "-NEWINSTANCE" in LICENSED_ISOLATED_ARGS
     assert "-NOUI" in LICENSED_ISOLATED_ARGS
     assert "-SKIPINI" not in LICENSED_ISOLATED_ARGS

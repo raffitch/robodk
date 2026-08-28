@@ -27,6 +27,7 @@ from .models import CylinderPlan, CylinderRecipe, CylinderSetup, LayerManifest
 from .processing import process_observation
 from .surface import surface_check
 from .toolpath import generate_cylinder_plan, points_array
+from .valve import instructions_match
 
 
 def geometry_preflight(plan: CylinderPlan, *, surface: dict | None = None,
@@ -103,7 +104,11 @@ def station_requirements(rdk: RdkIO, plan: CylinderPlan, config) -> dict:
                  if rdk.item_exists_as(config.air_on_program, "program") else [])
     actual_off = (rdk.program_instructions(config.air_off_program)
                   if rdk.item_exists_as(config.air_off_program, "program") else [])
-    mapping_ok = actual_on == expected_on and actual_off == expected_off
+    # Verify the numbers, not RoboDK's rendering (see valve.instructions_match).
+    mapping_ok = (instructions_match(actual_on, config.valve_outputs,
+                                     config.valve_active_value)
+                  and instructions_match(actual_off, config.valve_outputs,
+                                         config.valve_inactive_value))
     if not mapping_ok:
         items.append({"role": "valve_instruction_mapping", "name": "AirOn/AirOff",
                       "type": "program instructions", "present": False,

@@ -17,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
 from robodk import robolink
 
 from tasni.core.config import load_config
+from tasni.modules.extrusion.valve import instructions_match, valve_output_index
 
 LICENSED_ISOLATED_ARGS = ["-NEWINSTANCE", "-NOUI", "-EXIT_LAST_COM"]
 
@@ -32,7 +33,13 @@ def connect_for_station_save():
 
 
 def expected_instructions(outputs: list[str], value: int) -> list[str]:
-    return [f"Set {output}={value}" for output in outputs]
+    """What the instructions should look like, for error messages only.
+
+    Verification uses instructions_match(): RoboDK's rendering of a digital-output
+    instruction is not a stable contract, and pinning it makes a correct station
+    fail. The NUMBERS are what matter.
+    """
+    return [f"Set {valve_output_index(output)}={value}" for output in outputs]
 
 
 def program_instructions(program) -> list[str]:
@@ -44,16 +51,18 @@ def ensure_program(rdk, robot, name: str, outputs: list[str], value: int, *, rep
     existing = rdk.Item(name, robolink.ITEM_TYPE_PROGRAM)
     if existing.Valid():
         actual = program_instructions(existing)
-        if actual == expected:
+        if instructions_match(actual, outputs, value):
             return "verified"
         if not replace:
             raise RuntimeError(f"{name} exists with different instructions: {actual!r}")
         existing.Delete()
     program = rdk.AddProgram(name, robot)
     for output in outputs:
-        program.setDO(output, value)
+        # A NUMBER, not the name: the KUKA driver writes $OUT[<index>], and a name
+        # it cannot resolve becomes $OUT[0] -> KSS014444 on the controller.
+        program.setDO(valve_output_index(output), value)
     actual = program_instructions(program)
-    if actual != expected:
+    if not instructions_match(actual, outputs, value):
         raise RuntimeError(f"failed to create {name}: {actual!r}")
     return "created"
 
