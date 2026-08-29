@@ -111,10 +111,37 @@ def test_unknown_scan_key_rejected():
     print("[guard] unknown scan key -> KeyError (typo is an error, not a no-op)")
 
 
+# -- protocol 2: depth_scale removed, 1080p default, K migration ------------
+def test_depth_scale_is_gone_and_a_stale_override_is_dropped_with_a_warning(tmp_path, capsys):
+    from tasni.core.config import ScanConfig, load_config
+    assert "depth_scale" not in ScanConfig.model_fields
+    p = tmp_path / "tasni.config.json"
+    p.write_text('{"scan": {"depth_scale": 1000.0, "voxel_size_m": 0.002}}', encoding="utf-8")
+    cfg = load_config(p)
+    assert cfg.scan.voxel_size_m == 0.002
+    assert "scan.depth_scale" in capsys.readouterr().out
+
+
+def test_calibrated_720p_intrinsics_migrate_to_1080p_by_exact_scale():
+    from tasni.core.config import CameraConfig, migrate_camera_intrinsics, _DEFAULT_INTRINSICS
+    cam = CameraConfig()
+    assert cam.resolution == "1920x1080"
+    cal = [[889.8742, 0.0, 648.9804], [0.0, 890.8099, 362.0046], [0.0, 0.0, 1.0]]
+    cam.intrinsics = {**cam.intrinsics, "1280x720": cal}
+    assert migrate_camera_intrinsics(cam) is True
+    K = cam.K
+    assert abs(K[0, 0] - 889.8742 * 1.5) < 1e-6 and abs(K[1, 2] - 362.0046 * 1.5) < 1e-6
+    assert migrate_camera_intrinsics(cam) is False                      # idempotent
+    fresh = CameraConfig()
+    assert migrate_camera_intrinsics(fresh) is False                    # factory 720p: nothing to carry
+    assert fresh.intrinsics["1920x1080"] == _DEFAULT_INTRINSICS["1920x1080"]
+
+
 if __name__ == "__main__":
     test_defaults_present_and_sane()
     test_collision_hard_fail_is_default()
     test_json_override_merges_only_targeted_fields()
     test_compact_guard_uv_is_satisfiable_at_the_recommended_standoff()
     test_unknown_scan_key_rejected()
+    test_calibrated_720p_intrinsics_migrate_to_1080p_by_exact_scale()
     print("\nScanConfig tests passed.")

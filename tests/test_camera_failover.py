@@ -15,6 +15,7 @@ unroutable, so it stands in for "the LAN path is down".
 """
 from __future__ import annotations
 
+import json
 import socket
 import struct
 import sys
@@ -161,12 +162,25 @@ def test_health_reports_the_direct_path_before_any_capture(listener):
 
 # --- the real capture paths go through the ladder --------------------------
 
+_GREETING = {  # a minimal protocol-2 greeting, just enough for CameraGeometry.from_greeting
+    "protocol": 2, "depth_unit_mm": 0.1,
+    "depth": {"width": 4, "height": 4, "fx": 1.0, "fy": 1.0, "ppx": 2.0, "ppy": 2.0},
+    "color": {"width": 4, "height": 4, "fx": 1.0, "fy": 1.0, "ppx": 2.0, "ppy": 2.0},
+    "depth_to_color": {"rotation_row_major": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                       "translation_mm": [0.0, 0.0, 0.0]},
+}
+
+
 def _fake_camera(port_holder: list, mode: str = "frame") -> threading.Thread:
     """Minimal stand-in for the Jetson server: one client, one reply.
 
     ``frame`` serves a single color-only frame in the server's wire format
     (``<I depth_len><I color_len><d ts>`` + JPEG, mirroring
-    server_unicast_syncronous.py); ``burst`` answers the MODE BURST handshake."""
+    server_unicast_syncronous.py); ``burst`` answers the MODE BURST handshake,
+    followed by the protocol-2 greeting (server_unicast_syncronous.py sends it
+    right after ``BURST READY\\n``, before any frame -- burst frames are still
+    depth+color and CameraClient.burst() now reads that greeting same as
+    grab()/stream())."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.bind(("127.0.0.1", 0))
     srv.listen(4)
@@ -182,7 +196,7 @@ def _fake_camera(port_holder: list, mode: str = "frame") -> threading.Thread:
                 except OSError:
                     pass
                 if mode == "burst":
-                    conn.sendall(b"BURST READY\n")
+                    conn.sendall(b"BURST READY\n" + json.dumps(_GREETING).encode() + b"\n")
                 else:
                     ok, jpeg = cv2.imencode(".jpg", np.zeros((4, 4, 3), np.uint8))
                     assert ok

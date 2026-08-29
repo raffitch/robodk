@@ -18,6 +18,7 @@ survive — and that color-only really means depth_len=0.
 from __future__ import annotations
 
 import io
+import json  # noqa: E402  (add to the imports at the top)
 import struct
 import sys
 from pathlib import Path
@@ -29,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
 
 from tasni.core.camera import CameraClient, CameraError, _HEADER  # noqa: E402
 from tasni.core.config import CameraConfig  # noqa: E402
+from tasni.core.depth_geometry import CameraGeometry  # noqa: E402
 
 
 def _server_encode(color: np.ndarray, depth: np.ndarray | None,
@@ -276,7 +278,9 @@ class FakeBurstSocket:
             if not cmd:
                 continue
             if cmd.startswith(b"MODE BURST"):
-                self._out.extend(b"BURST READY\n")
+                # Protocol 2: the greeting follows READY, before any frame --
+                # mirrors server_unicast_syncronous.py's stream_burst.
+                self._out.extend(b"BURST READY\n" + _greeting_bytes())
             elif cmd == b"CAP":
                 color, depth, ts = self._frames[len(self._buffer)]
                 frame, _ = _server_encode(color, depth, ts)
@@ -362,6 +366,102 @@ def test_burst_handshake_rejected_on_old_server():
     print("[burst] old server (no BURST READY) -> CameraError; client falls back")
 
 
+# -- protocol 2: MODE FULL/BURST V2 + greeting -> Frame.geometry ------------
+GREETING = {
+    "protocol": 2, "aligned": False, "depth_unit_mm": 0.1,
+    "depth": {"width": 64, "height": 48, "fx": 60.0, "fy": 60.0, "ppx": 32.0, "ppy": 24.0,
+              "model": "brown_conrady", "coeffs": [0, 0, 0, 0, 0]},
+    "color": {"width": 64, "height": 48, "fx": 80.0, "fy": 80.0, "ppx": 32.0, "ppy": 24.0,
+              "model": "brown_conrady", "coeffs": [0, 0, 0, 0, 0]},
+    "depth_to_color": {"rotation_row_major": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                       "translation_mm": [14.7, 0.0, 0.0]},
+    "filters": [], "device": {"serial": "S"}, "temps": {"asic_c": 40.0, "projector_c": 37.0},
+    "global_time_enabled": True}
+
+
+def _greeting_bytes() -> bytes:
+    return json.dumps(GREETING, separators=(",", ":")).encode() + b"\n"
+
+
+def _patched_socket(sock):
+    import tasni.core.camera as camera_mod
+    orig = camera_mod.socket.socket
+    camera_mod.socket.socket = lambda *a, **k: sock
+    return camera_mod, orig
+
+
+def test_grab_with_depth_sends_v2_and_reads_the_greeting_first():
+    client = CameraClient(CameraConfig())
+    color = _make_color()
+    depth = (np.arange(64 * 48, dtype=np.uint16).reshape(48, 64) * 3)
+    frame_bytes, _ = _server_encode(color, depth, 7.0)
+    sock = FakeSocket(_greeting_bytes() + frame_bytes)
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        frame = client.grab(with_depth=True)
+    finally:
+        camera_mod.socket.socket = orig
+    assert bytes(sock.sent) == b"MODE FULL V2\n"
+    assert isinstance(frame.geometry, CameraGeometry)
+    assert frame.geometry.depth_unit_mm == 0.1 and frame.geometry.T_color_depth[0, 3] == 14.7
+    assert client.geometry is frame.geometry
+    np.testing.assert_array_equal(frame.depth, depth)
+    print("[v2] grab sent MODE FULL V2, parsed the greeting, attached geometry")
+
+
+def test_refusal_is_a_clear_error_not_a_hang():
+    client = CameraClient(CameraConfig())
+    sock = FakeSocket(b"ERR protocol 2 required; send MODE FULL V2\n")
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        try:
+            client.grab(with_depth=True)
+        except CameraError as e:
+            assert "restart the Tasni backend" in str(e)
+        else:
+            raise AssertionError("a refusal must raise CameraError")
+    finally:
+        camera_mod.socket.socket = orig
+    print("[v2] a protocol refusal raises CameraError telling the operator to restart")
+
+
+def test_color_only_grab_has_no_geometry_and_no_v2_token():
+    client = CameraClient(CameraConfig())
+    frame_bytes, _ = _server_encode(_make_color(), None, 1.0)
+    sock = FakeSocket(frame_bytes)
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        frame = client.grab(color_only=True)
+    finally:
+        camera_mod.socket.socket = orig
+    assert bytes(sock.sent) == b"MODE COLOR\n" and frame.geometry is None
+    print("[v2] color-only grab sends no V2 token and carries no geometry")
+
+
+def test_burst_reads_ready_then_greeting():
+    client = CameraClient(CameraConfig())
+    color = _make_color()
+    depth = np.full((48, 64), 4000, np.uint16)
+    frame_bytes, _ = _server_encode(color, depth, 2.0)
+    payload = (b"BURST READY\n" + _greeting_bytes()
+               + struct.pack("<I", 0) + struct.pack("<I", 5) + b"thumb"     # CAP reply
+               + struct.pack("<I", 1) + frame_bytes                          # GET reply
+               + struct.pack("<I", 0))                                       # CLEAR ack
+    sock = FakeSocket(payload, chunk=64)
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        with client.burst() as bs:
+            assert bs.capture() == b"thumb"
+            frames = bs.fetch_all()
+            bs.clear()
+    finally:
+        camera_mod.socket.socket = orig
+    assert bytes(sock.sent).startswith(b"MODE BURST V2\n")
+    assert len(frames) == 1 and frames[0].geometry.depth_unit_mm == 0.1
+    np.testing.assert_array_equal(frames[0].depth, depth)
+    print("[v2] burst reads BURST READY then the greeting before any frame")
+
+
 if __name__ == "__main__":
     test_full_frame_roundtrip()
     test_color_only_means_depth_len_zero()
@@ -373,4 +473,8 @@ if __name__ == "__main__":
     test_decode_color_cv2_fallback_matches_turbojpeg_path()
     test_burst_session_roundtrip()
     test_burst_handshake_rejected_on_old_server()
+    test_grab_with_depth_sends_v2_and_reads_the_greeting_first()
+    test_refusal_is_a_clear_error_not_a_hang()
+    test_color_only_grab_has_no_geometry_and_no_v2_token()
+    test_burst_reads_ready_then_greeting()
     print("\nCamera wire-format round-trip tests passed.")
