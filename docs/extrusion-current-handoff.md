@@ -319,28 +319,32 @@ baseline take, recovered with no robot time.
 
 ### Figures (2026-08-28)
 
-`tasni/modules/extrusion/figures.py` renders four figures per take from the archive
+`tasni/modules/extrusion/figures.py` renders six figures per take from the archive
 alone — no robot, no RoboDK, no camera — at 300 dpi PNG plus vector PDF:
 
 | figure | what it shows |
 |---|---|
 | `plan` | deposit cloud, extracted centreline, nominal ring, mm axes, scale bar |
 | `heightmap` | bird's-eye relief of the re-projected depth frame with a z colourbar |
+| `mesh` | the frame SURFACED: work surface and deposit, each from above and rotated |
 | `iso` | oblique cloud + centreline, vertical exaggeration stated on the axis |
 | `profile` | unrolled height z(θ) and radial deviation Δr(θ) over 360° |
+| `pipeline` | the method figure: the six arrays the chain held, in the order it held them |
 
-plus `figures/stack.{png,pdf}` per trial: every layer's latest take, plan + oblique.
-This is the successor to the original `PostExtrusionToolpath` `overlay.png` (alpha
-shape → skeletonize → matplotlib) whose 3-D companion was only ever `plt.show()`n.
+plus two per trial: `figures/stack.{png,pdf}` (every layer's latest take, plan +
+oblique) and `figures/tube.{png,pdf}` (the commanded bead against the measured
+footprint). This is the successor to the original `PostExtrusionToolpath`
+`overlay.png` (alpha shape → skeletonize → matplotlib) whose 3-D companion was only
+ever `plt.show()`n.
 
 `RingMeasureJob` draws them after the manifest is written and OUTSIDE the camera
 hold; a drawing failure is logged and the measurement stands. Serving is
 render-if-missing, so takes archived before this existed still produce figures:
 
 ```
-GET /api/modules/extrusion/trials/{id}/layers/{dir}/figures/{plan|heightmap|iso|profile}.{png|pdf}
-GET /api/modules/extrusion/trials/{id}/layers/{dir}/files/{color|comparison|segmentation|skeleton}.png
-GET /api/modules/extrusion/trials/{id}/figures/stack.{png|pdf}
+GET /api/modules/extrusion/trials/{id}/layers/{dir}/figures/{plan|heightmap|mesh|iso|profile|pipeline}.{png|pdf}
+GET /api/modules/extrusion/trials/{id}/layers/{dir}/files/{color|comparison|segmentation|skeleton|side}.png
+GET /api/modules/extrusion/trials/{id}/figures/{stack|tube}.{png|pdf}
 ```
 
 In the app, click a take in the measurement table to open its gallery; the
@@ -358,6 +362,43 @@ paper figure:
   so its first point repeats and the mean is biased by radius/N — 0.33 mm on the
   cell's 181-point 40 mm ring, which made the plotted RMS (11.45) disagree with the
   manifest (11.31) a reader checks it against. They now match to 1e-6.
+
+### The surfaced view (`mesh`, 2026-08-29)
+
+The old paper's mesh pictures — the frame as a surface, seen from the top and then
+rotated — came from `macros/3DScan.py`, which builds a Poisson mesh and hands it to
+`o3d.visualization.draw_geometries` (`macros/3DScan.py:354-358`). That window is
+interactive: it was rotated and screenshotted by hand, and the code wrote no image;
+the mesh itself went to a `TemporaryDirectory` only to be `RDK.AddFile`d into the
+station. The ring-stack chain never meshed at all — it goes depth → cloud → ROI →
+cluster → crest → raster → skeleton → spline — so there was nothing to render.
+
+`mesh` restores it as a file, from the archive, with no display: one row per
+surface (work surface, then deposit only), each drawn from above and rotated.
+
+- **2.5-D, not a solid.** One top-down RGB-D frame measures a height field; closing
+  it into a solid would invent the underside the camera never saw.
+- **Gaps stay gaps.** The mesh is gridded and triangulated in place, so a cell with
+  no return has no vertex and no triangle can cover it. A convex/Delaunay hull would
+  roof over the ring's hole. Triangles spanning more than 25 mm of height are dropped
+  so a dropout cliff is not bridged into a wall that was never there.
+- **The pitch comes from the cloud.** A grid finer than the cloud's own spacing gives
+  isolated cells and a scatter of specks (26 triangles from the 1517-point bead);
+  `_auto_cell` coarsens until cells average a few returns. The deposit lands at
+  ~3 mm because the chain voxel-downsamples at 2 mm — that IS the measurement's
+  resolution.
+- **The deposit panel reads `radial_trimmed`, not the archived cloud.** The archive
+  stores the CREST the centreline was thinned from (578 points on the first cell
+  ring, flanks already discarded); the chain's own deposit cluster is the same bead
+  with its sides on, which is what closes into a surface with a width.
+- **The stated exaggeration is the real one.** `set_box_aspect` stretches Z whatever
+  the data says — a flat `(1, 1, .55)` box exaggerated this bead ~6× while the axis
+  claimed ×2. The box now carries the data's own proportions, so the ×N on the axis
+  is what the picture does.
+
+Cost: ~9 s per take at 300 dpi (against `pipeline`'s ~34 s), drawn eagerly with the
+rest. Both figures re-run the chain, so `take_stages` memoises the LAST take, keyed
+on the manifest's mtime — a reprocessed take is never served from the cache.
 
 Cell protocol: scan surface applied → Center on scanned surface → Generate → place
 ring 1 → Characterize → Apply → Generate → Measure L1 ×5 (noise floor) → re-place

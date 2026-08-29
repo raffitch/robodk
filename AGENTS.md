@@ -97,8 +97,11 @@ sensor can measure. Failed characterization now archives raw RGB-D instead of lo
 only diagnostic frame.
 
 **2026-08-28 — figures per take.** `tasni/modules/extrusion/figures.py` renders `plan`,
-`heightmap`, `iso` and `profile` (300 dpi PNG + vector PDF) plus a per-trial `stack`,
-from the archive alone: no robot, no RoboDK, no camera. Every take draws them
+`heightmap`, `mesh`, `iso`, `profile` and `pipeline` (300 dpi PNG + vector PDF) plus a
+per-trial `stack` and `tube`, from the archive alone: no robot, no RoboDK, no camera.
+`mesh` (2026-08-29) is the surfaced view the old paper had — the frame meshed, from
+above and rotated — which used to exist only as an interactive Open3D window in
+`macros/3DScan.py` that wrote no file. Every take draws them
 automatically; serving is render-if-missing, so takes archived earlier — including
 `20260828-192115-47fb78ea` — produce figures with zero cell time. Click a take in the
 measurement table to see them. Needs `pip install -e .[figures]`; without matplotlib the

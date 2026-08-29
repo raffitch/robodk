@@ -444,3 +444,77 @@ def test_the_measured_bead_width_is_read_from_the_take_that_measured_it(tmp_path
     bare.pop("geometry", None)
     (layer_dir / "manifest.json").write_text(json.dumps(bare), encoding="utf-8")
     assert measured_bead_mm(load_take(layer_dir)) is None
+
+
+# ------------------------------------------------- the surfaced (meshed) view
+
+def _annulus_cloud(*, inner=50.0, outer=70.0, center=CENTER, z=6.0, count=6000, seed=3):
+    """A ring-shaped cloud with a genuine hole in the middle."""
+    rng = np.random.default_rng(seed)
+    theta = rng.uniform(0, 2 * np.pi, count)
+    r = np.sqrt(rng.uniform(inner ** 2, outer ** 2, count))
+    return np.column_stack((center[0] + r * np.cos(theta),
+                            center[1] + r * np.sin(theta),
+                            np.full(count, z) + rng.normal(0, .15, count)))
+
+
+def test_a_surface_mesh_leaves_the_hole_the_camera_actually_saw():
+    """Triangulating a ring must not roof over its middle.
+
+    A convex triangulation spans the hole with long thin triangles, drawing a
+    solid disc where the measurement found nothing -- the one thing a surface
+    figure must never invent.
+    """
+    from tasni.modules.extrusion.figures import surface_mesh
+
+    mesh = surface_mesh(_annulus_cloud())
+    assert mesh is not None and len(mesh.triangles) > 100
+
+    corners = np.stack((mesh.x, mesh.y), axis=1)[mesh.triangles]
+    radii = np.linalg.norm(corners.mean(axis=1) - np.array(CENTER), axis=1)
+    assert radii.min() > 45.0, "a triangle sits inside the ring's hole"
+    assert radii.max() < 75.0, "a triangle reaches past the deposit"
+    assert np.isfinite(mesh.z).all(), "every meshed vertex must carry a height"
+
+
+def test_a_surface_mesh_does_not_bridge_a_dropout_cliff():
+    """D435i dropouts sit hundreds of mm below the plane; a triangle joining one
+    to the deposit would draw a wall that was never there."""
+    from tasni.modules.extrusion.figures import surface_mesh
+
+    cloud = _annulus_cloud()
+    dropouts = cloud[:400].copy()
+    dropouts[:, 2] = -350.0                          # the holes the D435i leaves
+    mesh = surface_mesh(np.vstack((cloud, dropouts)))
+
+    assert mesh is not None
+    spans = np.ptp(mesh.z[mesh.triangles], axis=1)
+    assert spans.max() < 25.0, "a triangle bridges the cliff to a dropout"
+
+
+def test_the_mesh_figure_surfaces_both_the_scene_and_the_deposit(tmp_path):
+    """The old paper's picture: the frame as a surface, top-down and rotated."""
+    from tasni.modules.extrusion.figures import load_take, mesh_panels, render_layer_figures
+
+    layer_dir = write_take(tmp_path, layer_index=1)
+    panels = mesh_panels(load_take(layer_dir))
+
+    assert [p.key for p in panels] == ["scene", "deposit"]
+    assert all(len(p.points) for p in panels)
+
+    written = render_layer_figures(layer_dir, only="mesh")
+    assert {p.name for p in written} == {"mesh.png", "mesh.pdf"}
+    assert (layer_dir / "figures" / "mesh.png").stat().st_size > 20_000
+
+
+def test_the_mesh_figure_drops_the_scene_panel_when_there_is_no_frame(tmp_path):
+    """Without depth the only cloud is the deposit; drawing it twice, once
+    labelled 'scene', would claim a second view that was never captured."""
+    from tasni.modules.extrusion.figures import load_take, mesh_panels, render_layer_figures
+
+    layer_dir = write_take(tmp_path, layer_index=1, depth=False)
+    panels = mesh_panels(load_take(layer_dir))
+
+    assert [p.key for p in panels] == ["deposit"]
+    written = render_layer_figures(layer_dir, only="mesh")
+    assert {p.name for p in written} == {"mesh.png", "mesh.pdf"}

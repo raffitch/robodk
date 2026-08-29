@@ -161,6 +161,8 @@ const FIGURES: Array<{ stem: string; label: string; hint: string }> = [
     hint: "every stage: captured depth → ROI → deposit → crest → centreline" },
   { stem: "plan", label: "Plan view", hint: "deposit cloud, extracted centreline, nominal ring" },
   { stem: "heightmap", label: "Height map", hint: "bird's-eye relief of the depth frame" },
+  { stem: "mesh", label: "Surfaced view",
+    hint: "the frame meshed — work surface and deposit, from above and rotated" },
   { stem: "iso", label: "Oblique", hint: "3-D cloud + centreline, vertical exaggeration" },
   { stem: "profile", label: "Unrolled profile", hint: "height and radial deviation vs angle" },
 ];
@@ -193,6 +195,14 @@ function TakeFigures({ trialId, take }: { trialId: string; take: MeasureTake }) 
         <img src={`${base}/files/comparison.png`} alt="Segmentation with nominal and measured paths" loading="lazy" />
       </a>
       <figcaption><strong>Segmentation</strong> <span className="hint">raster the centreline came from</span></figcaption>
+    </figure>
+    <figure className="figure-card">
+      <a href={`${base}/files/skeleton.png`} target="_blank" rel="noreferrer">
+        <img src={`${base}/files/skeleton.png`} alt="Skeleton thinned from the segmentation" loading="lazy" />
+      </a>
+      <figcaption><strong>Skeleton</strong> <span className="hint">
+        the segmentation thinned to one pixel — the centreline before it was
+        mapped back to 3-D</span></figcaption>
     </figure>
     {/* Only the last take of a press carries the photo -- the ring does not move
         between the frames of one capture, so the others would repeat it. */}

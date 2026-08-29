@@ -5,14 +5,17 @@ next to it), so a figure can be produced long after the cell run, on a machine
 with no robot and no camera, and re-produced identically. Nothing in this module
 touches the robot, RoboDK or the job runner.
 
-Four figures per take:
+Six figures per take:
 
 ``plan``       top view: deposit cloud, extracted centreline, nominal circle
 ``heightmap``  bird's-eye height map of the re-projected depth frame, z colourbar
+``mesh``       the frame SURFACED: scene and deposit, each straight down and rotated
 ``iso``        oblique 3-D view of cloud + centreline (z exaggerated, and said so)
 ``profile``    unrolled: height z(theta) and radial deviation dr(theta) over 360 deg
+``pipeline``   the method figure: the six arrays the chain held, in order
 
-and one per trial, ``stack``: every layer's latest take, plan + oblique.
+and two per trial: ``stack`` (every layer's latest take, plan + oblique) and
+``tube`` (the commanded bead against the measured footprint).
 
 Matplotlib is imported lazily behind the Agg backend: importing this module must
 not require a display, and ``tasni`` must still import when matplotlib is absent.
@@ -28,7 +31,7 @@ import numpy as np
 
 from .processing import depth_to_work_points
 
-LAYER_FIGURES = ("plan", "heightmap", "iso", "profile", "pipeline")
+LAYER_FIGURES = ("plan", "heightmap", "mesh", "iso", "profile", "pipeline")
 TRIAL_FIGURES = ("stack", "tube")
 FORMATS = ("png", "pdf")
 DPI = 300
@@ -425,6 +428,13 @@ def unrolled_profile(measured: np.ndarray, center, radius: float) -> dict:
             "maximum_mm": float(np.abs(deviation).max())}
 
 
+# Two figures re-run the chain (the method figure and the surfaced view), and a
+# gallery load asks for them one request apart. Re-running costs ~2 s and ~25 MB
+# of intermediate cloud, so the LAST take is remembered and nothing else: keyed
+# on the manifest's mtime, so a reprocessed take is never served from the cache.
+_STAGE_CACHE: dict[tuple[str, int], "dict | None"] = {}
+
+
 def take_stages(take: TakeData) -> "dict | None":
     """Re-run the archived frame through the real chain, keeping every stage.
 
@@ -435,6 +445,18 @@ def take_stages(take: TakeData) -> "dict | None":
     """
     if take.depth is None or take.K is None or take.T_work_camera is None:
         return None
+    manifest_file = take.layer_dir / "manifest.json"
+    key = (str(take.layer_dir.resolve()),
+           manifest_file.stat().st_mtime_ns if manifest_file.is_file() else 0)
+    if key in _STAGE_CACHE:
+        return _STAGE_CACHE[key]
+    stages = _compute_stages(take)
+    _STAGE_CACHE.clear()
+    _STAGE_CACHE[key] = stages
+    return stages
+
+
+def _compute_stages(take: TakeData) -> "dict | None":
     from .processing import plan_for_archived_take, process_observation
 
     trial_file = take.layer_dir.parent / "trial.json"
@@ -621,6 +643,288 @@ def _square(ax, cloud, window=None):
     ax.set_ylim(cloud[:, 1].min() - pad, cloud[:, 1].max() + pad)
 
 
+# -- the surfaced (meshed) view ----------------------------------------------
+#
+# The legacy scan macro built a Poisson mesh and handed it to
+# ``o3d.visualization.draw_geometries``: an interactive window that had to be
+# rotated and screenshotted by hand, and wrote no file. Everything else in this
+# module renders from the archive with no display, and the surfaced view is no
+# exception -- it is a 2.5-D mesh, because a single top-down RGB-D frame
+# measures a height field and nothing else. Surfacing it as a closed solid
+# would invent the underside the camera never saw.
+
+@dataclass
+class MeshSurface:
+    """A triangle mesh over a top-down cloud: vertices in mm, triangles as indices."""
+
+    x: np.ndarray
+    y: np.ndarray
+    z: np.ndarray
+    triangles: np.ndarray
+    cell_mm: float
+
+    def triangulation(self):
+        from matplotlib.tri import Triangulation
+        return Triangulation(self.x, self.y, self.triangles)
+
+
+def _cell_counts(points, window, cell: float):
+    """Points per grid cell, plus the grid shape they were binned into."""
+    x0, x1, y0, y1 = window
+    nx = max(int(np.ceil((x1 - x0) / cell)), 2)
+    ny = max(int(np.ceil((y1 - y0) / cell)), 2)
+    ix = np.clip(((points[:, 0] - x0) / cell).astype(int), 0, nx - 1)
+    iy = np.clip(((points[:, 1] - y0) / cell).astype(int), 0, ny - 1)
+    flat = iy * nx + ix
+    return np.bincount(flat, minlength=nx * ny), nx, ny
+
+
+def _auto_cell(points, window, *, cells_across: int, min_cell_mm: float,
+               per_cell: float = 2.5) -> float:
+    """Coarsen until the cells actually hold points.
+
+    A pitch finer than the cloud's own spacing produces a grid of isolated
+    cells with no shared edges, and a mesh of isolated cells is a scatter of
+    specks (26 triangles from the cell's 1517-point bead). The rule is the
+    cloud's, not the figure's: grow the cell until it averages a few returns.
+    """
+    x0, x1, y0, y1 = window
+    span = max(x1 - x0, y1 - y0)
+    ceiling = max(span / 12.0, min_cell_mm)
+    cell = min(max(min_cell_mm, span / max(int(cells_across), 8)), ceiling)
+    for _ in range(8):
+        counts, _, _ = _cell_counts(points, window, cell)
+        filled = int((counts > 0).sum())
+        if not filled or len(points) / filled >= per_cell or cell >= ceiling:
+            break
+        cell = min(cell * 1.35, ceiling)
+    return cell
+
+
+def surface_mesh(points, *, window=None, cells_across: int = 120,
+                 min_cell_mm: float = .35, max_step_mm: float = 25.0
+                 ) -> "MeshSurface | None":
+    """Turn a cloud into a surface: mean height per cell, triangulated in place.
+
+    Gaps stay gaps. A cell the camera returned nothing for has no vertex, so no
+    triangle can cover it -- the hole in a ring stays a hole, which a convex
+    triangulation would roof over with long thin faces. ``max_step_mm`` drops
+    the triangles that would otherwise bridge a dropout cliff (the D435i leaves
+    returns hundreds of mm below the plane) and draw a wall that was never there.
+
+    Gridding rather than Delaunay is deliberate: it is deterministic, so the
+    same archived take re-renders to the same mesh, and the cell pitch bounds
+    the triangle count no matter how dense the frame is.
+    """
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    points = points[np.isfinite(points).all(axis=1)]
+    if len(points) < 3:
+        return None
+    if window is None:
+        window = (float(points[:, 0].min()), float(points[:, 0].max()),
+                  float(points[:, 1].min()), float(points[:, 1].max()))
+    window = tuple(float(v) for v in window)
+    x0, x1, y0, y1 = window
+    if max(x1 - x0, y1 - y0) <= 0:
+        return None
+    inside = ((points[:, 0] >= x0) & (points[:, 0] <= x1)
+              & (points[:, 1] >= y0) & (points[:, 1] <= y1))
+    points = points[inside]
+    if len(points) < 3:
+        return None
+
+    cell = _auto_cell(points, window, cells_across=cells_across,
+                      min_cell_mm=min_cell_mm)
+    counts, nx, ny = _cell_counts(points, window, cell)
+    ix = np.clip(((points[:, 0] - x0) / cell).astype(int), 0, nx - 1)
+    iy = np.clip(((points[:, 1] - y0) / cell).astype(int), 0, ny - 1)
+    totals = np.bincount(iy * nx + ix, weights=points[:, 2], minlength=nx * ny)
+    filled = counts > 0
+    if filled.sum() < 3:
+        return None
+    height = np.where(filled, totals / np.maximum(counts, 1), np.nan)
+
+    # Vertex ids for the cells that hold a measurement; -1 for the empty ones.
+    ids = np.full(height.size, -1, dtype=np.int64)
+    ids[filled] = np.arange(int(filled.sum()))
+    ids = ids.reshape(ny, nx)
+    a, b = ids[:-1, :-1], ids[:-1, 1:]
+    c, d = ids[1:, :-1], ids[1:, 1:]
+    quads = np.concatenate((np.stack((a, b, c), axis=-1).reshape(-1, 3),
+                            np.stack((b, d, c), axis=-1).reshape(-1, 3)))
+    triangles = quads[(quads >= 0).all(axis=1)]
+    if not len(triangles):
+        return None
+
+    xs = x0 + (np.arange(nx) + .5) * cell
+    ys = y0 + (np.arange(ny) + .5) * cell
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    vx, vy = grid_x.ravel()[filled], grid_y.ravel()[filled]
+    vz = height[filled]
+
+    triangles = triangles[np.ptp(vz[triangles], axis=1) <= float(max_step_mm)]
+    if not len(triangles):
+        return None
+    used, flat_index = np.unique(triangles, return_inverse=True)
+    return MeshSurface(x=vx[used], y=vy[used], z=vz[used],
+                       triangles=flat_index.reshape(-1, 3), cell_mm=cell)
+
+
+@dataclass
+class MeshPanel:
+    """One surface worth drawing, and the neighbourhood to draw it in."""
+
+    key: str
+    title: str
+    points: np.ndarray
+    window: tuple | None = None
+    cells_across: int = 120
+
+
+def _deposit_points(take: TakeData) -> "np.ndarray | None":
+    """The bead itself, as densely as the archive can show it.
+
+    The archived cloud is the CREST the centreline was thinned from -- 578
+    points on the cell's first ring, a bead's worth of dots with its flanks
+    already discarded. Meshing that draws specks. The chain's own deposit
+    cluster is the same bead with its sides still on it (1517 points on that
+    take), which is what closes into a surface with a width and a height.
+    """
+    stages = take_stages(take) or {}
+    for key in ("radial_trimmed", "deposit_cluster"):
+        points = stages.get(key)
+        if points is not None and len(points) > 200:
+            return np.asarray(points, dtype=float)
+    return take.cloud if take.cloud is not None and len(take.cloud) > 50 else None
+
+
+def mesh_panels(take: TakeData) -> list[MeshPanel]:
+    """The surfaces this take can honestly show: the scene, and the deposit.
+
+    The scene panel needs a re-projectable frame. Without one the archived cloud
+    IS the deposit, so a second panel labelled 'scene' would show the same points
+    twice and claim a view that was never captured; the figure then draws the
+    deposit alone.
+    """
+    deposit = _deposit_points(take)
+    panels: list[MeshPanel] = []
+    if take.depth is not None and take.K is not None and take.T_work_camera is not None:
+        frame = _scene_points(take)
+        if frame is not None and frame is take.cloud:
+            frame = None      # the re-projection came back empty; this is its fallback
+        if frame is not None and len(frame):
+            window = _work_window(deposit if deposit is not None else frame, take.radius)
+            near = _within(frame, window)
+            if len(near) > 50:
+                # Clipped to the deposit band: a dropout 400 mm below the plane
+                # is not part of the surface, it is the absence of one.
+                lo, hi = _deposit_band(near[:, 2])
+                near = near[(near[:, 2] > lo - 5.0) & (near[:, 2] < hi + 15.0)]
+            if len(near) > 50:
+                panels.append(MeshPanel("scene", "work surface as captured", near,
+                                        window, 120))
+    if deposit is not None:
+        panels.append(MeshPanel("deposit", "deposit only", deposit, None, 110))
+    return panels
+
+
+def _relief_factor(dx: float, dy: float, dz: float, target: float = .30) -> float:
+    """Vertical exaggeration that makes millimetres of bead read over a table.
+
+    ``_z_exaggeration`` sets the scale from the ring's radius, which is right
+    for a centreline drawn in open space; a surface is judged against its own
+    footprint, so this one asks for a relief about a third as tall as the panel
+    is wide, whatever the frame happens to contain.
+    """
+    if dz <= 0:
+        return 1.0
+    return max(1.0, round(target * max(dx, dy) / dz, 1))
+
+
+def _draw_mesh_pair(fig, grid, row: int, panel: MeshPanel, mesh: MeshSurface) -> str:
+    """One surface as two panels: straight down, then rotated into 3-D."""
+    tri = mesh.triangulation()
+    lo, hi = _deposit_band(mesh.z)
+    # The wireframe is what separates a mesh from a heat map, so it is drawn
+    # wherever a cell is still a few pixels wide at 300 dpi. On the shaded 3-D
+    # surface the same edges read far heavier, and past a few thousand triangles
+    # they close over the surface entirely.
+    edged, edged_3d = len(mesh.triangles) <= 45000, len(mesh.triangles) <= 8000
+
+    flat = fig.add_subplot(grid[row, 0])
+    shaded = flat.tripcolor(tri, mesh.z, shading="gouraud", cmap=CMAP,
+                            vmin=lo, vmax=hi)
+    if edged:
+        flat.triplot(tri, color="#ffffff", linewidth=.12, alpha=.28)
+    fig.colorbar(shaded, ax=flat, fraction=.046, pad=.03).set_label("Z (mm)", fontsize=8)
+    flat.set_title(f"{panel.title} — from above", fontsize=10)
+    _square(flat, panel.points, panel.window)
+
+    window = panel.window or (float(mesh.x.min()), float(mesh.x.max()),
+                              float(mesh.y.min()), float(mesh.y.max()))
+    dx, dy = window[1] - window[0], window[3] - window[2]
+    dz = float(mesh.z.max() - mesh.z.min())
+    factor = _relief_factor(dx, dy, dz)
+    turned = fig.add_subplot(grid[row, 1], projection="3d")
+    surface = turned.plot_trisurf(tri, mesh.z * factor, cmap=CMAP, antialiased=False,
+                                  linewidth=.08 if edged_3d else 0,
+                                  edgecolor="#33415555" if edged_3d else "none",
+                                  shade=True)
+    surface.set_clim(lo * factor, hi * factor)
+    turned.set_title(f"{panel.title} — rotated (Z × {factor:g})", fontsize=10)
+    turned.view_init(elev=26, azim=-62)
+    for axis in (turned.xaxis, turned.yaxis, turned.zaxis):
+        axis.set_tick_params(labelsize=6)
+    turned.set_xlabel("X (mm)", fontsize=7)
+    turned.set_ylabel("Y (mm)", fontsize=7)
+    turned.set_zlabel(f"Z × {factor:g} (mm)", fontsize=7)
+    turned.set_xlim(window[0], window[1])
+    turned.set_ylim(window[2], window[3])
+    try:
+        # The box has to carry the SAME proportions as the data, or the drawing
+        # exaggerates by whatever the box happens to be (a flat (1, 1, .55) box
+        # stretched this bead ~6x while the axis claimed x2). X and Y keep the
+        # ring round; Z is the stated factor and nothing more.
+        scale = max(dx, dy, 1e-6)
+        turned.set_box_aspect((dx / scale, dy / scale,
+                               max(dz * factor / scale, .12)))
+    except Exception:
+        pass
+    return f"{panel.title}: {len(mesh.triangles)} triangles at {mesh.cell_mm:.2f} mm"
+
+
+def _figure_mesh(plt, take: TakeData):
+    """The captured frame as a SURFACE — straight down, and rotated into 3-D.
+
+    The other figures draw points and lines; this one closes them into a mesh,
+    which is what makes a bead read as a bead rather than a smear of dots. Both
+    rows are the same mesh seen twice, so a reader can carry a feature from the
+    plan view into the oblique one.
+    """
+    drawn = [(panel, surface_mesh(panel.points, window=panel.window,
+                                  cells_across=panel.cells_across))
+             for panel in mesh_panels(take)]
+    drawn = [(panel, mesh) for panel, mesh in drawn if mesh is not None]
+    if not drawn:
+        return None
+    rows = len(drawn)
+    fig = plt.figure(figsize=(10.4, 4.7 * rows))
+    grid = fig.add_gridspec(rows, 2, hspace=.30, wspace=.22,
+                            left=.06, right=.97,
+                            top=.90 if rows > 1 else .84,
+                            bottom=.11 if rows > 1 else .14)
+    notes = [_draw_mesh_pair(fig, grid, row, panel, mesh)
+             for row, (panel, mesh) in enumerate(drawn)]
+    fig.suptitle(f"Surfaced view — {take.label}", fontsize=12)
+    fig.text(.5, .055 if rows > 1 else .07,
+             "Mesh built from the measured points; unmeasured cells are left open. "
+             + " · ".join(notes), ha="center", fontsize=7.5, color="#4b5563")
+    # This figure is 10.4 in wide, not the 6 in CAPTION_WRAP was tuned for.
+    fig.text(.5, .015, wrap_caption(take.caption, width=150), ha="center", va="bottom",
+             fontsize=7.5, color="#4b5563")
+    return fig
+
+
 def _tube(centreline: np.ndarray, bead_mm: float, *, sides: int = 20):
     """A pipe of diameter ``bead_mm`` swept along a closed centreline.
 
@@ -790,8 +1094,8 @@ def _figure_profile(plt, take: TakeData):
 
 
 _LAYER_BUILDERS = {"plan": _figure_plan, "heightmap": _figure_heightmap,
-                   "iso": _figure_iso, "profile": _figure_profile,
-                   "pipeline": _figure_pipeline}
+                   "mesh": _figure_mesh, "iso": _figure_iso,
+                   "profile": _figure_profile, "pipeline": _figure_pipeline}
 
 
 # -- the trial figure --------------------------------------------------------
