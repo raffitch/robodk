@@ -648,6 +648,7 @@ HEALTHY_FRAMES_AFTER_REBUILD = 30      # ~1 s of streaming at 30 fps
 
 pipeline = None          # replaced at startup, and on every successful rebuild
 depth_unit_mm = None
+depth_filters = None
 
 _camera_lock = threading.RLock()   # one camera behind many threads
 _camera_generation = 0             # bumped on every successful rebuild
@@ -886,23 +887,43 @@ def openPipeline():
     cfg.enable_stream(rs.stream.color, COLOR_SIZE[0], COLOR_SIZE[1], rs.format.bgr8, 30)
     pipeline = rs.pipeline()
     profile = pipeline.start(cfg)
-    device = profile.get_device()
-    # As-found FIRST: the depth table (incl. depthUnits) is part of this record.
-    rs_config.dump_advanced_mode_json(device, rs, ASFOUND_DIR, log=_log)
-    sensor = device.first_depth_sensor()
-    ACHIEVED_OPTIONS = rs_config.configure_depth_sensor(
-        sensor, rs, laser_power=RS_LASER_POWER, visual_preset=RS_VISUAL_PRESET, log=_log)
-    DEVICE_INFO = {
-        "serial": device.get_info(rs.camera_info.serial_number),
-        "fw": device.get_info(rs.camera_info.firmware_version),
-        "librealsense": rs_config.librealsense_version(rs),
-    }
-    STATIC_GEOMETRY = rs_geometry.static_geometry(profile, rs)     # raises on a bad extrinsic
-    gte = rs_config.read_global_time_enabled(sensor, rs, log=_log)
-    _log(f"RealSense: global_time_enabled = {gte}; temps = "
-         f"{rs_config.read_temperatures(sensor, rs, log=_log)}; "
-         f"depth {STATIC_GEOMETRY.depth_size} colour {STATIC_GEOMETRY.color_size}; "
-         f"depth->colour t = {STATIC_GEOMETRY.t_dc_mm.round(2).tolist()} mm")
+    try:
+        device = profile.get_device()
+        try:
+            # As-found FIRST: the depth table (incl. depthUnits) is part of this
+            # record. dump_advanced_mode_json guards its device calls internally,
+            # but its os.makedirs/open are not guarded (rs_config.py is frozen) --
+            # a full/unwritable ASFOUND_DIR must never stop the server serving
+            # depth, so the call itself is guarded here instead.
+            rs_config.dump_advanced_mode_json(device, rs, ASFOUND_DIR, log=_log)
+        except Exception as e:
+            _log(f"WARNING: as-found dump failed: {e}")
+        sensor = device.first_depth_sensor()
+        ACHIEVED_OPTIONS = rs_config.configure_depth_sensor(
+            sensor, rs, laser_power=RS_LASER_POWER, visual_preset=RS_VISUAL_PRESET, log=_log)
+        DEVICE_INFO = {
+            "serial": device.get_info(rs.camera_info.serial_number),
+            "fw": device.get_info(rs.camera_info.firmware_version),
+            "librealsense": rs_config.librealsense_version(rs),
+        }
+        STATIC_GEOMETRY = rs_geometry.static_geometry(profile, rs)     # raises on a bad extrinsic
+        gte = rs_config.read_global_time_enabled(sensor, rs, log=_log)
+        _log(f"RealSense: global_time_enabled = {gte}; temps = "
+             f"{rs_config.read_temperatures(sensor, rs, log=_log)}; "
+             f"depth {STATIC_GEOMETRY.depth_size} colour {STATIC_GEOMETRY.color_size}; "
+             f"depth->colour t = {STATIC_GEOMETRY.t_dc_mm.round(2).tolist()} mm")
+    except Exception:
+        # A started pipeline still holds the USB device. Leaving it running while
+        # this exception propagates (the extrinsic assert is DESIGNED to raise)
+        # means the next rebuild attempt's pipeline.start() can fail with a
+        # device-busy error caused by THIS attempt -- burning the supervisor's
+        # 3-attempt recovery budget on a self-inflicted wound. Stop it
+        # (best-effort; must never mask the real error) before re-raising.
+        try:
+            pipeline.stop()
+        except Exception:
+            pass
+        raise
     return pipeline
 
 

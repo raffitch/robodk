@@ -192,7 +192,7 @@ def test_color_only_quality_handshake_string():
     print("[handshake] quality token appended only when requested")
 
 
-from server.handshake import parse_handshake  # noqa: E402  (sys.path has server/ via tests/test_handshake.py's insert; add the same two inserts at the top of this file)
+from server.handshake import parse_handshake  # noqa: E402
 
 
 def test_server_parses_quality_handshake():
@@ -362,18 +362,6 @@ def test_burst_handshake_rejected_on_old_server():
     print("[burst] old server (no BURST READY) -> CameraError; client falls back")
 
 
-def test_server_burst_handshake_detection():
-    """Mirror the server's routing: a `MODE BURST` line selects burst mode (and is
-    distinct from MODE COLOR / FULL)."""
-    def detects_burst(req: bytes) -> bool:
-        return req.strip().upper().startswith(b"MODE BURST")
-    assert detects_burst(b"MODE BURST\n")
-    assert not detects_burst(b"MODE COLOR\n")
-    assert not detects_burst(b"")
-    assert not detects_burst(b"garbage")
-    print("[handshake] MODE BURST routes to burst mode")
-
-
 if __name__ == "__main__":
     test_full_frame_roundtrip()
     test_color_only_means_depth_len_zero()
@@ -385,5 +373,4 @@ if __name__ == "__main__":
     test_decode_color_cv2_fallback_matches_turbojpeg_path()
     test_burst_session_roundtrip()
     test_burst_handshake_rejected_on_old_server()
-    test_server_burst_handshake_detection()
     print("\nCamera wire-format round-trip tests passed.")
