@@ -745,7 +745,7 @@ from tasni.modules.extrusion.measure import paper_summary
 
 def _write_take(root, trial_id, layer_index, take, *, offset, rms, mean_abs, maximum,
                 acq_ms, valid=True, offset_norm=None, measured_offset=None,
-                phase=None, offline=False):
+                phase=None, offline=False, cycle_ms=None):
     if measured_offset is None:
         measured_offset = (float(offset_norm or 0.0), 0.0)
     if offset_norm is None:
@@ -770,7 +770,9 @@ def _write_take(root, trial_id, layer_index, take, *, offset, rms, mean_abs, max
                     "timings_ms": ({"capture_ms": 40.0, "total_ms": acq_ms - 40.0}
                                    if offline else
                                    {"capture_ms": 40.0, "total_ms": acq_ms - 40.0,
-                                    "acquisition_to_path_ms": acq_ms})})
+                                    "acquisition_to_path_ms": acq_ms,
+                                    **({} if cycle_ms is None
+                                       else {"inspection_cycle_ms": float(cycle_ms)})})})
     ExtrusionArchive(root).write_layer(manifest, nominal_xyz=np.zeros((4, 3)),
                                        commanded_xyz=np.zeros((4, 3)))
 
@@ -1496,3 +1498,52 @@ def test_the_draft_embeds_a_figure_for_every_condition(tmp_path):
     captions = [p.text for p in document.paragraphs if p.text.startswith("Figure ")]
     assert any("layer 1 - noise floor" in c for c in captions)
     assert any("layer 2 - stacked true" in c for c in captions)
+
+
+# ------------------------- what inspecting a layer actually costs the print
+
+def test_a_take_records_what_the_inspection_excursion_cost(tmp_path, monkeypatch):
+    """The paper has to answer "what does stopping to look cost you?".
+
+    Capture and processing were timed; the robot excursion -- out to the
+    viewpoint, settle, and back to the start -- was not, and it is the larger
+    half. It is also the only number here that cannot be recovered from the
+    archive afterwards, so it has to be taken while the robot is moving.
+    """
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    out = RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True)(Ctx())
+
+    timings = json.loads(
+        (Path(out["layer_dir"]) / "manifest.json").read_text())["processing"]["timings_ms"]
+    for key in ("move_to_pose_ms", "settle_ms", "capture_ms", "total_ms",
+                "return_ms", "inspection_cycle_ms"):
+        assert key in timings, f"{key} was not recorded"
+    assert timings["settle_ms"] == pytest.approx(svc.config.extrusion.settle_s * 1000.0)
+    assert timings["inspection_cycle_ms"] == pytest.approx(
+        timings["move_to_pose_ms"] + timings["settle_ms"] + timings["capture_ms"]
+        + timings["total_ms"] + timings["return_ms"], abs=1e-6)
+    # The session row carries it too, so the operator sees the cost as they go.
+    assert "inspection_cycle_ms" in MeasureSession.load(
+        tmp_path / "runs" / "extrusion", session.trial_id).records[0]["timings_ms"]
+
+
+def test_the_summary_reports_what_inspection_costs_per_layer(tmp_path):
+    """A duty-cycle number a reviewer can weigh against a layer time."""
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, auto_plan(), note="rings")
+    t = session.trial_id
+    _write_take(root, t, 1, 1, offset=None, offset_norm=0.4, rms=0.5, mean_abs=0.4,
+                maximum=1.1, acq_ms=1000, cycle_ms=14000)
+    _write_take(root, t, 1, 2, offset=None, offset_norm=0.5, rms=0.5, mean_abs=0.4,
+                maximum=1.2, acq_ms=1000, cycle_ms=16000)
+
+    summary = paper_summary(root, t)
+
+    cycle = summary["timing_ms"]["inspection_cycle_ms"]
+    assert cycle["n"] == 2 and cycle["mean"] == pytest.approx(15000.0)
+    markdown = summary["markdown"]
+    assert "Inspecting one layer cost 15000" in markdown
+    assert "rather than during deposition" in markdown

@@ -83,7 +83,10 @@ interface MeasureTake {
     measured_radius_mm: number; path_completeness: number } | null;
   geometry: { height_mean_mm: number; height_min_mm: number; height_max_mm: number;
     bead_width_mean_mm: number } | null;
-  timings_ms: { capture_ms?: number; total_ms?: number; acquisition_to_path_ms?: number };
+  timings_ms: { capture_ms?: number; total_ms?: number; acquisition_to_path_ms?: number;
+    move_to_pose_ms?: number; settle_ms?: number; return_ms?: number;
+    /** Out of the path, settle, capture, reconstruct, back: what one inspection costs. */
+    inspection_cycle_ms?: number };
   error?: string | null;
   reprocessed?: boolean;
 }
@@ -1259,7 +1262,7 @@ export default function Extrusion() {
         <thead><tr><th>Layer</th><th>Take</th><th>Phase</th><th>Introduced</th>
           <th>Measured |d|</th><th>Detection error</th>
           {allColumns && <><th>dx / dy</th><th>Mean |dev|</th><th>Max</th><th>Shape RMS</th>
-            <th>Height min/mean/max</th><th>Bead</th><th>Acq→path</th></>}
+            <th>Height min/mean/max</th><th>Bead</th><th>Acq→path</th><th>Layer cost</th></>}
           <th>RMS</th><th>Valid</th></tr></thead>
         <tbody>{takes.map((r) => {
           const truth = r.annotation?.introduced_offset_mm;
@@ -1287,6 +1290,8 @@ export default function Extrusion() {
               <td className="num">{r.geometry ? r.geometry.bead_width_mean_mm.toFixed(1) : "—"}</td>
               <td className="num">{r.timings_ms?.acquisition_to_path_ms
                 ? `${Math.round(r.timings_ms.acquisition_to_path_ms)} ms` : "—"}</td>
+              <td className="num">{r.timings_ms?.inspection_cycle_ms
+                ? `${(r.timings_ms.inspection_cycle_ms / 1000).toFixed(1)} s` : "—"}</td>
             </>}
             <td className="num">{r.metrics ? r.metrics.rms_mm.toFixed(2) : "—"}</td>
             <td><span className={`badge ${r.valid ? "good" : "bad"}`}>{r.valid ? "VALID" : "INVALID"}</span>

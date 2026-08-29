@@ -227,9 +227,12 @@ def _inspect_and_capture(services, ctx: JobContext, plan: CylinderPlan, layer, *
         seed_pose=seed_pose, collisions=collisions, near_mm=near_mm)
     ctx.check_cancel()
     artifacts.extend(inspect["artifacts"])
+    # What the excursion costs the print starts here: the arm leaving the path.
+    departed = time.perf_counter()
     if rdk.start_program(inspection_name, real_robot=True) < 0:
         raise RuntimeError(f"inspection program {inspection_name} could not start")
     _wait_program(ctx, rdk, inspection_name)
+    move_ms = (time.perf_counter() - departed) * 1000.0
     time.sleep(ecfg.settle_s)
     # Re-select the inspection TCP and chosen work frame before reading the
     # camera pose: the generated program's tool instruction does not update
@@ -245,7 +248,10 @@ def _inspect_and_capture(services, ctx: JobContext, plan: CylinderPlan, layer, *
     if ok:
         ctx.frame(jpeg.tobytes())
     return {"inspect": inspect, "T_work_camera": T_work_camera, "frame": frame,
-            "capture_ms": capture_ms}
+            "capture_ms": capture_ms, "move_ms": move_ms,
+            # The dwell is commanded, not measured: reporting the configured
+            # value keeps the cycle total honest when a test stubs out sleep.
+            "settle_ms": float(ecfg.settle_s) * 1000.0}
 
 
 def _prepare_robot(services, ctx: JobContext, plan: CylinderPlan, *, label: str):
@@ -280,6 +286,26 @@ def _prepare_robot(services, ctx: JobContext, plan: CylinderPlan, *, label: str)
     return rdk.current_joints()
 
 
+def add_return_timing(layer_dir, return_ms: float) -> dict | None:
+    """Fold the trip back into the take's timings, once the arm is home.
+
+    The archive is written before the return move -- a measurement must survive
+    a failure on the way back -- so the closing half of the excursion is patched
+    into the manifest afterwards. Nothing derived is touched.
+    """
+    manifest_file = Path(layer_dir) / "manifest.json"
+    if not manifest_file.is_file():
+        return None
+    payload = json.loads(manifest_file.read_text(encoding="utf-8"))
+    timings = (payload.setdefault("processing", {}).setdefault("timings_ms", {}))
+    timings["return_ms"] = float(return_ms)
+    timings["inspection_cycle_ms"] = float(sum(
+        float(timings.get(key) or 0.0) for key in
+        ("move_to_pose_ms", "settle_ms", "capture_ms", "total_ms", "return_ms")))
+    manifest_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return timings
+
+
 class RingMeasureJob:
     """Measure ONE hand-placed ring: inspect, capture, process, archive, return."""
 
@@ -309,6 +335,7 @@ class RingMeasureJob:
         archive = ExtrusionArchive(REPO_ROOT / "runs" / "extrusion")
         artifacts: list[str] = []
         current_program: str | None = None
+        layer_dir = None
         start_joints = _prepare_robot(services, ctx, self.plan, label="extrusion-measure")
         try:
             with _camera_hold(services, "extrusion-measure"):
@@ -370,6 +397,8 @@ class RingMeasureJob:
                 timings = processed.report["timings_ms"]
                 timings["capture_ms"] = capture_ms
                 timings["acquisition_to_path_ms"] = capture_ms + timings["total_ms"]
+                timings["move_to_pose_ms"] = captured["move_ms"]
+                timings["settle_ms"] = captured["settle_ms"]
                 manifest = LayerManifest(
                     **base, measured_path_file="measured_path.json",
                     pointcloud_file="height-or-pointcloud.npy",
@@ -419,10 +448,27 @@ class RingMeasureJob:
                     rdk.stop_program(current_program)
                 except Exception:
                     pass
+            came_home = time.perf_counter()
             try:
                 rdk.move_j_joints(start_joints)
             except Exception:
                 pass
+            return_ms = (time.perf_counter() - came_home) * 1000.0
+            if layer_dir is not None:
+                try:
+                    complete = add_return_timing(layer_dir, return_ms)
+                    if complete is not None:
+                        # The operator's table and the paper both read the cycle,
+                        # so the session row cannot lag the manifest.
+                        for record in self.session.records:
+                            if record.get("layer_name") == Path(layer_dir).name:
+                                record["timings_ms"] = complete
+                        self.session.save()
+                        ctx.log(f"inspection excursion {complete['inspection_cycle_ms']:.0f} ms "
+                                f"(out {complete.get('move_to_pose_ms', 0):.0f}, back "
+                                f"{return_ms:.0f})")
+                except Exception as exc:
+                    ctx.log(f"return timing not recorded (the measurement stands): {exc}")
             try:
                 rdk.delete_items(list(dict.fromkeys(reversed(artifacts))))
             except Exception:
@@ -721,7 +767,9 @@ def paper_summary(root: Path, trial_id: str) -> dict:
                 {key: stat["mean"] for key, stat in deviation.items()}, introduced_norm)})
     timings = [live_timings(m) for m in takes]
     timing = {key: _stat(t.get(key) for t in timings)
-              for key in ("capture_ms", "total_ms", "acquisition_to_path_ms")}
+              for key in ("capture_ms", "total_ms", "acquisition_to_path_ms",
+                          "move_to_pose_ms", "settle_ms", "return_ms",
+                          "inspection_cycle_ms")}
     timing["offline_reprocessed_takes"] = sum(
         1 for m in takes if (m.get("processing") or {}).get("offline_reprocess"))
     geometry = [m["geometry"] for m in takes if m.get("geometry")]
@@ -768,6 +816,13 @@ def paper_summary(root: Path, trial_id: str) -> dict:
                      f"three-dimensional path took {_fmt(acq, 0)} ms "
                      f"(capture {_fmt(timing['capture_ms'], 0)} ms, processing "
                      f"{_fmt(timing['total_ms'], 0)} ms).")
+    cycle = timing["inspection_cycle_ms"]
+    if cycle["n"]:
+        prose.append(f"Inspecting one layer cost {_fmt(cycle, 0)} ms of machine time end to end "
+                     f"over {cycle['n']} excursion(s) - leaving the path, settling, capturing, "
+                     f"reconstructing and returning (move out {_fmt(timing['move_to_pose_ms'], 0)} "
+                     f"ms, return {_fmt(timing['return_ms'], 0)} ms). This is the cost of "
+                     "inspecting between layers rather than during deposition.")
     if timing["offline_reprocessed_takes"]:
         prose.append(f"{timing['offline_reprocessed_takes']} take(s) were reprocessed offline "
                      "from their archived RGB-D frame; their geometry counts, and their "

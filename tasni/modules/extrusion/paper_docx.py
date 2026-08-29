@@ -47,7 +47,8 @@ METHOD = (
 CONDITION_HEADERS = ["Condition", "n", "Centre offset (mm)", "Detection error (mm)",
                      "Mean |dev| (mm)", "RMS (mm)", "Max (mm)", "Shape RMS (mm)"]
 TAKE_HEADERS = ["Layer", "Take", "Phase", "Introduced (mm)", "Measured offset (mm)",
-                "Detection error (mm)", "RMS (mm)", "Acq to path (ms)", "Valid"]
+                "Detection error (mm)", "RMS (mm)", "Acq to path (ms)",
+                "Layer cost (s)", "Valid"]
 
 
 def _pm(text: str) -> str:
@@ -222,6 +223,7 @@ def build_paper_docx(root, trial_id: str, out_path=None, *,
             f"{error:.2f}" if error is not None else "-",
             f"{metrics['rms_mm']:.2f}" if metrics.get("rms_mm") is not None else "-",
             f"{acq:.0f}" if acq else "-",
+            f"{timings['inspection_cycle_ms'] / 1000:.1f}" if timings.get("inspection_cycle_ms") else "-",
             "yes" if metrics.get("valid") else "no",
         ])
     _add_table(document, TAKE_HEADERS, rows)
