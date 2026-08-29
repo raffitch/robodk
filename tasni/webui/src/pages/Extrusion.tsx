@@ -633,6 +633,53 @@ export default function Extrusion() {
                                       : "no introduced offset");
     return parts.join(" · ");
   };
+  /** Tabula rasa: aim at the table, freeze a 3-layer plan there, open a session.
+   *
+   * The plan is only a SEARCH SEED -- characterize_ring makes no recipe
+   * assumption, it fits a circle within 150 mm of the plan's centre -- so a
+   * fresh ring needs a centre over the table and nothing else. Asking the
+   * operator to "generate a plan" first implied they had to know the ring's
+   * size before measuring it, which is backwards.
+   */
+  const freshStart = async () => {
+    if (!recipe || !setup) return;
+    const takenSoFar = measureSession?.records?.length ?? 0;
+    if (takenSoFar && !window.confirm(
+      `Session ${measureSession?.trial_id} has ${takenSoFar} take(s). They stay archived, `
+      + "but measurements from now on go to a NEW session and the run starts again at "
+      + "ring 1.\n\nStart a fresh ring?")) return;
+    setBusy(true); setLogs([]); setMessage("Aiming at the table for a fresh ring…");
+    try {
+      let nextSetup: Setup = { ...setup };
+      if (surface?.available) {
+        const centred = await api.post<{ setup: Partial<Setup>; surface: ScanSurface }>(
+          "/center-on-surface",
+          { radius_mm: recipe.radius_mm, bead_diameter_mm: recipe.bead_diameter_mm });
+        nextSetup = { ...nextSetup, ...centred.setup };
+        setSurface({ ...centred.surface, applied: true });
+        if (connected && setup.print_tool) {
+          const pose = await api.post<{ rpy_deg: number[] }>("/current-tcp", {
+            print_tool: setup.print_tool,
+            work_frame: centred.setup.work_frame || setup.work_frame,
+          });
+          nextSetup.orientation_rpy_deg = pose.rpy_deg as [number, number, number];
+        }
+      }
+      const nextRecipe = { ...recipe, layer_count: Math.max(3, recipe.layer_count) };
+      const generated = await api.post<Plan>("/generate",
+        { recipe: nextRecipe, setup: nextSetup });
+      setRecipe(nextRecipe); setSetup(nextSetup); setPlan(generated);
+      setPreflight(null); setResult(null); setPaper(null); setOpenTake(null);
+      const created = await api.post<{ session: MeasureSession }>(
+        "/measure/session/new", { note: measureNote });
+      setMeasureSession(created.session); setStepPin(null); setAxisKnown(false);
+      setOffsetX(0); setOffsetY(0); setPhase("noise floor"); setMeasureLayer(1);
+      setMessage(`Fresh session ${created.session.trial_id}${surface?.available
+        ? ", aimed at the centre of the scanned surface" : ""}. Place ring 1 on the board `
+        + "and press Characterize — its radius, bead and height are measured, not typed.");
+      refreshStatus();
+    } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
+  };
   const newMeasureSession = async () => {
     setBusy(true);
     try {
@@ -888,23 +935,18 @@ export default function Extrusion() {
                                               done: boolean }): RunStep => ({ ...over } as RunStep);
   const RUN: RunStep[] = [
     runStep({
-      id: "plan", label: "Plan", title: "Generate the plan this run measures against",
-      hands: "Scan surface applied, cylinder centred on it. Open Setup above if either is missing.",
-      done: Boolean(plan) && (plan?.layers.length ?? 0) >= 3,
-      button: "Generate plan · 3 layers",
-      onRun: () => recipe && generate({ ...recipe, layer_count: 3 }),
+      id: "fresh", label: "Fresh ring", title: "Start a fresh ring",
+      hands: "Nothing to place yet. Clear the board and have a scanned surface applied "
+        + "(Setup above); this press only decides where the camera looks.",
+      done: Boolean(plan) && (plan?.layers.length ?? 0) >= 3 && Boolean(measureSession),
+      button: "Aim at the table & open a session",
+      onRun: freshStart,
       disabled: !recipe || !selectionsReady || busy || Boolean(status?.running),
-      blocked: !selectionsReady ? "Open Setup and choose the work frame, print tool and camera tool." : null,
-      note: "Three layers now, because Apply never changes the layer count later.",
-    }),
-    runStep({
-      id: "session", label: "Session", title: "Open a session for this experiment",
-      hands: "Nothing to touch in the cell.",
-      done: Boolean(measureSession),
-      button: "Start session",
-      onRun: newMeasureSession,
-      disabled: !plan || busy || Boolean(status?.running),
-      note: "One folder holds every take, its raw depth frame and its figures.",
+      blocked: !selectionsReady
+        ? "Open Setup and choose the work frame, print tool and camera tool." : null,
+      note: "The ring's radius, bead and height are MEASURED in the next step, never typed: "
+        + "this only aims the search (within 150 mm of the centre) and fixes three layers, "
+        + "because Apply never changes the layer count later.",
     }),
     runStep({
       id: "ring1", label: "Ring 1", title: characterization
@@ -1318,6 +1360,8 @@ export default function Extrusion() {
         {plan && <span className="hint">r {plan.recipe.radius_mm} · bead {plan.recipe.bead_diameter_mm}
           {" "}· {plan.layers.length} layer{plan.layers.length === 1 ? "" : "s"}</span>}
         <span className="spacer" />
+        <button type="button" className="linkish" disabled={busy || status?.running}
+                onClick={freshStart}>Start over with a new ring</button>
         <button type="button" className="linkish"
                 onClick={() => setManualOpen(!manualOpen)}>{manualOpen ? "Hide" : "Manual"} controls</button>
       </div>
