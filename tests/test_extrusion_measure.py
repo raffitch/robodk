@@ -1860,3 +1860,62 @@ def test_the_axis_check_take_is_never_the_pre_shift_reference(tmp_path):
 
     assert shifted["paired_reference_takes"] == [3]
     assert shifted["paired_detection_error_mm"]["mean"] == pytest.approx(np.hypot(0.2, 0.1), abs=1e-9)
+
+
+# ------------- the depth must be of the pose it was taken at (cell, 2026-08-29)
+
+class StaleThenFreshCamera:
+    """The Jetson's temporal depth filter blends across frames.
+
+    After the arm moves, the first depth it emits is still weighted toward the
+    PREVIOUS distance. On the cell this returned the parked height (447 mm) with
+    a correct, freshly captured colour of the board at 312 mm -- geometry that
+    could not both be true, and which put every point 135 mm outside the search
+    region.
+    """
+
+    def __init__(self, stale_mm=640, fresh_mm=500, stale_frames=1):
+        self.stale_mm, self.fresh_mm = stale_mm, fresh_mm
+        self.stale_frames = stale_frames
+        self.grabs = 0
+
+    def grab(self, **kwargs):
+        self.grabs += 1
+        # The readiness grab happens before the move and is not counted against
+        # the stale run: it is the capture after the move that must be fresh.
+        value = self.stale_mm if self.grabs <= self.stale_frames + 1 else self.fresh_mm
+        from tasni.core.camera import Frame
+        return Frame(color=np.zeros((16, 16, 3), np.uint8),
+                     depth=np.full((16, 16), value, np.uint16), timestamp=1.0)
+
+
+def test_a_depth_frame_from_the_wrong_pose_is_grabbed_again(tmp_path, monkeypatch):
+    """A stale depth is silently wrong, so it must not be measured."""
+    svc, rdk, _ = measure_env(tmp_path, monkeypatch)
+    svc.camera = StaleThenFreshCamera()
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    out = RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True)(Ctx())
+
+    manifest = json.loads((Path(out["layer_dir"]) / "manifest.json").read_text())
+    check = manifest["processing"]["depth_plane_check"]
+    assert check["retries"] == 1, "the stale frame should have been thrown away"
+    assert check["camera_z_mm"] == pytest.approx(506.0)
+    assert check["observed_depth_mm"] == pytest.approx(500.0)
+
+
+def test_a_depth_frame_that_never_matches_the_pose_fails_loudly(tmp_path, monkeypatch):
+    """Better a refused measurement than a plausible wrong one."""
+    svc, rdk, _ = measure_env(tmp_path, monkeypatch)
+    svc.camera = StaleThenFreshCamera(stale_frames=99)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    with pytest.raises(RuntimeError) as failure:
+        RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True)(Ctx())
+
+    message = str(failure.value)
+    assert "640" in message and "506" in message, message
+    assert "temporal" in message.lower() or "stale" in message.lower(), message
+    assert rdk.events[-1] == ("move-joints", START_JOINTS)          # still comes home

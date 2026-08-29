@@ -200,6 +200,37 @@ class MeasureSession:
         return summary
 
 
+def depth_plane_check(depth, T_work_camera, config) -> dict:
+    """Does this depth frame describe the pose it was taken at?
+
+    Looking straight down at the work plane, the median depth over the frame is
+    the camera's own height above that plane: the board dominates the view and
+    the deposit stands a few millimetres proud of it. So the median must fall
+    between "the camera height, less the tallest deposit we would believe" and
+    "the camera height, plus a little for the plane's own error".
+
+    On the cell (2026-08-29) a capture came back with a correct colour frame of
+    the board at 312 mm and a depth frame reading 447 mm -- the height the arm
+    had been parked at. The Jetson filters depth through ``rs.temporal_filter``,
+    which blends each frame with previous ones, so the first depth after a move
+    is still weighted toward where the camera used to be. Colour carries no such
+    filter, which is why the two disagreed. That frame failed loudly because
+    everything landed outside the search region; a smaller residual would have
+    passed every gate and quietly moved a paper number instead.
+    """
+    camera_z = float(np.asarray(T_work_camera, dtype=float)[2, 3])
+    values = np.asarray(depth)
+    valid = values[values > 0]
+    observed = float(np.median(valid)) if valid.size else float("nan")
+    ceiling = float(getattr(config, "characterize_max_height_mm", 40.0))
+    slack = float(getattr(config, "depth_plane_slack_mm", 15.0))
+    low, high = camera_z - ceiling, camera_z + slack
+    return {"camera_z_mm": camera_z, "observed_depth_mm": observed,
+            "accepted_range_mm": [round(low, 1), round(high, 1)],
+            "valid_pixels": int(valid.size),
+            "agrees": bool(valid.size and low <= observed <= high)}
+
+
 def take_summary(layer_dir: Path, manifest: dict, *, reprocessed: bool = False) -> dict:
     """One row of the session table, built from what the archive actually holds."""
     processing = manifest.get("processing") or {}
@@ -244,11 +275,38 @@ def _inspect_and_capture(services, ctx: JobContext, plan: CylinderPlan, layer, *
     capture_ms = (time.perf_counter() - started) * 1000.0
     if frame.depth is None:
         raise RuntimeError("RGB-D capture returned no depth")
+    # Throw away a depth frame that still describes the pose before the move.
+    # Each grab pulls a new frame through the Jetson's temporal filter, so a
+    # retry is what lets it converge on where the camera actually is now.
+    attempts = int(getattr(ecfg, "depth_stale_retries", 2))
+    check = depth_plane_check(frame.depth, T_work_camera, ecfg)
+    retries = 0
+    while not check["agrees"] and retries < attempts:
+        retries += 1
+        ctx.log(f"depth said {check['observed_depth_mm']:.0f} mm with the camera "
+                f"{check['camera_z_mm']:.0f} mm above the work plane - discarding it and "
+                f"grabbing again ({retries}/{attempts})")
+        started = time.perf_counter()
+        frame = services.camera.grab(with_depth=True, timeout=ecfg.grab_timeout_s)
+        capture_ms = (time.perf_counter() - started) * 1000.0
+        if frame.depth is None:
+            raise RuntimeError("RGB-D capture returned no depth")
+        check = depth_plane_check(frame.depth, T_work_camera, ecfg)
+    check["retries"] = retries
+    if not check["agrees"]:
+        raise RuntimeError(
+            f"the depth frame does not describe this pose: median depth "
+            f"{check['observed_depth_mm']:.0f} mm with the camera "
+            f"{check['camera_z_mm']:.0f} mm above the work plane (expected "
+            f"{check['accepted_range_mm'][0]:.0f}-{check['accepted_range_mm'][1]:.0f} mm), "
+            f"after {retries} retry(s). The Jetson blends depth across frames "
+            "(rs.temporal_filter), so a stale depth reads as the previous standoff; if it "
+            "persists, check that the work frame still sits on the physical surface.")
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:
         ctx.frame(jpeg.tobytes())
     return {"inspect": inspect, "T_work_camera": T_work_camera, "frame": frame,
-            "capture_ms": capture_ms, "move_ms": move_ms,
+            "capture_ms": capture_ms, "move_ms": move_ms, "depth_plane_check": check,
             # The dwell is commanded, not measured: reporting the configured
             # value keeps the cycle total honest when a test stubs out sleep.
             "settle_ms": float(ecfg.settle_s) * 1000.0}
@@ -399,6 +457,7 @@ class RingMeasureJob:
                 timings["acquisition_to_path_ms"] = capture_ms + timings["total_ms"]
                 timings["move_to_pose_ms"] = captured["move_ms"]
                 timings["settle_ms"] = captured["settle_ms"]
+                processed.report["depth_plane_check"] = captured["depth_plane_check"]
                 manifest = LayerManifest(
                     **base, measured_path_file="measured_path.json",
                     pointcloud_file="height-or-pointcloud.npy",

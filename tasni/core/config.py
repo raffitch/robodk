@@ -836,6 +836,14 @@ class ExtrusionConfig(_Model):
     layer_floor_margin_mm: float = Field(default=2.0, ge=0, le=20)
     characterize_search_radius_mm: float = Field(default=150.0, gt=0, le=1000)
     characterize_max_height_mm: float = Field(default=40.0, gt=0, le=200)
+    # A depth frame must describe the pose it was taken at: looking down at the
+    # work plane, the median depth IS the camera's height above it. This is how
+    # far below the plane that median may sit before the frame is refused (the
+    # plane's own fit error); characterize_max_height_mm bounds the other side.
+    depth_plane_slack_mm: float = Field(default=15.0, gt=0, le=200)
+    # Retries when it disagrees. Each grab pulls a new frame through the Jetson's
+    # temporal depth filter, which is what lets it converge after a move.
+    depth_stale_retries: int = Field(default=2, ge=0, le=10)
     bead_width_bins: int = Field(default=36, ge=4, le=360)
     # After the largest deposit cluster is chosen, keep only points within a band
     # of the circle FITTED to that cluster -- fit, trim, refit, one pass per band,
