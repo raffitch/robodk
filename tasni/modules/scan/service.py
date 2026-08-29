@@ -141,6 +141,64 @@ class LargeSurfaceRequired(RuntimeError):
         self.payload = payload
 
 
+def _large_surface_fov_context(survey, geometry) -> dict:
+    """Shared context for :class:`LargeSurfaceRequired` payloads (2026-08-30
+    false-refusal investigation).
+
+    The operator judges "does the platform fit" from the COLOUR image, but
+    ``survey_surface``'s RANSAC plane fit runs over the native DEPTH frame, whose
+    field of view is materially wider under protocol 2 (colour ~69x42deg, depth
+    ~87x58deg -- see ``depth_geometry.py``). A platform that is genuinely bounded
+    with margin on screen can still trip this refusal when something coplanar
+    beyond its visible edges -- most often the floor or table it physically
+    rests on -- is picked up by the wider depth view and fitted as one
+    continuous flat surface. Returns ``{"colour_fov_deg", "depth_fov_deg"}``
+    (either may be ``None`` if unavailable) for both the message text and
+    structured payload fields the UI can render directly."""
+    colour_fov = ([round(float(v), 1) for v in survey.fov_deg]
+                  if survey is not None and survey.fov_deg else None)
+    depth_fov = None
+    if geometry is not None:
+        try:
+            fx, fy = float(geometry.depth_K[0, 0]), float(geometry.depth_K[1, 1])
+            dW, dH = geometry.depth_size
+            depth_fov = [round(float(np.degrees(2.0 * np.arctan(dW / (2.0 * fx)))), 1),
+                        round(float(np.degrees(2.0 * np.arctan(dH / (2.0 * fy)))), 1)]
+        except Exception:
+            depth_fov = None
+    return {"colour_fov_deg": colour_fov, "depth_fov_deg": depth_fov}
+
+
+def _large_surface_message(intro: str, fov: dict, extent, standoff_mm) -> str:
+    """Compose the truthful, numbered refusal message shared by both
+    ``LargeSurfaceRequired`` sites: names the colour-vs-depth field-of-view gap
+    (never just "the camera view", which the operator has no way to verify
+    against what they see), then the concrete numbers behind THIS refusal."""
+    colour_fov, depth_fov = fov.get("colour_fov_deg"), fov.get("depth_fov_deg")
+    fov_clause = ""
+    # Only claim "narrower" when it is actually true: legacy_aligned geometry (an
+    # archived take, or any future stream where depth truly is registered 1:1 to
+    # colour) has depth_fov == colour_fov by construction, and asserting a gap
+    # that is not there would be exactly the kind of unverifiable claim this fix
+    # exists to remove.
+    if (colour_fov and depth_fov
+            and (depth_fov[0] > colour_fov[0] + 0.5 or depth_fov[1] > colour_fov[1] + 0.5)):
+        fov_clause = (
+            f" The colour view here is ~{colour_fov[0]:.0f}x{colour_fov[1]:.0f}°, "
+            f"narrower than the depth sensor's own ~{depth_fov[0]:.0f}x{depth_fov[1]:.0f}° "
+            "field of view, so a surface that fits the colour image can still extend "
+            "past it in depth (most often the floor or table the platform rests on, "
+            "picked up as one continuous flat surface).")
+    extent_clause = ""
+    if extent and standoff_mm is not None:
+        extent_clause = (
+            f" The flat surface measured so far is at least "
+            f"{extent[0]:.0f} x {extent[1]:.0f} mm at ~{standoff_mm:.0f} mm standoff.")
+    return (intro + fov_clause + extent_clause
+            + " Survey it from five positions (center + four corners) to bound its "
+              "true edges, or switch to a declared work region.")
+
+
 def _crop_gate_payload(gate_payload: dict, scfg, K, image_size, look_mm: float,
                        survey=None, user_region_mm: tuple[float, float] | None = None
                        ) -> tuple[dict, "np.ndarray | None"]:
@@ -504,13 +562,33 @@ def lock_scan_surface(services, *, force_crop: bool = False,
         # Plan Task 3, the load-bearing invariant: entire-platform scope may not be
         # satisfied by a fabricated square. Refuse with the one action that CAN
         # measure this platform's real boundary.
+        #
+        # 2026-08-30 false-refusal investigation: the old message said "the platform
+        # overruns the camera view", which the operator could see with their own
+        # eyes was false -- the platform was fully visible, comfortably framed with
+        # margin, in the colour image. The refusal itself was correct (the RANSAC
+        # plane fit genuinely extends past the colour frame -- verified live on this
+        # camera with a real capture: a board resting on a desk fits the colour view,
+        # but the desk surface beyond it, coplanar and visible only to the wider
+        # native depth FOV, pulls the fitted rectangle past the colour frame); what
+        # was wrong was the MESSAGE, which named the wrong camera. It now says which
+        # field of view is binding and gives the actual numbers, so the operator can
+        # verify the claim instead of just disbelieving it.
         extent = [float(v) for v in (survey.extent_mm or ())] or None
+        fov = _large_surface_fov_context(survey, getattr(frame, "geometry", None))
+        standoff = (round(float(survey.standoff_mm), 0)
+                    if survey.standoff_mm is not None else None)
+        message = _large_surface_message(
+            "the depth sensor measured a flat surface that extends beyond what the "
+            "colour camera can see, so its full boundary cannot be confirmed from here.",
+            fov, extent, standoff)
         raise LargeSurfaceRequired({
             "error": "large_surface_required",
-            "message": ("the platform overruns the camera view, so its full boundary "
-                        "cannot be measured from here — survey it from five positions "
-                        "(center + four corners), or switch to a declared work region."),
+            "message": message,
             "extent_mm": extent,
+            "standoff_mm": standoff,
+            "valid_frac": round(float(full_frame_valid_frac), 3),
+            **fov,
             "surface_scope": surface_scope,
             "workflow_goal": workflow_goal,
             "primary_action": "survey_full_platform",
@@ -2785,12 +2863,23 @@ def generate_scan_targets(services, locked: LockedScanSurface | None = None) -> 
             # itself already refuses this case; this is the belt-and-braces guard for
             # a lock whose overrun was too marginal to trip surface_overruns_view.)
             if locked.surface_scope == SCOPE_ENTIRE_PLATFORM:
+                # Same truthful-message fix as lock_scan_surface's primary refusal
+                # (2026-08-30): name the colour-vs-depth field-of-view gap rather
+                # than the generic "camera view" the operator cannot verify.
+                extent = [float(v) for v in extent_mm] if extent_mm else None
+                fov = _large_surface_fov_context(survey, getattr(frame, "geometry", None))
+                standoff = (round(float(survey.standoff_mm), 0)
+                            if survey.standoff_mm is not None else None)
+                message = _large_surface_message(
+                    "the surface outline still touches the colour image border, so "
+                    "the full platform boundary is unmeasured.",
+                    fov, extent, standoff)
                 raise LargeSurfaceRequired({
                     "error": "large_surface_required",
-                    "message": ("the surface outline touches the image border, so the "
-                                "full platform boundary is unmeasured — survey it from "
-                                "five positions, or switch to a declared work region."),
-                    "extent_mm": [float(v) for v in extent_mm] if extent_mm else None,
+                    "message": message,
+                    "extent_mm": extent,
+                    "standoff_mm": standoff,
+                    **fov,
                     "surface_scope": locked.surface_scope,
                     "workflow_goal": locked.workflow_goal,
                     "primary_action": "survey_full_platform",

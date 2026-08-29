@@ -230,10 +230,35 @@ def survey_surface(
     # in depth-pixel space cannot answer "is this inside the COLOUR frame?" at all;
     # the fitted-rectangle test below is now the only framing decision.)
     def _corners_in_frame(corners, frac=float(th.frame_margin_uv)) -> bool:
+        """Containment uses the PINHOLE projection (``dist_color=None``), never the
+        calibrated Brown-Conrady model, even though every other projection in this
+        module (outline_uv/grid_uv/points_uv, below) deliberately DOES use it.
+
+        cv2's forward radial-distortion polynomial is only well-behaved inside the
+        domain it was fit on (roughly the image plus a modest margin); past that it
+        can turn non-monotonic and FOLD BACK, mapping a point that is genuinely far
+        outside the frame to a pixel that lands back inside it. Measured with a real
+        workstation calibration (k1=0.115, k2=-0.239): a point at normalized radius
+        ~1.3-1.6 (i.e. roughly 2x the frame's own half-diagonal) projects INSIDE the
+        image even though the pinhole projection of the same point is nowhere near
+        it -- confirmed both by direct sweep and by round-tripping a synthetic
+        oversized rectangle through this exact function (see
+        ``test_scan_survey.py``'s regression test). A corner that far out can only
+        arise from a genuinely oversized/overrunning fitted rectangle -- exactly the
+        case this test exists to catch -- so silently reporting it "framed" would
+        hide the one situation the framing gate is for.
+
+        The pinhole model has no such failure mode: u is a strictly monotonic,
+        unbounded function of the normalized coordinate, so a point that is truly
+        outside the frame always projects outside it, at any distance. Near the
+        REAL image boundary the two models differ by only a few pixels (far under
+        ``frac``'s margin), so no genuinely in-frame corner's classification
+        changes -- this only changes the verdict for corners that were already far
+        outside, from a spurious True to the correct False."""
         cc = np.asarray(corners, float).reshape(-1, 3)
         if cc.shape[0] < 4 or bool(np.any(cc[:, 2] <= 0)):
             return False
-        uv = project_to_color(cc, K_color, dist_color) / np.array([W, H], float)
+        uv = project_to_color(cc, K_color, None) / np.array([W, H], float)
         return bool(np.all((uv[:, 0] >= frac) & (uv[:, 0] <= 1.0 - frac)
                            & (uv[:, 1] >= frac) & (uv[:, 1] <= 1.0 - frac)))
 

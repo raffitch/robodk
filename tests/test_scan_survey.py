@@ -171,6 +171,62 @@ def test_crop_mode_uses_generic_reticle_square():
           tuple(round(x, 1) for x in m.extent_mm))
 
 
+def test_fully_framed_survives_distortion_fold_back():
+    """A ``gf.aligned`` fixture cannot exercise this: depth and colour share one
+    K/size there, so a corner that leaves the colour frame also leaves the depth
+    frame at the same normalized radius. Needs ``gf.offset`` with a depth FOV wide
+    enough to backproject genuinely off-colour-frame 3D points, plus REAL
+    (nonzero) colour distortion coefficients -- the fold-back only exists in the
+    calibrated Brown-Conrady model, not in ``gf.aligned``'s implicit zero
+    distortion.
+
+    Root cause (2026-08-30 false-refusal investigation): ``_corners_in_frame``
+    used to project the fitted rectangle's corners through the CALIBRATED
+    distortion model for its in-frame test. cv2's forward radial polynomial is
+    only monotonic inside its fitted domain; past it (normalized radius ~1.3-1.6
+    with this camera's own measured coefficients) it folds back, mapping a point
+    that is genuinely far outside the frame to a pixel that lands back inside.
+    This fixture reproduces exactly that: a 1399x100mm strip at 500mm standoff
+    (its colour FOV at 500mm spans only ~533x400mm) whose corners, before the
+    fix, projected back inside the colour frame under the calibrated model and
+    made ``fully_framed`` read True for an obviously overrunning rectangle.
+    """
+    # REAL colour distortion measured on the workstation D435i (cfg.camera.dist
+    # in tasni.config.json) -- ties this regression to genuine hardware, not an
+    # invented polynomial.
+    dist_color = np.array([0.11480838, -0.23856355, -0.00182125, 0.00042104, 0.0])
+    # Depth FOV much wider than colour's (K/size below), so a rectangle whose
+    # short axis (Y) fills the depth frame while its long axis (X) reaches well
+    # past the colour frame's edge is still backprojected in full -- exactly
+    # protocol 2's depth-wider-than-colour geometry, exaggerated so the corners
+    # land in the measured fold-back band.
+    depth_K = np.array([[40.0, 0, 80.0], [0, 40.0, 60.0], [0, 0, 1.0]])
+    geom = gf.offset(color_K=K, color_size=(W, H), depth_K=depth_K, depth_size=(160, 120))
+
+    Z = 500.0
+    xs = np.linspace(-700.0, 700.0, 400)     # normalized radius ~1.3-1.6 at Z=500mm:
+    ys = np.linspace(-50.0, 50.0, 40)        # the measured fold-back band (see survey.py).
+    XX, YY = np.meshgrid(xs, ys)
+    plane = np.column_stack([XX.ravel(), YY.ravel(), np.full(XX.size, Z)])
+    depth = gf.render_depth_in_depth_camera(plane, geom)
+    assert np.count_nonzero(depth) > 500, "fixture is not discriminating -- too few depth points"
+
+    # min_valid_depth_frac relaxed: the point of this fixture is the corner-
+    # containment test, not the "enough of the frame has depth" gate -- the
+    # exaggerated depth FOV needed to reach the fold-back band makes this thin
+    # strip fill only a small fraction of the (much larger) depth image.
+    th = SurveyThresholds(min_valid_depth_frac=0.01)
+    m = survey_surface(depth, geom, K, dist_color, th)
+    assert m.detected, m.to_dict()
+    assert m.extent_mm is not None and m.extent_mm[0] > 1300.0, (
+        "fixture must fit a genuinely oversized rectangle -- got", m.extent_mm)
+    assert not m.fully_framed, (
+        "a rectangle nearly 3x the colour FOV's width read as fully framed -- "
+        "the distortion fold-back regression is back", m.to_dict())
+    print("[fold-back] oversized rectangle", tuple(round(x, 1) for x in m.extent_mm),
+          "mm correctly NOT framed despite calibrated-model fold-back")
+
+
 def test_surface_dots_are_a_stable_lattice():
     """points_uv is the actual measured surface hits snapped to a FIXED image grid
     (one dot per occupied cell), not a per-frame random pixel subsample — so the HUD
@@ -225,6 +281,7 @@ if __name__ == "__main__":
     test_grid_spacing_nice_number()
     test_outline_uv_normalized()
     test_crop_mode_uses_generic_reticle_square()
+    test_fully_framed_survives_distortion_fold_back()
     test_surface_dots_are_a_stable_lattice()
     test_to_dict_serializable()
     print("\nsurvey.py tests passed.")
