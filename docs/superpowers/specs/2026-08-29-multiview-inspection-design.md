@@ -1,7 +1,9 @@
 # Multi-view inspection + side photo — design
 
 **Status:** design approved in principle by the operator on 2026-08-29 ("I still want to
-push"), written for implementation by a follow-up session via `superpowers:writing-plans`.
+push"). **Implementation plan for tasks 1–6:**
+`docs/superpowers/plans/2026-08-29-multiview-inspection.md` (execute that; tasks 7–10 get
+a second plan after the §8 A/B).
 **Scope:** the ring-stack **measure-only** experiment and its paper export first; the live
 print reuses the same capture function later (§10). **Both features are optional toggles
 and default OFF**, so the validated single-view chain and every number already archived
