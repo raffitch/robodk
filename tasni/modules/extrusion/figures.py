@@ -29,6 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ...core.depth_geometry import CameraGeometry
 from .processing import depth_to_work_points
 
 LAYER_FIGURES = ("plan", "heightmap", "mesh", "iso", "profile", "pipeline")
@@ -103,6 +104,7 @@ class TakeData:
     depth: np.ndarray | None
     K: np.ndarray | None
     T_work_camera: np.ndarray | None
+    geometry: CameraGeometry | None = None
 
     @property
     def _nominal_circle(self) -> tuple[tuple[float, float], float] | None:
@@ -139,8 +141,15 @@ class TakeData:
     @property
     def label(self) -> str:
         take = self.manifest.get("take") or 1
-        return (f"{self.manifest.get('trial_id', '?')} · "
+        label = (f"{self.manifest.get('trial_id', '?')} · "
                 f"layer {self.manifest.get('layer_index', '?')} take {take}")
+        # The archive's one read-side fallback (figures.geometry_for_take):
+        # a take with no recorded greeting is rendered as it was captured,
+        # aligned depth at 1 mm -- flag it so a reader does not mistake it
+        # for a protocol-2 (native, unaligned, 0.1 mm) capture.
+        if self.geometry is not None and self.geometry.legacy:
+            label += " · depth: legacy aligned 1 mm"
+        return label
 
     @property
     def caption(self) -> str:
@@ -198,6 +207,22 @@ def _intrinsics(manifest: dict, layer_dir: Path) -> np.ndarray | None:
     return None if found is None else np.asarray(found, dtype=float)
 
 
+def geometry_for_take(manifest: dict, K: np.ndarray | None,
+                      depth: np.ndarray | None) -> "CameraGeometry | None":
+    """The take's depth geometry: protocol-2 greeting from provenance, else the
+    legacy aligned model. This is the ONE place the archive read path may still
+    build a legacy geometry -- live code never does (see ``depth_geometry.py``);
+    it is what lets ring 1 and every pre-protocol-2 paper fixture keep rendering.
+    """
+    raw = (manifest.get("provenance") or {}).get("camera_geometry")
+    if raw and not raw.get("legacy_aligned"):
+        return CameraGeometry.from_greeting(raw)
+    if K is None or depth is None:
+        return None
+    d = np.asarray(depth)
+    return CameraGeometry.legacy_aligned(np.asarray(K, float), (d.shape[1], d.shape[0]))
+
+
 def load_take(layer_dir: Path) -> TakeData:
     layer_dir = Path(layer_dir)
     manifest_file = layer_dir / "manifest.json"
@@ -210,14 +235,15 @@ def load_take(layer_dir: Path) -> TakeData:
     if cloud is not None and (cloud.ndim != 2 or cloud.shape[1] != 3):
         cloud = None                                   # a height map, not a cloud
     transform = (manifest.get("provenance") or {}).get("T_work_camera")
+    depth = np.load(depth_file) if depth_file.is_file() else None
+    K = _intrinsics(manifest, layer_dir)
     return TakeData(
         layer_dir=layer_dir, manifest=manifest,
         nominal=_points(layer_dir / "nominal_path.json"),
         measured=_points(layer_dir / "measured_path.json"),
-        cloud=cloud,
-        depth=np.load(depth_file) if depth_file.is_file() else None,
-        K=_intrinsics(manifest, layer_dir),
-        T_work_camera=None if transform is None else np.asarray(transform, dtype=float))
+        cloud=cloud, depth=depth, K=K,
+        T_work_camera=None if transform is None else np.asarray(transform, dtype=float),
+        geometry=geometry_for_take(manifest, K, depth))
 
 
 # -- shared drawing helpers --------------------------------------------------
@@ -263,8 +289,9 @@ def _grid_heights(points: np.ndarray, center, half_mm: float, cell_mm: float):
 
 def _scene_points(take: TakeData) -> np.ndarray | None:
     """The densest cloud available: the whole re-projected frame, else the archived cloud."""
-    if take.depth is not None and take.K is not None and take.T_work_camera is not None:
-        points, _ = depth_to_work_points(take.depth, take.K, take.T_work_camera)
+    if (take.depth is not None and take.geometry is not None
+            and take.T_work_camera is not None):
+        points, _ = depth_to_work_points(take.depth, take.geometry, take.T_work_camera)
         return points if len(points) else take.cloud
     return take.cloud
 
@@ -449,7 +476,8 @@ def take_stages(take: TakeData) -> "dict | None":
     the scan extra (Open3D); without it the method figure is skipped like any
     other figure that cannot be drawn.
     """
-    if take.depth is None or take.K is None or take.T_work_camera is None:
+    if (take.depth is None or take.K is None or take.T_work_camera is None
+            or take.geometry is None):
         return None
     manifest_file = take.layer_dir / "manifest.json"
     key = (str(take.layer_dir.resolve()),
@@ -488,8 +516,8 @@ def _compute_stages(take: TakeData) -> "dict | None":
         image = np.zeros((*np.asarray(take.depth).shape[:2], 3), np.uint8)
     try:
         result = process_observation(
-            color=image, depth=take.depth,
-            T_work_camera=take.T_work_camera, K=take.K, plan=plan,
+            color=image, depth=take.depth, geometry=take.geometry,
+            T_work_camera=take.T_work_camera, K=take.K, dist=None, plan=plan,
             layer=plan.layers[index - 1],
             config=ExtrusionConfig.model_validate(config_payload), stages=stages)
     except Exception:

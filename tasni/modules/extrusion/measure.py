@@ -330,6 +330,8 @@ def _capture_at_pose(services, ctx: JobContext, T_work_camera) -> dict:
             f"{check['camera_z_mm']:.0f} mm above the work plane (expected "
             f"{check['accepted_range_mm'][0]:.0f}-{check['accepted_range_mm'][1]:.0f} mm), "
             f"after {retries} retry(s). " + detail)
+    if frame.geometry is None:
+        raise RuntimeError("depth frame arrived without a protocol-2 greeting")
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:
         ctx.frame(jpeg.tobytes())
@@ -729,13 +731,20 @@ class RingMeasureJob:
                         "excursion_index": excursion,
                         "repeat_index": repeat,
                         "repeats_in_excursion": self.repeats,
-                        "T_work_camera": np.asarray(T_work_camera, dtype=float).tolist()})
+                        "T_work_camera": np.asarray(T_work_camera, dtype=float).tolist(),
+                        # The frame's own greeting: native depth intrinsics and
+                        # the depth->colour extrinsic. Without it a reprocess or
+                        # a figure has no way to know this take was captured
+                        # unaligned, 0.1 mm (protocol 2) rather than the legacy
+                        # aligned 1 mm convention -- see figures.geometry_for_take.
+                        "camera_geometry": frame.geometry.to_dict()})
         floor = self.session.floor_profile(self.layer_index)
+        camera_cfg = services.config.camera
         try:
             processed = process_observation(
-                color=frame.color, depth=frame.depth, T_work_camera=T_work_camera,
-                K=services.config.camera.K, plan=self.plan, layer=layer, config=ecfg,
-                floor_profile=floor)
+                color=frame.color, depth=frame.depth, geometry=frame.geometry,
+                T_work_camera=T_work_camera, K=camera_cfg.K, dist=camera_cfg.dist,
+                plan=self.plan, layer=layer, config=ecfg, floor_profile=floor)
         except Exception as exc:
             # A failed measurement still archives its raw RGB-D: the operator
             # cannot re-place the ring exactly, so the frame is the only thing
@@ -853,10 +862,12 @@ class RingCharacterizeJob:
                 provenance = {**_provenance(services),
                               "T_work_camera": np.asarray(
                                   captured["T_work_camera"], dtype=float).tolist()}
+                camera_cfg = services.config.camera
                 try:
                     found = characterize_ring(
-                        color=frame.color, depth=frame.depth,
-                        T_work_camera=captured["T_work_camera"], K=services.config.camera.K,
+                        color=frame.color, depth=frame.depth, geometry=frame.geometry,
+                        T_work_camera=captured["T_work_camera"], K=camera_cfg.K,
+                        dist=camera_cfg.dist,
                         search_center_mm=(float(self.plan.setup.center_x_mm),
                                           float(self.plan.setup.center_y_mm)),
                         work_frame=self.plan.setup.work_frame, config=ecfg,

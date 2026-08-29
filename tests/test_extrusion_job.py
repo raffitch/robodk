@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,16 +10,20 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from tasni.core.camera import CameraError, Frame
-from tasni.core.camera_lease import CameraLease
-from tasni.core.config import AppConfig
-from tasni.modules.extrusion.models import (CylinderRecipe, CylinderSetup,
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import extrusion_synthetic as syn  # noqa: E402
+import geometry_fixtures as gf  # noqa: E402
+from tasni.core.camera import CameraError, Frame  # noqa: E402
+from tasni.core.camera_lease import CameraLease  # noqa: E402
+from tasni.core.config import AppConfig  # noqa: E402
+from tasni.modules.extrusion.models import (CylinderRecipe, CylinderSetup,  # noqa: E402
                                             DeviationMetrics)
-from tasni.modules.extrusion.processing import ProcessingResult
-from tasni.modules.extrusion import service as service_mod
-from tasni.modules.extrusion.service import (CylinderDryRunJob, CylinderPrintJob,
+from tasni.modules.extrusion.processing import ProcessingResult  # noqa: E402
+from tasni.modules.extrusion import service as service_mod  # noqa: E402
+from tasni.modules.extrusion.service import (CylinderDryRunJob, CylinderPrintJob,  # noqa: E402
                                              reprocess_saved_layer)
-from tasni.modules.extrusion.toolpath import generate_cylinder_plan
+from tasni.modules.extrusion.toolpath import generate_cylinder_plan  # noqa: E402
 
 
 # The fake robot's joint vector. Real joints (not a string sentinel) because the
@@ -167,7 +172,8 @@ class FakeCamera:
         else:
             self.depth_grabs += 1
         return Frame(color=np.zeros((16, 16, 3), np.uint8),
-                     depth=np.full((16, 16), 500, np.uint16), timestamp=1.0)
+                     depth=np.full((16, 16), 500, np.uint16), timestamp=1.0,
+                     geometry=gf.aligned(syn.K_720P, (16, 16)))
 
 
 def plan(*, layers=2, correction=True, auto_inspection=False):

@@ -16,6 +16,7 @@ import numpy as np
 from scipy.interpolate import splprep, splev
 from scipy.spatial import cKDTree
 
+from ...core.depth_geometry import CameraGeometry, ColorRegistered, backproject
 from ...core.geometry import transform_points
 from .comparison import compare_circle, corrected_circle, fit_circle_xy
 from .models import (CylinderPlan, CylinderRecipe, CylinderSetup, DeviationMetrics,
@@ -36,17 +37,12 @@ class ProcessingResult:
     geometry: RingGeometry | None = None
 
 
-def depth_to_work_points(depth: np.ndarray, K: np.ndarray,
-                         T_work_camera: np.ndarray, *, depth_scale: float = 1000.0
-                         ) -> tuple[np.ndarray, int]:
-    depth = np.asarray(depth)
-    valid = np.isfinite(depth) & (depth > 0)
-    v, u = np.nonzero(valid)
-    z = depth[v, u].astype(float) / float(depth_scale) * 1000.0
-    fx, fy = float(K[0, 0]), float(K[1, 1])
-    cx, cy = float(K[0, 2]), float(K[1, 2])
-    camera = np.column_stack(((u - cx) * z / fx, (v - cy) * z / fy, z))
-    return transform_points(T_work_camera, camera), int(valid.sum())
+def depth_to_work_points(depth: np.ndarray, geometry: CameraGeometry,
+                         T_work_camera: np.ndarray) -> tuple[np.ndarray, int]:
+    """Native depth -> work-frame mm. ``T_work_camera`` is the COLOUR camera's pose
+    (the hand-eye); ``backproject`` already returns colour-frame points."""
+    camera, _uv = backproject(depth, geometry)
+    return transform_points(T_work_camera, camera), int(len(camera))
 
 
 def deposit_floor_mm(config, chroma_gated: bool) -> float:
@@ -65,54 +61,60 @@ def deposit_floor_mm(config, chroma_gated: bool) -> float:
     return float(max(floor, getattr(config, "deposit_min_height_no_chroma_mm", 0.0)))
 
 
-def chroma_gated_depth(color: np.ndarray | None, depth: np.ndarray, config,
-                       counts: dict | None = None) -> tuple[np.ndarray, bool]:
-    """Blank depth wherever the colour frame says "board" rather than "bead".
+def chroma_gate_mask(color: np.ndarray | None, registered: ColorRegistered, config,
+                     counts: dict | None = None) -> tuple[np.ndarray, bool]:
+    """Per REGISTERED POINT: True where the colour frame says "bead", not "board".
 
-    Height cannot make that call. Depth here is quantised at 1 mm and the bare
-    ChArUco board reads 1-3 LSB above the work plane, so every floor a real bead
-    clears passes board with it. Cell 2026-08-29 take 4: a 22-point patch of
-    black checker 12 mm outside the ring survived the radial trim, dilated into a
-    17-22 px arm (the spur limit is 15) and exhausted the branch guard -- while
-    takes 1-3 carried the SAME patch and passed, biased 0.6-0.7 mm large in
-    radius, because their skeleton topology happened to stay benign. The guard is
-    topological, so it catches contamination only by luck; the fix is to not feed
-    it any.
-
-    Saturation separates the two ~20:1 (the clay is chromatic, the printed board
-    is not), which is also what lets the deposit floor drop -- see
-    ``plane_distance_threshold_m``.
-
-    Abstains, returning ``depth`` untouched, when the colour frame carries no
-    usable chroma: an RGB dropout or a depth-only synthetic fixture would
-    otherwise have its deposit erased instead of its board.
+    Depth is native and not aligned to colour any more (camera protocol 2), so
+    the gate cannot blank depth pixels in place; each depth point is projected
+    into the calibrated colour model (``registered.uv``) and the saturation mask
+    is read there. Everything else is the 2026-08-29 gate unchanged (`041ad1b`):
+    height cannot tell bead from board (the bare ChArUco board reads 1-3 LSB
+    above the work plane, so every floor a real bead clears passes board with
+    it -- cell 2026-08-29 take 4: a 22-point patch of black checker 12 mm
+    outside the ring survived the radial trim, dilated into a 17-22 px arm and
+    exhausted the branch guard). Saturation separates the two ~20:1 (the clay is
+    chromatic, the printed board is not): saturation > threshold, a
+    chroma-fraction abstention for RGB dropouts and depth-only fixtures, and a
+    closing so speckle inside the bead does not punch holes. Points that project
+    OUTSIDE the colour image (the depth field is wider than colour) have no
+    colour evidence and are dropped while the gate applies -- they are far
+    outside any ring ROI anyway. Abstains as ``(all True, False)``, which
+    ``deposit_floor_mm`` turns into the 2.5 mm floor.
     """
     def note(key: str, value: int) -> None:
         if counts is not None:
             counts[key] = value
 
-    depth = np.asarray(depth)
+    n = len(registered)
     threshold = int(getattr(config, "deposit_min_saturation", 0) or 0)
     if threshold <= 0 or color is None:
         note("chroma_gate_applied", 0)
-        return depth, False
+        return np.ones(n, bool), False
     image = np.asarray(color)
-    if image.ndim != 3 or image.shape[2] != 3 or image.shape[:2] != depth.shape[:2]:
+    w, h = registered.color_size
+    if image.ndim != 3 or image.shape[2] != 3 or image.shape[:2] != (h, w):
         note("chroma_gate_applied", 0)
-        return depth, False
+        return np.ones(n, bool), False
     saturation = cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_BGR2HSV)[:, :, 1]
     keep = (saturation > threshold).astype(np.uint8)
     note("chroma_gate_kept_pixels", int(keep.sum()))
-    floor = float(getattr(config, "deposit_min_chroma_fraction", 0.0))
-    if float(keep.mean()) < floor:
+    if float(keep.mean()) < float(getattr(config, "deposit_min_chroma_fraction", 0.0)):
         note("chroma_gate_applied", 0)
-        return depth, False
-    # Speckle inside the bead would otherwise punch holes through it.
-    keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+        return np.ones(n, bool), False
+    # Speckle inside the bead would otherwise punch holes through it. The close
+    # kernel was tuned at 720p; scale it with the colour frame's own width so a
+    # 1920x1080 colour image (protocol 2) closes the same physical gap.
+    k = max(3, int(round(5 * w / 1280.0)))
+    keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    u = np.rint(registered.uv[:, 0]).astype(int)
+    v = np.rint(registered.uv[:, 1]).astype(int)
+    inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    mask = np.zeros(n, bool)
+    mask[inside] = keep[v[inside], u[inside]] > 0
     note("chroma_gate_applied", 1)
-    gated = depth.copy()
-    gated[keep == 0] = 0
-    return gated, True
+    note("chroma_gate_outside_colour", int((~inside).sum()))
+    return mask, True
 
 
 def _largest_label(points: np.ndarray, labels: np.ndarray) -> np.ndarray:
@@ -641,12 +643,20 @@ def plan_for_archived_take(manifest: dict, trial: dict, *,
 
 
 def process_observation(*, color: np.ndarray, depth: np.ndarray,
-                        T_work_camera: np.ndarray, K: np.ndarray,
+                        geometry: CameraGeometry, T_work_camera: np.ndarray,
+                        K: np.ndarray, dist: np.ndarray | None,
                         plan: CylinderPlan, layer: LayerPath, config,
                         floor_profile: np.ndarray | None = None,
                         stages: dict | None = None,
                         assemble_arcs: bool = False) -> ProcessingResult:
     """Reconstruct one layer from exactly one saved synchronized RGB-D frame.
+
+    ``geometry`` is the frame's own greeting (native depth intrinsics + the
+    depth->colour extrinsic; Task 7's ``CameraGeometry``); ``T_work_camera`` is
+    the COLOUR camera's hand-eye pose, which is what its colour-frame points
+    need. ``K``/``dist`` are the CALIBRATED colour model, used for exactly one
+    thing: projecting registered depth points into the colour image for the
+    chroma gate (see :func:`chroma_gate_mask`).
 
     ``floor_profile`` is the previous layer's measured centreline (Nx3, work
     frame). Given it, the ROI floor becomes that surface's local height at the
@@ -674,9 +684,10 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     counts: dict[str, int] = {}
 
     mark = time.perf_counter()
-    depth, chroma_gated = chroma_gated_depth(color, depth, config, counts)
-    points, counts["raw_depth_pixels"] = depth_to_work_points(
-        depth, K, T_work_camera, depth_scale=1000.0)
+    reg = ColorRegistered.build(depth, geometry, K, dist)
+    keep_mask, chroma_gated = chroma_gate_mask(color, reg, config, counts)
+    points = transform_points(T_work_camera, reg.pts_mm[keep_mask])
+    counts["raw_depth_pixels"] = int(keep_mask.sum())
     timings["backproject_ms"] = (time.perf_counter() - mark) * 1000
     keep("backprojected", points)
     setup, recipe = plan.setup, plan.recipe
@@ -854,8 +865,9 @@ class CharacterizationResult:
             "bead_width_max_mm", "top_z_mean_mm", "top_z_min_mm", "top_z_max_mm")}
 
 
-def characterize_ring(*, color: np.ndarray, depth: np.ndarray, T_work_camera: np.ndarray,
-                      K: np.ndarray, search_center_mm, work_frame: str, config,
+def characterize_ring(*, color: np.ndarray, depth: np.ndarray, geometry: CameraGeometry,
+                      T_work_camera: np.ndarray, K: np.ndarray, dist: np.ndarray | None,
+                      search_center_mm, work_frame: str, config,
                       inspection_tool: str = "Realsense",
                       print_tool: str = "LongCalibTool") -> CharacterizationResult:
     """Measure a ring with NO recipe assumption: coarse fit, then the normal pipeline.
@@ -866,13 +878,19 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, T_work_camera: np
     throwaway recipe so the refined centreline, radius and height profile come out
     of the same code the layer measurements use -- one pipeline, one set of
     numbers, no second implementation to keep honest.
+
+    ``geometry`` is the frame's own greeting; ``K``/``dist`` are the CALIBRATED
+    colour model used only to register depth points into the colour image for
+    the chroma gate -- see :func:`process_observation`.
     """
     started = time.perf_counter()
     counts: dict[str, int] = {}
     # The same gate as the layer measurements: characterization defines the
     # recipe they are then judged against, so the two must see the same cloud.
-    depth, chroma_gated = chroma_gated_depth(color, depth, config, counts)
-    points, counts["raw_depth_pixels"] = depth_to_work_points(depth, K, T_work_camera)
+    reg = ColorRegistered.build(depth, geometry, K, dist)
+    keep_mask, chroma_gated = chroma_gate_mask(color, reg, config, counts)
+    points = transform_points(T_work_camera, reg.pts_mm[keep_mask])
+    counts["raw_depth_pixels"] = int(keep_mask.sum())
     center = np.asarray(search_center_mm, dtype=float)
     min_z = deposit_floor_mm(config, chroma_gated)
     radial = np.linalg.norm(points[:, :2] - center, axis=1)
@@ -903,8 +921,9 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, T_work_camera: np
         inspection_auto=True, center_x_mm=float(coarse_center[0]),
         center_y_mm=float(coarse_center[1]))
     plan = generate_cylinder_plan(recipe, setup)
-    refined = process_observation(color=color, depth=depth, T_work_camera=T_work_camera,
-                                  K=K, plan=plan, layer=plan.layers[0], config=config,
+    refined = process_observation(color=color, depth=depth, geometry=geometry,
+                                  T_work_camera=T_work_camera, K=K, dist=dist,
+                                  plan=plan, layer=plan.layers[0], config=config,
                                   assemble_arcs=True)
     geometry = refined.geometry
     report = {**refined.report, "coarse": coarse, "counts_coarse": counts,

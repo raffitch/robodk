@@ -3,7 +3,9 @@
 Point-splat + z-buffer, numpy only: dense surface samples in the WORK frame are
 moved into the camera frame with inv(T_work_camera), projected with K, and the
 nearest depth per pixel is kept. Depth is uint16 millimetres, 0 = no return --
-exactly what ``processing.depth_to_work_points`` expects (depth_scale=1000).
+exactly what ``processing.depth_to_work_points`` expects when handed an ALIGNED
+legacy geometry (``geometry_fixtures.aligned(K, size)``): depth image == colour
+image, 1 mm units, so this renderer's single K/size pair describes both.
 """
 from __future__ import annotations
 
