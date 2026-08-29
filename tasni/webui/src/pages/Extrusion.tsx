@@ -117,6 +117,24 @@ const PHASES: Array<{ value: string; label: string; hint: string }> = [
     hint: "the TOP ring displaced by the offset you typed — the controlled validation" },
 ];
 
+/** One step of the ring run: what to do, the single press that does it. */
+interface RunStep {
+  id: string; label: string; title: string; done: boolean;
+  /** The layer this step measures, when it measures one. */
+  layer?: number;
+  hands?: string;
+  records?: string;
+  button?: string;
+  onRun?: () => void;
+  disabled?: boolean;
+  blocked?: string | null;
+  note?: string;
+  progress?: { have: number; need: number };
+  moves?: boolean;
+  offsetInput?: boolean;
+  axisAck?: boolean;
+}
+
 /** The archive's own naming: take 1 keeps the historical name, repeats get a suffix. */
 function layerDirName(take: MeasureTake): string {
   if (take.layer_name) return take.layer_name;
@@ -349,6 +367,13 @@ export default function Extrusion() {
   // Eight columns answer "did that take work?"; the rest are for writing the
   // paper afterwards and only get in the way at the cell.
   const [allColumns, setAllColumns] = useState(false);
+  // Which step the operator is looking at. Null = wherever the run actually is;
+  // clicking a chip in the rail pins an earlier step until it is done again.
+  const [stepPin, setStepPin] = useState<number | null>(null);
+  const [offsetAxis, setOffsetAxis] = useState<"X" | "Y">("X");
+  const [offsetMag, setOffsetMag] = useState(10);
+  const [axisKnown, setAxisKnown] = useState(false);
+  const [manualOpen, setManualOpen] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   const refreshStatus = useCallback(() => {
@@ -496,11 +521,13 @@ export default function Extrusion() {
       setMessage("Station loaded. Select print/inspection tools, work frame, and inspection target.");
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
-  const generate = async () => {
-    if (!recipe || !setup) return;
+  const generate = async (recipeOverride?: Recipe) => {
+    const useRecipe = recipeOverride ?? recipe;
+    if (!useRecipe || !setup) return;
     setBusy(true);
     try {
-      const next = await api.post<Plan>("/generate", { recipe, setup });
+      if (recipeOverride) setRecipe(recipeOverride);
+      const next = await api.post<Plan>("/generate", { recipe: useRecipe, setup });
       setPlan(next); setSelectedLayer(1); setQuickLayers([1]);
       setApproveRepresentativeLayers(false); setPreflight(null); setResult(null);
       // Pure geometry, no station: safe to show the derived viewpoint immediately.
@@ -557,12 +584,13 @@ export default function Extrusion() {
   // running -> idle edge rather than polling.
   useEffect(() => { if (status && !status.running) refreshMeasure(); },
             [status?.running, refreshMeasure]);
-  /** What this press will archive as ground truth, in the operator's words. */
-  const annotationLabel = (): string => {
-    const parts = [`layer ${measureLayer}`];
-    if (phase) parts.push(phase);
-    parts.push(offsetX || offsetY ? `introduced offset (${offsetX}, ${offsetY}) mm`
-                                 : "no introduced offset");
+  /** What a press will archive as ground truth, in the operator's words. */
+  const annotationLabel = (layerIndex = measureLayer, takePhase = phase,
+                           offset: [number, number] = [offsetX, offsetY]): string => {
+    const parts = [`layer ${layerIndex}`];
+    if (takePhase) parts.push(takePhase);
+    parts.push(offset[0] || offset[1] ? `introduced offset (${offset[0]}, ${offset[1]}) mm`
+                                      : "no introduced offset");
     return parts.join(" · ");
   };
   const newMeasureSession = async () => {
@@ -594,23 +622,26 @@ export default function Extrusion() {
       refreshStatus();
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
-  const measure = async () => {
+  const measure = async (take?: { layer: number; phase: string; offset: [number, number] }) => {
     if (!plan) return;
+    const layerIndex = take ? take.layer : measureLayer;
+    const takePhase = take ? take.phase : phase;
+    const [dx, dy] = take ? take.offset : [offsetX, offsetY];
     // One take's timeline per take: stale lines from the previous ring read as
     // this one's.
     setBusy(true); setLogs([]);
     try {
-      const shifted = offsetX !== 0 || offsetY !== 0;
+      const shifted = dx !== 0 || dy !== 0;
       await api.post("/measure/layer", {
-        fingerprint: plan.fingerprint, layer_index: measureLayer,
-        annotation: { introduced_offset_mm: shifted ? [offsetX, offsetY] : null,
-                      phase: phase || undefined, note: measureNote },
+        fingerprint: plan.fingerprint, layer_index: layerIndex,
+        annotation: { introduced_offset_mm: shifted ? [dx, dy] : null,
+                      phase: takePhase || undefined, note: measureNote },
         confirm_robot_motion: confirmMotion,
         collision_check_enabled: false,
       });
       // Echo the ground truth back: it is the number every detection-error
       // figure is measured against, and nothing else on screen repeats it.
-      setMessage(`MEASURE started — recording as ${annotationLabel()}. `
+      setMessage(`MEASURE started — recording as ${annotationLabel(layerIndex, takePhase, [dx, dy])}. `
         + "Collision validation OFF; camera move only, no extrusion, no valve.");
       refreshStatus();
     } catch (e: any) { setBusy(false); setMessage(e.message); }
@@ -740,49 +771,159 @@ export default function Extrusion() {
   const countOffset = (millimetres: number) => validTakes.filter(
     (t) => Math.abs(offsetNorm(t) - millimetres) < 0.51).length;
   const applied = measureSession?.applied ?? null;
+  const characterization = measureSession?.characterizations?.length
+    ? measureSession.characterizations[measureSession.characterizations.length - 1] : null;
   const planIsApplied = !applied || plan?.fingerprint === applied.fingerprint;
   const floorReady = measureLayer <= 1
     || Boolean(measureSession?.tops?.[String(measureLayer - 1)]);
-  const layerCount = plan?.layers.length ?? recipe?.layer_count ?? 0;
-  const guide: Array<{ title: string; detail: string; done: boolean; progress?: string }> = [
-    { title: "Set Layers to 3, then Generate coordinates",
-      detail: "Apply keeps whatever layer count the recipe already has, so a session "
-        + "generated with 1 layer refuses Measure layer 2 later.",
-      done: layerCount >= 3 && Boolean(plan) },
-    { title: "New session",
-      detail: "One trial directory for the whole experiment. Every take, its raw RGB-D "
-        + "frame and its figures land inside it.",
-      done: Boolean(measureSession) },
-    { title: "Place ring 1 within ~50 mm of the table centre → Characterize ring",
-      detail: "The recipe comes from the physical ring — no calipers. The robot moves the "
-        + "camera, measures the ring and returns.",
-      done: (measureSession?.characterizations?.length ?? 0) > 0 },
-    { title: "Apply to recipe & placement",
-      detail: "The step that was skipped on 2026-08-28. Without it every take is scored "
-        + "against a plan the ring was never placed on.",
-      done: Boolean(applied) && planIsApplied },
-    { title: "Noise floor — Measure layer 1 five times, touching nothing",
-      detail: "Phase “noise floor”. This is the sensing repeatability the paper reads "
-        + "every other number against.",
-      progress: `${countPhase(1, "noise floor")}/5`, done: countPhase(1, "noise floor") >= 5 },
-    { title: "Placement repeatability — lift and re-place ring 1, three times",
-      detail: "Phase “re-placed”, offset still zero. Measure after each re-placement.",
-      progress: `${countPhase(1, "re-placed")}/3`, done: countPhase(1, "re-placed") >= 3 },
-    { title: "Stack — ring 2 on layer 2 (×3), then ring 3 on layer 3 (×3)",
-      detail: "Phase “stacked true”, placed as accurately as you can. Check completeness "
-        + "on layer 2's first take: the floor margin is 2 mm and these rings are wavy.",
-      progress: `L2 ${countPhase(2, "stacked true")}/3 · L3 ${countPhase(3, "stacked true")}/3`,
-      done: countPhase(2, "stacked true") >= 3 && countPhase(3, "stacked true") >= 3 },
-    { title: "Introduced offsets — TOP ring only, 10 mm then 15 mm, three takes each",
-      detail: "Type the offset BEFORE pressing Measure so the ground truth is archived "
-        + "beside the result — and type what you ACTUALLY moved: 12 mm scores as well as 10.",
-      progress: `10 mm ${countOffset(10)}/3 · 15 mm ${countOffset(15)}/3`,
-      done: countOffset(10) >= 3 && countOffset(15) >= 3 },
-    { title: "Paper summary → copy the Markdown block",
-      detail: "Grouped per layer and phase, with detection error against what you typed.",
-      done: Boolean(paper) },
+
+  // -- the run as a sequence -------------------------------------------------
+  // One thing to do at a time, in the order the protocol needs it. Each step
+  // owns the take it records, so the operator never sets layer/phase/offset by
+  // hand and a mislabelled group cannot happen by forgetting a control.
+  const noiseTakes = countPhase(1, "noise floor");
+  const replacedTakes = countPhase(1, "re-placed");
+  const layer2Takes = countPhase(2, "stacked true");
+  const layer3Takes = countPhase(3, "stacked true");
+  const shift10 = countOffset(10), shift15 = countOffset(15);
+  const topLayer = plan?.layers.length ?? 1;
+  const offsetVector: [number, number] = offsetAxis === "X" ? [offsetMag, 0] : [0, offsetMag];
+  const motionBlocked = !plan ? "Generate the plan first."
+    : !connected ? "Connect to RoboDK — the camera move is a real robot motion."
+    : !planIsApplied ? "Press “Use this ring” so the session measures against the plan it applied."
+    : !confirmMotion ? "Tick “Hands clear” — the robot moves the camera."
+    : null;
+  const runStep = (over: Partial<RunStep> & { id: string; label: string; title: string;
+                                              done: boolean }): RunStep => ({ ...over } as RunStep);
+  const RUN: RunStep[] = [
+    runStep({
+      id: "plan", label: "Plan", title: "Generate the plan this run measures against",
+      hands: "Scan surface applied, cylinder centred on it. Open Setup above if either is missing.",
+      done: Boolean(plan) && (plan?.layers.length ?? 0) >= 3,
+      button: "Generate plan · 3 layers",
+      onRun: () => recipe && generate({ ...recipe, layer_count: 3 }),
+      disabled: !recipe || !selectionsReady || busy || Boolean(status?.running),
+      blocked: !selectionsReady ? "Open Setup and choose the work frame, print tool and camera tool." : null,
+      note: "Three layers now, because Apply never changes the layer count later.",
+    }),
+    runStep({
+      id: "session", label: "Session", title: "Open a session for this experiment",
+      hands: "Nothing to touch in the cell.",
+      done: Boolean(measureSession),
+      button: "Start session",
+      onRun: newMeasureSession,
+      disabled: !plan || busy || Boolean(status?.running),
+      note: "One folder holds every take, its raw depth frame and its figures.",
+    }),
+    runStep({
+      id: "ring1", label: "Ring 1", title: characterization
+        ? "Use this ring as the recipe" : "Characterize ring 1",
+      hands: characterization
+        ? "Leave the ring exactly where it is."
+        : "Place ring 1 flat on the board, within about 50 mm of the table centre.",
+      done: Boolean(applied) && planIsApplied,
+      button: characterization ? "Use this ring" : "Characterize ring 1",
+      onRun: characterization ? applyCharacterization : characterize,
+      moves: !characterization,
+      disabled: characterization
+        ? (busy || Boolean(status?.running))
+        : (!plan || !connected || !confirmMotion || busy || Boolean(status?.running)),
+      blocked: characterization ? null
+        : (!connected ? "Connect to RoboDK first." : !confirmMotion ? "Tick “Hands clear”." : null),
+      note: characterization
+        ? `Measured r ${characterization.radius_mm.toFixed(1)} mm · bead `
+          + `${characterization.bead_width_mm.toFixed(1)} mm · height `
+          + `${characterization.top_z_min_mm.toFixed(1)}–${characterization.top_z_max_mm.toFixed(1)} mm. `
+          + "This sets the recipe and the cylinder centre from the physical ring."
+        : "The robot moves the camera over the ring, takes one frame and returns.",
+    }),
+    runStep({
+      id: "noise", layer: 1, label: "Noise floor", title: "Noise floor — five takes, touching nothing",
+      hands: "Hands off. Do not touch the ring, the board or the table between takes.",
+      done: noiseTakes >= 5, progress: { have: noiseTakes, need: 5 },
+      button: `Measure take ${Math.min(noiseTakes + 1, 5)} of 5`,
+      records: annotationLabel(1, "noise floor", [0, 0]),
+      onRun: () => measure({ layer: 1, phase: "noise floor", offset: [0, 0] }),
+      moves: true, disabled: Boolean(motionBlocked) || busy || Boolean(status?.running),
+      blocked: motionBlocked,
+      note: "How repeatably the chain sees a ring that has not moved — every other number is read against this.",
+    }),
+    runStep({
+      id: "replace", layer: 1, label: "Re-place", title: "Placement repeatability — three takes",
+      hands: "Lift ring 1 off the board and set it back down as accurately as you can. Once per take.",
+      done: replacedTakes >= 3, progress: { have: replacedTakes, need: 3 },
+      button: `Measure take ${Math.min(replacedTakes + 1, 3)} of 3`,
+      records: annotationLabel(1, "re-placed", [0, 0]),
+      onRun: () => measure({ layer: 1, phase: "re-placed", offset: [0, 0] }),
+      moves: true, disabled: Boolean(motionBlocked) || busy || Boolean(status?.running),
+      blocked: motionBlocked,
+      note: "How repeatably a hand places a ring — separate from how well the chain sees it.",
+    }),
+    runStep({
+      id: "ring2", layer: 2, label: "Ring 2", title: "Ring 2 on the stack — three takes",
+      hands: "Place ring 2 on top of ring 1, as true as you can. Leave it there for all three takes.",
+      done: layer2Takes >= 3, progress: { have: layer2Takes, need: 3 },
+      button: `Measure layer 2 · take ${Math.min(layer2Takes + 1, 3)} of 3`,
+      records: annotationLabel(2, "stacked true", [0, 0]),
+      onRun: () => measure({ layer: 2, phase: "stacked true", offset: [0, 0] }),
+      moves: true, disabled: Boolean(motionBlocked) || busy || Boolean(status?.running),
+      blocked: motionBlocked,
+      note: "Check the first take says VALID before continuing: where ring 2 sits low there is under a "
+        + "millimetre of floor margin and its low stretches can be clipped.",
+    }),
+    runStep({
+      id: "ring3", layer: 3, label: "Ring 3", title: "Ring 3 on the stack — three takes",
+      hands: "Place ring 3 on top, as true as you can.",
+      done: layer3Takes >= 3, progress: { have: layer3Takes, need: 3 },
+      button: `Measure layer 3 · take ${Math.min(layer3Takes + 1, 3)} of 3`,
+      records: annotationLabel(3, "stacked true", [0, 0]),
+      onRun: () => measure({ layer: 3, phase: "stacked true", offset: [0, 0] }),
+      moves: true, disabled: Boolean(motionBlocked) || busy || Boolean(status?.running),
+      blocked: motionBlocked,
+      note: "The camera climbs with the stack: every layer is measured from 300 mm above its own top.",
+    }),
+    runStep({
+      id: "offsets", layer: topLayer, label: "Offsets",
+      title: !axisKnown ? "Find out which way is +X"
+        : `Displace the top ring — about ${shift10 < 3 ? 10 : 15} mm`,
+      hands: !axisKnown
+        ? "Slide the TOP ring roughly 10 mm along one board edge, measure once, then read the "
+          + "Offset column below to see which axis moved and in which direction. Put it back after."
+        : `Mark where the top ring sits, slide it along a board edge, and measure what you `
+          + `actually moved with a steel rule. Type that number — 12 mm scores as well as 10.`,
+      done: shift10 >= 3 && shift15 >= 3,
+      progress: axisKnown ? { have: shift10 < 3 ? shift10 : shift15, need: 3 } : undefined,
+      button: !axisKnown ? "Take one throwaway measurement"
+        : `Measure take ${Math.min((shift10 < 3 ? shift10 : shift15) + 1, 3)} of 3`,
+      records: axisKnown ? annotationLabel(topLayer, "top ring shifted", offsetVector) : undefined,
+      onRun: () => measure(axisKnown
+        ? { layer: topLayer, phase: "top ring shifted", offset: offsetVector }
+        : { layer: topLayer, phase: "", offset: [0, 0] }),
+      moves: true, disabled: Boolean(motionBlocked) || busy || Boolean(status?.running),
+      blocked: motionBlocked,
+      offsetInput: axisKnown,
+      axisAck: true,
+      note: "Displace the TOP ring only — a ring underneath is the measurement floor for everything "
+        + "above it. Keep it under 25 mm.",
+    }),
+    runStep({
+      id: "summary", label: "Summary", title: "Take the numbers",
+      hands: "Nothing to touch in the cell.",
+      done: Boolean(paper),
+      button: "Paper summary",
+      onRun: showPaper,
+      disabled: !measureSession,
+      note: "Grouped per layer and phase, with the detection error against what you typed.",
+    }),
   ];
-  const nextStep = guide.findIndex((step) => !step.done);
+  const autoIndex = RUN.findIndex((step) => !step.done);
+  const activeIndex = (stepPin !== null && RUN[stepPin] && !RUN[stepPin].done)
+    ? stepPin : (autoIndex < 0 ? RUN.length - 1 : autoIndex);
+  const active = RUN[activeIndex];
+  // The floor is the layer BELOW the one this step measures -- not the one the
+  // manual selector happens to be showing.
+  const stepFloorReady = !active.layer || active.layer <= 1
+    || Boolean(measureSession?.tops?.[String(active.layer - 1)]);
 
   return <div>
     <div className="page-head">
@@ -916,7 +1057,7 @@ export default function Extrusion() {
       </div>}
       <div className="preview-generation">
         <div><b>Generate robot coordinates</b><span>This freezes the current recipe and station selections into an exact fingerprint. Any later input change invalidates it.</span></div>
-        <div className="btn-row"><button disabled={!recipe || !selectionsReady || busy || status?.running} onClick={generate}>Generate coordinates & fingerprint</button>
+        <div className="btn-row"><button disabled={!recipe || !selectionsReady || busy || status?.running} onClick={() => generate()}>Generate coordinates & fingerprint</button>
           <button className="secondary" disabled={!plan || busy || status?.running} onClick={runPreflight}>Geometry & station preflight</button>
           <button className="secondary" disabled={!connected || busy || status?.running} onClick={resetGenerated}>Reset / clean RoboDK path</button></div>
       </div>
@@ -1004,94 +1145,108 @@ export default function Extrusion() {
     {mode === "measure" && <div className="card ring-card">
       <h2 className="visually-hidden">Ring stack — measure only</h2>
       <div className="ring-head">
-        <div className="next-step">
-          <span className="k">Next</span>
-          <b>{nextStep < 0 ? "All steps done — take the paper summary."
-                           : guide[nextStep].title}</b>
-          {nextStep >= 0 && guide[nextStep].progress && <em>{guide[nextStep].progress}</em>}
+        <div className="step-rail" role="list">
+          {RUN.map((step, index) => <button key={step.id} type="button" role="listitem"
+            className={`step-chip${step.done ? " done" : ""}${index === activeIndex ? " current" : ""}`}
+            aria-current={index === activeIndex ? "step" : undefined}
+            onClick={() => setStepPin(index === activeIndex ? null : index)}>
+            <span className="dot">{step.done ? "✓" : index + 1}</span>{step.label}
+          </button>)}
         </div>
         <button type="button" className="secondary guide-btn"
                 onClick={() => setGuideOpen(true)}>Run guide</button>
       </div>
 
-      <div className="ring-row">
-        <span className="k">Session</span>
-        <b className="mono">{measureSession ? measureSession.trial_id : "none yet"}</b>
-        {plan && <span className="hint">r {plan.recipe.radius_mm} · bead {plan.recipe.bead_diameter_mm}
-          {" "}· {plan.layers.length} layer{plan.layers.length === 1 ? "" : "s"}</span>}
-        <span className="spacer" />
-        <input className="note-input" placeholder="note" value={measureNote}
-               onChange={(e) => setMeasureNote(e.target.value)} />
-        <button className="secondary" disabled={!plan || busy || status?.running}
-                onClick={newMeasureSession}>New session</button>
-      </div>
-
-      {!plan && <p className="hint warn-text">Open <b>Setup</b> above and press
-        <b> Generate coordinates &amp; fingerprint</b> — a session records the plan it measures against.</p>}
-      {plan && plan.layers.length < 3 && <p className="hint warn-text">This plan has
-        {" "}{plan.layers.length} layer{plan.layers.length === 1 ? "" : "s"}. Set <b>Layers</b> to 3 in
-        Setup and generate again before measuring a stack — Apply never changes the layer count.</p>}
-      {plan?.restored_from && <p className="hint">Plan restored from session
-        <code> {plan.restored_from} </code>after a restart — no need to press Apply.</p>}
       {applied && !planIsApplied && <div className="io-note warn-text">
         <b>This is not the plan the session applied</b> (ring characterized at r {applied.recipe.radius_mm} mm,
         centre {applied.setup.center_x_mm.toFixed(1)}, {applied.setup.center_y_mm.toFixed(1)}).
-        Press <b>Apply to recipe &amp; placement</b> below before measuring.
+        Press <b>Use this ring</b> again before measuring.
+      </div>}
+      {plan?.restored_from && <p className="hint">Plan restored from session
+        <code> {plan.restored_from} </code>after a restart — no need to apply again.</p>}
+
+      {/* Exactly one thing to do, and the press that does it. Everything the step
+          records is set by the step itself, so no control can be left on a stale
+          value from the take before. */}
+      <div className={`step-panel${active.moves ? " moves" : ""}`}>
+        <div className="step-what">
+          <h3>{active.title}</h3>
+          {active.hands && <p className="hands">{active.hands}</p>}
+        </div>
+
+        {active.offsetInput && <div className="step-inputs">
+          <label>Moved along <select value={offsetAxis}
+            onChange={(e) => setOffsetAxis(e.target.value === "Y" ? "Y" : "X")}>
+            <option value="X">X</option><option value="Y">Y</option>
+          </select></label>
+          <label>by <input type="number" step={1} value={offsetMag}
+            onChange={(e) => setOffsetMag(Number(e.target.value))} /> mm</label>
+          <span className="hint">negative if it moved the other way</span>
+        </div>}
+
+        {active.records && <p className="records"><span className="k">Records</span>
+          <b>{active.records}</b></p>}
+
+        <div className="step-go">
+          {active.moves && <label className="go-confirm">
+            <input type="checkbox" checked={confirmMotion}
+                   onChange={(e) => setConfirmMotion(e.target.checked)} />
+            Hands clear — the robot may move the camera</label>}
+          <button className="go-btn" disabled={active.disabled || !stepFloorReady}
+                  onClick={active.onRun}>{active.button}</button>
+          {(busy || status?.running) && <button className="secondary" onClick={cancel}>Cancel</button>}
+          {active.progress && <span className="step-progress">
+            {active.progress.have} of {active.progress.need} done</span>}
+        </div>
+
+        {active.blocked && <p className="hint warn-text">{active.blocked}</p>}
+        {!stepFloorReady && <p className="hint warn-text">
+          Measure layer {(active.layer ?? 1) - 1} first — it is the measurement floor for
+          layer {active.layer}.</p>}
+        {active.note && <p className="hint">{active.note}</p>}
+        {active.axisAck && <label className="axis-ack">
+          <input type="checkbox" checked={axisKnown}
+                 onChange={(e) => setAxisKnown(e.target.checked)} />
+          I know which axis and sign the ring moves along</label>}
+      </div>
+
+      <div className="ring-foot">
+        <span className="hint">{measureSession
+          ? `session ${measureSession.trial_id}` : "no session yet"}</span>
+        {plan && <span className="hint">r {plan.recipe.radius_mm} · bead {plan.recipe.bead_diameter_mm}
+          {" "}· {plan.layers.length} layer{plan.layers.length === 1 ? "" : "s"}</span>}
+        <span className="spacer" />
+        <button type="button" className="linkish"
+                onClick={() => setManualOpen(!manualOpen)}>{manualOpen ? "Hide" : "Manual"} controls</button>
+      </div>
+
+      {manualOpen && <div className="manual-panel">
+        <p className="hint">Off-script takes: choose the layer, phase and offset yourself. The run
+          above keeps counting whatever matches its steps.</p>
+        <div className="ring-row">
+          <input className="note-input" placeholder="note" value={measureNote}
+                 onChange={(e) => setMeasureNote(e.target.value)} />
+          <button className="secondary" disabled={!plan || busy || status?.running}
+                  onClick={newMeasureSession}>New session</button>
+          <span className="spacer" />
+          <label>Layer <select value={measureLayer}
+            onChange={(e) => setMeasureLayer(Number(e.target.value))}>
+            {(plan?.layers ?? []).map((l) => <option key={l.layer_index} value={l.layer_index}>{l.layer_index}</option>)}
+          </select></label>
+          <label>Phase <select value={phase} onChange={(e) => setPhase(e.target.value)}>
+            <option value="">(none)</option>
+            {PHASES.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+          </select></label>
+          <label>X <input type="number" step={1} value={offsetX}
+            onChange={(e) => setOffsetX(Number(e.target.value))} /></label>
+          <label>Y <input type="number" step={1} value={offsetY}
+            onChange={(e) => setOffsetY(Number(e.target.value))} /></label>
+          <button className="secondary" disabled={!plan || !connected || !confirmMotion || busy
+                    || status?.running || !planIsApplied || !floorReady}
+                  onClick={() => measure()}>Measure — {annotationLabel()}</button>
+        </div>
       </div>}
 
-      <div className="ring-row">
-        <span className="k">Ring 1</span>
-        <button disabled={!plan || !connected || !confirmMotion || busy || status?.running}
-                onClick={characterize}>Characterize</button>
-        {measureSession?.characterizations?.length ? (() => {
-          const c = measureSession.characterizations[measureSession.characterizations.length - 1];
-          return <>
-            <span className="hint">r {c.radius_mm.toFixed(1)} · bead {c.bead_width_mm.toFixed(1)} ·
-              height {c.top_z_min_mm.toFixed(1)}–{c.top_z_max_mm.toFixed(1)} mm</span>
-            <button className={planIsApplied ? "secondary" : ""} disabled={busy || status?.running}
-                    onClick={applyCharacterization}>Apply to recipe &amp; placement</button>
-          </>;
-        })() : <span className="hint">measures the physical ring and sets the recipe from it</span>}
-      </div>
-
-      <div className="ring-row">
-        <span className="k">Measure</span>
-        <label>Layer <select value={measureLayer} onChange={(e) => setMeasureLayer(Number(e.target.value))}>
-          {(plan?.layers ?? []).map((l) => <option key={l.layer_index} value={l.layer_index}>{l.layer_index}</option>)}
-        </select></label>
-        <label>Phase <select value={phase} onChange={(e) => setPhase(e.target.value)}>
-          <option value="">(none)</option>
-          {PHASES.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
-        </select></label>
-        <label>Offset X <input type="number" step={1} value={offsetX}
-          onChange={(e) => setOffsetX(Number(e.target.value))} /></label>
-        <label>Y <input type="number" step={1} value={offsetY}
-          onChange={(e) => setOffsetY(Number(e.target.value))} /></label>
-        <span className="hint">mm</span>
-        {(offsetX !== 0 || offsetY !== 0) && <button className="secondary"
-          onClick={() => { setOffsetX(0); setOffsetY(0); }}>Clear</button>}
-      </div>
-
-      {/* The ground truth every detection-error number is measured against. It is
-          sticky between presses, so it is echoed where the operator is looking. */}
-      <div className={`take-echo ${offsetX || offsetY ? "shifted" : ""}`}>
-        <span className="k">Records</span>
-        <b>{annotationLabel()}</b>
-        {(offsetX !== 0 || offsetY !== 0) &&
-          <span className="warn-text">move the TOP ring by exactly this first</span>}
-      </div>
-      {!floorReady && <p className="hint warn-text">Measure layer {measureLayer - 1} first — it is
-        the measurement floor for layer {measureLayer}.</p>}
-
-      <div className="go-row">
-        <label className="go-confirm"><input type="checkbox" checked={confirmMotion}
-          onChange={(e) => setConfirmMotion(e.target.checked)} />
-          Hands clear — the robot may move the camera (collision validation off)</label>
-        <button className="go-btn" disabled={!plan || !connected || !confirmMotion || busy || status?.running
-                          || !planIsApplied || !floorReady}
-                onClick={measure}>Measure layer {measureLayer}</button>
-        {(busy || status?.running) && <button className="secondary" onClick={cancel}>Cancel</button>}
-      </div>
       {logs.length > 0 && <div className="log measure-log">{logs.slice(-6).map((line, i) =>
         <div key={i} className={line.startsWith("ERROR") ? "err" : ""}>{line}</div>)}</div>}
       {takes.length ? <div className="take-head">
@@ -1199,10 +1354,12 @@ export default function Extrusion() {
           <button type="button" className="secondary" onClick={() => setGuideOpen(false)}>Close</button>
         </div>
         <ol className="guide-steps">
-          {guide.map((step, i) => <li key={step.title}
-            className={step.done ? "done" : i === nextStep ? "current" : ""}>
-            <b>{step.title}</b>{step.progress && <em>{step.progress}</em>}
-            <span>{step.detail}</span>
+          {RUN.map((step, index) => <li key={step.id}
+            className={step.done ? "done" : index === activeIndex ? "current" : ""}>
+            <b>{step.title}</b>
+            {step.progress && <em>{step.progress.have}/{step.progress.need}</em>}
+            {step.hands && <span>{step.hands}</span>}
+            {step.note && <span className="muted-note">{step.note}</span>}
           </li>)}
         </ol>
         <div className="io-note">

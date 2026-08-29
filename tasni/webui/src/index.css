@@ -462,31 +462,60 @@ tr.clickable.selected > td { background: var(--panel-2); box-shadow: inset 2px 0
 .visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 
-/* -- ring-stack measure-only: one row per decision -------------------------- */
-.ring-card { display: grid; gap: 10px; }
-.ring-head { display: flex; align-items: center; justify-content: space-between; gap: 14px;
+/* -- ring-stack measure-only: one step at a time ---------------------------- */
+.ring-card { display: grid; gap: 12px; }
+.ring-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px;
   flex-wrap: wrap; }
-.next-step { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; min-width: 0; }
-.next-step .k { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
-.next-step b { font-size: 14px; }
-.next-step em { font-style: normal; font-family: var(--mono); font-size: 11px; color: var(--accent);
-  border: 1px solid rgba(76,154,255,.5); border-radius: 999px; padding: 1px 8px; }
 .guide-btn { flex: 0 0 auto; }
-.ring-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; }
-.ring-row > .k { flex: 0 0 62px; font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+
+.step-rail { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.step-chip { display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px 5px 6px;
+  border: 1px solid var(--border); border-radius: 999px; background: transparent;
+  color: var(--muted); font-size: 11.5px; cursor: pointer; }
+.step-chip .dot { width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--bg); border: 1px solid var(--border); font-family: var(--mono); font-size: 10px; }
+.step-chip.done { color: var(--ok); border-color: rgba(63,185,80,.4); }
+.step-chip.done .dot { background: rgba(63,185,80,.16); border-color: rgba(63,185,80,.5); color: var(--ok); }
+.step-chip.current { color: var(--accent); border-color: var(--accent);
+  background: rgba(76,154,255,.12); font-weight: 700; }
+.step-chip.current .dot { background: var(--accent); border-color: var(--accent); color: #0b1017; }
+.step-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.step-panel { display: grid; gap: 12px; padding: 18px 20px; border: 1px solid var(--border);
+  border-radius: 10px; background: var(--bg); }
+.step-panel.moves { border-left: 3px solid var(--warn); }
+.step-what h3 { margin: 0 0 6px; font-size: 18px; letter-spacing: -.01em; }
+.step-what .hands { margin: 0; font-size: 14.5px; line-height: 1.5; color: var(--text); max-width: 68ch; }
+.step-inputs { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.step-inputs label { display: inline-flex; align-items: center; gap: 7px; margin: 0; font-size: 13px;
   color: var(--muted); }
-.ring-row .mono { font-family: var(--mono); font-size: 12px; }
-.ring-row .spacer { flex: 1 1 auto; }
+.step-inputs input[type="number"] { width: 86px; }
+.step-inputs select { width: auto; }
+.records { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; margin: 0;
+  padding: 7px 10px; border-radius: 6px; background: var(--panel); border: 1px solid var(--border); }
+.records .k { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.records b { font-family: var(--mono); font-size: 12.5px; font-weight: 500; }
+.step-go { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.go-confirm { display: flex; align-items: center; gap: 8px; font-size: 12.5px; margin: 0; }
+.go-btn { font-size: 14px; padding: 10px 20px; }
+.step-progress { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+.axis-ack { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted);
+  margin: 0; }
+
+.ring-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.ring-foot .spacer { flex: 1 1 auto; }
+.linkish { background: none; border: 0; padding: 0; color: var(--accent); font-size: 12px;
+  cursor: pointer; text-decoration: underline; }
+.linkish:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.manual-panel { padding: 12px 14px; border: 1px dashed var(--border); border-radius: 8px;
+  display: grid; gap: 10px; }
+.manual-panel .hint { margin: 0; }
+.ring-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .ring-row label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
   color: var(--muted); margin: 0; }
-.ring-row select, .ring-row input[type="number"] { width: auto; min-width: 64px; }
-.ring-row .note-input { width: 130px; }
-.go-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 2px;
-  padding: 11px 12px; border: 1px solid rgba(210,153,34,.45); border-radius: 8px;
-  background: rgba(210,153,34,.07); }
-.go-confirm { display: flex; align-items: center; gap: 8px; font-size: 12.5px; margin: 0; flex: 1 1 auto; }
-.go-btn { flex: 0 0 auto; }
+.ring-row select, .ring-row input[type="number"] { width: auto; min-width: 62px; }
+.ring-row .note-input { width: 120px; }
+.ring-row .spacer { flex: 1 1 auto; }
 
 /* -- the protocol, in a dialog --------------------------------------------- */
 .guide-modal { border: 1px solid var(--border); border-radius: 12px; padding: 0;
@@ -502,17 +531,13 @@ tr.clickable.selected > td { background: var(--panel-2); box-shadow: inset 2px 0
 .guide-steps li { color: var(--muted); font-size: 12px; line-height: 1.45; }
 .guide-steps li b { display: inline; color: var(--text); font-size: 12.5px; }
 .guide-steps li span { display: block; margin-top: 2px; }
+.guide-steps li .muted-note { color: var(--muted); font-size: 11.5px; }
 .guide-steps li em { margin-left: 8px; padding: 1px 7px; border-radius: 999px; font-style: normal;
   font-family: var(--mono); font-size: 11px; border: 1px solid var(--border); color: var(--muted); }
 .guide-steps li.done b { color: var(--ok); }
 .guide-steps li.done::marker { color: var(--ok); }
 .guide-steps li.current b { color: var(--accent); }
 .guide-steps li.current em { border-color: rgba(76,154,255,.55); color: var(--accent); }
-.take-echo { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 8px 0 4px;
-  padding: 8px 11px; border: 1px solid var(--border); border-radius: 7px; font-size: 12px; }
-.take-echo.shifted { border-color: rgba(210,153,34,.55); background: rgba(210,153,34,.08); }
-.take-echo .k { color: var(--muted); text-transform: uppercase; letter-spacing: .5px; font-size: 10px; }
-.take-echo b { font-family: var(--mono); font-size: 12.5px; }
 .measure-log { max-height: 120px; margin-top: 10px; }
 .run-status { margin: 0 0 14px; padding: 9px 13px; border: 1px solid var(--border);
   border-radius: 8px; background: var(--panel); display: grid; gap: 7px; }
