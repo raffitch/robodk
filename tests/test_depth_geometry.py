@@ -50,6 +50,47 @@ def test_backproject_with_identity_geometry_is_the_old_formula():
     np.testing.assert_allclose(pts[uv[:, 0] == 0], [[-160 / 300 * 1000, -120 / 300 * 1000, 1000]])
 
 
+def test_backproject_stride_recovers_original_pixel_coords_and_matches_stride1():
+    g = gf.aligned(K_C, SIZE_C)
+    depth = np.zeros((240, 320), np.uint16)
+    depth[120, 160] = 500  # even (v, u): survives a stride=2 subsample
+    depth[80, 200] = 700   # even (v, u): survives a stride=2 subsample
+    pts1, uv1 = dg.backproject(depth, g, stride=1)
+    pts2, uv2 = dg.backproject(depth, g, stride=2)
+    # uv_depth must be ORIGINAL-image pixel coordinates (multiples of the
+    # stride), not the subsampled array's own indices -- a bug here would
+    # return (80, 60) instead of (160, 120).
+    assert set(map(tuple, uv2.tolist())) == {(160, 120), (200, 80)}
+    assert np.all(uv2 % 2 == 0)
+    # the point recovered at a given pixel is the same regardless of stride
+    for u, v in [(160, 120), (200, 80)]:
+        p1 = pts1[(uv1[:, 0] == u) & (uv1[:, 1] == v)]
+        p2 = pts2[(uv2[:, 0] == u) & (uv2[:, 1] == v)]
+        assert len(p1) == 1 and len(p2) == 1
+        np.testing.assert_allclose(p2, p1)
+
+
+def test_backproject_mask_selects_exact_subset():
+    g = gf.aligned(K_C, SIZE_C)
+    depth = np.zeros((240, 320), np.uint16)
+    depth[100, 50] = 300
+    depth[150, 200] = 450
+    depth[10, 10] = 900   # valid depth, but excluded by the mask below
+    mask = np.zeros((240, 320), bool)
+    mask[100, 50] = True
+    mask[150, 200] = True
+    pts, uv = dg.backproject(depth, g, mask=mask)
+    assert len(pts) == 2
+    assert set(map(tuple, uv.tolist())) == {(50, 100), (200, 150)}
+    expected = {
+        (50, 100): [(50 - 160) / 300 * 300, (100 - 120) / 300 * 300, 300],
+        (200, 150): [(200 - 160) / 300 * 450, (150 - 120) / 300 * 450, 450],
+    }
+    for (u, v), want in expected.items():
+        p = pts[(uv[:, 0] == u) & (uv[:, 1] == v)]
+        np.testing.assert_allclose(p[0], want)
+
+
 def test_depth_pose_composes_on_the_right():
     g = gf.offset(color_K=K_C, color_size=SIZE_C)
     T_base_color = np.eye(4); T_base_color[:3, 3] = [100, 200, 300]
