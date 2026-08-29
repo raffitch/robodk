@@ -198,11 +198,15 @@ const recipeFields: Array<{ key: keyof Recipe; label: string; min: number; max: 
   { key: "points_per_circle", label: "Curve samples", min: 24, max: 720, step: 12, unit: "pts" },
 ];
 
-function BirdseyeStack({ plan, selectedLayer, onSelect, measured }: {
+function BirdseyeStack({ plan, selectedLayer, onSelect, measured, showBead }: {
   plan: Plan; selectedLayer: number; onSelect: (layer: number) => void;
   // Measured centrelines by layer index, in work-frame mm: what is actually
   // on the table, drawn over what was commanded.
   measured?: Record<string, number[][]>;
+  // Draw each layer at the commanded bead width instead of as a hairline: what
+  // is deposited is a bead with a footprint, and the curve alone hides the
+  // quantity the inspection measures.
+  showBead?: boolean;
 }) {
   const width = 640, height = 440, pad = 38;
   const { radius_mm: radius, layer_height_mm: layerHeight } = plan.recipe;
@@ -261,6 +265,9 @@ function BirdseyeStack({ plan, selectedLayer, onSelect, measured }: {
   const guideIndices = [0, .25, .5, .75].map((fraction) =>
     Math.min(plan.recipe.points_per_circle - 1,
              Math.round(fraction * plan.recipe.points_per_circle)));
+  // The oblique projection compresses X by .866, so that is the honest factor
+  // for a width drawn in the plane of the layer.
+  const beadPx = Math.max(2, plan.recipe.bead_diameter_mm * scale * .866);
 
   return <svg viewBox={`0 0 ${width} ${height}`} className="birdseye-map"
               aria-label="Oblique bird's-eye view of the complete layer stack">
@@ -286,12 +293,18 @@ function BirdseyeStack({ plan, selectedLayer, onSelect, measured }: {
     {projectedLayers.map(({ item, rawPoints }) => {
       const selected = item.layer_index === selectedLayer;
       const start = project(rawPoints[0]);
+      const depth = .42 + item.layer_index / plan.layers.length * .34;
       return <g key={item.layer_index} className="stack-layer"
                 onClick={() => onSelect(item.layer_index)}>
-        <path d={path(rawPoints)} fill={selected ? "rgba(76,154,255,.10)" : "none"}
+        {showBead && <path d={path(rawPoints)} fill="none"
               stroke={selected ? "#66a6ff" : "#39d0bd"}
-              strokeOpacity={selected ? 1 : .42 + item.layer_index / plan.layers.length * .34}
-              strokeWidth={selected ? 4 : 2} strokeLinecap="round" strokeLinejoin="round" />
+              strokeOpacity={(selected ? .34 : depth * .38)}
+              strokeWidth={beadPx} strokeLinecap="round" strokeLinejoin="round" />}
+        <path d={path(rawPoints)} fill={selected && !showBead ? "rgba(76,154,255,.10)" : "none"}
+              stroke={selected ? "#66a6ff" : "#39d0bd"}
+              strokeOpacity={selected ? 1 : depth}
+              strokeWidth={selected ? (showBead ? 2 : 4) : (showBead ? 1.2 : 2)}
+              strokeLinecap="round" strokeLinejoin="round" />
         {selected && <circle cx={start.x} cy={start.y} r="5" fill="#f0a45d" />}
       </g>;
     })}
@@ -379,6 +392,15 @@ export default function Extrusion() {
   const [offsetMag, setOffsetMag] = useState(10);
   const [axisKnown, setAxisKnown] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
+  // Off by default: the hairline is the toolpath, and the band is what that
+  // toolpath actually lays down. Remembered per browser.
+  const [showBead, setShowBead] = useState(() => {
+    try { return localStorage.getItem("extrusion.showBead") === "1"; } catch { return false; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("extrusion.showBead", showBead ? "1" : "0"); }
+    catch { /* private mode */ }
+  }, [showBead]);
   const logRef = useRef<HTMLDivElement>(null);
 
   const refreshStatus = useCallback(() => {
@@ -1080,10 +1102,15 @@ export default function Extrusion() {
 
     <div className="card birdseye-card">
       <div className="birdseye-head"><div><h2>Live bird’s-eye draft</h2><p>Sliders update this analytic preview immediately. It is not an executable robot plan until coordinates are generated below.</p></div>
-        {layer && <div className="layer-readout">LAYER {layer.layer_index}<b>Z {layer.nominal_z_mm.toFixed(2)} mm</b></div>}</div>
+        <div className="birdseye-tools">
+          <label className="bead-toggle"><input type="checkbox" checked={showBead}
+            onChange={(e) => setShowBead(e.target.checked)} />
+            Bead width{recipe ? ` · Ø ${recipe.bead_diameter_mm} mm` : ""}</label>
+          {layer && <div className="layer-readout">LAYER {layer.layer_index}<b>Z {layer.nominal_z_mm.toFixed(2)} mm</b></div>}
+        </div></div>
       {visualPlan && layer ? <div className="birdseye-layout">
         <BirdseyeStack plan={visualPlan} selectedLayer={visualSelectedLayer} onSelect={setSelectedLayer}
-                       measured={measureSession?.tops} />
+                       measured={measureSession?.tops} showBead={showBead} />
         <div className="layer-rail">{visualPlan.layers.map((item) => <button key={item.layer_index}
           className={`layer-tile ${item.layer_index === visualSelectedLayer ? "selected" : ""}`}
           onClick={() => setSelectedLayer(item.layer_index)}>

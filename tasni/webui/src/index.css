@@ -539,6 +539,9 @@ tr.clickable.selected > td { background: var(--panel-2); box-shadow: inset 2px 0
 .guide-steps li.current b { color: var(--accent); }
 .guide-steps li.current em { border-color: rgba(76,154,255,.55); color: var(--accent); }
 .measure-log { max-height: 120px; margin-top: 10px; }
+.birdseye-tools { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.bead-toggle { display: inline-flex; align-items: center; gap: 7px; margin: 0; font-size: 12px;
+  color: var(--muted); white-space: nowrap; }
 .run-status { margin: 0 0 14px; padding: 9px 13px; border: 1px solid var(--border);
   border-radius: 8px; background: var(--panel); display: grid; gap: 7px; }
 .run-status .status-line { margin: 0; }
