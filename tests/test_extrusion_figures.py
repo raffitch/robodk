@@ -103,6 +103,39 @@ def write_take(root, *, trial_id="t1", layer_index=1, take=1, measured=None,
                                measured_xyz=measured, pointcloud_xyz=cloud, depth=frame)
 
 
+def write_characterization(root, *, trial_id="c1", index=1, radius=RADIUS, center=CENTER,
+                           bead=8.0, height=6.0, seed=5):
+    """One archived ring characterization, produced by the REAL ``characterize_ring``
+    pass (not a hand-built report.json) -- so ``report['coarse']`` is the actual
+    throwaway recipe ``_compute_characterization_stages`` has to rebuild."""
+    from tasni.modules.extrusion.processing import characterize_ring
+
+    plan = _plan(layers=1)
+    archive = ExtrusionArchive(root)
+    if not (root / trial_id / "trial.json").is_file():
+        archive.create_trial(trial_id, plan, mode="MEASURE_ONLY")
+    T = syn.inspection_camera_T((center[0], center[1], height), 300.0)
+    geometry = gf.aligned(syn.K_720P, syn.SIZE_720P)
+    depth = syn.render_scene([syn.RingSpec(radius, bead, center, height_fn=syn.flat(height))],
+                             T, plane_center_xy_mm=center, seed=seed)
+    color = np.zeros((syn.SIZE_720P[1], syn.SIZE_720P[0], 3), np.uint8)
+    config = ExtrusionConfig()
+    found = characterize_ring(
+        color=color, depth=depth, geometry=geometry, T_work_camera=T,
+        K=syn.K_720P, dist=None, search_center_mm=center,
+        work_frame="Tasni Work Frame", config=config,
+        inspection_tool="Realsense", print_tool="LongCalibTool")
+    report = {**found.report, "summary": {**found.summary(), "index": index},
+             "provenance": {"T_work_camera": np.asarray(T, dtype=float).tolist(),
+                            "camera_intrinsics": {"K": syn.K_720P.tolist()},
+                            "processing_config": config.model_dump(mode="json")}}
+    return archive.write_characterization(
+        trial_id, index, color=color, depth=depth, measured_xyz=found.measured_xyz,
+        derived_images={"segmentation.png": found.segmentation,
+                        "skeleton.png": found.skeleton, "comparison.png": found.comparison},
+        report=report)
+
+
 def test_rendering_a_take_writes_every_figure_in_both_formats(tmp_path):
     from tasni.modules.extrusion import figures
 
@@ -572,3 +605,139 @@ def test_a_protocol_2_take_uses_its_recorded_geometry(tmp_path):
     take = figures.load_take(layer_dir)
     assert take.geometry.legacy is False and take.geometry.depth_unit_mm == 0.1
     assert "legacy" not in take.label
+
+
+# ------------------------------------------ the controllable 3-D view (iso/birdseye)
+
+def test_render_view_azimuth_and_elevation_are_controllable(tmp_path):
+    """The one thing the operator asked to be sure of: not stuck at one angle."""
+    from tasni.modules.extrusion import figures
+
+    take = figures.load_take(write_take(tmp_path))
+    fig = figures.render_view(take, azim=12.0, elev=48.0)
+    try:
+        ax = fig.axes[0]
+        assert ax.elev == pytest.approx(48.0)
+        assert ax.azim == pytest.approx(12.0)
+    finally:
+        figures._pyplot().close(fig)
+
+
+def test_birdseye_looks_straight_down_orthographic_with_no_exaggeration(tmp_path):
+    from tasni.modules.extrusion import figures
+
+    take = figures.load_take(write_take(tmp_path))
+    fig = figures._figure_birdseye(figures._pyplot(), take)
+    try:
+        ax = fig.axes[0]
+        assert ax.elev == pytest.approx(90.0)
+        assert getattr(ax, "get_proj_type", lambda: "ortho")() == "ortho"
+        caption = fig.texts[-1].get_text()
+        assert "vertical exaggeration" not in caption, "nothing to exaggerate looking straight down"
+        # Looking straight down, the Z axis is edge-on and its label would sit
+        # on top of the title -- height is still carried honestly by colour.
+        assert ax.get_zlabel() == ""
+        assert ax.get_zticks().size == 0
+    finally:
+        figures._pyplot().close(fig)
+
+
+def test_birdseye_frames_the_whole_ring_with_margin_not_a_crop(tmp_path):
+    from tasni.modules.extrusion import figures
+
+    take = figures.load_take(write_take(tmp_path))
+    fig = figures._figure_birdseye(figures._pyplot(), take)
+    try:
+        ax = fig.axes[0]
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        ring = take.measured
+        assert x0 < ring[:, 0].min() and x1 > ring[:, 0].max(), "the ring is clipped in X"
+        assert y0 < ring[:, 1].min() and y1 > ring[:, 1].max(), "the ring is clipped in Y"
+    finally:
+        figures._pyplot().close(fig)
+
+
+def test_iso_states_and_actually_applies_its_vertical_exaggeration(tmp_path):
+    """The recorded trap: a figure that CLAIMS a factor but draws a different one.
+
+    The stated factor is read straight off the caption (black-box), then
+    checked against the actual plotted data -- not recomputed from a helper
+    the figure itself might disagree with.
+    """
+    import re
+    from tasni.modules.extrusion import figures
+
+    take = figures.load_take(write_take(tmp_path))
+    fig = figures._figure_iso(figures._pyplot(), take)
+    try:
+        caption = fig.texts[-1].get_text()
+        match = re.search(r"vertical exaggeration ×([\d.]+)", caption)
+        assert match, caption
+        factor = float(match.group(1))
+        assert factor > 1.0, "fixture must produce a real exaggeration to check against"
+        line = next(l for l in fig.axes[0].get_lines()
+                   if l.get_label() == "extracted centreline")
+        drawn_z = np.asarray(line.get_data_3d()[2])
+        assert np.allclose(drawn_z, take.measured[:, 2] * factor)
+    finally:
+        figures._pyplot().close(fig)
+
+
+def test_iso_and_birdseye_are_saved_for_every_take(tmp_path):
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_take(tmp_path)
+    written = {p.name for p in figures.render_layer_figures(layer_dir, formats=("png",))}
+    assert {"iso.png", "birdseye.png"} <= written
+
+
+# --------------------------------------------------- ring characterizations (no recipe)
+
+def test_load_take_reads_a_characterization_directory(tmp_path):
+    """No manifest.json exists for a characterization -- report.json stands in."""
+    from tasni.modules.extrusion import figures
+
+    char_dir = write_characterization(tmp_path)
+    assert not (char_dir / "manifest.json").is_file()
+    assert (char_dir / "report.json").is_file()
+
+    take = figures.load_take(char_dir)
+    assert take.manifest["kind"] == "characterization"
+    assert take.nominal is None, "no recipe existed yet -- there is no nominal ring"
+    assert take.measured is not None and len(take.measured) > 10
+    assert take.radius == pytest.approx(RADIUS, rel=.15)
+    assert take.center == pytest.approx(CENTER, abs=5.0)
+    assert "characterization" in take.label
+    assert "no recipe assumed" in take.caption
+
+
+def test_a_characterization_renders_the_full_figure_set(tmp_path):
+    """The paper's whole stage sequence, reproducible from a characterization too."""
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion import figures
+
+    char_dir = write_characterization(tmp_path)
+    written = figures.render_layer_figures(char_dir, formats=("png",))
+    names = {p.name for p in written}
+
+    # Every figure this module knows how to draw comes out of a characterization,
+    # not just the subset that happens to need no reconstructed plan.
+    assert names == {f"{stem}.png" for stem in figures.LAYER_FIGURES}
+    for path in written:
+        assert path.stat().st_size > 1000, f"{path.name} is suspiciously small"
+
+
+def test_a_characterizations_pipeline_figure_reruns_its_own_coarse_plan(tmp_path):
+    """The coarse recipe characterize_ring used is never archived -- only the
+    numbers it was built from (report['coarse']). This rebuilds it and re-runs
+    the real chain, so the method figure shows what THIS pass actually saw."""
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion import figures
+
+    take = figures.load_take(write_characterization(tmp_path))
+    stages = figures.take_stages(take)
+
+    assert stages and "result" in stages
+    assert len(stages["backprojected"]) > len(stages["work_roi"]) > 0
+    assert stages["result"].measured_xyz is not None

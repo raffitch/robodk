@@ -606,9 +606,79 @@ def test_entire_platform_overrun_refuses_instead_of_auto_cropping():
         assert payload["primary_action"] == "survey_full_platform"
         assert payload["surface_scope"] == scan_service.SCOPE_ENTIRE_PLATFORM
         assert scan_service.SCOPE_DECLARED_REGION in payload["alternatives"]
+        # 2026-08-30 false-refusal fix: the message must never claim the colour
+        # view is narrower than the depth view when it is not -- _build_fakes
+        # renders through gf.aligned (depth registered 1:1 to colour, the legacy/
+        # archived convention), so colour_fov_deg and depth_fov_deg must come out
+        # numerically equal here, and the message must NOT assert a gap that does
+        # not exist. The old wording ("the platform overruns the camera view") is
+        # also gone -- it named an undifferentiated "camera view" the operator had
+        # no way to check against what they could plainly see.
+        assert payload["colour_fov_deg"] == payload["depth_fov_deg"], payload
+        assert "narrower" not in payload["message"], payload["message"]
+        assert "the platform overruns the camera view" not in payload["message"]
+        assert payload["standoff_mm"] is not None
+        assert payload["extent_mm"] is not None and len(payload["extent_mm"]) == 2
     finally:
         TABLE_HALF_MM = saved
     print("[scope] entire-platform overrun -> refused:", payload["message"][:60])
+
+
+def test_large_surface_message_names_the_true_colour_vs_depth_fov_gap():
+    """2026-08-30 false-refusal investigation, cause 3: the operator reported
+    ``"i can see the floor and the frame, so the platform is not larger than
+    camera view"`` -- the refusal WAS correct (a real capture proved the RANSAC
+    plane fit can genuinely extend past the colour frame, picking up something
+    coplanar beyond the platform's visible edges through the wider native depth
+    FOV), but its message named an undifferentiated "camera view" the operator
+    could not verify against what they saw.
+
+    ``_build_fakes`` (used by ``test_entire_platform_overrun_refuses_instead_of_
+    auto_cropping`` above) renders through ``gf.aligned``, where depth is
+    registered 1:1 to colour -- it cannot exercise this fix at all, since
+    colour_fov and depth_fov come out identical there by construction. This
+    tests the message-building helpers directly against a REAL ``gf.offset``
+    geometry with a depth FOV wider than colour's, proving the fix actually
+    names the gap (and the correct numbers) when one genuinely exists.
+    """
+    depth_K = np.array([[90.0, 0, 80.0], [0, 90.0, 60.0], [0, 0, 1.0]])
+    offset_geom = gf.offset(color_K=K, color_size=(W, H), depth_K=depth_K, depth_size=(160, 120))
+    aligned_geom = gf.aligned(K, (W, H))
+
+    class _FakeSurvey:
+        fov_deg = (
+            float(np.degrees(2.0 * np.arctan(W / (2.0 * K[0, 0])))),
+            float(np.degrees(2.0 * np.arctan(H / (2.0 * K[1, 1])))),
+        )
+
+    survey = _FakeSurvey()
+
+    fov_aligned = scan_service._large_surface_fov_context(survey, aligned_geom)
+    fov_offset = scan_service._large_surface_fov_context(survey, offset_geom)
+
+    # gf.aligned: depth_K == color_K, depth_size == color_size by construction ->
+    # the two FOVs must come out numerically identical.
+    assert fov_aligned["colour_fov_deg"] == fov_aligned["depth_fov_deg"], fov_aligned
+
+    # gf.offset with a much smaller depth fx/fy: the depth FOV is genuinely wider
+    # on both axes.
+    assert fov_offset["depth_fov_deg"][0] > fov_offset["colour_fov_deg"][0] + 1.0, fov_offset
+    assert fov_offset["depth_fov_deg"][1] > fov_offset["colour_fov_deg"][1] + 1.0, fov_offset
+
+    msg_aligned = scan_service._large_surface_message(
+        "intro.", fov_aligned, [900.0, 500.0], 450.0)
+    msg_offset = scan_service._large_surface_message(
+        "intro.", fov_offset, [900.0, 500.0], 450.0)
+
+    assert "narrower" not in msg_aligned, msg_aligned
+    assert "narrower" in msg_offset, msg_offset
+    # The actual depth FOV numbers must appear in the message, not just a vague claim.
+    assert f"{fov_offset['depth_fov_deg'][0]:.0f}" in msg_offset, (fov_offset, msg_offset)
+    assert f"{fov_offset['colour_fov_deg'][0]:.0f}" in msg_offset, (fov_offset, msg_offset)
+    # The measured extent + standoff are named too, not just asserted in the abstract.
+    assert "900" in msg_offset and "450" in msg_offset, msg_offset
+    print("[fov message] aligned ->", msg_aligned[:70])
+    print("[fov message] offset  ->", msg_offset[:110])
 
 
 def test_full_frame_valid_frac_uses_colour_registration_not_raw_depth_r_important1():
@@ -3116,6 +3186,7 @@ if __name__ == "__main__":
     test_prepare_frame_result_refuses_when_the_robot_moved()
     test_prepare_frame_result_requires_a_survey_record()
     test_entire_platform_overrun_refuses_instead_of_auto_cropping()
+    test_large_surface_message_names_the_true_colour_vs_depth_fov_gap()
     test_declared_region_still_crops_the_same_overrun_surface()
     test_lock_real_guard_band_rejection_at_close_standoff()
     test_lock_never_classifies_the_fabricated_reticle_square_when_not_fully_framed()

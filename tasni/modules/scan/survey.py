@@ -45,6 +45,11 @@ class SurveyThresholds:
     #                                       => object bounded in view (keep the rectangle)
     work_crop_mm: tuple[float, float] = (1000.0, 1000.0)  # generic work square when the
     #                                       surface overruns the view (edges untrustworthy)
+    center_patch_frac: float = 0.25       # aiming-reticle region (same convention as
+    #     ScanGateThresholds.center_patch_frac) that SEEDS the plane fit below, so
+    #     RANSAC locks onto the surface the operator is aiming at rather than
+    #     whichever coplanar-ish cluster happens to have the most points anywhere
+    #     in the wider native depth frame (e.g. an adjoining floor).
 
 
 @dataclass
@@ -187,9 +192,25 @@ def survey_surface(
     if len(pts_mm) > th.max_samples:
         pts_mm = pts_mm[::int(np.ceil(len(pts_mm) / th.max_samples))]
 
+    # 2b. Seed region (2026-08-30 false-refusal fix): the colour-image centre
+    # patch, same box convention as ColorRegistered._center_patch_bounds / the
+    # depth gate's own centre-patch aiming region -- what the operator is
+    # actually pointed at. Passed to fit_plane as seed_mask so the RANSAC locks
+    # onto the plane THROUGH this region rather than whichever cluster anywhere
+    # in the (wider-than-colour) native depth frame happens to have the most
+    # points -- see fit_plane's own docstring for the live-cell evidence.
+    seed_uv = project_to_color(pts_mm, K_color, dist_color)
+    pf = float(np.clip(th.center_patch_frac, 0.05, 1.0))
+    cw, ch = max(2, int(W * pf)), max(2, int(H * pf))
+    sx0, sy0 = (W - cw) // 2, (H - ch) // 2
+    sx1, sy1 = sx0 + cw, sy0 + ch
+    seed_mask = ((seed_uv[:, 0] >= sx0) & (seed_uv[:, 0] < sx1)
+                & (seed_uv[:, 1] >= sy0) & (seed_uv[:, 1] < sy1))
+
     # 3. RANSAC plane fit (COLOUR camera frame), then re-orient the normal to face it.
     try:
-        normal, centroid, _ = fit_plane(pts_mm, distance=th.ransac_distance_mm)
+        normal, centroid, _ = fit_plane(pts_mm, distance=th.ransac_distance_mm,
+                                        seed_mask=seed_mask)
     except ValueError:
         return _not_detected(th, fov_deg)
 
@@ -230,10 +251,35 @@ def survey_surface(
     # in depth-pixel space cannot answer "is this inside the COLOUR frame?" at all;
     # the fitted-rectangle test below is now the only framing decision.)
     def _corners_in_frame(corners, frac=float(th.frame_margin_uv)) -> bool:
+        """Containment uses the PINHOLE projection (``dist_color=None``), never the
+        calibrated Brown-Conrady model, even though every other projection in this
+        module (outline_uv/grid_uv/points_uv, below) deliberately DOES use it.
+
+        cv2's forward radial-distortion polynomial is only well-behaved inside the
+        domain it was fit on (roughly the image plus a modest margin); past that it
+        can turn non-monotonic and FOLD BACK, mapping a point that is genuinely far
+        outside the frame to a pixel that lands back inside it. Measured with a real
+        workstation calibration (k1=0.115, k2=-0.239): a point at normalized radius
+        ~1.3-1.6 (i.e. roughly 2x the frame's own half-diagonal) projects INSIDE the
+        image even though the pinhole projection of the same point is nowhere near
+        it -- confirmed both by direct sweep and by round-tripping a synthetic
+        oversized rectangle through this exact function (see
+        ``test_scan_survey.py``'s regression test). A corner that far out can only
+        arise from a genuinely oversized/overrunning fitted rectangle -- exactly the
+        case this test exists to catch -- so silently reporting it "framed" would
+        hide the one situation the framing gate is for.
+
+        The pinhole model has no such failure mode: u is a strictly monotonic,
+        unbounded function of the normalized coordinate, so a point that is truly
+        outside the frame always projects outside it, at any distance. Near the
+        REAL image boundary the two models differ by only a few pixels (far under
+        ``frac``'s margin), so no genuinely in-frame corner's classification
+        changes -- this only changes the verdict for corners that were already far
+        outside, from a spurious True to the correct False."""
         cc = np.asarray(corners, float).reshape(-1, 3)
         if cc.shape[0] < 4 or bool(np.any(cc[:, 2] <= 0)):
             return False
-        uv = project_to_color(cc, K_color, dist_color) / np.array([W, H], float)
+        uv = project_to_color(cc, K_color, None) / np.array([W, H], float)
         return bool(np.all((uv[:, 0] >= frac) & (uv[:, 0] <= 1.0 - frac)
                            & (uv[:, 1] >= frac) & (uv[:, 1] <= 1.0 - frac)))
 

@@ -5,17 +5,25 @@ next to it), so a figure can be produced long after the cell run, on a machine
 with no robot and no camera, and re-produced identically. Nothing in this module
 touches the robot, RoboDK or the job runner.
 
-Six figures per take:
+Seven figures per take:
 
 ``plan``       top view: deposit cloud, extracted centreline, nominal circle
 ``heightmap``  bird's-eye height map of the re-projected depth frame, z colourbar
 ``mesh``       the frame SURFACED: scene and deposit, each straight down and rotated
-``iso``        oblique 3-D view of cloud + centreline (z exaggerated, and said so)
+``iso``        the 3-D scene at a controllable azimuth/elevation, default oblique
+``birdseye``   the SAME 3-D view pinned top-down, orthographic, framed to fit
+               the whole ring with margin -- ``render_view(..., birdseye=True)``
 ``profile``    unrolled: height z(theta) and radial deviation dr(theta) over 360 deg
 ``pipeline``   the method figure: the six arrays the chain held, in order
 
 and two per trial: ``stack`` (every layer's latest take, plan + oblique) and
 ``tube`` (the commanded bead against the measured footprint).
+
+A take is either an archived layer (``layer-*/manifest.json``) or a ring
+characterization (``characterize-*/report.json``, written before any recipe
+exists -- see ``ExtrusionArchive.write_characterization``). Both load through
+the same ``load_take``/``TakeData`` path so every figure in this module can be
+produced from either kind of archived take.
 
 Matplotlib is imported lazily behind the Agg backend: importing this module must
 not require a display, and ``tasni`` must still import when matplotlib is absent.
@@ -32,7 +40,7 @@ import numpy as np
 from ...core.depth_geometry import CameraGeometry
 from .processing import depth_to_work_points
 
-LAYER_FIGURES = ("plan", "heightmap", "mesh", "iso", "profile", "pipeline")
+LAYER_FIGURES = ("plan", "heightmap", "mesh", "iso", "birdseye", "profile", "pipeline")
 TRIAL_FIGURES = ("stack", "tube")
 FORMATS = ("png", "pdf")
 DPI = 300
@@ -141,8 +149,11 @@ class TakeData:
     @property
     def label(self) -> str:
         take = self.manifest.get("take") or 1
-        label = (f"{self.manifest.get('trial_id', '?')} · "
-                f"layer {self.manifest.get('layer_index', '?')} take {take}")
+        if self.manifest.get("kind") == "characterization":
+            label = f"{self.manifest.get('trial_id', '?')} · characterization {take}"
+        else:
+            label = (f"{self.manifest.get('trial_id', '?')} · "
+                    f"layer {self.manifest.get('layer_index', '?')} take {take}")
         # The archive's one read-side fallback (figures.geometry_for_take):
         # a take with no recorded greeting is rendered as it was captured,
         # aligned depth at 1 mm -- flag it so a reader does not mistake it
@@ -156,12 +167,17 @@ class TakeData:
         """The one line that keeps a figure honest when it is pasted into a paper."""
         metrics = self.manifest.get("metrics") or {}
         annotation = self.manifest.get("annotation") or {}
-        offset = annotation.get("introduced_offset_mm")
         parts = []
-        if offset and any(float(v) for v in offset):
-            parts.append(f"introduced offset ({offset[0]:g}, {offset[1]:g}) mm")
+        if self.manifest.get("kind") == "characterization":
+            # No recipe existed yet, so there is no "introduced offset" to
+            # report -- a characterization measures a ring as it was found.
+            parts.append("ring characterization: coarse-fit ROI, no recipe assumed")
         else:
-            parts.append("no introduced offset")
+            offset = annotation.get("introduced_offset_mm")
+            if offset and any(float(v) for v in offset):
+                parts.append(f"introduced offset ({offset[0]:g}, {offset[1]:g}) mm")
+            else:
+                parts.append("no introduced offset")
         if metrics.get("center_offset_norm_mm") is not None:
             parts.append(f"measured centre offset {metrics['center_offset_norm_mm']:.2f} mm")
         if metrics.get("rms_mm") is not None:
@@ -223,12 +239,53 @@ def geometry_for_take(manifest: dict, K: np.ndarray | None,
     return CameraGeometry.legacy_aligned(np.asarray(K, float), (d.shape[1], d.shape[0]))
 
 
+def _characterization_manifest(char_dir: Path, report: dict) -> dict:
+    """Adapt a ``characterize-NN/report.json`` into the manifest shape every
+    figure builder in this module already reads.
+
+    A characterization measures a ring with NO recipe assumption (see
+    ``processing.characterize_ring``), so it is archived without a
+    ``manifest.json``, a ``recipe`` or a ``nominal_path.json`` -- what IS on
+    disk is the refined fit in ``report['summary']`` and the throwaway coarse
+    recipe the pipeline actually ran with, in ``report['coarse']`` (see
+    ``_compute_characterization_stages``, which rebuilds that recipe to
+    re-run the method figure). Filenames (``color.png``/``depth.npy``/
+    ``measured_path.json``) already match the layer defaults ``load_take``
+    assumes, so only the manifest-shaped metadata needs synthesizing.
+    """
+    summary = report.get("summary") or {}
+    trial_file = char_dir.parent / "trial.json"
+    trial = (json.loads(trial_file.read_text(encoding="utf-8"))
+             if trial_file.is_file() else {})
+    provenance = dict(report.get("provenance") or {})
+    provenance.setdefault("work_frame", report.get("coordinate_frame"))
+    return {
+        "trial_id": trial.get("trial_id", char_dir.parent.name),
+        "layer_index": "characterization", "take": summary.get("index", 1),
+        "mode": "CHARACTERIZE", "kind": "characterization",
+        "recipe": {"radius_mm": summary.get("radius_mm"),
+                   "bead_diameter_mm": summary.get("bead_width_mm")},
+        "metrics": {"measured_center_mm": summary.get("center_mm")},
+        "geometry": report.get("geometry"),
+        "provenance": provenance,
+        "color_file": "color.png", "depth_file": "depth.npy",
+        "pointcloud_file": None,
+        "warnings": report.get("warnings", []),
+        "_report": report,      # kept for _compute_characterization_stages
+    }
+
+
 def load_take(layer_dir: Path) -> TakeData:
     layer_dir = Path(layer_dir)
     manifest_file = layer_dir / "manifest.json"
-    if not manifest_file.is_file():
-        raise FileNotFoundError(f"not an archived take: {layer_dir}")
-    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    if manifest_file.is_file():
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    else:
+        report_file = layer_dir / "report.json"
+        if not report_file.is_file():
+            raise FileNotFoundError(f"not an archived take: {layer_dir}")
+        manifest = _characterization_manifest(
+            layer_dir, json.loads(report_file.read_text(encoding="utf-8")))
     cloud_file = layer_dir / (manifest.get("pointcloud_file") or "height-or-pointcloud.npy")
     depth_file = layer_dir / (manifest.get("depth_file") or "depth.npy")
     cloud = np.load(cloud_file) if cloud_file.is_file() else None
@@ -413,33 +470,137 @@ def _figure_heightmap(plt, take: TakeData):
     return fig
 
 
-def _figure_iso(plt, take: TakeData):
-    if take.cloud is None and take.measured is None:
+def _view_cloud(take: TakeData) -> tuple[np.ndarray | None, tuple | None]:
+    """The densest cloud a 3-D view can honestly draw, windowed to the whole
+    ring with margin.
+
+    Prefers the full re-projected frame (what the camera actually saw) over
+    the archived post-processed cloud, which is the CREST only -- a top-layer
+    selection made after the deposit is found (see ``_deposit_points``); a
+    scene view exists to show what was captured, not just the feature the
+    pipeline kept. Falls back to the archived cloud when there is no frame to
+    re-project (no depth, or a legacy take with no greeting).
+    """
+    anchor = take.nominal if take.nominal is not None else (
+        take.measured if take.measured is not None else take.cloud)
+    window = (_work_window(anchor, take.radius)
+              if anchor is not None and len(anchor) else None)
+    scene = _scene_points(take)                    # frame, else the archived cloud
+    cloud = None
+    if scene is not None and len(scene):
+        band = ((scene[:, 2] > WORK_BAND_MM[0]) & (scene[:, 2] < WORK_BAND_MM[1]))
+        near = _within(scene[band], window) if window is not None else scene[band]
+        if len(near) > 50:
+            cloud = near
+    if cloud is None and take.cloud is not None and len(take.cloud):
+        # The window/band emptied the frame (or there was none) -- the
+        # archived (post-processed) cloud is the fallback, not a blank axes.
+        cloud = take.cloud
+    return cloud, window
+
+
+def render_view(take: TakeData, *, azim: float = -58.0, elev: float = 26.0,
+                birdseye: bool = False, title: str | None = None, plt=None):
+    """One 3-D view of a take's scene, at whatever azimuth/elevation is asked for.
+
+    This is the controllable entry point behind both the ``iso`` figure
+    (default oblique) and the ``birdseye`` figure (``birdseye=True``): the
+    same rendering, aimed differently, so the two can never show different
+    data by accident.
+
+    ``birdseye=True`` looks straight down (elevation pinned to 90°, an
+    orthographic projection so it reads as a true plan rather than a
+    perspective sketch) and widens the window so the WHOLE ring sits inside
+    the axes with margin -- not a crop of it.
+    """
+    plt = plt or _pyplot()
+    cloud, window = _view_cloud(take)
+    if cloud is None and take.measured is None and take.nominal is None:
         return None
-    fig = plt.figure(figsize=(6.6, 5.4))
-    ax = fig.add_subplot(111, projection="3d")
-    zs = [a[:, 2] for a in (take.cloud, take.measured) if a is not None and len(a)]
+    if birdseye:
+        elev, azim = 90.0, -90.0
+        if window is not None:
+            cx, cy = (window[0] + window[1]) / 2.0, (window[2] + window[3]) / 2.0
+            half = max(window[1] - window[0], window[3] - window[2]) / 2.0 * 1.15
+            window = (cx - half, cx + half, cy - half, cy + half)
+    zs = [a[:, 2] for a in (cloud, take.measured, take.nominal) if a is not None and len(a)]
     span = float(np.ptp(np.concatenate(zs))) if zs else 0.0
-    factor = _z_exaggeration(take.radius, span)
-    if take.cloud is not None and len(take.cloud):
-        ax.scatter(take.cloud[:, 0], take.cloud[:, 1], take.cloud[:, 2] * factor,
-                   s=2, c=CLOUD, linewidths=0, label="deposit surface")
+    # A top-down view has no perspective for height to read through, so there
+    # is nothing honest to exaggerate -- Z is drawn true and said so.
+    factor = 1.0 if birdseye else _z_exaggeration(take.radius, span)
+
+    fig = plt.figure(figsize=(7.2, 6.6) if birdseye else (6.6, 5.4))
+    ax = fig.add_subplot(111, projection="3d")
+    if cloud is not None and len(cloud):
+        dots = ax.scatter(cloud[:, 0], cloud[:, 1], cloud[:, 2] * factor, s=2,
+                          c=cloud[:, 2], cmap=CMAP, linewidths=0,
+                          label=f"scene ({len(cloud)} pts)")
+        fig.colorbar(dots, ax=ax, shrink=.7, pad=.09).set_label("Z (mm)", fontsize=8)
     if take.nominal is not None:
         ax.plot(take.nominal[:, 0], take.nominal[:, 1], take.nominal[:, 2] * factor,
-                color=NOMINAL, linewidth=1.4, linestyle="--", label="nominal circle")
+                color=NOMINAL, linewidth=1.6, linestyle="--", label="nominal circle")
+    truth = expected_ring(take)
+    if truth is not None:
+        ax.plot(truth[:, 0], truth[:, 1], truth[:, 2] * factor, color=GROUND_TRUTH,
+                linewidth=1.7, linestyle="-.", label="ground truth")
     if take.measured is not None:
         ax.plot(take.measured[:, 0], take.measured[:, 1], take.measured[:, 2] * factor,
-                color=MEASURED, linewidth=2.2, label="extracted centreline")
+                color=MEASURED, linewidth=2.4, label="extracted centreline")
     ax.set_xlabel("X (mm)", fontsize=9)
     ax.set_ylabel("Y (mm)", fontsize=9)
-    ax.set_zlabel(f"Z × {factor:g} (mm)", fontsize=9)
-    ax.set_title(f"Oblique view — {take.label}", fontsize=10)
-    ax.view_init(elev=26, azim=-58)
-    ax.legend(loc="upper left", fontsize=8)
-    fig.text(.5, .015, f"{take.caption} · vertical exaggeration ×{factor:g}",
-             ha="center", fontsize=7.5, color="#4b5563")
-    fig.tight_layout(rect=(0, .035, 1, 1))
+    if birdseye:
+        # Looking straight down, the Z axis is edge-on: its ticks/label land
+        # on top of the title rather than reading as a third dimension.
+        # Height is still carried honestly -- by the colour, via the colourbar.
+        ax.set_zticks([])
+        ax.set_zlabel("")
+    else:
+        ax.set_zlabel("Z (mm)" if factor == 1.0 else f"Z × {factor:g} (mm)", fontsize=9)
+    kind = "Bird's-eye (top-down)" if birdseye else "Oblique view"
+    # A 3-D axes' own ``set_title`` centres on the AXES, not the figure -- for
+    # a long label that can push the text left of the canvas edge and clip it.
+    # ``suptitle`` centres on the whole figure instead.
+    fig.suptitle(title or f"{kind} — {take.label}", fontsize=10,
+                y=.97 if birdseye else .99)
+    ax.view_init(elev=elev, azim=azim)
+    if birdseye:
+        try:
+            ax.set_proj_type("ortho")
+        except Exception:
+            pass
+    if window is not None:
+        ax.set_xlim(window[0], window[1])
+        ax.set_ylim(window[2], window[3])
+    if cloud is not None and len(cloud):
+        ax.legend(loc="upper left", fontsize=8)
+    # The box has to carry the SAME proportions as the data, or the drawing
+    # exaggerates by whatever the box happens to be, on top of (or instead
+    # of) the stated factor -- see ``_draw_mesh_pair``'s box-aspect trap.
+    try:
+        dx = (window[1] - window[0]) if window is not None else (
+            float(np.ptp(cloud[:, 0])) if cloud is not None and len(cloud) else 1.0)
+        dy = (window[3] - window[2]) if window is not None else (
+            float(np.ptp(cloud[:, 1])) if cloud is not None and len(cloud) else 1.0)
+        scale = max(dx, dy, 1e-6)
+        ax.set_box_aspect((dx / scale, dy / scale, max(span * factor / scale, .12)))
+    except Exception:
+        pass
+    caption = take.caption
+    if factor != 1.0:
+        caption += f" · vertical exaggeration ×{factor:g}"
+    if birdseye:
+        caption += " · top-down, framed to fit the whole ring with margin"
+    fig.text(.5, .015, wrap_caption(caption), ha="center", fontsize=7.5, color="#4b5563")
+    fig.tight_layout(rect=(0, .035, 1, .95 if birdseye else 1))
     return fig
+
+
+def _figure_iso(plt, take: TakeData):
+    return render_view(take, azim=-58.0, elev=26.0, birdseye=False, plt=plt)
+
+
+def _figure_birdseye(plt, take: TakeData):
+    return render_view(take, birdseye=True, plt=plt)
 
 
 def unrolled_profile(measured: np.ndarray, center, radius: float) -> dict:
@@ -484,7 +645,9 @@ def take_stages(take: TakeData) -> "dict | None":
            manifest_file.stat().st_mtime_ns if manifest_file.is_file() else 0)
     if key in _STAGE_CACHE:
         return _STAGE_CACHE[key]
-    stages = _compute_stages(take)
+    stages = (_compute_characterization_stages(take)
+              if take.manifest.get("kind") == "characterization"
+              else _compute_stages(take))
     _STAGE_CACHE.clear()
     _STAGE_CACHE[key] = stages
     return stages
@@ -522,6 +685,69 @@ def _compute_stages(take: TakeData) -> "dict | None":
             config=ExtrusionConfig.model_validate(config_payload), stages=stages)
     except Exception:
         # A take that cannot be reconstructed still gets its other figures.
+        return stages or None
+    stages["result"] = result
+    return stages
+
+
+def _compute_characterization_stages(take: TakeData) -> "dict | None":
+    """Re-run a characterization's own (unarchived) throwaway plan.
+
+    ``characterize_ring`` fits a coarse circle from the frame itself, builds a
+    one-layer plan from it (radius/height/bead clipped exactly the way it
+    does), and re-runs ``process_observation`` on that plan -- but the coarse
+    plan is never written to disk, only the numbers it was built from
+    (``report['coarse']``, stashed on the manifest by
+    ``_characterization_manifest``). Rebuilding it here, the same way, lets
+    the method figure show what THIS pass actually saw instead of drawing a
+    second, possibly-drifted implementation of the same fit.
+    """
+    report = take.manifest.get("_report") or {}
+    coarse = report.get("coarse")
+    config_payload = (take.manifest.get("provenance") or {}).get("processing_config")
+    if (not coarse or not config_payload or take.depth is None or take.K is None
+            or take.T_work_camera is None or take.geometry is None):
+        return None
+    trial_file = take.layer_dir.parent / "trial.json"
+    if not trial_file.is_file():
+        return None
+    trial = json.loads(trial_file.read_text(encoding="utf-8"))
+    from .models import CylinderRecipe, CylinderSetup
+    from .toolpath import generate_cylinder_plan
+    from ...core.config import ExtrusionConfig
+    trial_setup = trial.get("setup") or {}
+    center = coarse.get("center_mm") or [0.0, 0.0]
+    try:
+        config = ExtrusionConfig.model_validate(config_payload)
+        recipe = CylinderRecipe(
+            radius_mm=float(np.clip(coarse["radius_mm"], 5.0, 500.0)), layer_count=1,
+            layer_height_mm=float(np.clip(coarse["height_mm"], 0.5, 50.0)),
+            bead_diameter_mm=float(np.clip(coarse["bead_width_mm"], 0.5, 50.0)),
+            robot_speed_mm_s=75.0, extrusion_rate_pct=0.0,
+            points_per_circle=config.measured_spline_points)
+        setup = CylinderSetup(
+            print_tool=trial_setup.get("print_tool") or "unknown",
+            work_frame=trial_setup.get("work_frame") or "work frame",
+            inspection_tool=trial_setup.get("inspection_tool") or "unknown",
+            inspection_auto=True, center_x_mm=float(center[0]), center_y_mm=float(center[1]))
+        plan = generate_cylinder_plan(recipe, setup)
+    except Exception:
+        return None
+    stages: dict = {}
+    colour = take.layer_dir / (take.manifest.get("color_file") or "color.png")
+    image = None
+    if colour.is_file():
+        import cv2
+        image = cv2.imread(str(colour), cv2.IMREAD_COLOR)
+    if image is None:
+        image = np.zeros((*np.asarray(take.depth).shape[:2], 3), np.uint8)
+    from .processing import process_observation
+    try:
+        result = process_observation(
+            color=image, depth=take.depth, geometry=take.geometry,
+            T_work_camera=take.T_work_camera, K=take.K, dist=None, plan=plan,
+            layer=plan.layers[0], config=config, stages=stages, assemble_arcs=True)
+    except Exception:
         return stages or None
     stages["result"] = result
     return stages
@@ -574,7 +800,7 @@ def _figure_pipeline(plt, take: TakeData):
     if raw is None or not len(raw):
         return None
     result = stages.get("result")
-    radius = (take._nominal_circle or ((0.0, 0.0), 40.0))[1]
+    radius = take._nominal_circle[1] if take._nominal_circle is not None else take.radius
     roi = stages.get("above_floor")
     if roi is None or not len(roi):
         roi = stages.get("work_roi")
@@ -847,10 +1073,13 @@ def mesh_panels(take: TakeData) -> list[MeshPanel]:
         if frame is not None and frame is take.cloud:
             frame = None      # the re-projection came back empty; this is its fallback
         # The window is anchored on something the RECIPE knows about -- the
-        # deposit, else the ring that was commanded. Never on the frame itself:
-        # a raw frame's extent is the room, and the failed take 20260828-124136
-        # sized a 32 m panel from one (32 triangles at a 222 mm pitch).
-        anchor = deposit if deposit is not None else take.nominal
+        # deposit, else the ring that was commanded, else (a characterization
+        # has no commanded ring) the centreline it measured. Never on the
+        # frame itself: a raw frame's extent is the room, and the failed take
+        # 20260828-124136 sized a 32 m panel from one (32 triangles at a
+        # 222 mm pitch).
+        anchor = deposit if deposit is not None else (
+            take.nominal if take.nominal is not None else take.measured)
         if frame is not None and len(frame) and anchor is not None and len(anchor):
             window = _work_window(anchor, take.radius)
             near = _within(frame, window)
@@ -1137,6 +1366,7 @@ def _figure_profile(plt, take: TakeData):
 
 _LAYER_BUILDERS = {"plan": _figure_plan, "heightmap": _figure_heightmap,
                    "mesh": _figure_mesh, "iso": _figure_iso,
+                   "birdseye": _figure_birdseye,
                    "profile": _figure_profile, "pipeline": _figure_pipeline}
 
 

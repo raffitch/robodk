@@ -313,6 +313,88 @@ def test_the_same_frame_still_fails_with_the_chroma_gate_disabled():
                                                    voxel_size_m=0.002))
 
 
+# ------------------------------- branch-guard spur limit: measured, not nominal
+
+def test_spur_guard_uses_the_deposits_own_footprint_not_an_inflated_recipe_bead():
+    """A caller's ``recipe.bead_diameter_mm`` can be stale or simply wrong -- a
+    fresh trial's generic default, an operator's guess before any ring has been
+    characterized. The spur-pruning tolerance must not inherit that number
+    uncritically: an OVERSTATED bead inflates the tolerance, which prunes a
+    LONGER twig without asking whether it is real (see the next test for what
+    that costs). Two calls on the SAME clean ring, one with the true bead and
+    one with it more than doubled, must (a) both measure the ring the same way
+    -- this is a topology guard, not a measurement stage -- and (b) both report
+    a ``spur_guard_bead_mm`` clamped near the true footprint, not the inflated
+    recipe value.
+    """
+    pytest.importorskip("open3d")
+    T = syn.inspection_camera_T([CENTER[0], CENTER[1], 6.0], 300.0)
+    ring = syn.RingSpec(40.0, 10.0, CENTER, height_fn=syn.flat(6.0))
+    scene = np.vstack((syn.plane_points(center_xy_mm=CENTER), ring.surface_points()))
+    depth = syn.render_depth(scene, T, noise_mm=0.3)
+    color = np.zeros((720, 1280, 3), np.uint8)
+
+    def run(bead_mm):
+        plan = scene_plan(radius=40.0, bead=bead_mm, layer_height=6.0, center=CENTER)
+        return process_observation(
+            color=color, depth=depth, geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
+            T_work_camera=T, K=syn.K_720P, dist=None, plan=plan, layer=plan.layers[0],
+            config=ExtrusionConfig())
+
+    true_bead = run(10.0)          # recipe already matches the physical ring
+    inflated = run(25.0)           # recipe overstates the bead by 2.5x
+
+    assert true_bead.report["valid"] and inflated.report["valid"]
+    true_guard_mm = true_bead.report["counts"]["spur_guard_bead_mm"]
+    inflated_guard_mm = inflated.report["counts"]["spur_guard_bead_mm"]
+    assert true_guard_mm == pytest.approx(9.5, abs=1.5)
+    # The whole point: NOT the inflated 25 mm the caller supplied.
+    assert inflated_guard_mm < 15.0
+    assert inflated_guard_mm == pytest.approx(true_guard_mm, abs=1.0)
+    # The measurement itself is unmoved by the recipe's (wrong) bead guess.
+    assert inflated.metrics.measured_radius_mm == pytest.approx(
+        true_bead.metrics.measured_radius_mm, abs=1.0)
+    assert (inflated.report["geometry"]["bead_width_mean_mm"]
+            == pytest.approx(true_bead.report["geometry"]["bead_width_mean_mm"], abs=1.0))
+
+
+def test_spur_guard_still_catches_real_contamination_regardless_of_recipe_bead():
+    """The guard must not go silent just because a caller's recipe happens to be
+    wrong in the SAFE direction either. A ring with a genuine tangential shelf
+    of extra material welded to its outer edge (the synthetic stand-in for the
+    2026-08-29 cell's board-patch-on-the-flank failure) has to keep tripping
+    the branch guard whether the recipe's bead assumption is accurate or
+    grossly inflated -- clamping the tolerance to the measured footprint must
+    never let a genuinely contaminated topology through just because the
+    caller supplied a bad number.
+    """
+    pytest.importorskip("open3d")
+    T = syn.inspection_camera_T([CENTER[0], CENTER[1], 6.0], 300.0)
+    ring = syn.RingSpec(40.0, 10.0, CENTER, height_fn=syn.flat(6.0))
+    # A tangential shelf just proud of the ring's own outer edge, spanning a
+    # 20 degree arc -- long enough that neither an accurate nor a doubled+
+    # dilation/spur tolerance can absorb it into the clean loop.
+    r0 = 40.0 + 10.0 / 2.0 + 3.0
+    thetas = np.deg2rad(np.arange(0.0, 20.0, 0.5))
+    radii = np.arange(r0 - 2.5, r0 + 2.5, 0.5)
+    Th, R = np.meshgrid(thetas, radii, indexing="ij")
+    shelf = np.column_stack((
+        CENTER[0] + R.ravel() * np.cos(Th.ravel()),
+        CENTER[1] + R.ravel() * np.sin(Th.ravel()),
+        np.full(Th.size, 4.0)))
+    scene = np.vstack((syn.plane_points(center_xy_mm=CENTER), ring.surface_points(), shelf))
+    depth = syn.render_depth(scene, T, noise_mm=0.3)
+    color = np.zeros((720, 1280, 3), np.uint8)
+
+    for bead_mm in (10.0, 30.0):
+        plan = scene_plan(radius=40.0, bead=bead_mm, layer_height=6.0, center=CENTER)
+        with pytest.raises(RuntimeError, match="branch guard exhausted"):
+            process_observation(
+                color=color, depth=depth, geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
+                T_work_camera=T, K=syn.K_720P, dist=None, plan=plan, layer=plan.layers[0],
+                config=ExtrusionConfig())
+
+
 def test_chroma_gate_keeps_the_chromatic_bead_and_blanks_the_achromatic_board():
     K = np.array([[400.0, 0, 20.0], [0, 400.0, 20.0], [0, 0, 1.0]])
     depth = np.full((40, 40), 300, np.uint16)

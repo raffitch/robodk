@@ -71,17 +71,71 @@ def _plane_basis(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def fit_plane(points: np.ndarray, *, distance: float = 0.006,
-              n_iterations: int = 1000, seed: int = 0
+              n_iterations: int = 1000, seed: int = 0,
+              seed_mask: np.ndarray | None = None
               ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """RANSAC the dominant plane, then least-squares refine on its inliers.
 
     Returns ``(normal_unit, centroid, inlier_mask)``. The normal is oriented to
     positive base-Z ("up"). Deterministic for a fixed ``seed``.
+
+    ``seed_mask`` (2026-08-30 false-refusal investigation): when given, biases
+    plane selection toward the plane THROUGH those points, instead of toward
+    whichever plane in the whole cloud has the most inliers. Plain
+    maximal-consensus RANSAC is blind to intent: given a work platform and a
+    larger patch of something else coplanar-ish elsewhere in the same frame
+    (most commonly the floor beyond a platform's edges, or the floor behind/
+    around it), it deterministically wins with whichever has more points --
+    confirmed live: a 450 mm platform (248k points) lost to an adjoining
+    1071 mm floor (600k points) in the same frame, RANSAC picking the floor
+    every time. ``seed_mask`` names the points the caller actually cares about
+    (typically the aiming reticle / centre-patch region, which is what the
+    operator is actually looking at): a plane is first fit using ONLY those
+    points (recursively, through this same function, so a noisy seed patch is
+    still RANSAC-robust) -- a much smaller, deliberately-scoped candidate set,
+    so a bigger unrelated cluster elsewhere in the frame is never even in
+    contention. That seed plane's inlier set is then GROWN across the full
+    cloud (everything within ``distance`` of that specific plane) and
+    least-squares refined -- the same refine step the unseeded path already
+    does, just anchored at the caller's intent instead of raw popularity.
+
+    Falls back to the unseeded (whole-cloud, today's) behavior when
+    ``seed_mask`` is ``None``, selects fewer than 3 points, or fails to fit a
+    plane on its own -- so a genuinely single-surface scene, or one where the
+    seed region happens to be empty, degrades exactly to the pre-existing
+    algorithm.
     """
     pts = np.asarray(points, dtype=float).reshape(-1, 3)
     n = len(pts)
     if n < 3:
         raise ValueError("need >= 3 points to fit a plane")
+
+    if seed_mask is not None:
+        seed_mask = np.asarray(seed_mask, dtype=bool).reshape(-1)
+        if seed_mask.shape[0] != n:
+            raise ValueError("seed_mask must have one entry per point")
+        seed_pts = pts[seed_mask]
+        if len(seed_pts) >= 3:
+            try:
+                seed_normal, seed_centroid, _ = fit_plane(
+                    seed_pts, distance=distance, n_iterations=n_iterations, seed=seed)
+            except ValueError:
+                seed_normal = None
+            if seed_normal is not None:
+                grown = np.abs((pts - seed_centroid) @ seed_normal) < distance
+                if int(grown.sum()) >= 3:
+                    inl = pts[grown]
+                    centroid = inl.mean(axis=0)
+                    _, _, vt = np.linalg.svd(inl - centroid, full_matrices=False)
+                    normal = vt[2]
+                    normal = normal / np.linalg.norm(normal)
+                    if normal[2] < 0:
+                        normal = -normal
+                    mask = np.abs((pts - centroid) @ normal) < distance
+                    return normal, centroid, mask
+        # Seed region empty / too sparse / failed to fit on its own -- fall
+        # through to the unseeded whole-cloud RANSAC below.
+
     rng = np.random.default_rng(seed)
 
     best_mask: np.ndarray | None = None

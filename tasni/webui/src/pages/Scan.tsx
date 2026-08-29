@@ -116,6 +116,14 @@ interface LargeSurfaceDetail {
   error: string;
   message: string;
   extent_mm?: [number, number] | null;
+  // colour_fov_deg/depth_fov_deg/standoff_mm (2026-08-30 false-refusal fix): the
+  // numbers behind the message, so the operator can verify the claim instead of
+  // just disbelieving it — the refusal names the COLOUR field of view (what they
+  // are looking at) as narrower than the DEPTH field of view (what the plane fit
+  // actually measured over), not "the camera view" as an undifferentiated whole.
+  colour_fov_deg?: [number, number] | null;
+  depth_fov_deg?: [number, number] | null;
+  standoff_mm?: number | null;
   surface_scope?: string;
   workflow_goal?: string;
   primary_action?: string;
@@ -1549,15 +1557,24 @@ function LargeSurfaceNotice({ detail, busy, onSurvey, onDeclareRegion }:
   { detail: LargeSurfaceDetail; busy: boolean; onSurvey: () => void;
     onDeclareRegion: () => void }) {
   const ext = detail.extent_mm;
+  const colourFov = detail.colour_fov_deg;
+  const depthFov = detail.depth_fov_deg;
   return (
     <div className="verdict borderline" style={{ marginTop: 12, marginBottom: 0 }}>
       <div className="verdict-head">
         <span className="verdict-tag">LARGE SURFACE</span>
         <span>{detail.message}</span>
       </div>
+      {colourFov && depthFov && (
+        <div className="hint">Colour field of view ~{Math.round(colourFov[0])} × {Math.round(colourFov[1])}°
+          vs. the depth sensor's own ~{Math.round(depthFov[0])} × {Math.round(depthFov[1])}° — the plane fit
+          runs over the wider depth view, so something coplanar beyond the platform's visible edges (commonly
+          the floor or table it rests on) can be measured as part of the same surface.</div>
+      )}
       {ext && (
-        <div className="hint">Visible extent so far: {Math.round(ext[0])} × {Math.round(ext[1])} mm
-          — at least one edge is outside the frame, so this is a lower bound, not the
+        <div className="hint">Fitted extent so far: {Math.round(ext[0])} × {Math.round(ext[1])} mm
+          {detail.standoff_mm ? ` at ~${Math.round(detail.standoff_mm)} mm standoff` : ""}
+          — at least one edge is outside the colour frame, so this is a lower bound, not the
           platform size.</div>
       )}
       <div className="btn-row">
