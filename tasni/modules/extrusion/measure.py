@@ -1060,26 +1060,47 @@ def detection_error_mm(manifest: dict) -> "float | None":
 AXIS_CHECK_PHASE = "axis check"
 
 
-def pre_shift_reference(manifest: dict, manifests: list[dict]) -> "dict | None":
-    """The ring's last valid measurement before THIS take displaced it.
-
-    Same layer, no introduced offset, a lower take number, a fitted centre, and
-    not the axis-check take. A zero-offset take AFTER the shift is the ring put
-    back, not where it was moved from, so only earlier takes qualify.
-    """
-    layer = int(manifest.get("layer_index") or 0)
-    take = int(manifest.get("take") or 1)
-    earlier = []
+def _undisplaced_takes(manifests: list[dict], layer: int, *,
+                       before_take: int | None = None) -> list[dict]:
+    """Valid, zero-offset, centre-bearing takes of one layer, axis check excluded."""
+    found = []
     for other in manifests:
         metrics = other.get("metrics") or {}
         phase = str((other.get("annotation") or {}).get("phase") or "").strip()
         if (int(other.get("layer_index") or 0) == layer
-                and int(other.get("take") or 1) < take
+                and (before_take is None or int(other.get("take") or 1) < before_take)
                 and introduced_offset_mm(other) == (0.0, 0.0)
                 and phase != AXIS_CHECK_PHASE
                 and metrics.get("valid") and metrics.get("measured_center_mm")):
-            earlier.append(other)
-    return max(earlier, key=lambda m: int(m.get("take") or 1), default=None)
+            found.append(other)
+    return found
+
+
+def pre_shift_reference(manifest: dict, manifests: list[dict]) -> "dict | None":
+    """The measurement THIS take's displacement is measured from.
+
+    First choice, and the only one until 2026-08-29: the same ring's last valid
+    zero-offset take before this one. Same layer, a lower take number, not the
+    axis-check throwaway (a ring moved an untyped amount). A zero-offset take
+    AFTER the shift is the ring put back, not where it was moved from, so only
+    earlier takes qualify.
+
+    Fallback, for a ring that arrives already displaced: the latest valid
+    zero-offset take of the layer BENEATH it. The protocol's top ring is now
+    PLACED off-centre rather than slid, so it has no undisplaced measurement of
+    its own to pair with -- and it never will. Physically that is the right
+    reference anyway: the rule measures how far this ring sits from the one it
+    was stacked on, and centre(this) - centre(below) is exactly that. Scored
+    against the plan centre instead, the whole stack's placement error would be
+    charged to the chain.
+    """
+    layer = int(manifest.get("layer_index") or 0)
+    take = int(manifest.get("take") or 1)
+    same = _undisplaced_takes(manifests, layer, before_take=take)
+    if same:
+        return max(same, key=lambda m: int(m.get("take") or 1))
+    below = _undisplaced_takes(manifests, layer - 1) if layer > 1 else []
+    return max(below, key=lambda m: int(m.get("take") or 1), default=None)
 
 
 def paired_detection(manifest: dict, manifests: list[dict]) -> "dict | None":
@@ -1105,7 +1126,12 @@ def paired_detection(manifest: dict, manifests: list[dict]) -> "dict | None":
         return None
     before = reference["metrics"]["measured_center_mm"]
     shift = (float(after[0]) - float(before[0]), float(after[1]) - float(before[1]))
+    reference_layer = int(reference.get("layer_index") or 0)
     return {"reference_take": int(reference.get("take") or 1),
+            "reference_layer": reference_layer,
+            # True when the ring arrived displaced and is measured against the
+            # one it was stacked on, rather than against its own earlier self.
+            "relative_to_layer_below": reference_layer != int(manifest.get("layer_index") or 0),
             "measured_shift_mm": [shift[0], shift[1]],
             "measured_shift_norm_mm": float(math.hypot(*shift)),
             "detection_error_mm": float(math.hypot(shift[0] - truth[0],
@@ -1203,6 +1229,11 @@ def paper_summary(root: Path, trial_id: str) -> dict:
             "paired_shift_norm_mm": _stat(p["measured_shift_norm_mm"] for p in paired),
             "paired_detection_error_mm": _stat(p["detection_error_mm"] for p in paired),
             "paired_reference_takes": sorted({p["reference_take"] for p in paired}),
+            "paired_reference_layers": sorted({p["reference_layer"] for p in paired}),
+            # A ring that arrived displaced is scored against the ring beneath
+            # it, not against an earlier self it never had.
+            "paired_against_layer_below": bool(
+                paired and all(p["relative_to_layer_below"] for p in paired)),
             # How this condition's takes were bought, and how tightly they
             # agreed with each other. Together across conditions these separate
             # the camera's repeatability from the robot's -- see `repeatability`.
@@ -1268,13 +1299,19 @@ def paper_summary(root: Path, trial_id: str) -> dict:
     for c in conditions:
         if c["introduced_norm_mm"] > 0 and c["paired_detection_error_mm"]["n"]:
             refs = c["paired_reference_takes"]
+            ref_layers = c["paired_reference_layers"]
             ref_text = (f"take {refs[0]}" if len(refs) == 1
                         else "takes " + ", ".join(str(r) for r in refs))
+            ref_layer = (ref_layers[0] if len(ref_layers) == 1 else c["layer_index"])
+            against = (f"the measured centre of the ring it was stacked on (layer "
+                       f"{ref_layer} {ref_text})"
+                       if c["paired_against_layer_below"] else
+                       f"the ring's own last measured position before it was moved (layer "
+                       f"{ref_layer} {ref_text})")
             prose.append(f"A {c['introduced_norm_mm']:.1f} mm introduced offset was recovered "
                          f"as {_fmt(c['paired_shift_norm_mm'])} mm over "
-                         f"{c['paired_detection_error_mm']['n']} take(s), measured against the "
-                         f"ring's own last measured position before it was moved (layer "
-                         f"{c['layer_index']} {ref_text}); detection error "
+                         f"{c['paired_detection_error_mm']['n']} take(s), measured against "
+                         f"{against}; detection error "
                          f"{_fmt(c['paired_detection_error_mm'])} mm (against the plan centre: "
                          f"{_fmt(c['detection_error_mm'])} mm).")
         elif c["introduced_norm_mm"] > 0:

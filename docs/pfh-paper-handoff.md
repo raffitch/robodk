@@ -100,25 +100,21 @@ Restart the backend first (it caches imported modules; check `/api/health` →
 5. **Placement repeatability** (phase `re-placed`): lift and re-place ring 1
    **three times**, measuring each. Still one press per take — your hand has to move
    between them, so they cannot be batched.
-6. **Build the stack** (phase `stacked true`): ring 2 placed true → **one press**
-   (three frames, arm parked); ring 3 true → **one press**. Each layer must be
-   measured as it goes on, because layer N's measurement floor *is* layer N−1's
-   measured top.
-7. **Then come back DOWN, displacing each ring while it is the top one.** Only the
-   top ring can be moved: one with another resting on it cannot be slid or lifted
-   without disturbing what sits above it, and a ring underneath is the measurement
-   floor for everything above it. So, for layer 3, then 2, then 1:
-   - *(layers 2 and 1 only)* lift the ring above off and set it aside → **one press**
-     (phase `newly exposed`). A fresh undisplaced baseline for the newly exposed
-     ring, taken **after** the lift — it is what that ring's own shift is scored
-     against, and it also measures whether lifting a ring off disturbs the one
-     beneath it.
-   - displace this ring ~**10 mm** along a board edge → **one press**; then
-     ~**15 mm from the same marks** (not 5 mm further) → **one press** (phase
-     `top ring shifted`). Type what you actually moved, measured with a steel rule,
-     into *introduced offset X/Y* **before** pressing — 12 mm scores as well as 10.
-   The paper gets the detection error at **three stack heights** instead of only at
-   the top, and no lift is ever attempted on a buried ring.
+6. **Build the stack, bottom to top** (phase `stacked true`): ring 2 placed true →
+   **one press** (three frames, arm parked); ring 3 true → **one press**. Each layer
+   must be measured as it goes on, because layer N's measurement floor *is* layer
+   N−1's measured top.
+7. **Ring 4, placed deliberately off-centre** (phase `top ring shifted`). Set it on
+   top of the stack pushed to one side along a board edge, measure how far it sits
+   from ring 3 with a steel rule, type that into *introduced offset X/Y* **before**
+   pressing, then **one press**. Anything from about 5 to 25 mm works, and 12 mm
+   scores as well as 10. If you do not yet know which board edge is +X, the step
+   offers one throwaway take (phase `axis check`) that tells you from the Offset
+   column; it is excluded from the pairing.
+
+   Nothing is ever slid or lifted off. No ring is disturbed after it has been
+   measured, and no ring is ever asked to move while another rests on it.
+
 8. **Paper summary** → copy the Markdown block, or **Word draft** → a `.docx` with
    the method paragraph, the condition table and the per-take table as real Word
    tables plus the figures, ready to paste into the manuscript. Both are rebuilt from
@@ -128,7 +124,8 @@ Restart the backend first (it caches imported modules; check `/api/health` →
 
 The rail runs this order for you and sets layer, phase and offset per step, so no
 control can be left on a stale value. Finishing a step advances the run by itself;
-clicking a chip goes back to any step without losing your place.
+clicking a chip goes back to any step without losing your place. The plan is fixed at
+**4 layers** — three placed true, one placed off-centre.
 
 ### The side photo (2026-08-29)
 
@@ -239,13 +236,11 @@ introduced offset at ~18 mm). If a take still fails, its raw RGB-D is archived a
   highest ring in the stack and nothing downstream is affected. Physically it is
   also the only one that *can* be displaced: a buried ring cannot be slid or lifted
   without disturbing everything resting on it.
-- **So the stack is torn back down** (2026-08-29). Building 1-2-3 and only ever
-  displacing ring 3 gets the detection error at one stack height. Building up, then
-  lifting ring 3 off to displace ring 2, then ring 2 off to displace ring 1, gets it
-  at three — with every displacement still on a ring that is on top at the time.
-  Each newly exposed ring takes a fresh `newly exposed` baseline **after** the lift,
-  which is both what its shift is paired against and the only measurement of whether
-  lifting a ring off disturbs the one beneath it.
+- **So the offset ring goes on LAST and is never moved again** (2026-08-29). Rather
+  than stack three and then slide the top one, the run stacks three true and places a
+  **fourth already off-centre**. Nothing is ever slid or lifted, so no ring is
+  disturbed after it has been measured — which also means the run never has to reason
+  about whether a lift moved the ring beneath.
 - **Three takes per condition, not one.** `paper-summary` reports mean ± sd per
   condition; a single take has no sd, and requirement #3 needs ≥ 12 measurements in
   total anyway. Those three are frames taken with the arm **parked** — one trip out,
@@ -267,10 +262,17 @@ ways and the paper quotes the second:
   `axis check` throwaway (a ring moved an untyped amount). A zero-offset take taken
   *after* the shift (ring put back) is never the reference.
 
-Consequences for the protocol: an undisplaced take of the ring must exist before it
-is displaced — `stacked true` for the top ring, `newly exposed` for each ring the
-teardown uncovers (step 6 before step 7, and the lift's baseline before that ring's
-shift — the guide already orders it that way);
+**A ring placed already displaced has no earlier self to pair with**, and never will.
+`pre_shift_reference` therefore falls back to the latest valid zero-offset take of the
+layer **beneath** it — which is the right reference anyway, because the steel rule
+measured how far ring 4 sits from ring 3. `paired_against_layer_below` records that
+this happened and the prose says "the ring it was stacked on". The same-layer
+reference stays first choice, so a ring that WAS slid still pairs against its own
+undisplaced take.
+
+Consequences for the protocol: layer 3 must be measured before ring 4 goes on
+(step 6 before step 7 — the guide already orders it that way, and layer 4's ROI floor
+needs it regardless);
 the +X throwaway is recorded with phase `axis check` and must be put back on its
 marks; and the 15 mm condition is measured from the original marks. A displaced
 condition with no undisplaced take of its layer before it is listed under *Still

@@ -120,11 +120,16 @@ const PHASES: Array<{ value: string; label: string; hint: string }> = [
     hint: "ring lifted and put back by hand — placement repeatability" },
   { value: "stacked true", label: "Stacked true",
     hint: "the next ring placed as accurately as you can, no deliberate offset" },
-  { value: "newly exposed", label: "Newly exposed",
-    hint: "the ring above was just lifted off — this ring's baseline as the new top" },
   { value: "top ring shifted", label: "Top ring shifted",
-    hint: "the TOP ring displaced by the offset you typed — the controlled validation" },
+    hint: "the top ring placed off-centre by the offset you typed — the controlled validation" },
 ];
+
+/** The protocol's shape. Constants, not state: they define the run, not its progress. */
+const REPEATS = 3;          // frames per condition, taken with the arm PARKED
+const NOISE_TRIPS = 5;      // whole excursions out and back, unattended, one press
+// Three rings stacked as true as a hand can, then a fourth placed deliberately
+// off-centre: the controlled error the paper's claim rests on.
+const STACK_LAYERS = 4;
 
 /** One step of the ring run: what to do, the single press that does it. */
 interface RunStep {
@@ -685,7 +690,7 @@ export default function Extrusion() {
           nextSetup.orientation_rpy_deg = pose.rpy_deg as [number, number, number];
         }
       }
-      const nextRecipe = { ...recipe, layer_count: Math.max(3, recipe.layer_count) };
+      const nextRecipe = { ...recipe, layer_count: Math.max(STACK_LAYERS, recipe.layer_count) };
       const generated = await api.post<Plan>("/generate",
         { recipe: nextRecipe, setup: nextSetup });
       setRecipe(nextRecipe); setSetup(nextSetup); setPlan(generated);
@@ -961,8 +966,6 @@ export default function Extrusion() {
   //     spread alone, three frames on one trip, in seconds.
   // Read together they say how much of the deviation is the robot and how much
   // is the camera, which is the claim the noise floor exists to support.
-  const REPEATS = 3;                     // frames per condition, arm parked
-  const NOISE_TRIPS = 5;                 // whole excursions, unattended
   const noiseTakes = countPhase(1, "noise floor");
   const replacedTakes = countPhase(1, "re-placed");
   const topLayer = plan?.layers.length ?? 1;
@@ -1008,30 +1011,27 @@ export default function Extrusion() {
       moves: true, disabled: stalled, blocked: motionBlocked,
     });
   };
-  /** Displace THIS layer's ring — it is the top one by now — and measure it. */
-  const shiftStep = (layer: number, opts: { firstOfTheRun: boolean }): RunStep => {
-    const small = countShift(layer, "small"), large = countShift(layer, "large");
-    const onSmall = small < REPEATS;
-    const have = onSmall ? small : large;
-    const nominal = onSmall ? 10 : 15;
-    const owed = Math.max(1, REPEATS - have);
-    // The axis check is a one-off for the whole run: once the operator knows
-    // which way is +X, every later layer reuses the answer.
-    const needsAxis = opts.firstOfTheRun && !axisKnown;
+  /** The top ring, PLACED off-centre: the controlled error the paper shows. */
+  const displacedStep = (layer: number): RunStep => {
+    const placed = countShift(layer, "small") + countShift(layer, "large");
+    const owed = Math.max(1, REPEATS - placed);
+    // Which way is +X has to be known before an offset can be typed with a sign.
+    // One throwaway take answers it, and it is excluded from the pairing.
+    const needsAxis = !axisKnown;
     return runStep({
-      id: `shift${layer}`, label: `Shift L${layer}`, layer,
+      id: `displaced${layer}`, label: `Ring ${layer} offset`, layer,
       title: needsAxis ? "Find out which way is +X"
-        : `Displace ring ${layer} — about ${nominal} mm`,
+        : `Ring ${layer} placed deliberately off-centre`,
       hands: needsAxis
-        ? "Slide the TOP ring roughly 10 mm along one board edge, measure once, then read the "
-          + "Offset column below to see which axis moved and in which direction. Put it back "
-          + "on its marks after."
-        : `Ring ${layer} is the top ring now. Mark where it sits, slide it along a board edge, `
-          + `and measure what you actually moved with a steel rule, from those marks. Type that `
-          + `number — 12 mm scores as well as 10. The ${nominal === 15 ? "15" : "10"} mm `
-          + `condition is measured from the SAME marks, not from where the last one left it.`,
-      done: !needsAxis && small >= REPEATS && large >= REPEATS,
-      progress: needsAxis ? undefined : { have, need: REPEATS },
+        ? `Place ring ${layer} on top, pushed roughly 10 mm off-centre along one board `
+          + "edge, and measure once. The Offset column below then tells you which axis "
+          + "moved and in which direction."
+        : `Place ring ${layer} on top of the stack, deliberately off-centre along a board `
+          + `edge. Measure how far it sits from the ring beneath it with a steel rule and `
+          + `type that — anything from about 5 to 25 mm works, and 12 mm scores as well `
+          + `as 10. Then keep clear.`,
+      done: !needsAxis && placed >= REPEATS,
+      progress: needsAxis ? undefined : { have: placed, need: REPEATS },
       button: needsAxis ? "Take one throwaway measurement"
         : `Measure ${owed} frame${owed === 1 ? "" : "s"} — one trip, arm parked`,
       records: needsAxis ? undefined
@@ -1040,57 +1040,29 @@ export default function Extrusion() {
         ? { layer, phase: "axis check", offset: [0, 0] }
         : { layer, phase: "top ring shifted", offset: offsetVector, repeats: owed }),
       moves: true, disabled: stalled, blocked: motionBlocked,
-      offsetInput: !needsAxis, axisAck: opts.firstOfTheRun,
-      note: `Displace ring ${layer} only. Keep it under 25 mm. The shift is scored against `
-        + `this layer's last undisplaced take, so that one must come first — the step above `
-        + `takes it.`,
+      offsetInput: !needsAxis, axisAck: true,
+      note: "This ring arrives already displaced, so it has no undisplaced take of its own "
+        + `to be scored against. It is paired against the measured centre of ring ${layer - 1} `
+        + "instead — which is what the rule measured anyway: how far this ring sits from the "
+        + "one it was stacked on.",
     });
   };
-
-  // The stack goes UP to build the floors, then comes DOWN to be displaced.
-  //
-  // Every displacement must happen on a ring that is on TOP: a ring with
-  // another resting on it cannot be lifted or slid without disturbing what sits
-  // above it, and a ring underneath is the measurement floor for everything
-  // above it. So the run builds 1-2-3 (each layer measured, because layer N's
-  // floor IS layer N-1's measured top), then displaces ring 3, lifts it off,
-  // displaces ring 2, lifts it off, displaces ring 1. Every ring gets its
-  // controlled offset while it is reachable, and the paper gets the detection
-  // error at three stack heights instead of only at the top.
-  const teardown: RunStep[] = [];
-  for (let layer = topLayer; layer >= 1; layer--) {
-    // Layer 3's undisplaced baseline is the "stacked true" pair of takes from
-    // the build-up. Every lower layer needs a FRESH one: the ring above it was
-    // just lifted off, and whether that disturbed it is exactly what a baseline
-    // taken before the lift could not tell us.
-    if (layer < topLayer) {
-      teardown.push(parkedStep({
-        id: `exposed${layer}`, label: `Expose L${layer}`, layer, phase: "newly exposed",
-        title: `Lift ring ${layer + 1} off — measure ring ${layer} as the new top`,
-        hands: `Lift ring ${layer + 1} off the stack and set it aside. Do not touch ring `
-          + `${layer}. It is the top of the stack now.`,
-        note: "A fresh undisplaced baseline for this ring, taken AFTER the one above it came "
-          + "off — the take its own displacement is scored against. It also measures whether "
-          + "lifting a ring off disturbs the one beneath it, which nothing else here can see.",
-      }));
-    }
-    teardown.push(shiftStep(layer, { firstOfTheRun: layer === topLayer }));
-  }
 
   const RUN: RunStep[] = [
     runStep({
       id: "fresh", label: "Fresh ring", title: "Start a fresh ring",
       hands: "Nothing to place yet. Clear the board and have a scanned surface applied "
         + "(Setup above); this press only decides where the camera looks.",
-      done: Boolean(plan) && (plan?.layers.length ?? 0) >= 3 && Boolean(measureSession),
+      done: Boolean(plan) && (plan?.layers.length ?? 0) >= STACK_LAYERS && Boolean(measureSession),
       button: "Aim at the table & open a session",
       onRun: freshStart,
       disabled: !recipe || !selectionsReady || busy || Boolean(status?.running),
       blocked: !selectionsReady
         ? "Open Setup and choose the work frame, print tool and camera tool." : null,
       note: "The ring's radius, bead and height are MEASURED in the next step, never typed: "
-        + "this only aims the search (within 150 mm of the centre) and fixes three layers, "
-        + "because Apply never changes the layer count later.",
+        + `this only aims the search (within 150 mm of the centre) and fixes ${STACK_LAYERS} `
+        + "layers, because Apply never changes the layer count later. Three go on true; the "
+        + "fourth goes on deliberately off-centre.",
     }),
     runStep({
       id: "ring1", label: "Ring 1", title: characterization
@@ -1154,9 +1126,10 @@ export default function Extrusion() {
       title: "Ring 3 on the stack — three frames",
       hands: "Place ring 3 on top, as true as you can, then keep clear.",
       note: "The camera climbs with the stack: every layer is measured from 300 mm above its "
-        + "own top. This is also ring 3's undisplaced baseline — it is displaced next.",
+        + "own top. Three rings placed as true as a hand can is the baseline the deliberate "
+        + "offset is read against.",
     }),
-    ...teardown,
+    displacedStep(topLayer),
     runStep({
       id: "summary", label: "Summary", title: "Take the numbers",
       hands: "Nothing to touch in the cell.",
@@ -1661,16 +1634,19 @@ export default function Extrusion() {
           </li>)}
         </ol>
         <div className="io-note">
-          <b>The stack goes up, then comes down.</b> Only the <b>TOP</b> ring may ever be
-          displaced — layer N is measured above layer N−1's latest take, so sliding a ring
-          that has another resting on it corrupts everything above it, and you cannot lift it
-          without disturbing them either. So the run builds 1‑2‑3 first (each layer measured,
-          because layer N's floor <i>is</i> layer N−1's measured top), then works back down:
-          displace ring 3, lift it off, displace ring 2, lift it off, displace ring 1. Every
-          ring is displaced while it is the reachable one, and the paper gets the detection
-          error at three stack heights instead of one. After each lift the run takes a fresh
-          undisplaced baseline of the newly exposed ring — that is what its own shift is
-          scored against.
+          <b>Bottom to top, and the error goes on last.</b> Rings 1, 2 and 3 are stacked and
+          measured as true as a hand can place them — each layer must be measured as it goes
+          on, because layer N's measurement floor <i>is</i> layer N−1's measured top. Then ring
+          4 goes on <b>deliberately off-centre</b>: the controlled error the paper's claim
+          rests on. Nothing is ever slid or lifted off, so no ring is disturbed after it has
+          been measured.
+        </div>
+        <div className="io-note">
+          <b>What ring 4 is scored against.</b> It arrives already displaced, so it has no
+          undisplaced take of its own to pair with. It is paired against the measured centre of
+          <b> ring 3</b> instead — which is what your rule measured anyway: how far ring 4 sits
+          from the ring it was stacked on. Scored against the plan centre instead, the whole
+          stack's hand-placement error would be charged to the sensing chain.
         </div>
         <div className="io-note">
           <b>Two kinds of repeat, and why only some batch.</b> The <b>noise floor</b> sends the

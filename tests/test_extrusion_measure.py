@@ -2130,65 +2130,73 @@ def test_old_takes_without_a_trip_stamp_read_as_their_own_excursion(tmp_path, mo
     assert capture_style(legacy) == "re-approach"
 
 
-def test_the_teardown_pairs_each_ring_against_its_own_post_lift_baseline(tmp_path, monkeypatch):
-    """The whole run, in order, with the stack torn back down.
+def test_a_ring_placed_displaced_is_paired_against_the_ring_it_sits_on(tmp_path, monkeypatch):
+    """Ring 4 arrives already off-centre, so it has no earlier self to pair with.
 
-    Layer 3 is displaced while it is the top ring, then lifted off so layer 2 is
-    the top, and so on. Each ring's shift must pair against the baseline taken
-    AFTER the ring above it came off -- pairing against a baseline measured
-    while it was still buried would fold "did the lift disturb it?" into the
-    chain's detection error, which is the one number the paper claims.
+    The rule measured how far it sits from ring 3, so that is what it must be
+    scored against. Scored against the plan centre instead, the whole stack's
+    hand-placement error is charged to the sensing chain.
     """
     from tasni.modules.extrusion.measure import paper_summary
 
     svc, rdk, camera = measure_env(tmp_path, monkeypatch)
-    plan = auto_plan()
+    plan = auto_plan(layers=4)
     root = tmp_path / "runs" / "extrusion"
     session = MeasureSession.create(root, plan)
-    # Ring 2 sits at 200,150; the lift nudges it to 203,150; the 10 mm shift
-    # then takes it to 213,150. Paired against the post-lift baseline the chain
-    # sees exactly 10; against the pre-lift one it would see 13.
-    where = {"n": 0}
-    positions = [(200.0, 150.0)] * 3 + [(203.0, 150.0)] * 3 + [(213.0, 150.0)] * 3
+    # The stack was hand-placed 3 mm off the plan centre; ring 4 then sits a
+    # further 10 mm out. The chain must report 10, not 13.
+    centres = iter([(203.0, 150.0)] * 3 + [(213.0, 150.0)] * 3)
 
     def at_position(**kwargs):
         out = fake_measure_processing(**kwargs)
-        centre = positions[where["n"]]
+        centre = next(centres)
         out.metrics.measured_center_mm = centre
-        # Keep the fake self-consistent: the offset IS where the ring sits
-        # relative to the plan centre, which is what the unpaired score reads.
         out.metrics.center_offset_mm = (centre[0] - 200.0, centre[1] - 150.0)
-        where["n"] += 1
         return out
 
     monkeypatch.setattr(measure_mod, "process_observation", at_position)
-    # Build: layer 2 measured true, with ring 3 on top of it.
-    RingMeasureJob(svc, plan, session, 2, annotation={"phase": "stacked true"},
+    for layer in (1, 2, 3):
+        session.tops[layer] = [[0.0, 0.0, 0.0]]          # floors for the layer above
+    RingMeasureJob(svc, plan, session, 3, annotation={"phase": "stacked true"},
                    check_collisions=False, repeats=3)(Ctx())
-    # Teardown: ring 3 lifted off, layer 2 re-baselined as the new top...
-    RingMeasureJob(svc, plan, session, 2, annotation={"phase": "newly exposed"},
-                   check_collisions=False, repeats=3)(Ctx())
-    # ...then displaced 10 mm and measured.
-    RingMeasureJob(svc, plan, session, 2,
+    RingMeasureJob(svc, plan, session, 4,
                    annotation={"phase": "top ring shifted",
                                "introduced_offset_mm": [10, 0]},
                    check_collisions=False, repeats=3)(Ctx())
 
     summary = paper_summary(root, session.trial_id)
     shifted = next(c for c in summary["conditions"] if c["introduced_norm_mm"] > 0)
-    # Paired against take 6 (the last `newly exposed`), not take 3.
-    assert shifted["paired_reference_takes"] == [6]
+    assert shifted["paired_reference_layers"] == [3], "paired against the ring beneath it"
+    assert shifted["paired_against_layer_below"] is True
     assert shifted["paired_shift_norm_mm"]["mean"] == pytest.approx(10.0, abs=0.01)
     assert shifted["paired_detection_error_mm"]["mean"] == pytest.approx(0.0, abs=0.01)
-    # Scored against the plan centre instead, the lift's 3 mm would show up as
-    # detection error the chain never made.
+    # The unpaired score carries the stack's own 3 mm placement error.
     assert shifted["detection_error_mm"]["mean"] == pytest.approx(3.0, abs=0.01)
+    assert any("the ring it was stacked on" in p for p in summary["prose"])
 
 
-# -- the side photo for the paper --------------------------------------------
-# One RGB photo of the stack from the side after a layer's capture completes.
-# TAUGHT targets, because the operator taught them around the real obstacles in
-# the cell and nothing in the station model knows those are there.
+def test_a_ring_that_was_slid_still_pairs_against_its_own_earlier_take(tmp_path, monkeypatch):
+    """The same-layer reference stays first choice; the layer below is a fallback.
+
+    A ring measured true and THEN displaced has its own undisplaced position on
+    record, which is a tighter reference than the ring beneath it.
+    """
+    from tasni.modules.extrusion.measure import pre_shift_reference
+
+    same_layer = {"layer_index": 3, "take": 2, "annotation": {},
+                  "metrics": {"valid": True, "measured_center_mm": [201.0, 150.0]}}
+    below = {"layer_index": 2, "take": 9, "annotation": {},
+             "metrics": {"valid": True, "measured_center_mm": [200.0, 150.0]}}
+    shifted = {"layer_index": 3, "take": 5,
+               "annotation": {"introduced_offset_mm": [10, 0]},
+               "metrics": {"valid": True, "measured_center_mm": [211.0, 150.0]}}
+
+    assert pre_shift_reference(shifted, [below, same_layer, shifted]) is same_layer
+    # With no take of its own, it falls back to the ring beneath.
+    assert pre_shift_reference(shifted, [below, shifted]) is below
+    # Layer 1 has nothing beneath it, so it stays unpaired rather than inventing one.
+    lonely = {**shifted, "layer_index": 1}
+    assert pre_shift_reference(lonely, [below, lonely]) is None
 
 def test_the_side_photo_goes_out_and_back_through_the_approach_target(tmp_path, monkeypatch):
     """Neutral -> approach -> side, and side -> approach -> neutral.
