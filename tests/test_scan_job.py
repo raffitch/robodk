@@ -175,7 +175,9 @@ def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
             for n in list(names): state["targets"].pop(n, None)
         def move_j(self, name): state["cam"] = state["targets"][name]
         def add_frame(self, name, T, parent=None):
-            self.inserted["frame"] = np.asarray(T, float)
+            # Keyed by name: insert_scan adds the corner frame AND the centre frame,
+            # so a single "frame" slot would hide one of them.
+            self.inserted["frame" if name == scan_service.FRAME_NAME else name] =                 np.asarray(T, float)
             return SimpleNamespace(Valid=lambda: True)
         def add_rectangle(self, name, corners, parent=None, color=None):
             self.inserted["rect"] = np.asarray(corners, float)
@@ -306,6 +308,14 @@ def test_generate_run_insert():
             np.testing.assert_allclose(np.abs(centre), [size[0] / 2, size[1] / 2], atol=1e-6)
             assert np.linalg.norm(centre) > 1.0, centre
             np.testing.assert_allclose(centre, corners_frame[:, :2].mean(axis=0), atol=1e-6)
+
+            # ...and the same middle is published as a FRAME under the corner frame, so
+            # it is saved with the station and survives the runs directory being cleared.
+            assert out["center_frame"] == scan_service.CENTER_NAME
+            assert active["center_frame"] == scan_service.CENTER_NAME
+            centre_T = rdk.inserted[scan_service.CENTER_NAME]
+            np.testing.assert_allclose(centre_T[:3, :3], np.eye(3), atol=1e-9)
+            np.testing.assert_allclose(centre_T[:3, 3], corners_frame.mean(axis=0), atol=1e-6)
 
             # Insert by run_id (from disk) also works.
             rdk.inserted.clear()

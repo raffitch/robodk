@@ -281,20 +281,30 @@ def test_surface_placement_is_fingerprinted():
 def test_api_centres_on_the_scanned_surface_and_gates_when_absent(tmp_path, monkeypatch):
     monkeypatch.setattr(runs, "REPO_ROOT", tmp_path)
     client = TestClient(create_app(AppConfig()))
-    empty = client.get("/api/modules/extrusion/scan-surface").json()
+    frame = {"work_frame": "Tasni Work Frame"}
+    body = {"radius_mm": 40, "bead_diameter_mm": 6, **frame}
+    empty = client.get("/api/modules/extrusion/scan-surface", params=frame).json()
     assert empty["applied"] is False and empty["available"] is False
     assert client.post("/api/modules/extrusion/center-on-surface",
-                       json={"radius_mm": 40, "bead_diameter_mm": 6}).status_code == 409
+                       json=body).status_code == 409
 
     write_active_scan(tmp_path)
-    applied = client.get("/api/modules/extrusion/scan-surface").json()
+    applied = client.get("/api/modules/extrusion/scan-surface", params=frame).json()
     assert applied["applied"] is True and applied["available"] is True
-    centred = client.post("/api/modules/extrusion/center-on-surface",
-                          json={"radius_mm": 40, "bead_diameter_mm": 6}).json()
+    assert applied["source"] == "scan_run"
+    centred = client.post("/api/modules/extrusion/center-on-surface", json=body).json()
     assert centred["setup"] == {"work_frame": "Tasni Work Frame", "center_x_mm": 200.0,
                                 "center_y_mm": 150.0, "build_plane_z_mm": 0.0,
                                 "scan_run_id": "20260812-101500"}
     assert centred["fit"]["inside"] is True
+
+    # The disk pointer describes ONE frame. Asking in another must not silently reuse
+    # its numbers -- the platform is simply unknown there until the station says.
+    other = {"work_frame": "World"}
+    assert client.get("/api/modules/extrusion/scan-surface",
+                      params=other).json()["applied"] is False
+    assert client.post("/api/modules/extrusion/center-on-surface",
+                       json={**body, **other}).status_code == 409
 
     # That placement flows through generate -> preflight as surface-placed.
     payload = generate_payload()

@@ -29,8 +29,17 @@ interface ScanSurface {
   applied: boolean; available: boolean; note?: string;
   frame?: string; rectangle?: string | null; run_id?: string | null;
   applied_at?: string | null; size_mm?: [number, number] | null;
-  center_mm?: [number, number] | null;
+  center_mm?: [number, number] | null; center_z_mm?: number;
+  // Where the middle came from. The station sources outlive a cleared runs/ tree;
+  // "scan_run" is the disk pointer and is the only one that carries a run id.
+  source?: "center_frame" | "surface_object" | "scan_run";
+  extents_known?: boolean;
 }
+const PLATFORM_SOURCE: Record<string, string> = {
+  center_frame: "centre frame in RoboDK",
+  surface_object: "work-surface object in RoboDK",
+  scan_run: "applied scan run",
+};
 interface InspectionPreview {
   auto: boolean; object_diameter_mm: number; standoff_mm: number; ok: boolean;
   work_frame: string; warnings: string[];
@@ -457,8 +466,12 @@ export default function Extrusion() {
       if (value.result?.kind?.startsWith("cylinder_")) setResult(value.result);
     }).catch(() => {});
   }, []);
-  const refreshSurface = useCallback(() => {
-    api.get<ScanSurface>("/scan-surface").then(setSurface).catch(() => setSurface(null));
+  // The platform is resolved IN a frame, so this has to be re-asked whenever the
+  // work-frame selection changes -- the same table has different coordinates in each.
+  const refreshSurface = useCallback((frame: string) => {
+    if (!frame) { setSurface(null); return; }
+    api.get<ScanSurface>(`/scan-surface?work_frame=${encodeURIComponent(frame)}`)
+      .then(setSurface).catch(() => setSurface(null));
   }, []);
   useEffect(() => {
     api.get<Config>("/config").then((value) => {
@@ -468,8 +481,11 @@ export default function Extrusion() {
       setPlan(value); setRecipe(value.recipe); setSetup(value.setup);
       setSelectedLayer(1); setQuickLayers([1]);
     }).catch(() => {});
-    refreshStatus(); refreshSurface();
-  }, [refreshStatus, refreshSurface]);
+    refreshStatus();
+  }, [refreshStatus]);
+  useEffect(() => {
+    refreshSurface(setup?.work_frame ?? "");
+  }, [refreshSurface, setup?.work_frame, connected]);
 
   useEffect(() => subscribe((event: JobEvent) => {
     const name = event.payload?.name as string | undefined;
@@ -558,8 +574,8 @@ export default function Extrusion() {
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
 
-  const centerOnScannedSurface = async () => {
-    if (!setup || !recipe) return;
+  const centerOnPlatform = async () => {
+    if (!setup || !recipe || !setup.work_frame) return;
     // Re-centring on the scanned surface throws away a placement measured from
     // the physical ring. Doing that mid-session and regenerating is exactly how
     // the 2026-08-28 stale-plan artifact was produced.
@@ -567,12 +583,13 @@ export default function Extrusion() {
       `This session measures against the ring characterized at r ${measureSession.applied.recipe.radius_mm} mm, `
       + `centre (${measureSession.applied.setup.center_x_mm.toFixed(1)}, `
       + `${measureSession.applied.setup.center_y_mm.toFixed(1)}). Centring on the scanned surface `
-      + "replaces that placement with the table centre, and measuring against it would score the "
+      + "replaces that placement with the platform centre, and measuring against it would score the "
       + "ring against a plan it was never placed on.\n\nRe-centre anyway?")) return;
-    setBusy(true); setMessage("Reading the applied scan surface…");
+    setBusy(true); setMessage(`Locating the middle of the platform in ${setup.work_frame}…`);
     try {
       const response = await api.post<{ setup: Partial<Setup>; surface: ScanSurface; fit: SurfaceFit }>(
-        "/center-on-surface", { radius_mm: recipe.radius_mm, bead_diameter_mm: recipe.bead_diameter_mm });
+        "/center-on-surface", { radius_mm: recipe.radius_mm,
+          bead_diameter_mm: recipe.bead_diameter_mm, work_frame: setup.work_frame });
       const frame = response.setup.work_frame || setup.work_frame;
       const pose = await api.post<{ xyz_mm: number[]; rpy_deg: number[] }>("/current-tcp", {
         print_tool: setup.print_tool, work_frame: frame,
@@ -581,9 +598,12 @@ export default function Extrusion() {
       setSetup({ ...setup, ...response.setup,
         orientation_rpy_deg: pose.rpy_deg as [number, number, number] });
       const size = response.surface.size_mm;
-      invalidate(response.fit.inside
-        ? `Centred on the scanned surface${size ? ` (${size[0].toFixed(0)} × ${size[1].toFixed(0)} mm)` : ""} in ${response.setup.work_frame}; current neutral TCP orientation captured as ${pose.rpy_deg.map((v) => v.toFixed(1)).join(", ")}° — generate coordinates next.`
-        : `Centred, but the wall overhangs the measured surface by ${Math.abs(response.fit.minimum_margin_mm ?? 0).toFixed(1)} mm. Reduce the radius or re-scan a larger surface; preflight will reject it.`);
+      const where = `on the middle of the platform${size ? ` (${size[0].toFixed(0)} × ${size[1].toFixed(0)} mm)` : ""} in ${frame}, from the ${PLATFORM_SOURCE[response.surface.source ?? ""] ?? "platform"}`;
+      invalidate(response.fit.checked === false
+        ? `Centred ${where}; its extents are unknown here, so the wall was NOT checked against them — ${response.fit.reason ?? "no bounds"}.`
+        : response.fit.inside
+        ? `Centred ${where}; current neutral TCP orientation captured as ${pose.rpy_deg.map((v) => v.toFixed(1)).join(", ")}° — generate coordinates next.`
+        : `Centred, but the wall overhangs the platform by ${Math.abs(response.fit.minimum_margin_mm ?? 0).toFixed(1)} mm. Reduce the radius or re-scan a larger surface; preflight will reject it.`);
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
 
@@ -592,7 +612,7 @@ export default function Extrusion() {
     try {
       await api.post("/connect");
       const discovered = await api.get<StationOptions>("/station-options");
-      setOptions(discovered); setConnected(true); refreshSurface();
+      setOptions(discovered); setConnected(true);
       setMessage("Station loaded. Select print/inspection tools, work frame, and inspection target.");
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
@@ -689,7 +709,8 @@ export default function Extrusion() {
       if (surface?.available) {
         const centred = await api.post<{ setup: Partial<Setup>; surface: ScanSurface }>(
           "/center-on-surface",
-          { radius_mm: recipe.radius_mm, bead_diameter_mm: recipe.bead_diameter_mm });
+          { radius_mm: recipe.radius_mm, bead_diameter_mm: recipe.bead_diameter_mm,
+            work_frame: setup.work_frame });
         nextSetup = { ...nextSetup, ...centred.setup };
         setSurface({ ...centred.surface, applied: true });
         if (connected && setup.print_tool) {
@@ -1255,25 +1276,31 @@ export default function Extrusion() {
           </div>
           <div className="btn-row">
             <button className="secondary" disabled={!surface?.available || !connected || !setup.print_tool || busy || status?.running}
-              onClick={centerOnScannedSurface}>Center on scanned surface</button>
+              title={`Put the cylinder on the middle of the platform, expressed in ${setup.work_frame || "the selected work frame"}`}
+              onClick={centerOnPlatform}>Center on platform</button>
             <button className="secondary" disabled={!connected || busy || !setup.print_tool || !setup.work_frame}
               onClick={captureCurrentOrientation}>Capture neutral orientation only</button>
             <button className="secondary" disabled={!connected || busy || !setup.print_tool || !setup.work_frame}
               onClick={seedFromCurrentTcp}>Seed path start from current TCP</button>
           </div>
           <div className={`surface-row ${surface?.available ? "ready" : "warn-text"}`}>
-            <span className="conn-label">Scan surface</span>
-            <span className="status-line">{surface?.applied
-              ? `${surface.frame} · ${surface.size_mm ? `${surface.size_mm[0].toFixed(0)} × ${surface.size_mm[1].toFixed(0)} mm · ` : ""}run ${surface.run_id ?? "unknown"}${surface.applied_at ? ` · applied ${surface.applied_at.replace("T", " ")}` : ""}`
-              : surface?.note || "No scanned surface applied — run the Scan module first."}</span>
-            <button className="secondary" disabled={busy} onClick={refreshSurface}>Re-check</button>
+            <span className="conn-label">Platform</span>
+            <span className="status-line">{surface?.available
+              ? `middle at (${surface.center_mm?.[0].toFixed(1)}, ${surface.center_mm?.[1].toFixed(1)}) in ${surface.frame} · ${surface.size_mm ? `${surface.size_mm[0].toFixed(0)} × ${surface.size_mm[1].toFixed(0)} mm · ` : "size unknown · "}${PLATFORM_SOURCE[surface.source ?? ""] ?? "unknown source"}${surface.run_id ? ` ${surface.run_id}` : ""}`
+              : surface?.note || `No platform is known in ${setup.work_frame || "the selected work frame"}.`}</span>
+            <button className="secondary" disabled={busy}
+              onClick={() => refreshSurface(setup.work_frame)}>Re-check</button>
           </div>
-          {surface?.applied && !surface.available && <div className="hint warn-text">{surface.note}</div>}
-          <div className="hint">Preferred flow: scan the surface, insert it, then <b>Center on scanned surface</b> — the cylinder lands in the middle of the measured rectangle and automatically captures the current neutral TCP orientation. <b>Capture neutral orientation only</b> refreshes orientation without changing the cylinder center or Z. Center, build-plane Z, and RoboDK XYZRPW are expressed in the selected work frame. The generated IK keeps the neutral front/elbow/wrist configuration, limits both axes 4 and 6 to ±90°, and samples the interpolated joint path to block hidden wrist flips before playback. These exact values are fingerprinted and simulated.</div>
+          {surface?.available && !surface.extents_known && <div className="hint warn-text">
+            The middle is known but the platform&apos;s size is not, in this frame — the wall
+            will NOT be checked for overhang. Select <code>Tasni Work Frame</code> for that check.</div>}
+          <div className="hint">Preferred flow: scan the platform, insert it, then <b>Center on platform</b> — the cylinder lands in the middle of the measured rectangle and automatically captures the current neutral TCP orientation. The middle is read from RoboDK (the <code>Tasni Work Center</code> frame, else the <code>Tasni Work Surface</code> object) and only then from the applied scan run, so it survives clearing the runs folder; the work-frame dropdown chooses which coordinate system it is expressed in, not where the platform is. <b>Capture neutral orientation only</b> refreshes orientation without changing the cylinder center or Z. Center, build-plane Z, and RoboDK XYZRPW are expressed in the selected work frame. The generated IK keeps the neutral front/elbow/wrist configuration, limits both axes 4 and 6 to ±90°, and samples the interpolated joint path to block hidden wrist flips before playback. These exact values are fingerprinted and simulated.</div>
           {setup.scan_run_id
             ? <div className="hint">Placed on scan run <code>{setup.scan_run_id}</code>. Re-scanning the surface invalidates this placement, and preflight rejects a wall that overhangs the measured rectangle.</div>
-            : surface?.available && surface.frame !== setup.work_frame &&
-              <div className="hint warn-text">A scanned surface is applied on <code>{surface.frame}</code> but this path is placed manually in <code>{setup.work_frame || "no frame"}</code>.</div>}
+            : surface?.available && surface.center_mm
+              && (Math.hypot(setup.center_x_mm - surface.center_mm[0],
+                             setup.center_y_mm - surface.center_mm[1]) > 1) &&
+              <div className="hint warn-text">This path is placed at ({setup.center_x_mm.toFixed(1)}, {setup.center_y_mm.toFixed(1)}), but the middle of the platform in <code>{setup.work_frame}</code> is ({surface.center_mm[0].toFixed(1)}, {surface.center_mm[1].toFixed(1)}).</div>}
           {setup.work_frame === "World" && <div className="hint warn-text">World is allowed, but every X/Y/Z value is then a station-world coordinate. Use the current-TCP seed button unless world zero is deliberately your build plane.</div>}
         </>}
       </div>

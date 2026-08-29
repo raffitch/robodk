@@ -1196,6 +1196,51 @@ class RdkIO:
             return False
         return bool(self.rdk.Item(name, types[kind]).Valid())
 
+    def frame_origin_in_frame(self, frame_name: str,
+                              in_frame_name: str) -> np.ndarray | None:
+        """Origin (xyz mm) of frame ``frame_name`` expressed in ``in_frame_name``.
+
+        ``None`` when either frame is absent, so callers fall through to another
+        source instead of placing work at a fabricated zero.
+        """
+        import robolink
+
+        frame = self.rdk.Item(frame_name, robolink.ITEM_TYPE_FRAME)
+        reference = self.rdk.Item(in_frame_name, robolink.ITEM_TYPE_FRAME)
+        if not frame.Valid() or not reference.Valid():
+            return None
+        try:
+            return pose_to_T(frame.PoseWrt(reference))[:3, 3]
+        except Exception:
+            return None
+
+    def object_mesh_in_frame(self, object_name: str,
+                             in_frame_name: str) -> np.ndarray | None:
+        """Vertices (N x 3 mm) of an OBJECT's mesh, expressed in ``in_frame_name``.
+
+        This is how a scan-derived work surface is recovered from the *station* rather
+        than from ``runs/`` — the corners the scan drew are baked into the object's own
+        geometry, so they outlive the run directory that produced them. ``GetPoints``
+        returns XYZijk rows in the object's local coordinates; its pose relative to the
+        asked-for frame carries them the rest of the way. ``None`` when the object is
+        absent or carries no readable mesh.
+        """
+        import robolink
+
+        obj = self.rdk.Item(object_name, robolink.ITEM_TYPE_OBJECT)
+        reference = self.rdk.Item(in_frame_name, robolink.ITEM_TYPE_FRAME)
+        if not obj.Valid() or not reference.Valid():
+            return None
+        try:
+            points, _ = obj.GetPoints(robolink.FEATURE_OBJECT_MESH)
+            local = np.asarray(points, dtype=float)
+            T = pose_to_T(obj.PoseWrt(reference))
+        except Exception:
+            return None
+        if local.ndim != 2 or local.shape[0] == 0 or local.shape[1] < 3:
+            return None
+        return (T[:3, :3] @ local[:, :3].T).T + T[:3, 3]
+
     def use_named_tool_frame(self, tool_name: str, frame_name: str) -> np.ndarray:
         """Activate exact selected TOOL and FRAME items; return flange->TCP."""
         import robolink

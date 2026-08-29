@@ -80,6 +80,11 @@ SCAN_MIN_VIEWS = 4
 # Names of the items insert creates in the station (replaced on each insert).
 FRAME_NAME = "Tasni Work Frame"
 RECT_NAME = "Tasni Work Surface"
+#: A frame on the MIDDLE of the measured rectangle, as a child of FRAME_NAME.
+#: FRAME_NAME's origin is deliberately a CORNER, so downstream work that wants the
+#: middle of the platform (extrusion centring) would otherwise have to recover the
+#: rectangle first. This frame is that answer, saved with the station.
+CENTER_NAME = "Tasni Work Center"
 MESH_NAME = "Tasni Scan Mesh"
 
 # five_position_capture's corner-detection retry (Task 13 review, remedy ii): a
@@ -3414,6 +3419,12 @@ def insert_scan(services, *, job: "ScanCaptureJob | None" = None,
     # derived from the corners; the (X, Y) extents alone cannot give the sign.
     corners_frame_mm = rectangle_in_frame(frame_T_mm, corners_mm)
     center_frame_mm = corners_frame_mm.mean(axis=0)
+    # Publish that middle as a frame too, not just as numbers in active.json: a frame
+    # is saved with the .rdk, so the platform centre outlives the runs directory and
+    # can be selected straight from any work-frame dropdown.
+    center_T = np.eye(4)
+    center_T[:3, 3] = center_frame_mm
+    center_frame = rdk.add_frame(CENTER_NAME, center_T, parent=frame)
     # §11 provenance (Task 5): read from the SAME resolved report as the geometry
     # above — never a different source — so provenance can never disagree with what
     # was actually inserted. Absent (None) whenever the run carried no survey
@@ -3423,7 +3434,7 @@ def insert_scan(services, *, job: "ScanCaptureJob | None" = None,
     payload = {
         "module": "scan", "run_id": stamp_id, "source": source,
         "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "frame": FRAME_NAME, "rectangle": RECT_NAME,
+        "frame": FRAME_NAME, "rectangle": RECT_NAME, "center_frame": CENTER_NAME,
         "mesh": MESH_NAME if mesh_inserted else None,
         "size_mm": report.get("plane", {}).get("size_mm"),
         "rectangle_corners_frame_mm": corners_frame_mm.tolist(),
@@ -3434,7 +3445,9 @@ def insert_scan(services, *, job: "ScanCaptureJob | None" = None,
     }
     runs.write_active("scan", payload)
     return {"status": "inserted", "frame": FRAME_NAME, "rectangle": RECT_NAME,
+            "center_frame": CENTER_NAME,
             "mesh": MESH_NAME if mesh_inserted else None, "run_id": stamp_id,
             "source": source, "active": payload,
+            "center_frame_valid": bool(getattr(center_frame, "Valid", lambda: True)()),
             "frame_valid": bool(getattr(frame, "Valid", lambda: True)()),
             "rectangle_valid": bool(getattr(rect, "Valid", lambda: True)())}

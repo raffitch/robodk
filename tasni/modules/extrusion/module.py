@@ -19,7 +19,8 @@ from .measure import (MODE as MEASURE_MODE, MeasureSession, RingCharacterizeJob,
 from .models import CylinderPlan, CylinderRecipe, CylinderSetup
 from .service import (CylinderDryRunJob, CylinderPrintJob, _utcnow, geometry_preflight,
                       reprocess_saved_layer, station_requirements)
-from .surface import active_scan_surface, surface_fit
+from .surface import (CENTER_FRAME_NAME, SURFACE_OBJECT_NAME, active_scan_payload,
+                      mesh_corners, resolve_platform_center, surface_fit)
 from .toolpath import corrected_cylinder_plan, generate_cylinder_plan
 
 if TYPE_CHECKING:
@@ -101,10 +102,15 @@ class CharacterizeBody(BaseModel):
 
 
 class SurfaceCenterBody(BaseModel):
-    """The wall footprint to fit while centring, so the answer carries its own check."""
+    """The wall footprint to fit while centring, so the answer carries its own check.
+
+    ``work_frame`` is the frame selected in the UI: it chooses the coordinate system
+    the returned centre is expressed in, not where the platform is.
+    """
 
     radius_mm: float = Field(gt=0)
     bead_diameter_mm: float = Field(gt=0)
+    work_frame: str = Field(min_length=1)
 
 
 class ExtrusionModule(WorkflowModule):
@@ -131,6 +137,36 @@ class ExtrusionModule(WorkflowModule):
 
     def _measure_root(self):
         return REPO_ROOT / "runs" / "extrusion"
+
+    def _platform(self, services: ServiceContainer, work_frame: str) -> dict | None:
+        """The middle of the build platform expressed in ``work_frame``, or ``None``.
+
+        Reads the STATION first — the scan-inserted centre frame, else the work-surface
+        object's own mesh — and only then ``runs/scan/active.json``. That ordering is
+        the point: the geometry a scan draws into RoboDK is saved with the station and
+        survives a deleted run directory, so clearing sessions no longer orphans a
+        placement whose surface is still sitting in the tree.
+
+        Station reads are best-effort. A RoboDK hiccup must degrade to the disk pointer
+        rather than fail the whole request, since every caller here is read-only.
+        """
+        center_xyz = corners = None
+        if work_frame and services.session.is_open:
+            try:
+                center_xyz = services.rdk.frame_origin_in_frame(CENTER_FRAME_NAME, work_frame)
+                points = services.rdk.object_mesh_in_frame(SURFACE_OBJECT_NAME, work_frame)
+                corners = None if points is None else mesh_corners(points)
+            except Exception:
+                center_xyz = corners = None
+        platform = resolve_platform_center(
+            work_frame, center_frame_xyz=center_xyz, surface_corners=corners,
+            active=active_scan_payload())
+        if platform is None:
+            return None
+        note = "" if platform["extents_known"] else (
+            f"the platform's size is not known in {work_frame!r}"
+            + ("" if corners is None else " (its rectangle is not square-on to this frame)"))
+        return {**platform, "note": note}
 
     def _session(self, *, create: bool = False) -> MeasureSession | None:
         """The MEASURE_ONLY session, always re-read from disk.
@@ -323,40 +359,51 @@ class ExtrusionModule(WorkflowModule):
                 raise HTTPException(503, f"could not read selected TCP pose: {exc}")
 
         @router.get("/scan-surface")
-        def scan_surface() -> dict:
-            """The work surface the Scan module currently has applied to the station."""
-            surface = active_scan_surface()
-            if surface is None:
-                return {"applied": False, "available": False,
-                        "note": "No scanned surface is applied. Run the Scan module and "
-                                "insert its result to build on the measured table."}
-            return {"applied": True, **surface}
+        def scan_surface(work_frame: str = "") -> dict:
+            """The platform this module would centre on, expressed in ``work_frame``."""
+            platform = self._platform(services, work_frame)
+            if platform is None:
+                return {"applied": False, "available": False, "frame": work_frame,
+                        "note": ("No platform is known for this work frame. Run the Scan "
+                                 f"module and insert its result, or place a {CENTER_FRAME_NAME!r} "
+                                 "frame in the middle of the platform yourself.")}
+            return {"applied": True, "available": True, "note": "", **platform}
 
         @router.post("/center-on-surface")
         def center_on_surface(body: SurfaceCenterBody) -> dict:
-            """Read only: the placement that centres this wall on the scanned surface."""
-            surface = active_scan_surface()
-            if surface is None:
-                raise HTTPException(
-                    409, "no scanned surface is applied — run the Scan module and insert "
-                         "its result first")
-            if not surface["available"]:
-                raise HTTPException(409, surface["note"])
+            """Read only: the placement that puts this wall in the middle of the platform.
+
+            The centre is resolved from the STATION first (see
+            :func:`~.surface.resolve_platform_center`) and then expressed in the frame
+            the operator selected, so the dropdown chooses the coordinate system while
+            the cylinder still lands on the middle of the table.
+            """
             if services.session.is_open and not services.rdk.item_exists_as(
-                    surface["frame"], "frame"):
+                    body.work_frame, "frame"):
                 raise HTTPException(
-                    409, f"the applied scan frame {surface['frame']!r} is not in the open "
-                         "station — re-insert the scan")
-            center_x, center_y = surface["center_mm"]
+                    409, f"work frame {body.work_frame!r} is not in the open station")
+            platform = self._platform(services, body.work_frame)
+            if platform is None:
+                raise HTTPException(
+                    409, f"the middle of the platform is not known in {body.work_frame!r} — "
+                         f"insert a scan, or add a {CENTER_FRAME_NAME!r} frame at the middle "
+                         "of the platform and re-check")
+            center_x, center_y = platform["center_mm"]
             fit = surface_fit(
-                surface, center_x_mm=center_x, center_y_mm=center_y,
+                platform, center_x_mm=center_x, center_y_mm=center_y,
                 outer_radius_mm=body.radius_mm + body.bead_diameter_mm / 2.0)
             return {
-                # Build plane Z is 0: the scan frame's origin sits ON the surface.
-                "setup": {"work_frame": surface["frame"], "center_x_mm": center_x,
-                          "center_y_mm": center_y, "build_plane_z_mm": 0.0,
-                          "scan_run_id": surface["run_id"]},
-                "surface": surface, "fit": fit,
+                "setup": {"work_frame": body.work_frame, "center_x_mm": center_x,
+                          "center_y_mm": center_y,
+                          # The platform's own height in this frame -- zero only while
+                          # the selected frame happens to sit ON the surface.
+                          "build_plane_z_mm": platform["center_z_mm"],
+                          # Only a disk-sourced centre claims a run; a station-sourced
+                          # one has none, and inventing one would arm the staleness
+                          # check against a scan this placement never came from.
+                          "scan_run_id": platform["run_id"]},
+                "surface": {"applied": True, "available": True, "note": "", **platform},
+                "fit": fit,
             }
 
         @router.post("/inspection-pose")
@@ -409,9 +456,9 @@ class ExtrusionModule(WorkflowModule):
         def preflight(body: FingerprintBody) -> dict:
             if self._plan is None or body.fingerprint != self._plan.fingerprint:
                 raise HTTPException(409, "toolpath changed; generate the current recipe again")
-            result = geometry_preflight(self._plan, surface=active_scan_surface(),
-                                        camera=services.config.camera,
-                                        config=services.config.extrusion)
+            result = geometry_preflight(
+                self._plan, surface=self._platform(services, self._plan.setup.work_frame),
+                camera=services.config.camera, config=services.config.extrusion)
             if not services.session.is_open:
                 result["station"] = {"ready": False,
                                      "error": "connect RoboDK to validate selected station items"}
