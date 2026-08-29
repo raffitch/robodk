@@ -220,6 +220,14 @@ class CameraClient:
                 "- restart the Tasni backend (it is speaking an older protocol)")
         try:
             geom = CameraGeometry.from_greeting(json.loads(line.decode("utf-8")))
+        except UnicodeDecodeError as e:
+            # Binary frame bytes where greeting belongs = server is still pre-protocol-2.
+            # Measured live on 2026-08-29 during deploy window (host v2, server old).
+            raise CameraError(
+                f"camera server sent binary frame bytes where the protocol-2 greeting should be "
+                f"(byte 0x{line[0]:02x} at position 0) — the server is still on the old protocol. "
+                f"Deploy the new server and restart it: `py -3.10 tools/jetson_deploy.py deploy`"
+            ) from e
         except (ValueError, json.JSONDecodeError) as e:
             raise CameraError(f"invalid camera greeting: {e}") from e
         self.geometry = geom

@@ -474,6 +474,35 @@ def test_refusal_is_a_clear_error_not_a_hang():
     print("[v2] a protocol refusal raises CameraError telling the operator to restart")
 
 
+def test_old_server_sends_binary_frame_where_greeting_should_be():
+    """When a NEW host meets an OLD server (during deploy window or if pull fails),
+    the old server sends raw frame bytes instead of a JSON greeting. This must
+    raise CameraError naming the deployment remedy rather than surfacing a codec
+    error (the binary byte 0xac in the frame header is not valid UTF-8)."""
+    client = CameraClient(CameraConfig())
+    # Simulate old server: send raw frame header bytes (binary, not UTF-8) + newline
+    # so _read_line() returns them, and _read_greeting tries to decode as JSON.
+    # Frame header is struct.pack("<IId", depth_len, color_len, timestamp).
+    old_server_bytes = struct.pack("<IId", 100, 200, 0.0) + b"\n"
+    sock = FakeSocket(old_server_bytes)
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        try:
+            client.grab(with_depth=True)
+        except CameraError as e:
+            msg = str(e)
+            # Verify the message names the deployment remedy
+            assert "jetson_deploy.py deploy" in msg, f"Error should name deploy command: {msg}"
+            assert "old protocol" in msg, f"Error should explain old protocol: {msg}"
+            # Verify it shows the binary byte that failed (not a generic decode error)
+            assert "0x" in msg, f"Error should show hex byte: {msg}"
+        else:
+            raise AssertionError("binary frame data must raise CameraError")
+    finally:
+        camera_mod.socket.socket = orig
+    print("[v2] old server (binary frame instead of greeting) raises clear deploy message")
+
+
 def test_color_only_grab_has_no_geometry_and_no_v2_token():
     client = CameraClient(CameraConfig())
     frame_bytes, _ = _server_encode(_make_color(), None, 1.0)
@@ -570,6 +599,7 @@ if __name__ == "__main__":
     test_stream_with_depth_sends_v2_and_reads_the_greeting_before_the_first_frame()
     test_stream_greeting_failure_closes_the_socket_instead_of_leaking_it()
     test_refusal_is_a_clear_error_not_a_hang()
+    test_old_server_sends_binary_frame_where_greeting_should_be()
     test_color_only_grab_has_no_geometry_and_no_v2_token()
     test_burst_reads_ready_then_greeting()
     test_burst_refusal_carries_the_restart_hint_not_a_generic_message()
