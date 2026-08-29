@@ -1,7 +1,7 @@
 // Fighter-jet style aiming HUD over the live camera frame. Driven purely by the
 // backend "gate" event (distance/tilt/offset + per-gate booleans + camera-frame
 // jog deltas + thresholds), so it needs no other config. The camera is 16:9 and
-// the preview box is 16:9, so the 1280x720 viewBox lines up 1:1 with the image.
+// the preview box is 16:9, so the 1280x720 viewBox is a normalised canvas over the image (the stream itself is 1920x1080 since camera protocol 2; all overlay coords arrive normalised 0-1).
 //
 // Wrapped in an error boundary: a malformed/partial frame can at worst blank the
 // overlay for one frame, never the whole page.
@@ -64,7 +64,7 @@ export interface GateReading {
   warnings?: string[];
 }
 
-const W = 1280, H = 720, CX = W / 2, CY = H / 2;
+const W = 1280, H = 720, CX = W / 2, CY = H / 2;  // SVG canvas only - NOT the camera resolution
 const OK = "#46d160", WARN = "#e6a93a", BAD = "#f5564d";
 const DIM = "rgba(125,235,160,.55)", INK = "rgba(6,11,8,.64)";
 const MONO = "ui-monospace, Consolas, monospace";
