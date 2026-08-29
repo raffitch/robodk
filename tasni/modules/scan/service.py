@@ -32,6 +32,7 @@ import numpy as np
 
 from ...core import runs
 from ...core.camera import CameraError
+from ...core.depth_geometry import ColorRegistered, backproject
 # latest_characterization/CHARACTERIZATION_DIR live in tasni.core.characterize
 # (Task 16 review, Finding 2 — moved OUT of tools/characterize_distance.py,
 # which is excluded from packaging, so a tasni/ module never depends on the
@@ -211,15 +212,31 @@ def _large_surface_crop_mm(scfg, K, image_size, look_mm: float,
     return [float(scfg.work_crop_mm[0]), float(scfg.work_crop_mm[1])]
 
 
-def _plane_rms_mm(depth, K, *, stride: int = 8, outline_uv=None) -> float | None:
+def _registered(frame, cfg, stride: int = 1) -> ColorRegistered:
+    """The frame's depth registered into the calibrated colour model (Task 7/10) --
+    the one place the scan module turns a native depth frame + the connection's
+    greeting into colour-frame mm points. Every consumer below that used to read
+    ``frame.depth`` directly (plane RMS, corner evidence) now goes through this."""
+    return ColorRegistered.build(frame.depth, frame.geometry, cfg.camera.K,
+                                 cfg.camera.dist, stride=stride)
+
+
+def _plane_rms_mm(frame, cfg, *, stride: int = 8, outline_uv=None) -> float | None:
     """Plane-fit RMS (mm) of the SURVEYED surface, for the quality report.
 
-    ``outline_uv`` (normalized image coords, the survey's own outline) restricts the
-    fit to the surface being locked. Without it the fit spans the whole frame —
-    table edges, floor, background — and the "residual" becomes the scene's depth
-    spread, not the surface's flatness: the first live frame-only insert reported
-    364 mm RMS for a sheet of paper. Same defect class as the characterization
-    tool's whole-frame fit (fixed 2026-08-13); this is the scan-lock instance.
+    ``outline_uv`` (normalized COLOUR-image coords, the survey's own outline)
+    restricts the fit to the surface being locked. Without it the fit spans
+    whatever the frame's registered points cover — table edges, floor, background
+    — and the "residual" becomes the scene's depth spread, not the surface's
+    flatness: the first live frame-only insert reported 364 mm RMS for a sheet of
+    paper. Same defect class as the characterization tool's whole-frame fit (fixed
+    2026-08-13); this is the scan-lock instance.
+
+    The mask now lives in COLOUR pixel space (``ColorRegistered.in_polygon``),
+    not the depth image's own pixel grid — native depth is unaligned to colour
+    (protocol 2), so a depth-pixel mask cannot answer "is this point inside the
+    outline the operator saw?" any more; that question is only answerable on the
+    registered points' own colour-frame positions.
 
     A loose 25 mm band still drops the few spurious stereo/alignment pixels inside
     the outline (physically not the surface) before the RMS, mirroring the
@@ -228,27 +245,19 @@ def _plane_rms_mm(depth, K, *, stride: int = 8, outline_uv=None) -> float | None
     Returns ``None`` (never NaN) when starved of samples or the fit fails — NaN
     would poison JSON on both client paths.
     """
-    d = np.asarray(depth, dtype=float)[::stride, ::stride]
+    reg = _registered(frame, cfg, stride)
     if outline_uv is not None and len(outline_uv) >= 3:
-        import cv2
-
-        h, w = d.shape
         poly = np.asarray(outline_uv, dtype=float)
         # Shrink 3% toward the centroid: the outline traces the surface EDGE, and a
-        # boundary pixel of the (strided) mask can straddle it, pulling neighbouring
-        # off-surface depth into the fit and inflating the residual.
+        # boundary point near it can straddle it, pulling neighbouring off-surface
+        # depth into the fit and inflating the residual.
         centre = poly.mean(axis=0)
         poly = centre + (poly - centre) * 0.97
-        px = np.column_stack([poly[:, 0] * w, poly[:, 1] * h]).astype(np.int32)
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, [px], 1)
-        d = np.where(mask.astype(bool), d, 0.0)
-    v, u = np.nonzero(d > 0)
-    if len(v) < 50:
+        pts = reg.pts_mm[reg.in_polygon(poly)]
+    else:
+        pts = reg.pts_mm
+    if len(pts) < 50:
         return None
-    z = d[v, u]
-    fx, fy, cx, cy = K[0][0], K[1][1], K[0][2], K[1][2]
-    pts = np.stack([(u * stride - cx) / fx * z, (v * stride - cy) / fy * z, z], axis=1)
     try:
         normal, centroid, _ = fit_plane(pts, distance=6.0)
     except Exception:
@@ -424,13 +433,17 @@ def _authoritative_acquisition(services, *, owner: str):
     if not frames:
         raise RuntimeError("surface measurement failed - no depth frames received")
     color, depth = _combine_depth_frames(frames)
+    # frames[-1].geometry: every frame in this acquisition shares one connection
+    # (and so one greeting/CameraGeometry), so the median-combined frame carries
+    # the geometry of its sources -- there is nothing to disambiguate between them.
     frame = SimpleNamespace(
         color=color, depth=depth,
-        timestamp=getattr(frames[-1], "timestamp", time.time()))
+        timestamp=getattr(frames[-1], "timestamp", time.time()),
+        geometry=frames[-1].geometry)
     reading = evaluate_depth_gate(
-        frame.depth, K, scan_gate_thresholds(scfg), depth_scale=scfg.depth_scale)
+        frame.depth, frames[-1].geometry, K, cfg.camera.dist, scan_gate_thresholds(scfg))
     measurement = survey_surface(
-        frame.depth, K, _survey_thresholds(scfg), depth_scale=scfg.depth_scale)
+        frame.depth, frames[-1].geometry, K, cfg.camera.dist, _survey_thresholds(scfg))
     snapshot = refresh_robot_state(rdk)
     return frame, len(frames), reading, measurement, snapshot, frames
 
@@ -571,7 +584,7 @@ def lock_scan_surface(services, *, force_crop: bool = False,
     record = None
     if crop_mode:
         mode = MODE_USER_SPECIFIED
-        plane_rms = _plane_rms_mm(depth, K, outline_uv=survey.outline_uv)
+        plane_rms = _plane_rms_mm(frame, cfg, outline_uv=survey.outline_uv)
         record = _survey_record_from_lock(
             survey, seed_T, snapshot, services.config.camera,
             mode=mode, n_frames=n_frames, measurement_ts=frame.timestamp,
@@ -619,7 +632,7 @@ def lock_scan_surface(services, *, force_crop: bool = False,
             classify_scfg, identity_note = _compact_identity_scfg(scfg)
             if identity_note:
                 gate_payload.setdefault("warnings", []).append(identity_note)
-            outline_history = _survey_outline_history(raw_frames, K, scfg)
+            outline_history = _survey_outline_history(raw_frames, K, cfg.camera.dist, scfg)
             boundary = _work_boundary(scfg, frame.color)
             eligibility = classify_compact(
                 survey, survey.outline_uv, boundary, classify_scfg,
@@ -627,7 +640,7 @@ def lock_scan_surface(services, *, force_crop: bool = False,
             gate_payload["compact_eligibility"] = eligibility.to_dict()
             if eligibility.eligible:
                 mode = MODE_COMPACT
-                plane_rms = _plane_rms_mm(depth, K, outline_uv=survey.outline_uv)
+                plane_rms = _plane_rms_mm(frame, cfg, outline_uv=survey.outline_uv)
                 # Hybrid extent: keep the depth-measured PLANE, take the EDGES from
                 # the boundary the classifier just corroborated. Depth alone stops
                 # ~20 mm short at the rim of a raised object; vision does not.
@@ -838,7 +851,7 @@ def _compact_identity_scfg(scfg) -> "tuple[object, str | None]":
         f"({nominal}); the identity check used {available} frame(s) instead.")
 
 
-def _survey_outline_history(raw_frames, K, scfg) -> list:
+def _survey_outline_history(raw_frames, K, dist, scfg) -> list:
     """Independently survey each RAW (pre-fusion) depth frame from this lock's
     acquisition and collect its rectangle outline, ALIGNED to a common
     reference, for classify_compact's §6 rectangle-identity gate (Task 18;
@@ -909,9 +922,9 @@ def _survey_outline_history(raw_frames, K, scfg) -> list:
     history: list = []
     reference: np.ndarray | None = None
     for fr in raw_frames:
-        if fr.depth is None:
+        if fr.depth is None or fr.geometry is None:
             continue
-        m = survey_surface(fr.depth, K, th, depth_scale=scfg.depth_scale)
+        m = survey_surface(fr.depth, fr.geometry, K, dist, th)
         if not m.outline_uv:
             continue
         outline = np.asarray(m.outline_uv, dtype=float)
@@ -950,20 +963,14 @@ def _guard_violation_backoff_hint(raw_corners_uv, guard: float, standoff_mm) -> 
             f"(~{(scale - 1.0) * 100:.0f}% farther) so the boundary clears the guard margin")
 
 
-def _backproject_depth(depth: np.ndarray, K: np.ndarray, *,
-                       depth_scale: float = 1000.0) -> np.ndarray:
-    """Back-project a raw uint16 depth image to camera-frame 3D points (mm)."""
-    d = np.asarray(depth, float)
-    fx, fy = float(K[0, 0]), float(K[1, 1])
-    cx, cy = float(K[0, 2]), float(K[1, 2])
-    ys, xs = np.nonzero(d > 0)
-    if len(ys) == 0:
-        return np.zeros((0, 3), float)
-    z_mm = d[ys, xs] / float(depth_scale) * 1000.0
-    return np.column_stack([(xs - cx) / fx * z_mm, (ys - cy) / fy * z_mm, z_mm])
+def _backproject_depth(depth: np.ndarray, geometry) -> np.ndarray:
+    """Back-project a native depth image to COLOUR-camera-frame 3D points (mm),
+    through Task 7's geometry-aware ``backproject`` -- the one place raw depth
+    becomes 3D, now shared with the scan gate/survey/corner-evidence/TSDF paths."""
+    return backproject(depth, geometry)[0]
 
 
-def _deproject_plane_points_mm(depth, K, T_base_cam, *, plane_normal_cam,
+def _deproject_plane_points_mm(depth, geometry, T_base_cam, *, plane_normal_cam,
                                plane_point_cam, band_mm: float,
                                stride: int = 6) -> "tuple[np.ndarray, float, float]":
     """Deproject a strided grid of depth pixels that lie within ``band_mm`` of the
@@ -988,15 +995,17 @@ def _deproject_plane_points_mm(depth, K, T_base_cam, *, plane_normal_cam,
       sliver against an empty (0-depth) background also reads ``purity_frac`` near
       1.0, since there is nothing else to dilute it.
 
-    Explicit millimetres throughout -- deliberately the SAME pattern as
-    ``corner_evidence._deproject_base`` (depth is the raw uint16 RealSense frame,
-    read directly as millimetres; no ``depth_scale`` division). This module does
-    NOT reuse ``_backproject_depth`` above for this: that helper returns
-    CAMERA-frame points scaled by ``depth_scale``, an extra parameter/convention a
-    caller has to know to apply correctly, whereas the five-position survey (the
-    one caller of this function) needs BASE-frame mm points and nothing else --
-    matching ``corner_evidence``'s own unambiguous, self-contained convention
-    keeps the whole five-position pipeline's units consistent end to end.
+    Explicit millimetres throughout, via ``geometry.depth_unit_mm`` -- the raw depth
+    is never assumed to already be millimetres. This module now DOES reuse the same
+    ``backproject`` primitive ``_backproject_depth`` wraps (Task 7's
+    ``core.depth_geometry``): the reason it used to opt out no longer applies --
+    ``_backproject_depth`` used to take an extra raw-to-mm conversion factor a
+    caller had to apply correctly by hand, whereas the ``CameraGeometry`` the
+    greeting carries now makes the unit explicit and SHARED across every consumer
+    (this module, ``corner_evidence.py`` via ``ColorRegistered``, the TSDF fuse).
+    The five-position survey (the one caller of this function) gets COLOUR-frame mm
+    points straight out of ``backproject`` -- matching ``measurement.normal_cam``'s
+    own frame -- then does its own plane-band filter and base-frame transform below.
 
     ``stride`` subsamples the frame (every ``stride``-th row/col): the per-capture
     local plane this feeds (``rect_fit.fit_global_plane``, via
@@ -1037,24 +1046,15 @@ def _deproject_plane_points_mm(depth, K, T_base_cam, *, plane_normal_cam,
     ray-plane intersection remains). See the Task 13 review fix reports for the
     full before/after measurement and this mechanism trace.
     """
-    d = np.asarray(depth, dtype=float)
-    if d.ndim != 2 or d.size == 0:
+    d = np.asarray(depth)
+    if d.ndim != 2 or d.size == 0 or geometry is None:
         return np.zeros((0, 3), dtype=float), 0.0, 0.0
     h, w = d.shape
-    ys, xs = np.mgrid[0:h:stride, 0:w:stride]
-    n_grid_total = int(ys.size)
-    z = d[ys, xs]
-    valid = z > 0
-    n_valid = int(np.count_nonzero(valid))
+    n_grid_total = (h // stride) * (w // stride)
+    pts_cam, _uv_depth = backproject(d, geometry, stride=stride)
+    n_valid = len(pts_cam)
     if n_valid == 0:
         return np.zeros((0, 3), dtype=float), 0.0, 0.0
-    xs_v = xs[valid].astype(float)
-    ys_v = ys[valid].astype(float)
-    z_v = z[valid].astype(float)
-    fx, fy, cx, cy = float(K[0][0]), float(K[1][1]), float(K[0][2]), float(K[1][2])
-    x_cam = (xs_v - cx) / fx * z_v
-    y_cam = (ys_v - cy) / fy * z_v
-    pts_cam = np.column_stack([x_cam, y_cam, z_v])
 
     n = np.asarray(plane_normal_cam, dtype=float)
     n = n / max(float(np.linalg.norm(n)), 1e-9)
@@ -1301,8 +1301,9 @@ def five_position_capture(services, survey: FivePositionSurvey) -> dict:
     Scoped to this function only -- ``lock_scan_surface``/``_authoritative_acquisition``
     are untouched, so the compact/crop lock path's behaviour does not change.
     """
-    K = services.config.camera.K
-    scfg = services.config.scan
+    cfg = services.config
+    K = cfg.camera.K
+    scfg = cfg.scan
     rdk = services.rdk
     kind = survey.step
     if kind == "review":
@@ -1346,7 +1347,7 @@ def five_position_capture(services, survey: FivePositionSurvey) -> dict:
         # would make the coverage gate below unreachable).
         corner_th = replace(_survey_thresholds(scfg),
                             min_valid_depth_frac=_CORNER_DETECT_SANITY_FRAC)
-        measurement = survey_surface(frame.depth, K, corner_th, depth_scale=scfg.depth_scale)
+        measurement = survey_surface(frame.depth, frame.geometry, K, cfg.camera.dist, corner_th)
 
     if not measurement.detected:
         raise RuntimeError(
@@ -1354,7 +1355,7 @@ def five_position_capture(services, survey: FivePositionSurvey) -> dict:
 
     T_base_cam = snapshot.camera_T_np()
     plane_points_base, plane_purity_frac, plane_coverage_frac = _deproject_plane_points_mm(
-        frame.depth, K, T_base_cam, plane_normal_cam=measurement.normal_cam,
+        frame.depth, frame.geometry, T_base_cam, plane_normal_cam=measurement.normal_cam,
         plane_point_cam=measurement.centroid_cam_mm,
         band_mm=float(scfg.survey_plane_inlier_band_mm))
 
@@ -1422,7 +1423,7 @@ def five_position_capture(services, survey: FivePositionSurvey) -> dict:
         kind=kind, robot=snapshot, measurement_ts=float(frame.timestamp),
         captured_at=snapshot.fetched_at, n_frames=int(n_frames),
         standoff_mm=float(measurement.standoff_mm), tilt_deg=float(measurement.tilt_deg),
-        valid_frac=valid_frac, plane_rms_mm=_plane_rms_mm(frame.depth, K),
+        valid_frac=valid_frac, plane_rms_mm=_plane_rms_mm(frame, cfg),
         plane_normal_base=tuple(float(v) for v in normal_base),
         plane_point_base=tuple(float(v) for v in point_base))
 
@@ -1439,7 +1440,7 @@ def five_position_capture(services, survey: FivePositionSurvey) -> dict:
             # loses real wraparound coverage; see corner_evidence.extract_corner_evidence's
             # own docstring.
             evidence = extract_corner_evidence(
-                frame.depth, K, polygon_uv, T_base_cam,
+                _registered(frame, cfg), K, polygon_uv, T_base_cam,
                 corner_hint_uv=(0.5, 0.5), closed=True)
 
     state = survey.add_capture(record, plane_points_base, evidence)
@@ -1483,21 +1484,25 @@ def _surface_footprint_base(survey, seed_T: np.ndarray) -> np.ndarray | None:
     return _densify_quad(corners_base, n=6)
 
 
-def _save_views(views, K, width, height, run_dir, *, depth_scale, log) -> None:
+def _save_views(views, run_dir, *, log) -> None:
     """Persist each captured view (color JPEG + 16-bit depth PNG + camera pose) under
     ``<run>/views/`` for a later camera-perspective coverage overlay.
 
     Diagnostic only (``scan.save_views``). The depth is written as a single-channel
-    16-bit PNG (lossless, the raw mm units), color as JPEG; ``views.json`` records K,
-    image size, depth scale and each view's base->camera pose so the fused cloud can
-    be re-projected into any view.
+    16-bit PNG (lossless) -- NATIVE raw units per protocol 2, i.e. 0.1 mm steps, NOT
+    millimetres (a viewer must read ``camera_geometry.depth_unit_mm`` from
+    ``views.json`` to interpret it, exactly like every other consumer in this
+    module). ``views.json`` records the first view's full ``CameraGeometry``
+    (``views[0].geometry.to_dict()`` -- every view in one capture job shares the
+    same connection/greeting, so there is nothing to disambiguate between them) and
+    each view's base->camera pose, so the fused cloud can be re-projected into any
+    view.
     """
     from pathlib import Path
 
     vdir = Path(run_dir) / "views"
     vdir.mkdir(parents=True, exist_ok=True)
-    meta = {"K": np.asarray(K, float).tolist(), "size": [int(width), int(height)],
-            "depth_scale": float(depth_scale), "views": []}
+    meta = {"camera_geometry": views[0].geometry.to_dict(), "views": []}
     for i, v in enumerate(views):
         cv2.imwrite(str(vdir / f"view_{i:02d}.jpg"), v.color,
                     [cv2.IMWRITE_JPEG_QUALITY, 92])
@@ -1519,10 +1524,9 @@ def _reference_locate(services, frame, survey, seed_T: np.ndarray,
     """
     cfg = services.config
     scfg = cfg.scan
-    K = cfg.camera.K
     pub = _log_pub(services)
 
-    pts_cam_mm = _backproject_depth(frame.depth, K, depth_scale=scfg.depth_scale)
+    pts_cam_mm = _backproject_depth(frame.depth, frame.geometry)
     if len(pts_cam_mm) == 0:
         raise RuntimeError("reference locate: no valid depth pixels in the survey frame")
 
@@ -3105,15 +3109,14 @@ class ScanCaptureJob:
                 start_joints = None
 
             if scfg.save_views and self.params.save_artifacts:
-                _save_views(views, K, width, height, run_dir,
-                            depth_scale=scfg.depth_scale, log=ctx.log)
+                _save_views(views, run_dir, log=ctx.log)
 
             ctx.progress(len(targets), len(targets), "fusing")
             voxel_m = (self.params.voxel_size_m
                        if self.params.voxel_size_m is not None else scfg.voxel_size_m)
             ctx.log(f"fusing {len(views)} views (TSDF voxel {voxel_m * 1000:.1f} mm)…")
-            res = fuse_views(views, K, width, height, voxel_size_m=voxel_m,
-                             sdf_trunc_m=scfg.sdf_trunc_m, depth_scale=scfg.depth_scale,
+            res = fuse_views(views, voxel_size_m=voxel_m,
+                             sdf_trunc_m=scfg.sdf_trunc_m,
                              depth_min_m=scfg.depth_min_m, depth_max_m=scfg.depth_max_m)
 
             # Isolate the work surface (the "top layer"): crop to a box around where the
@@ -3182,7 +3185,6 @@ class ScanCaptureJob:
                 min_support_views=scfg.measured_mesh_min_support_views,
                 min_support_ratio=scfg.measured_mesh_min_support_ratio,
                 min_normal_dot=scfg.measured_mesh_min_normal_dot,
-                depth_scale=scfg.depth_scale,
                 depth_min_m=scfg.depth_min_m,
                 depth_max_m=scfg.depth_max_m,
                 keep_largest_component=scfg.measured_mesh_keep_largest_component,
@@ -3294,9 +3296,19 @@ class ScanCaptureJob:
                 ctx.log(f"{name}: no depth — skipped")
                 skipped.append(name)
                 continue
+            if frames[0].geometry is None:
+                # No protocol-2 greeting for this connection -- the unit is unknown,
+                # and defaulting one would silently misread this view's depth (the
+                # extrusion inspection defect this task's dispatch names: a 0.1 mm
+                # frame read as 1 mm reads a real ~300 mm standoff as ~3000 mm).
+                # Skip the pose rather than fuse a mis-scaled view.
+                ctx.log(f"{name}: no camera geometry in greeting — skipped")
+                skipped.append(name)
+                continue
             color, depth = _combine_depth_frames(frames)
             pose = rdk.camera_pose_T()                 # uses the STORED tool offset
-            views.append(ScanView(color=color, depth=depth, pose_T=pose))
+            views.append(ScanView(color=color, depth=depth, pose_T=pose,
+                                  geometry=frames[0].geometry))
             ok, jpeg = cv2.imencode(".jpg", color)
             if ok:
                 ctx.frame(jpeg.tobytes())
@@ -3366,8 +3378,15 @@ class ScanCaptureJob:
                 ctx.log(f"{name}: no depth/pose — skipped")
                 skipped.append(name)
                 continue
+            if g["frames"][0].geometry is None:
+                # See _capture_per_pose's identical guard: no greeting -> unknown
+                # unit -> skip rather than fuse a mis-scaled view.
+                ctx.log(f"{name}: no camera geometry in greeting — skipped")
+                skipped.append(name)
+                continue
             color, depth = _combine_depth_frames(g["frames"])
-            views.append(ScanView(color=color, depth=depth, pose_T=g["pose"]))
+            views.append(ScanView(color=color, depth=depth, pose_T=g["pose"],
+                                  geometry=g["frames"][0].geometry))
         ctx.log(f"burst transfer complete: {len(frames)} frame(s), {len(views)} usable")
         return views, skipped
 

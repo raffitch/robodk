@@ -19,6 +19,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ...core.depth_geometry import CameraGeometry, ColorRegistered
+
 
 @dataclass
 class ScanGateThresholds:
@@ -73,43 +75,34 @@ def _not_detected(th: ScanGateThresholds, valid_frac: float) -> ScanGateReading:
         max_tilt_deg=th.max_tilt_deg)
 
 
-def evaluate_depth_gate(depth: np.ndarray | None, K: np.ndarray,
-                        th: ScanGateThresholds, *, depth_scale: float = 1000.0,
+def evaluate_depth_gate(depth: np.ndarray | None, geometry: CameraGeometry, K_color,
+                        dist_color, th: ScanGateThresholds, *,
                         max_samples: int = 3000) -> ScanGateReading:
-    """Build the :class:`ScanGateReading` for one depth frame.
+    """Build the :class:`ScanGateReading` for one NATIVE depth frame.
 
-    ``depth`` is the raw depth image (uint16 mm for the D435i, i.e. raw value == mm
-    when ``depth_scale == 1000``); ``None`` (or all-invalid) ⇒ not detected. ``K`` is
-    the camera matrix for that frame (back-projects the patch to 3D to estimate the
-    surface tilt).
+    The reticle is a COLOUR-image region (that is what the operator sees and aims),
+    so the depth points are registered into the calibrated colour model first
+    (:class:`ColorRegistered`, Task 7) and the centre patch is selected THERE;
+    distance/tilt are then computed on colour-frame points. ``None`` (or
+    all-invalid/no geometry) ⇒ not detected.
     """
-    if depth is None or np.asarray(depth).size == 0:
+    if depth is None or np.asarray(depth).size == 0 or geometry is None:
         return _not_detected(th, 0.0)
-    d = np.asarray(depth)
-    h, w = d.shape[:2]
-    pf = float(np.clip(th.center_patch_frac, 0.05, 1.0))
-    cw, ch = max(2, int(w * pf)), max(2, int(h * pf))
-    x0, y0 = (w - cw) // 2, (h - ch) // 2
-    patch = d[y0:y0 + ch, x0:x0 + cw].astype(np.float64)
-    valid = patch > 0
-    valid_frac = float(valid.mean())
-    if valid_frac < th.min_valid_depth_frac:
+    # stride=2: the gate only needs enough points for a coarse centre-patch plane fit,
+    # not every native depth pixel -- keeps this cheap on every live HUD tick.
+    reg = ColorRegistered.build(depth, geometry, K_color, dist_color, stride=2)
+    in_patch = reg.in_center_patch(th.center_patch_frac)
+    valid_frac = min(1.0, reg.valid_frac_in_center_patch(th.center_patch_frac))
+    if valid_frac < th.min_valid_depth_frac or in_patch.sum() < 8:
         return _not_detected(th, valid_frac)
 
-    # Distance = median valid depth (raw mm at depth_scale 1000); scale-general.
-    distance_mm = float(np.median(patch[valid]) / float(depth_scale) * 1000.0)
+    pts = reg.pts_mm[in_patch]
+    distance_mm = float(np.median(pts[:, 2]))
 
-    # Tilt: back-project the valid patch pixels (absolute image coords) to camera 3D
-    # and fit a plane; tilt = angle between its normal and the optical axis.
-    K = np.asarray(K, dtype=float)
-    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    ys, xs = np.nonzero(valid)
-    z = patch[valid]
-    if len(z) > max_samples:                 # subsample for speed (deterministic stride)
-        step = int(np.ceil(len(z) / max_samples))
-        ys, xs, z = ys[::step], xs[::step], z[::step]
-    u, v = xs + x0, ys + y0
-    pts = np.column_stack([(u - cx) / fx * z, (v - cy) / fy * z, z])
+    # Tilt: fit a plane to the centre-patch points (already COLOUR-frame mm) and
+    # measure the angle between its normal and the optical axis.
+    if len(pts) > max_samples:                 # subsample for speed (deterministic stride)
+        pts = pts[::int(np.ceil(len(pts) / max_samples))]
     centroid = pts.mean(axis=0)
     _, _, vt = np.linalg.svd(pts - centroid, full_matrices=False)
     normal = vt[2] / max(float(np.linalg.norm(vt[2])), 1e-9)

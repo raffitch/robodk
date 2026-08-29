@@ -13,7 +13,9 @@ testable core-style service.
 
 Conventions match ``depth_gate.py``:
 
-  * depth is raw uint16; mm = raw / depth_scale * 1000 (so raw == mm at depth_scale 1000)
+  * depth is native raw (uint16); pixel -> mm goes through ``geometry.depth_unit_mm``
+    via ``backproject`` (Task 7), which also registers the points into the COLOUR
+    camera frame — every point/overlay this module produces is already in that frame
   * the surface normal is oriented to FACE the camera (Z component < 0)
   * tilt = angle between the normal and the optical axis (0 = fronto-parallel)
   * tilt_b / tilt_c are KUKA B/C corrections (rotate about Y / X) — same math as the gate
@@ -24,6 +26,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from ...core.depth_geometry import CameraGeometry, backproject, project_to_color
 from .plane import (fit_plane, reticle_plane_square, _oriented_rectangle,
                     _plane_basis)
 
@@ -135,55 +138,56 @@ def _snap_125(rough_mm: float) -> float:
 
 def survey_surface(
     depth: np.ndarray | None,
-    K: np.ndarray,
+    geometry: CameraGeometry | None,
+    K_color: np.ndarray,
+    dist_color,
     thresholds: SurveyThresholds,
-    *,
-    depth_scale: float = 1000.0,
 ) -> SurveyMeasurement:
-    """Survey the dominant surface across a full depth frame for the aiming HUD.
+    """Survey the dominant surface across a full NATIVE depth frame for the aiming HUD.
 
-    ``depth`` is the raw uint16 depth image (mm = raw / depth_scale * 1000; raw == mm at
-    depth_scale 1000; 0 = invalid). ``K`` is the camera matrix for that frame. Returns a
-    :class:`SurveyMeasurement` with standoff/tilt/extent + outline & grid overlays in
-    normalized image coords. ``None``/all-invalid/too-little-depth ⇒ not detected.
+    ``depth`` is the raw depth image (0 = invalid); ``geometry`` (Task 7's
+    :class:`CameraGeometry`, from the connection's greeting) carries the unit and the
+    depth->colour registration. ``K_color``/``dist_color`` are the calibrated colour
+    model — the image the HUD actually shows, and what every overlay below is
+    projected into. Returns a :class:`SurveyMeasurement` with standoff/tilt/extent +
+    outline & grid overlays in normalized COLOUR-image coords.
+    ``None``/no geometry/all-invalid/too-little-depth ⇒ not detected.
     """
-    K = np.asarray(K, dtype=float)
+    K_color = np.asarray(K_color, dtype=float)
     th = thresholds
 
-    # 1. FOV (always computable from K + image size; default to a sane size if no depth).
-    if depth is None or np.asarray(depth).size == 0:
-        # No image to size from — use K's principal point as a rough size proxy.
-        W = int(round(2.0 * float(K[0, 2]))) or 1
-        H = int(round(2.0 * float(K[1, 2]))) or 1
-        return _not_detected(th, _fov_deg(K, W, H))
+    # 1. FOV (of the COLOUR image the HUD shows -- always computable from K_color +
+    # geometry.color_size; falls back to K's own principal point as a size proxy when
+    # there is nothing to survey at all).
+    if geometry is not None:
+        W, H = geometry.color_size
+    else:
+        W = int(round(2.0 * float(K_color[0, 2]))) or 1
+        H = int(round(2.0 * float(K_color[1, 2]))) or 1
+    fov_deg = _fov_deg(K_color, W, H)
+
+    if depth is None or np.asarray(depth).size == 0 or geometry is None:
+        return _not_detected(th, fov_deg)
 
     d = np.asarray(depth)
-    H, W = int(d.shape[0]), int(d.shape[1])
-    fov_deg = _fov_deg(K, W, H)
-
-    fx, fy = float(K[0, 0]), float(K[1, 1])
-    cx, cy = float(K[0, 2]), float(K[1, 2])
-
-    # 2. Back-project valid pixels to camera 3D (mm).
-    valid = d > 0
-    valid_frac = float(valid.mean())
+    # Fraction of the DEPTH frame with valid depth -- same meaning as before (the
+    # depth image, not the colour image, is what the sensor actually filled in).
+    valid_frac = float(np.count_nonzero(d)) / float(d.size) if d.size else 0.0
     if valid_frac < th.min_valid_depth_frac:
         return _not_detected(th, fov_deg)
 
-    ys, xs = np.nonzero(valid)
-    z_mm = d[ys, xs].astype(np.float64) / float(depth_scale) * 1000.0
+    # 2. Back-project valid depth pixels to COLOUR-camera-frame 3D (mm), already
+    # registered by backproject() -- deterministic stride-subsample (2D grid, so
+    # roughly stride**2 fewer points) to at most max_samples.
+    n_valid = int(np.count_nonzero(d))
+    stride = 1
+    if n_valid > th.max_samples:
+        stride = int(np.ceil((n_valid / float(th.max_samples)) ** 0.5))
+    pts_mm, _uv_depth = backproject(d, geometry, stride=stride)
+    if len(pts_mm) > th.max_samples:
+        pts_mm = pts_mm[::int(np.ceil(len(pts_mm) / th.max_samples))]
 
-    # Deterministic stride-subsample to at most max_samples points.
-    n = len(z_mm)
-    if n > th.max_samples:
-        step = int(np.ceil(n / th.max_samples))
-        ys, xs, z_mm = ys[::step], xs[::step], z_mm[::step]
-
-    X = (xs - cx) / fx * z_mm
-    Y = (ys - cy) / fy * z_mm
-    pts_mm = np.column_stack([X, Y, z_mm])
-
-    # 3. RANSAC plane fit (camera frame), then re-orient the normal to face the camera.
+    # 3. RANSAC plane fit (COLOUR camera frame), then re-orient the normal to face it.
     try:
         normal, centroid, _ = fit_plane(pts_mm, distance=th.ransac_distance_mm)
     except ValueError:
@@ -201,8 +205,6 @@ def survey_surface(
         return _not_detected(th, fov_deg)
 
     inlier_pts = pts_mm[inlier_mask]
-    inlier_xs = xs[inlier_mask]
-    inlier_ys = ys[inlier_mask]
 
     # 4. Measurements from inliers (same tilt math as depth_gate.py lines 121-127).
     standoff_mm = float(np.median(inlier_pts[:, 2]))
@@ -223,20 +225,17 @@ def survey_surface(
     # well-margined object read as an overrun and fall back to the generic square.
     # Instead TRUST THE FITTED RECTANGLE: if its projected corners sit inside the
     # frame with a margin, the object is bounded in view and we keep its rectangle.
-    margin = th.border_margin_px
-    depth_within_border = not (
-        bool(np.any(inlier_xs < margin)) or bool(np.any(inlier_xs > W - 1 - margin)) or
-        bool(np.any(inlier_ys < margin)) or bool(np.any(inlier_ys > H - 1 - margin))
-    )
-
+    # (``border_margin_px``'s old raw-pixel-in-the-DEPTH-image test is gone with it —
+    # native depth pixels no longer correspond 1:1 to colour pixels, so a border test
+    # in depth-pixel space cannot answer "is this inside the COLOUR frame?" at all;
+    # the fitted-rectangle test below is now the only framing decision.)
     def _corners_in_frame(corners, frac=float(th.frame_margin_uv)) -> bool:
         cc = np.asarray(corners, float).reshape(-1, 3)
         if cc.shape[0] < 4 or bool(np.any(cc[:, 2] <= 0)):
             return False
-        cu = (cc[:, 0] * fx / cc[:, 2] + cx) / W
-        cv = (cc[:, 1] * fy / cc[:, 2] + cy) / H
-        return bool(np.all((cu >= frac) & (cu <= 1.0 - frac)
-                           & (cv >= frac) & (cv <= 1.0 - frac)))
+        uv = project_to_color(cc, K_color, dist_color) / np.array([W, H], float)
+        return bool(np.all((uv[:, 0] >= frac) & (uv[:, 0] <= 1.0 - frac)
+                           & (uv[:, 1] >= frac) & (uv[:, 1] <= 1.0 - frac)))
 
     fully_framed = _corners_in_frame(corners3d)
 
@@ -259,14 +258,14 @@ def survey_surface(
     }
     ok = all(gates.values())
 
-    # 8. Overlay — outline_uv (project the 4 rectangle corners to normalized image coords).
+    # 8. Overlay — outline_uv (project the 4 rectangle corners to normalized COLOUR
+    # image coords, through the calibrated colour model — CameraGeometry.color_size,
+    # not the depth image, is "the image the HUD shows").
     def _project(p: np.ndarray):
-        Zc = float(p[2])
-        if Zc <= 0:
+        if float(p[2]) <= 0:
             return None
-        u_norm = (float(p[0]) * fx / Zc + cx) / W
-        v_norm = (float(p[1]) * fy / Zc + cy) / H
-        return (u_norm, v_norm)
+        uv = project_to_color(np.asarray(p, float).reshape(1, 3), K_color, dist_color)[0]
+        return (float(uv[0]) / W, float(uv[1]) / H)
 
     outline_uv: list[tuple[float, float]] = []
     for c in corners3d:
@@ -276,8 +275,9 @@ def survey_surface(
     if not outline_uv:
         outline_uv = None  # type: ignore[assignment]
 
-    # 9. Overlay — adaptive 1-2-5 metric grid aligned to the rectangle axes.
-    rough_spacing_mm = th.grid_target_px * standoff_mm / fx
+    # 9. Overlay — adaptive 1-2-5 metric grid aligned to the rectangle axes. Sized in
+    # COLOUR pixels (grid_target_px is an on-screen size in the image the HUD draws).
+    rough_spacing_mm = th.grid_target_px * standoff_mm / float(K_color[0, 0])
     spacing_mm = _snap_125(rough_spacing_mm)
 
     rel = inlier_pts - centroid
@@ -318,11 +318,9 @@ def survey_surface(
     points_uv = None
     if len(inlier_pts) > 0:
         Zc = inlier_pts[:, 2]
-        valid = Zc > 0
-        real_uv = np.column_stack([
-            (inlier_pts[valid, 0] * fx / Zc[valid] + cx) / W,
-            (inlier_pts[valid, 1] * fy / Zc[valid] + cy) / H,
-        ])
+        in_front = Zc > 0
+        real_uv = (project_to_color(inlier_pts[in_front], K_color, dist_color)
+                  / np.array([W, H], float))
         in_frame = np.all((real_uv >= 0.0) & (real_uv <= 1.0), axis=1)
         real_uv = real_uv[in_frame]
         if len(real_uv):

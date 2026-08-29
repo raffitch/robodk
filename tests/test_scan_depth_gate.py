@@ -14,12 +14,15 @@ import numpy as np
 import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tasni.modules.scan.depth_gate import (  # noqa: E402
     ScanGateThresholds, evaluate_depth_gate)
 from tasni.core.config import ScanConfig  # noqa: E402
 from tasni.modules.scan.service import (  # noqa: E402
     live_scan_telemetry_payload, stabilize_live_scan_payload)
+
+import geometry_fixtures as gf  # noqa: E402
 
 W, H = 320, 240
 K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
@@ -43,7 +46,7 @@ def _render(normal, dist_mm):
 
 def test_frontal_plane_all_green():
     th = ScanGateThresholds(ideal_distance_mm=500, distance_tol_mm=120, max_tilt_deg=20)
-    r = evaluate_depth_gate(_render([0, 0, 1], 500), K, th)
+    r = evaluate_depth_gate(_render([0, 0, 1], 500), gf.aligned(K, (W, H)), K, None, th)
     assert r.detected and r.ok, r.to_dict()
     assert abs(r.distance_mm - 500) < 5, r.distance_mm
     assert r.tilt_deg < 1.0, r.tilt_deg
@@ -53,7 +56,7 @@ def test_frontal_plane_all_green():
 def test_tilt_measured_and_gated():
     th = ScanGateThresholds(ideal_distance_mm=500, distance_tol_mm=120, max_tilt_deg=20)
     r = evaluate_depth_gate(_render([0, np.sin(np.deg2rad(30)), np.cos(np.deg2rad(30))], 500),
-                            K, th)
+                            gf.aligned(K, (W, H)), K, None, th)
     assert abs(r.tilt_deg - 30) < 1.5, r.tilt_deg          # tilt recovered
     assert r.gates["distance"] and not r.gates["angle"]    # 30deg > 20deg limit -> red
     assert not r.ok
@@ -66,7 +69,7 @@ def test_tilt_measured_and_gated():
 
 def test_too_far_fails_distance():
     th = ScanGateThresholds(ideal_distance_mm=500, distance_tol_mm=120, max_tilt_deg=20)
-    r = evaluate_depth_gate(_render([0, 0, 1], 800), K, th)
+    r = evaluate_depth_gate(_render([0, 0, 1], 800), gf.aligned(K, (W, H)), K, None, th)
     assert r.detected and not r.gates["distance"] and not r.ok
     assert r.move_cam[2] > 0                                 # "too far" -> positive Z error
     print("[far] distance", round(r.distance_mm, 1), "-> distance lamp red")
@@ -74,10 +77,22 @@ def test_too_far_fails_distance():
 
 def test_no_surface_not_detected():
     th = ScanGateThresholds(min_valid_depth_frac=0.5)
-    r = evaluate_depth_gate(np.zeros((H, W), np.uint16), K, th)
+    r = evaluate_depth_gate(np.zeros((H, W), np.uint16), gf.aligned(K, (W, H)), K, None, th)
     assert not r.detected and not r.ok and r.distance_mm is None
-    assert evaluate_depth_gate(None, K, th).detected is False
+    assert evaluate_depth_gate(None, gf.aligned(K, (W, H)), K, None, th).detected is False
     print("[empty] no depth -> not detected")
+
+
+def test_gate_reads_the_reticle_through_the_colour_model_not_the_depth_centre():
+    """With a real (offset) registration the depth image centre is NOT the colour
+    reticle. Put the plane only under the colour reticle and prove the gate sees it."""
+    geom = gf.offset(color_K=K, color_size=(W, H), depth_size=(160, 120))
+    xs, ys = np.meshgrid(np.linspace(-60, 60, 41), np.linspace(-45, 45, 31))
+    plane = np.column_stack([xs.ravel(), ys.ravel(), np.full(xs.size, 500.0)])   # colour frame
+    depth = gf.render_depth_in_depth_camera(plane, geom)
+    r = evaluate_depth_gate(depth, geom, K, None, ScanGateThresholds(center_patch_frac=0.2,
+                                                                     min_valid_depth_frac=0.2))
+    assert r.detected and abs(r.distance_mm - 500.0) < 1.0 and r.tilt_deg < 1.0
 
 
 def test_live_telemetry_uses_surface_appropriate_standoff():
@@ -679,6 +694,7 @@ if __name__ == "__main__":
     test_tilt_measured_and_gated()
     test_too_far_fails_distance()
     test_no_surface_not_detected()
+    test_gate_reads_the_reticle_through_the_colour_model_not_the_depth_centre()
     test_live_telemetry_uses_surface_appropriate_standoff()
     test_live_target_is_continuous_across_color_frame_boundary()
     test_live_outline_uses_saved_color_calibration()

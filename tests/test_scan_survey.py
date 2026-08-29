@@ -14,9 +14,12 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tasni.modules.scan.survey import (  # noqa: E402
     SurveyThresholds, survey_surface)
+
+import geometry_fixtures as gf  # noqa: E402
 
 W, H = 320, 240
 K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
@@ -52,7 +55,7 @@ def _render_framed(normal_cam, dist_mm, W=W, H=H, K=K):
 
 def test_frontal_plane_all_green():
     th = SurveyThresholds()  # accurate band 300..800, max tilt 6
-    m = survey_surface(_render_framed([0, 0, 1], 500), K, th)
+    m = survey_surface(_render_framed([0, 0, 1], 500), gf.aligned(K, (W, H)), K, None, th)
     assert m.detected and m.ok, m.to_dict()
     assert abs(m.standoff_mm - 500) < 5, m.standoff_mm
     assert m.tilt_deg < 1.0, m.tilt_deg
@@ -66,7 +69,7 @@ def test_tilt_measured():
     th = SurveyThresholds()
     # 20deg about Y: normal = (sin20, 0, -cos20) (already faces the camera).
     a = np.deg2rad(20)
-    m = survey_surface(_render([np.sin(a), 0, np.cos(a)], 500), K, th)
+    m = survey_surface(_render([np.sin(a), 0, np.cos(a)], 500), gf.aligned(K, (W, H)), K, None, th)
     assert abs(m.tilt_deg - 20) < 1.5, m.tilt_deg
     assert not m.gates["angle"], "20deg > 6deg limit -> angle red"
     assert not m.ok
@@ -79,7 +82,7 @@ def test_tilt_measured():
 
 def test_too_far_reference_mode():
     th = SurveyThresholds()
-    m = survey_surface(_render([0, 0, 1], 1200), K, th)
+    m = survey_surface(_render([0, 0, 1], 1200), gf.aligned(K, (W, H)), K, None, th)
     assert m.detected
     assert not m.gates["distance"], "1200mm > accurate_max 800 -> distance red"
     assert not m.ok
@@ -88,10 +91,10 @@ def test_too_far_reference_mode():
 
 def test_no_depth_not_detected():
     th = SurveyThresholds()
-    m = survey_surface(np.zeros((H, W), np.uint16), K, th)
+    m = survey_surface(np.zeros((H, W), np.uint16), gf.aligned(K, (W, H)), K, None, th)
     assert not m.detected and not m.ok
     assert m.standoff_mm is None
-    assert survey_surface(None, K, th).detected is False
+    assert survey_surface(None, gf.aligned(K, (W, H)), K, None, th).detected is False
     print("[empty] no depth -> not detected")
 
 
@@ -101,7 +104,7 @@ def test_partial_surface_not_framed():
     # Zero out only the bottom-right quadrant: 75% of the frame stays valid (> 0.3),
     # and the visible inliers still touch the top/left borders -> not fully framed.
     d[H // 2:, W // 2:] = 0
-    m = survey_surface(d, K, th)
+    m = survey_surface(d, gf.aligned(K, (W, H)), K, None, th)
     assert m.detected, "three quadrants still have plenty of valid depth"
     assert not m.fully_framed, "inliers touch the top/left image borders"
     assert not m.gates["framed"]
@@ -111,7 +114,7 @@ def test_partial_surface_not_framed():
 def test_extent_approximate():
     th = SurveyThresholds()
     dist = 500.0
-    m = survey_surface(_render([0, 0, 1], dist), K, th)
+    m = survey_surface(_render([0, 0, 1], dist), gf.aligned(K, (W, H)), K, None, th)
     fx, fy = K[0, 0], K[1, 1]
     expect_w = W * dist / fx        # real-world width spanned by the frame at 500mm
     expect_h = H * dist / fy
@@ -124,7 +127,7 @@ def test_extent_approximate():
 
 def test_grid_spacing_nice_number():
     th = SurveyThresholds()
-    m = survey_surface(_render([0, 0, 1], 500), K, th)
+    m = survey_surface(_render([0, 0, 1], 500), gf.aligned(K, (W, H)), K, None, th)
     nice = {1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000}
     assert m.grid_spacing_mm in nice, m.grid_spacing_mm
     assert m.grid_uv is not None and len(m.grid_uv) > 0
@@ -136,7 +139,7 @@ def test_outline_uv_normalized():
     # image -> normalized to [0,1]. (An overrunning surface intentionally projects a
     # generic square that exceeds the frame; that path is covered separately below.)
     th = SurveyThresholds()
-    m = survey_surface(_render_framed([0, 0, 1], 500), K, th)
+    m = survey_surface(_render_framed([0, 0, 1], 500), gf.aligned(K, (W, H)), K, None, th)
     assert m.fully_framed, "centered surface should be fully framed (board-hug path)"
     assert m.outline_uv is not None and len(m.outline_uv) == 4, m.outline_uv
     for u, v in m.outline_uv:
@@ -150,7 +153,7 @@ def test_crop_mode_uses_generic_reticle_square():
     reticle (the optical axis), not the over-running board rectangle. extent_mm stays
     the raw measured extent (used to decide the surface is large)."""
     th = SurveyThresholds(work_crop_mm=(600.0, 600.0))
-    m = survey_surface(_render([0, 0, 1], 500), K, th)   # plane fills frame -> not framed
+    m = survey_surface(_render([0, 0, 1], 500), gf.aligned(K, (W, H)), K, None, th)   # plane fills frame -> not framed
     assert m.detected and not m.fully_framed, (m.detected, m.fully_framed)
     c = np.asarray(m.corners_cam_mm, float)
     assert c.shape == (4, 3), c.shape
@@ -174,7 +177,7 @@ def test_surface_dots_are_a_stable_lattice():
     dots mark where depth truly landed and hold still instead of 'dancing'."""
     th = SurveyThresholds()
     d = _render_framed([0, 0, 1], 500)
-    m1 = survey_surface(d, K, th)
+    m1 = survey_surface(d, gf.aligned(K, (W, H)), K, None, th)
     assert m1.points_uv is not None and len(m1.points_uv) > 20, m1.points_uv
     for u, v in m1.points_uv:
         assert 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0, (u, v)
@@ -182,7 +185,7 @@ def test_surface_dots_are_a_stable_lattice():
     # not the full raw inlier cloud.
     assert len(m1.points_uv) <= 4000, len(m1.points_uv)
     # Deterministic: identical depth -> identical dots (proves it is NOT re-sampled).
-    m2 = survey_surface(d.copy(), K, th)
+    m2 = survey_surface(d.copy(), gf.aligned(K, (W, H)), K, None, th)
     assert m1.points_uv == m2.points_uv, "same input must yield identical dots"
     # Steady under small depth noise: the centroid-anchored lattice barely moves, so
     # the projected dots do not jump (the anti-'dance' property the user asked for).
@@ -190,7 +193,7 @@ def test_surface_dots_are_a_stable_lattice():
     noisy = d.astype(np.int32)
     nz = noisy > 0
     noisy[nz] += rng.integers(-2, 3, size=int(nz.sum()))
-    mn = survey_surface(np.clip(noisy, 0, None).astype(np.uint16), K, th)
+    mn = survey_surface(np.clip(noisy, 0, None).astype(np.uint16), gf.aligned(K, (W, H)), K, None, th)
     A, B = np.asarray(m1.points_uv), np.asarray(mn.points_uv)
     nn = np.sqrt(((B[:, None, :] - A[None, :, :]) ** 2).sum(-1)).min(axis=1)
     assert float(np.median(nn)) < 0.01, float(np.median(nn))  # < 1% of the frame
@@ -201,7 +204,7 @@ def test_surface_dots_are_a_stable_lattice():
 def test_to_dict_serializable():
     import json
     th = SurveyThresholds()
-    d = survey_surface(_render([0, 0, 1], 500), K, th).to_dict()
+    d = survey_surface(_render([0, 0, 1], 500), gf.aligned(K, (W, H)), K, None, th).to_dict()
     assert isinstance(d["normal_cam"], list)
     assert isinstance(d["centroid_cam_mm"], list)
     assert isinstance(d["extent_mm"], list)

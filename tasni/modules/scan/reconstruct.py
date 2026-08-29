@@ -27,9 +27,11 @@ import numpy as np
 class ScanView:
     """One captured viewpoint for fusion."""
 
-    color: np.ndarray         # HxWx3 BGR uint8 (as the camera client decodes it)
-    depth: np.ndarray         # HxW depth, raw units (uint16 mm for the D435i)
-    pose_T: np.ndarray        # 4x4 base->camera, translation in mm (RoboDK units)
+    color: np.ndarray         # HxWx3 BGR uint8 (diagnostics / saved views only --
+    #                            the fuse is depth-only, see fuse_views)
+    depth: np.ndarray         # HxW NATIVE depth, geometry.depth_unit_mm per step
+    pose_T: np.ndarray        # 4x4 base->COLOUR camera, mm (the hand-eye pose)
+    geometry: "CameraGeometry"  # this view's connection greeting (Task 7/8)
 
 
 @dataclass
@@ -57,62 +59,69 @@ def _pose_to_extrinsic_m(pose_T: np.ndarray) -> np.ndarray:
     return invert_T(T)
 
 
-def fuse_views(views: list[ScanView], K: np.ndarray, width: int, height: int, *,
-               voxel_size_m: float = 0.004, sdf_trunc_m: float = 0.02,
-               depth_scale: float = 1000.0, depth_min_m: float = 0.2,
+def fuse_views(views: list[ScanView], *, voxel_size_m: float = 0.004,
+               sdf_trunc_m: float = 0.02, depth_min_m: float = 0.2,
                depth_max_m: float = 1.5) -> FusionResult:
-    """Integrate every posed RGBD view into a TSDF volume and extract the mesh + cloud.
+    """Integrate every posed DEPTH view into a TSDF volume (no colour: the scan mesh
+    is neutral by contract -- ``clean_measured_surface_mesh`` always repaints it --
+    and native depth is not registered pixel-for-pixel to colour the way the old
+    aligned stream was, so there is nothing honest to paint the raw TSDF mesh with).
 
-    Geometry is returned in the **robot base frame, in metres**. ``depth_scale``
-    converts the raw depth to metres (1000 for uint16 mm); depth outside
-    ``[depth_min_m, depth_max_m]`` is dropped (near-sensor noise / far background).
+    Geometry is returned in the **robot base frame, in metres**. Each view integrates
+    through its OWN ``geometry`` (protocol 2 views need not share one connection's
+    intrinsics): intrinsic = ``depth_K`` @ ``depth_size`` (the native DEPTH camera,
+    not the colour model), extrinsic = the DEPTH camera's pose (``depth_pose``, from
+    the view's hand-eye COLOUR pose via ``T_color_depth``), and Open3D's
+    ``depth_scale`` is derived from ``geometry.depth_unit_mm`` -- no code here
+    assumes RealSense's old 1000 (uint16 mm) convention now that protocol 2 streams
+    native 0.1 mm units; depth outside ``[depth_min_m, depth_max_m]`` is dropped
+    (near-sensor noise / far background).
     """
     import open3d as o3d
+    from ...core.depth_geometry import depth_pose
 
     if not views:
         raise ValueError("no views to fuse")
-
-    intrinsic = _intrinsic(K, width, height)
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=float(voxel_size_m), sdf_trunc=float(sdf_trunc_m),
-        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
-
-    min_raw = float(depth_min_m) * float(depth_scale)
+        color_type=o3d.pipelines.integration.TSDFVolumeColorType.NoColor)
     n_used = 0
     for v in views:
-        color = np.asarray(v.color)
-        depth = np.asarray(v.depth)
-        if depth.shape[:2] != color.shape[:2]:
-            raise ValueError(
-                f"depth {depth.shape[:2]} and color {color.shape[:2]} differ — the "
-                f"server must align depth to color (full depth+color stream)")
-        # BGR (camera client) -> RGB (Open3D); drop too-near depth (keep dtype).
-        rgb = np.ascontiguousarray(color[:, :, ::-1])
+        g = v.geometry
+        w, h = g.depth_size
+        depth = np.ascontiguousarray(np.asarray(v.depth, np.uint16))
+        units_per_m = 1000.0 / float(g.depth_unit_mm)   # raw depth units -> metres
         d = depth.copy()
-        d[d < min_raw] = 0
+        d[d < float(depth_min_m) * units_per_m] = 0
+        grey = np.zeros((h, w, 3), np.uint8)
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            o3d.geometry.Image(rgb), o3d.geometry.Image(np.ascontiguousarray(d)),
-            depth_scale=float(depth_scale), depth_trunc=float(depth_max_m),
+            o3d.geometry.Image(grey), o3d.geometry.Image(d),
+            depth_scale=units_per_m, depth_trunc=float(depth_max_m),
             convert_rgb_to_intensity=False)
-        volume.integrate(rgbd, intrinsic, _pose_to_extrinsic_m(v.pose_T))
+        volume.integrate(rgbd, _intrinsic(g.depth_K, w, h),
+                         _pose_to_extrinsic_m(depth_pose(v.pose_T, g)))
         n_used += 1
-
     mesh = volume.extract_triangle_mesh()
     mesh.compute_vertex_normals()
-    cloud = volume.extract_point_cloud()
-    return FusionResult(mesh=mesh, cloud=cloud, n_views=n_used)
+    return FusionResult(mesh=mesh, cloud=volume.extract_point_cloud(), n_views=n_used)
 
 
 def look_point_from_views(views: list[ScanView], *, patch_frac: float = 0.25
                           ) -> np.ndarray | None:
     """The point the camera was aimed at, in the base frame (mm) — for ROI cropping.
 
-    For each view, the surface point on the optical axis is ``cam_pos + d * forward``
-    where ``d`` is the central-patch median depth (mm) and ``forward`` is the camera
-    +Z in base. Averaging across views gives the work-surface centre robustly, even
-    for near-parallel top-down views (where a ray-intersection would be ill-posed).
-    Returns ``None`` if no view had usable central depth.
+    The central patch is the DEPTH image's own centre (native depth is not aligned
+    to colour under protocol 2), so the ray is the DEPTH camera's axis, not the
+    colour camera's: ``T = depth_pose(v.pose_T, v.geometry)``. For each view, the
+    surface point on that axis is ``cam_pos + d * forward`` where ``d`` is the
+    central-patch median depth (mm, via the view's own ``depth_unit_mm``) and
+    ``forward`` is the depth camera's +Z in base. Averaging across views gives the
+    work-surface centre robustly, even for near-parallel top-down views (where a
+    ray-intersection would be ill-posed). Returns ``None`` if no view had usable
+    central depth.
     """
+    from ...core.depth_geometry import depth_pose
+
     pts: list[np.ndarray] = []
     for v in views:
         d = np.asarray(v.depth)
@@ -125,8 +134,9 @@ def look_point_from_views(views: list[ScanView], *, patch_frac: float = 0.25
         valid = valid[valid > 0]
         if valid.size < 10:
             continue
-        T = np.asarray(v.pose_T, dtype=float)
-        pts.append(T[:3, 3] + float(np.median(valid)) * T[:3, 2])
+        T = depth_pose(v.pose_T, v.geometry)
+        d_mm = float(np.median(valid)) * float(v.geometry.depth_unit_mm)
+        pts.append(T[:3, 3] + d_mm * T[:3, 2])
     if not pts:
         return None
     return np.mean(np.asarray(pts), axis=0)
@@ -248,33 +258,38 @@ def _keep_largest_component(mesh):
     return mesh, int(len(counts)), float(areas[keep_label])
 
 
-def _view_support_counts(vertices_m: np.ndarray, views: list[ScanView], K: np.ndarray,
-                         width: int, height: int, *, depth_scale: float,
+def _view_support_counts(vertices_m: np.ndarray, views: list[ScanView], *,
                          tolerance_m: float, depth_min_m: float,
                          depth_max_m: float) -> tuple[np.ndarray, np.ndarray]:
     """Count how many camera views actually support each mesh vertex.
 
-    A vertex is considered supported by a view when it projects inside the image and
-    the measured depth at that pixel is close to the vertex's projected camera-Z.
-    This is a pragmatic confidence/probability proxy for TSDF meshes: random flying
-    surfaces usually have weak multi-view support, while real surface patches are
-    confirmed by repeated observations.
+    A vertex is considered supported by a view when it projects inside that view's
+    OWN native depth image (protocol 2: each view carries its own ``geometry``, not
+    a shared K/size) via the DEPTH camera's own model/pose, and the measured depth
+    at that pixel (scaled by the view's own ``depth_unit_mm``) is close to the
+    vertex's projected depth-camera-Z. This is a pragmatic confidence/probability
+    proxy for TSDF meshes: random flying surfaces usually have weak multi-view
+    support, while real surface patches are confirmed by repeated observations.
     """
+    from ...core.depth_geometry import depth_pose
+
     n = len(vertices_m)
     supported = np.zeros(n, dtype=np.uint16)
     observable = np.zeros(n, dtype=np.uint16)
     if n == 0 or not views:
         return supported, observable
 
-    fx, fy, cx, cy = map(float, (K[0, 0], K[1, 1], K[0, 2], K[1, 2]))
     verts_mm = np.asarray(vertices_m, dtype=float) * 1000.0
     tol_m = float(tolerance_m)
     for v in views:
+        g = v.geometry
         depth = np.asarray(v.depth)
-        if depth.ndim != 2 or depth.size == 0:
+        if depth.ndim != 2 or depth.size == 0 or g is None:
             continue
-        h, w = depth.shape[:2]
-        T = np.asarray(v.pose_T, dtype=float).reshape(4, 4)
+        w, h = g.depth_size
+        fx, fy, cx, cy = map(float, (g.depth_K[0, 0], g.depth_K[1, 1],
+                                     g.depth_K[0, 2], g.depth_K[1, 2]))
+        T = depth_pose(v.pose_T, g)
         R, t = T[:3, :3], T[:3, 3]
         pc_mm = (verts_mm - t) @ R
         z_m = pc_mm[:, 2] / 1000.0
@@ -284,11 +299,11 @@ def _view_support_counts(vertices_m: np.ndarray, views: list[ScanView], K: np.nd
         with np.errstate(divide="ignore", invalid="ignore"):
             u = np.rint(fx * (pc_mm[:, 0] / pc_mm[:, 2]) + cx).astype(np.int32)
             vv = np.rint(fy * (pc_mm[:, 1] / pc_mm[:, 2]) + cy).astype(np.int32)
-        inside = in_front & (u >= 0) & (u < min(width, w)) & (vv >= 0) & (vv < min(height, h))
+        inside = in_front & (u >= 0) & (u < w) & (vv >= 0) & (vv < h)
         idx = np.flatnonzero(inside)
         if len(idx) == 0:
             continue
-        d_m = depth[vv[idx], u[idx]].astype(float) / float(depth_scale)
+        d_m = depth[vv[idx], u[idx]].astype(float) * float(g.depth_unit_mm) / 1000.0
         has_depth = d_m > 0.0
         if not np.any(has_depth):
             continue
@@ -303,7 +318,7 @@ def clean_measured_surface_mesh(mesh, views: list[ScanView], wp, K: np.ndarray,
                                 rect_margin_m: float, support_tolerance_m: float,
                                 min_support_views: int, min_support_ratio: float,
                                 min_normal_dot: float,
-                                depth_scale: float, depth_min_m: float,
+                                depth_min_m: float,
                                 depth_max_m: float,
                                 keep_largest_component: bool = True,
                                 project_to_plane: bool = True,
@@ -318,6 +333,12 @@ def clean_measured_surface_mesh(mesh, views: list[ScanView], wp, K: np.ndarray,
       3. reject near-vertical side walls by normal direction,
       4. drop disconnected islands so loose fragments not attached to the rectangle
          are not imported into RoboDK.
+
+    ``K``/``width``/``height`` are kept in the signature for the callers that
+    already have the colour model handy here, but are no longer forwarded into
+    support counting (Task 10): each view now carries its OWN ``geometry``
+    (protocol 2), so ``_view_support_counts`` reads intrinsics/pose/unit per view
+    instead of assuming one shared colour K/size for every capture.
     """
     vertices = np.asarray(mesh.vertices, dtype=float)
     triangles = np.asarray(mesh.triangles, dtype=np.int32)
@@ -362,8 +383,7 @@ def clean_measured_surface_mesh(mesh, views: list[ScanView], wp, K: np.ndarray,
         normal_mask = np.ones(len(vertices), dtype=bool)
 
     supported, observable = _view_support_counts(
-        vertices, views, K, width, height, depth_scale=depth_scale,
-        tolerance_m=support_tolerance_m, depth_min_m=depth_min_m,
+        vertices, views, tolerance_m=support_tolerance_m, depth_min_m=depth_min_m,
         depth_max_m=depth_max_m)
     with np.errstate(divide="ignore", invalid="ignore"):
         ratio = np.divide(supported, observable, out=np.zeros_like(supported, dtype=float),

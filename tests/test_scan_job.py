@@ -25,7 +25,9 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import geometry_fixtures as gf  # noqa: E402
 from tasni.core import runs  # noqa: E402
 from tasni.core.camera_lease import CameraLease  # noqa: E402
 from tasni.core.config import AppConfig, ScanConfig  # noqa: E402
@@ -110,7 +112,8 @@ def _render(T_base_cam, table_half_mm=None, noise_mm=0.0, rng=None, rotation_deg
     # of geometry. Two-tone, keyed on the same `valid` mask as depth, mirrors how
     # a real RGB frame actually looks (a light table against a darker surround).
     color = np.where(np.repeat(valid[..., None], 3, axis=2), 200, 50).astype(np.uint8)
-    return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP)
+    return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP,
+                            geometry=gf.aligned(K, (W, H)))
 
 
 def _build_fakes(mount_mm=(40.0, -15.0, 55.0)):
@@ -1415,7 +1418,11 @@ def test_save_views_persists_per_pose_frames():
             assert len(list(vdir.glob("depth_*.png"))) == res["n_views"]
             meta = _json.loads((vdir / "views.json").read_text())
             assert len(meta["views"]) == res["n_views"]
-            assert meta["size"] == [W, H] and len(meta["K"]) == 3
+            # views.json now carries the full CameraGeometry (Task 10), not a bare
+            # K/size pair -- the fakes render through gf.aligned(K, (W, H)), so its
+            # own "size"/"K" fields (the legacy_aligned convention) still line up.
+            geom = meta["camera_geometry"]
+            assert geom["size"] == [W, H] and len(geom["K"]) == 3
             assert len(meta["views"][0]["pose_T_mm"]) == 4   # 4x4 pose persisted
         finally:
             scan_service.new_run_dir = orig
@@ -2112,7 +2119,8 @@ def _render_with_floor(T_base_cam, *, table_z=0.0, floor_z=_FLOOR_Z_MM):
     valid_floor = (s_floor > 0) & np.isfinite(s_floor)
     depth = np.where(on_table, s_table, np.where(valid_floor, s_floor, 0)).astype(np.uint16)
     color = np.full((H, W, 3), 128, np.uint8)
-    return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP)
+    return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP,
+                            geometry=gf.aligned(K, (W, H)))
 
 
 def _corner_polygon_uv(cx, cy, arm=0.3):
@@ -2163,7 +2171,7 @@ def _true_table_plane_cam(cx, cy, *, table_z=0.0):
     th = SurveyThresholds(accurate_min_mm=300.0, accurate_max_mm=800.0, survey_max_tilt_deg=6.0,
                           grid_target_px=64, frame_margin_uv=0.02, work_crop_mm=(1000.0, 1000.0),
                           min_valid_depth_frac=0.05)
-    m = real_survey_surface(depth_clean, K, th, depth_scale=1000.0)
+    m = real_survey_surface(depth_clean, gf.aligned(K, (W, H)), K, None, th)
     assert m.detected, "table-only reference render must be detected"
     return m.normal_cam, m.centroid_cam_mm, m.standoff_mm, m.tilt_deg
 
@@ -2176,7 +2184,8 @@ def _render_zero_background(T_base_cam, *, table_z=0.0):
     helper in this file."""
     depth = _render_table_only(T_base_cam, table_z=table_z)
     color = np.full((H, W, 3), 128, np.uint8)
-    return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP)
+    return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP,
+                            geometry=gf.aligned(K, (W, H)))
 
 
 def _build_fakes_five_position_background(table_z_by_kind=None, *, background="floor"):
@@ -2252,8 +2261,8 @@ def _patch_boundary_and_plane_for_five_position_background(table_z_by_kind):
     orig_survey_surface = scan_service.survey_surface
     orig_color_boundary = scan_service.color_work_boundary
 
-    def patched_survey_surface(depth, K_, th, **kw):
-        real = orig_survey_surface(depth, K_, th, **kw)
+    def patched_survey_surface(depth, geometry, K_, dist_, th, **kw):
+        real = orig_survey_surface(depth, geometry, K_, dist_, th, **kw)
         if not real.detected:
             return real
         import dataclasses
@@ -2305,11 +2314,12 @@ def test_deproject_plane_points_mm_filters_background_to_plane_inliers():
     bg_frac = float(np.mean(depth_bg > 1000))
     assert bg_frac > 0.7, bg_frac      # a genuinely majority-background frame
 
+    geom = gf.aligned(K, (W, H))
     pts_before, purity_before, coverage_before = scan_service._deproject_plane_points_mm(
-        depth_bg, K, T, plane_normal_cam=normal_cam, plane_point_cam=centroid_cam_mm,
+        depth_bg, geom, T, plane_normal_cam=normal_cam, plane_point_cam=centroid_cam_mm,
         band_mm=1.0e6)                 # effectively unfiltered -- reproduces the pre-fix behaviour
     pts_after, purity_after, coverage_after = scan_service._deproject_plane_points_mm(
-        depth_bg, K, T, plane_normal_cam=normal_cam, plane_point_cam=centroid_cam_mm,
+        depth_bg, geom, T, plane_normal_cam=normal_cam, plane_point_cam=centroid_cam_mm,
         band_mm=6.0)                   # the scan.survey_plane_inlier_band_mm default
 
     from tasni.modules.scan.rect_fit import fit_global_plane
@@ -2466,7 +2476,8 @@ def test_five_position_capture_rejects_genuinely_bad_aim_with_real_background():
         valid_floor = (s_floor > 0) & np.isfinite(s_floor)
         depth = np.where(on_table, s_table, np.where(valid_floor, s_floor, 0)).astype(np.uint16)
         color = np.full((H, W, 3), 128, np.uint8)
-        return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP)
+        return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP,
+                               geometry=gf.aligned(K, (W, H)))
 
     services, state = _build_fakes_five_position_background(background="floor")
     real_grab = services.camera.grab
@@ -2537,14 +2548,15 @@ def test_five_position_capture_rejects_tiny_table_sliver_via_coverage_gate():
                  & (s > 0) & np.isfinite(s))
         depth = np.where(valid, s, 0).astype(np.uint16)
         color = np.full((H, W, 3), 128, np.uint8)
-        return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP)
+        return SimpleNamespace(color=color, depth=depth, timestamp=FRAME_TIMESTAMP,
+                               geometry=gf.aligned(K, (W, H)))
 
     # Unit-level sanity first: prove purity alone would be misled, coverage is not.
     tiny_frame = render_tiny(T)
     normal_cam, centroid_cam_mm, _standoff_mm, _tilt = _true_table_plane_cam(cx, cy)
     _pts, purity, coverage = scan_service._deproject_plane_points_mm(
-        tiny_frame.depth, K, T, plane_normal_cam=normal_cam, plane_point_cam=centroid_cam_mm,
-        band_mm=6.0)
+        tiny_frame.depth, tiny_frame.geometry, T, plane_normal_cam=normal_cam,
+        plane_point_cam=centroid_cam_mm, band_mm=6.0)
     assert purity > 0.9, purity          # the blind spot: silent bg -> purity looks fine
     assert coverage < 0.05, coverage     # but coverage correctly shows almost nothing is there
 
@@ -3277,7 +3289,10 @@ def test_plane_rms_none_when_starved_never_nan():
     """Review finding: NaN here kills the /ws JSON on the client and 500s the
     lock/insert responses (FastAPI renders with allow_nan=False)."""
     K = np.array([[600.0, 0.0, 32.0], [0.0, 600.0, 32.0], [0.0, 0.0, 1.0]])
-    assert scan_service._plane_rms_mm(np.zeros((64, 64)), K) is None
+    frame = SimpleNamespace(depth=np.zeros((64, 64), np.uint16),
+                            geometry=gf.aligned(K, (64, 64)))
+    cfg = SimpleNamespace(camera=SimpleNamespace(K=K, dist=None))
+    assert scan_service._plane_rms_mm(frame, cfg) is None
 
 
 def test_finite_or_none_guards_payload_metrics():

@@ -1,6 +1,21 @@
+import sys
+from pathlib import Path
+
 import numpy as np
 
-from tasni.modules.scan.corner_evidence import extract_corner_evidence, _deproject_base
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import geometry_fixtures as gf  # noqa: E402
+from tasni.core.depth_geometry import ColorRegistered  # noqa: E402
+from tasni.modules.scan.corner_evidence import extract_corner_evidence, _deproject_base  # noqa: E402
+
+
+def _reg(depth, K):
+    """Wrap a synthetic aligned-mm depth image into a ColorRegistered (Task 10):
+    the scenes below are rendered as aligned depth in K's model (depth == colour
+    image, 1 mm units), matching gf.aligned's legacy convention."""
+    h, w = np.asarray(depth).shape
+    return ColorRegistered.build(depth, gf.aligned(K, (w, h)), K, None)
 
 
 def _rot_x(deg):
@@ -57,7 +72,7 @@ def test_corner_and_edges_are_extracted_in_base_frame():
     correct output."""
     depth, K, poly = _scene_with_discontinuity()
     T = _tilted_pose()
-    ev = extract_corner_evidence(depth, K, poly, T, corner_hint_uv=(0.5, 0.5))
+    ev = extract_corner_evidence(_reg(depth, K), K, poly, T, corner_hint_uv=(0.5, 0.5))
     assert ev is not None
     assert np.linalg.norm(np.asarray(ev.corner_uv) - 0.5) < 0.02
     pts = ev.edge_points_base
@@ -102,7 +117,7 @@ def test_local_bisector_lands_on_surface_when_global_vertex_mean_would_not():
     T = np.eye(4)
     T[2, 3] = 900.0
 
-    ev = extract_corner_evidence(depth, K, poly, T, corner_hint_uv=(0.12, 0.12))
+    ev = extract_corner_evidence(_reg(depth, K), K, poly, T, corner_hint_uv=(0.12, 0.12))
     assert ev is not None
     pts = ev.edge_points_base
     assert pts.shape[0] >= 20
@@ -129,7 +144,7 @@ def test_arm_stops_at_a_sharp_heading_turn_border_follow():
     poly = np.array([[0.5, 0.95], [0.5, 0.5], [0.95, 0.5], [0.95, 1.0]])
     T = np.eye(4)
     T[2, 3] = 900.0
-    ev = extract_corner_evidence(depth, K, poly, T, corner_hint_uv=(0.5, 0.5),
+    ev = extract_corner_evidence(_reg(depth, K), K, poly, T, corner_hint_uv=(0.5, 0.5),
                                   arm_frac=0.6, samples_per_arm=60)
     assert ev is not None
     pts = ev.edge_points_base
@@ -156,7 +171,7 @@ def test_corner_sample_is_inset_like_edge_samples():
     depth, K, poly = _scene()
     T = np.eye(4)
     T[2, 3] = 900.0
-    ev = extract_corner_evidence(depth, K, poly, T, corner_hint_uv=(0.5, 0.5),
+    ev = extract_corner_evidence(_reg(depth, K), K, poly, T, corner_hint_uv=(0.5, 0.5),
                                   inset_px=4.0)
     assert ev is not None and ev.corner_base_mm is not None
 
@@ -183,7 +198,7 @@ def test_returns_none_when_only_one_arm_has_depth_support():
     depth[:135, :] = 0.0  # wipes out arm+1 entirely; trims arm-1's near-corner end
     T = np.eye(4)
     T[2, 3] = 900.0
-    assert extract_corner_evidence(depth, K, poly, T, corner_hint_uv=(0.5, 0.5)) is None
+    assert extract_corner_evidence(_reg(depth, K), K, poly, T, corner_hint_uv=(0.5, 0.5)) is None
 
 
 def test_closed_contour_wraps_to_find_both_arms_at_index_zero():
@@ -202,9 +217,9 @@ def test_closed_contour_wraps_to_find_both_arms_at_index_zero():
     T = np.eye(4)
     T[2, 3] = 900.0
 
-    assert extract_corner_evidence(depth, K, poly, T, corner_hint_uv=(0.5, 0.5)) is None
+    assert extract_corner_evidence(_reg(depth, K), K, poly, T, corner_hint_uv=(0.5, 0.5)) is None
 
-    ev = extract_corner_evidence(depth, K, poly, T, corner_hint_uv=(0.5, 0.5), closed=True)
+    ev = extract_corner_evidence(_reg(depth, K), K, poly, T, corner_hint_uv=(0.5, 0.5), closed=True)
     assert ev is not None
     pts = ev.edge_points_base
     assert pts.shape[0] >= 20
@@ -214,13 +229,13 @@ def test_closed_contour_wraps_to_find_both_arms_at_index_zero():
 def test_returns_none_without_depth_support():
     depth, K, poly = _scene()
     depth[:] = 0.0
-    assert extract_corner_evidence(depth, K, poly, np.eye(4)) is None
+    assert extract_corner_evidence(_reg(depth, K), K, poly, np.eye(4)) is None
 
 
 def test_returns_none_for_degenerate_polygon():
     depth, K, _ = _scene()
     tiny = np.array([[0.5, 0.5], [0.501, 0.5]])
-    assert extract_corner_evidence(depth, K, tiny, np.eye(4)) is None
+    assert extract_corner_evidence(_reg(depth, K), K, tiny, np.eye(4)) is None
 
 
 def test_returns_none_for_degenerate_zero_area_polygon():
@@ -228,14 +243,14 @@ def test_returns_none_for_degenerate_zero_area_polygon():
     arm length to walk, and must not be mistaken for a valid L-shaped corner."""
     depth, K, _ = _scene()
     clustered = np.array([[0.5, 0.5], [0.5001, 0.5], [0.5002, 0.5]])
-    assert extract_corner_evidence(depth, K, clustered, np.eye(4)) is None
+    assert extract_corner_evidence(_reg(depth, K), K, clustered, np.eye(4)) is None
 
 
 def test_returns_none_for_nan_depth():
     """NaN depth must never leak into the output (no NaN-bearing partial result)."""
     depth, K, poly = _scene()
     depth[:] = np.nan
-    result = extract_corner_evidence(depth, K, poly, np.eye(4))
+    result = extract_corner_evidence(_reg(depth, K), K, poly, np.eye(4))
     assert result is None
 
 
@@ -245,7 +260,7 @@ def test_returns_none_for_partial_nan_depth_without_support():
     depth, K, poly = _scene()
     depth[:] = np.nan
     depth[::2, ::2] = 0.0
-    result = extract_corner_evidence(depth, K, poly, np.eye(4))
+    result = extract_corner_evidence(_reg(depth, K), K, poly, np.eye(4))
     if result is not None:
         assert np.all(np.isfinite(result.edge_points_base))
     else:
@@ -262,7 +277,7 @@ def test_arm_walk_terminates_at_polyline_end_without_crash():
     rather than the topology side)."""
     depth, K = _scene()[0], _scene()[1]
     short_poly = np.array([[0.5, 0.5], [0.6, 0.5], [0.7, 0.5]])
-    result = extract_corner_evidence(depth, K, short_poly, np.eye(4),
+    result = extract_corner_evidence(_reg(depth, K), K, short_poly, np.eye(4),
                                       corner_hint_uv=(0.5, 0.5))
     assert result is None
 
@@ -275,7 +290,7 @@ def test_arm_walk_direct_short_polyline_produces_bounded_points():
     respected either way, but there is nothing valid to return here)."""
     depth, K = _scene()[0], _scene()[1]
     poly = np.array([[0.4, 0.5], [0.5, 0.5], [0.6, 0.5]])
-    result = extract_corner_evidence(depth, K, poly, np.eye(4),
+    result = extract_corner_evidence(_reg(depth, K), K, poly, np.eye(4),
                                       corner_hint_uv=(0.5, 0.5),
                                       arm_frac=2.0)
     assert result is None
@@ -289,4 +304,4 @@ def test_returns_none_for_nan_camera_pose():
     depth, K, poly = _scene()
     T = np.eye(4)
     T[2, 3] = np.nan
-    assert extract_corner_evidence(depth, K, poly, T, corner_hint_uv=(0.5, 0.5)) is None
+    assert extract_corner_evidence(_reg(depth, K), K, poly, T, corner_hint_uv=(0.5, 0.5)) is None
