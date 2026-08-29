@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
 
 from tasni.core.camera import CameraClient, CameraError, _HEADER  # noqa: E402
 from tasni.core.config import CameraConfig  # noqa: E402
@@ -171,19 +172,6 @@ def test_grab_sends_mode_color_handshake():
     print("[handshake] grab(color_only=True) sent MODE COLOR, depth skipped")
 
 
-def _server_parse_handshake(req: bytes) -> "tuple[bool, int | None]":
-    """Mirror the server's handshake parse (server_unicast_syncronous.py:69-77):
-    color-only flag + optional clamped JPEG quality. Kept in lockstep with the
-    server the same way _server_encode mirrors its framing."""
-    req = req.strip().upper()
-    color_only = req.startswith(b"MODE COLOR") or req == b"C"
-    quality = None
-    for tok in req.split():
-        if tok.startswith(b"Q") and tok[1:].isdigit():
-            quality = max(10, min(100, int(tok[1:])))
-    return color_only, quality
-
-
 def test_color_only_quality_handshake_string():
     """grab(color_only=True, quality=n) must append ` Q<n>`; with no quality it
     stays the bare `MODE COLOR\\n` (back-compat with servers that ignore Q)."""
@@ -204,17 +192,15 @@ def test_color_only_quality_handshake_string():
     print("[handshake] quality token appended only when requested")
 
 
+from server.handshake import parse_handshake  # noqa: E402  (sys.path has server/ via tests/test_handshake.py's insert; add the same two inserts at the top of this file)
+
+
 def test_server_parses_quality_handshake():
-    """The server contract: MODE COLOR [Q<n>] -> (color_only, clamped quality);
-    anything else -> FULL. Guards both sides of the wire."""
-    assert _server_parse_handshake(b"MODE COLOR\n") == (True, None)
-    assert _server_parse_handshake(b"MODE COLOR Q60\n") == (True, 60)
-    assert _server_parse_handshake(b"C") == (True, None)
-    assert _server_parse_handshake(b"") == (False, None)          # -> FULL
-    assert _server_parse_handshake(b"garbage") == (False, None)   # -> FULL
-    assert _server_parse_handshake(b"MODE COLOR Q5\n")[1] == 10    # clamped low
-    assert _server_parse_handshake(b"MODE COLOR Q999\n")[1] == 100 # clamped high
-    print("[handshake] server parse: color-only flag + clamped quality")
+    assert parse_handshake(b"MODE COLOR\n")["quality"] is None
+    assert parse_handshake(b"MODE COLOR Q60\n")["quality"] == 60
+    assert parse_handshake(b"MODE COLOR Q5\n")["quality"] == 10
+    assert parse_handshake(b"MODE COLOR Q999\n")["quality"] == 100
+    assert parse_handshake(b"")["depth_requested"] and not parse_handshake(b"")["v2"]
 
 
 def test_scan_h264_handshake_requests_telemetry():

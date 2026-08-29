@@ -13,6 +13,15 @@ import lz4.frame as lz4f
 import io
 import turbojpeg
 import scan_overlay  # pure-numpy live-rectangle trim + colour edge cross-check
+from handshake import parse_handshake
+import rs_config
+import rs_geometry
+
+ASFOUND_DIR = os.environ.get("RS_ASFOUND_DIR", "/home/jetson/robodk-characterization")
+# Work-volume clip ahead of the spatial filter (audit R5): background depth must not
+# be smoothed into surface edges, and nothing may fabricate depth.
+RS_DEPTH_MIN_M = 0.15
+RS_DEPTH_MAX_M = 1.5
 
 port = 1024
 SCAN_COLOR_JPEG_QUALITY = 100
@@ -603,8 +612,8 @@ def get_ip_address():
 
 # --- Camera supervision -----------------------------------------------------
 #
-# ``pipeline``/``align`` are built once at startup and shared by every client
-# thread, and until now nothing ever rebuilt them. On 2026-08-29 the D435i
+# ``pipeline`` is built once at startup and shared by every client thread, and
+# until now nothing ever rebuilt it. On 2026-08-29 the D435i
 # streamed for two healthy hours and then stopped delivering at 14:44:04; from
 # that moment EVERY acquisition raised "Frame didn't arrive within 5000" -- 57 in
 # a row -- while the service stayed ``active``, kept LISTENING on 1024 and kept
@@ -638,7 +647,6 @@ MAX_REBUILDS_WITHOUT_PROGRESS = 3
 HEALTHY_FRAMES_AFTER_REBUILD = 30      # ~1 s of streaming at 30 fps
 
 pipeline = None          # replaced at startup, and on every successful rebuild
-align = None
 depth_unit_mm = None
 
 _camera_lock = threading.RLock()   # one camera behind many threads
@@ -710,7 +718,7 @@ def _release_pipeline():
 
 def _rebuild_pipeline(observed_generation):
     """Re-open the camera once, on behalf of every waiting client thread."""
-    global pipeline, align, depth_unit_mm
+    global pipeline, depth_unit_mm
     global _camera_generation, _consecutive_timeouts, _camera_unavailable_reason
     global _rebuilds_without_progress, _frames_since_rebuild
 
@@ -726,14 +734,14 @@ def _rebuild_pipeline(observed_generation):
             _recovery_sleep(pause)
             try:
                 _release_pipeline()
-                new_pipeline, new_align = openPipeline()
+                new_pipeline = openPipeline()
             except Exception as exc:
                 last_error = exc
                 print(f"  reopen attempt {attempt}/{len(RECOVERY_BACKOFF_S)} "
                       f"failed: {exc}", flush=True)
                 continue
 
-            pipeline, align = new_pipeline, new_align
+            pipeline = new_pipeline
             try:
                 depth_unit_mm = (pipeline.get_active_profile().get_device()
                                  .first_depth_sensor().get_depth_scale() * 1000.0)
@@ -804,28 +812,21 @@ def read_frames():
         return frames
 
 
-def getFrames(align, depth_filters):
+def getFrames(depth_filters):
+    """One native depth frame (filtered) + the colour frame. NOT aligned: the host
+    back-projects with the depth intrinsics it received in the greeting."""
     frames = read_frames()
-    aligned_frames = align.process(frames)
-
-    depth = aligned_frames.get_depth_frame()
-    color = aligned_frames.get_color_frame()
-
+    depth = frames.get_depth_frame()
+    color = frames.get_color_frame()
     if not depth or not color:
         return None, None, None
+    for f in depth_filters:
+        depth = f.process(depth)
+    return (np.asanyarray(depth.get_data()), np.asanyarray(color.get_data()),
+            frames.get_timestamp())
 
-    for filter in depth_filters:
-        depth = filter.process(depth)
-
-    depth_data = np.asanyarray(depth.get_data())
-    color_data = np.asanyarray(color.get_data())
-
-    ts = frames.get_timestamp()
-
-    return depth_data, color_data, ts
-
-width = 1280;
-height = 720;
+DEPTH_SIZE = (1280, 720)      # the D435i's top depth mode
+COLOR_SIZE = (1920, 1080)     # audit R7: ChArUco corner precision bounds every downstream number
 
 
 # Depth acquisition tuning. Overridable per-cell via the service environment so a
@@ -870,82 +871,55 @@ RS_VISUAL_PRESET = int(_env_number('RS_VISUAL_PRESET', -1))
 RS_LASER_POWER = _env_number('RS_LASER_POWER', -1.0)
 
 
-def set_high_accuracy_preset(profile):
-    """Configure the depth sensor's preset + laser power, and LOG WHAT STUCK.
-
-    The previous version resolved the preset via
-    ``getattr(rs, 'rs400_visual_preset', object)`` and, on builds where that enum is
-    not exposed (this Jetson's pyrealsense2 among them), silently fell through to a
-    bare 3. It then announced "High Accuracy" without ever reading the value back --
-    and the device in fact sat at 0 (Custom) for over a month while the docs claimed
-    otherwise. Every option is now read back after writing, so the log states the
-    achieved configuration rather than the attempted one.
-
-    Both the preset and the laser power default to LEAVE-ALONE (-1): the dated
-    depth characterization was measured under whatever the device is actually
-    running, so changing either silently on every restart would invalidate that
-    record. Set RS_VISUAL_PRESET / RS_LASER_POWER to trial a change as an
-    explicit experiment with its own before/after measurement. (High Accuracy in
-    particular is the wrong direction for edge coverage: it raises the confidence
-    threshold, returning fewer but surer points, when the measured defect is
-    MISSING coverage at surface edges.)
-    """
-    try:
-        sensor = profile.get_device().first_depth_sensor()
-    except Exception as e:
-        print(f"WARNING: no depth sensor to configure: {e}", flush=True)
-        return
-    wanted = [
-        # Every client of this server shares one pipeline, so enabling the
-        # emitter here covers scan, calibration, extrusion/cylinder measuring
-        # and the live preview alike — there is no per-feature IR state to
-        # keep in sync, and nothing anywhere turns it back off.
-        ('emitter_enabled', getattr(rs.option, 'emitter_enabled', None), 1.0)]
-    if RS_LASER_POWER >= 0:
-        wanted.insert(0, ('laser_power', getattr(rs.option, 'laser_power', None),
-                          RS_LASER_POWER))
-    else:
-        try:
-            cur = sensor.get_option(rs.option.laser_power)
-            print(f"RealSense: laser_power left as-is at {cur:g} "
-                  "(set RS_LASER_POWER to change it)", flush=True)
-        except Exception:
-            pass
-    if RS_VISUAL_PRESET >= 0:
-        wanted.insert(0, ('visual_preset', getattr(rs.option, 'visual_preset', None),
-                          float(RS_VISUAL_PRESET)))
-    else:
-        try:
-            cur = sensor.get_option(rs.option.visual_preset)
-            print(f"RealSense: visual_preset left as-is at {cur:g} "
-                  "(set RS_VISUAL_PRESET to change it)", flush=True)
-        except Exception:
-            pass
-    for name, option, value in wanted:
-        if option is None or not sensor.supports(option):
-            print(f"RealSense: {name} unsupported on this device/build — skipped", flush=True)
-            continue
-        try:
-            rng = sensor.get_option_range(option)
-            clamped = min(max(value, rng.min), rng.max)
-            sensor.set_option(option, clamped)
-            print(f"RealSense: {name} -> requested {value:g}, set {clamped:g}, "
-                  f"device reports {sensor.get_option(option):g} "
-                  f"(range {rng.min:g}..{rng.max:g})", flush=True)
-        except Exception as e:
-            print(f"WARNING: could not set {name}={value:g}: {e}", flush=True)
+STATIC_GEOMETRY = None      # rs_geometry.StaticGeometry, set by openPipeline
+ACHIEVED_OPTIONS = {}       # read-back values, set by openPipeline
+DEVICE_INFO = {}
 
 
 def openPipeline():
+    """Start depth 720p + colour 1080p (no infrared: nobody reads it), configure the
+    depth sensor with read-back, record the as-found ASIC JSON, and extract the
+    static geometry the greeting carries. Returns the pipeline."""
+    global STATIC_GEOMETRY, ACHIEVED_OPTIONS, DEVICE_INFO
     cfg = rs.config()
-    cfg.enable_stream(rs.stream.depth, width, height, rs.format.z16, 30)
-    cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, 30)
-    cfg.enable_stream(rs.stream.infrared, 1)
+    cfg.enable_stream(rs.stream.depth, DEPTH_SIZE[0], DEPTH_SIZE[1], rs.format.z16, 30)
+    cfg.enable_stream(rs.stream.color, COLOR_SIZE[0], COLOR_SIZE[1], rs.format.bgr8, 30)
     pipeline = rs.pipeline()
     profile = pipeline.start(cfg)
-    set_high_accuracy_preset(profile)
-    align = rs.align(rs.stream.color)
-    return pipeline, align
+    device = profile.get_device()
+    # As-found FIRST: the depth table (incl. depthUnits) is part of this record.
+    rs_config.dump_advanced_mode_json(device, rs, ASFOUND_DIR, log=_log)
+    sensor = device.first_depth_sensor()
+    ACHIEVED_OPTIONS = rs_config.configure_depth_sensor(
+        sensor, rs, laser_power=RS_LASER_POWER, visual_preset=RS_VISUAL_PRESET, log=_log)
+    DEVICE_INFO = {
+        "serial": device.get_info(rs.camera_info.serial_number),
+        "fw": device.get_info(rs.camera_info.firmware_version),
+        "librealsense": rs_config.librealsense_version(rs),
+    }
+    STATIC_GEOMETRY = rs_geometry.static_geometry(profile, rs)     # raises on a bad extrinsic
+    gte = rs_config.read_global_time_enabled(sensor, rs, log=_log)
+    _log(f"RealSense: global_time_enabled = {gte}; temps = "
+         f"{rs_config.read_temperatures(sensor, rs, log=_log)}; "
+         f"depth {STATIC_GEOMETRY.depth_size} colour {STATIC_GEOMETRY.color_size}; "
+         f"depth->colour t = {STATIC_GEOMETRY.t_dc_mm.round(2).tolist()} mm")
+    return pipeline
+
+
+def _log(msg):
+    print(msg, flush=True)
+
+
+def make_greeting() -> dict:
+    """The per-connection greeting: static geometry + LIVE temps + achieved options."""
+    sensor = pipeline.get_active_profile().get_device().first_depth_sensor()
+    return rs_geometry.build_greeting(
+        STATIC_GEOMETRY, depth_unit_mm=depth_unit_mm,
+        filters=["threshold", "disparity", "spatial", "temporal", "disparity_inv"],
+        temps=rs_config.read_temperatures(sensor, rs, log=_log),
+        global_time_enabled=rs_config.read_global_time_enabled(sensor, rs, log=_log),
+        achieved=ACHIEVED_OPTIONS, device=DEVICE_INFO)
+
 
 def handle_client(conn, addr):
     jpeg = turbojpeg.TurboJPEG('/usr/lib/aarch64-linux-gnu/libturbojpeg.so.0')
@@ -958,64 +932,60 @@ def handle_client(conn, addr):
     except OSError:
         pass
 
-    # Optional, backward-compatible handshake. Right after connecting a client may
-    # send ONE line declaring the stream it wants:
-    #     "MODE COLOR"        -> lightweight COLOR-ONLY (depth_len=0, no align/filter/lz4)
-    #     "MODE COLOR Q60"    -> color-only AND encode JPEG at quality 60 (smaller =
-    #                            fewer bytes over Wi-Fi = higher preview fps)
-    #     "MODE COLOR H264"   -> color-only, hardware-NVENC H.264 byte-stream (see
-    #                            stream_h264) instead of per-frame JPEG. "B<kbps>"
-    #                            sets the encoder bitrate (e.g. "MODE COLOR H264 B4000").
-    #     "MODE FULL"         -> the full depth+color stream
-    # No line (timeout) / anything unrecognized => FULL at default quality, so
-    # existing depth/scan clients are unaffected (they just connect and read). A
-    # bare 'C' is also accepted. Color-only is used by the live aiming preview +
+    # Handshake. Right after connecting a client sends ONE line declaring the
+    # stream it wants (parsed by handshake.parse_handshake — shared with the host
+    # test suite so the two sides can't silently drift):
+    #     "MODE FULL V2"      -> depth+colour, protocol 2 (JSON greeting, raw depth)
+    #     "MODE BURST V2"     -> burst capture of protocol-2 frames (see stream_burst)
+    #     "MODE COLOR [Q<n>] [H264 [B<kbps>]] [SCAN]"  -> colour-only paths, unchanged
+    #     "MODE TELEMETRY"    -> scan telemetry side-channel, unchanged
+    # Anything else that asks for depth — no line (timeout), a bare "MODE FULL", or
+    # garbage — is a pre-V2 depth request and is REFUSED below: a host that did not
+    # restart after the protocol change must fail loudly at the handshake, not
+    # misread the JSON greeting as a frame length and hang. A bare 'C' is still
+    # accepted for MODE COLOR. Color-only is used by the live aiming preview +
     # calibration (which never use depth); it cuts ~75% of the per-frame bytes AND
-    # the Nano's align+filter CPU — the difference between a ~0.5 fps preview and a
+    # the Nano's filter CPU — the difference between a ~0.5 fps preview and a
     # realtime one. The optional Q<n> lets the *preview* trade a little image
     # quality for speed while full-res captures keep the default (high) quality.
     # H264 goes further — the Nano's dedicated hardware encoder cuts preview
     # bandwidth ~10-20x and offloads the CPU. It is lossy + inter-frame (can soften
     # ChArUco corners) so it's the live-preview path only; one-shot captures keep
-    # the JPEG/lossless path (the client never requests H264 for those).
-    #     "MODE BURST"        -> burst capture: buffer aligned depth+color frames in
-    #                            RAM and ship them all in one transfer at the end (see
-    #                            stream_burst). Keeps the robot tour from stalling on a
-    #                            per-pose depth transfer over Wi-Fi.
-    color_only = False
-    quality = None
-    codec = 'jpeg'
-    burst = False
-    telemetry_only = False
-    scan_telemetry = False
-    h264_bitrate = 4000  # kbps; overridden by a "B<kbps>" handshake token
+    # the JPEG/lossless path (the client never requests H264 for those). MODE BURST
+    # buffers frames in RAM and ships them all in one transfer at the end — keeps
+    # the robot tour from stalling on a per-pose depth transfer over Wi-Fi.
+    #
+    # Send timeout: this server is single-threaded with listen(1), so a client
+    # that dies without a clean RST would otherwise leave sendall blocked
+    # forever and the server would stop accepting anyone (the "NO SIGNAL"
+    # wedge). With a timeout, a stuck/dead client just gets dropped and we go
+    # back to accept(). Generous enough that a slow-but-alive link (a full
+    # depth+color frame over slow Wi-Fi can take a few seconds) is not killed.
+    req = b""
     try:
         conn.settimeout(0.5)
-        req = conn.recv(64).strip().upper()
-        burst = req.startswith(b'MODE BURST')
-        telemetry_only = req.startswith(b'MODE TELEMETRY')
-        color_only = req.startswith(b'MODE COLOR') or req == b'C'
-        scan_telemetry = b'SCAN' in req.split()
-        for tok in req.split():
-            if tok == b'H264':
-                codec = 'h264'
-            elif tok.startswith(b'Q') and tok[1:].isdigit():
-                quality = max(10, min(100, int(tok[1:])))
-            elif tok.startswith(b'B') and tok[1:].isdigit():
-                h264_bitrate = max(500, min(20000, int(tok[1:])))
+        req = conn.recv(64)
     except (socket.timeout, OSError):
         pass
     finally:
-        # Send timeout: this server is single-threaded with listen(1), so a client
-        # that dies without a clean RST would otherwise leave sendall blocked
-        # forever and the server would stop accepting anyone (the "NO SIGNAL"
-        # wedge). With a timeout, a stuck/dead client just gets dropped and we go
-        # back to accept(). Generous enough that a slow-but-alive link (a full
-        # depth+color frame over slow Wi-Fi can take a few seconds) is not killed.
-        conn.settimeout(10.0)
-    print(f"Connection from {addr} (color_only={color_only}, codec={codec}, "
-          f"quality={quality}, bitrate={h264_bitrate}, burst={burst}, "
-          f"telemetry_only={telemetry_only}, scan_telemetry={scan_telemetry})")
+        conn.settimeout(10.0)     # see the comment above about the send timeout
+    hs = parse_handshake(req)
+    color_only, codec, quality = hs["mode"] == "color", hs["codec"], hs["quality"]
+    h264_bitrate, burst = hs["bitrate"], hs["mode"] == "burst"
+    telemetry_only, scan_telemetry = hs["mode"] == "telemetry", hs["scan_telemetry"]
+    print(f"Connection from {addr} ({hs})", flush=True)
+
+    if hs["depth_requested"] and not hs["v2"]:
+        # Big-bang protocol change: a host that did not restart must fail HERE,
+        # loudly, not misread the JSON greeting as a frame length and hang.
+        print(f"client {addr[0]} did not request V2; this server speaks protocol 2 only "
+              f"(got {req!r})", flush=True)
+        try:
+            conn.sendall(b"ERR protocol 2 required; send MODE FULL V2\n")
+        except OSError:
+            pass
+        conn.close()
+        return
 
     if telemetry_only:
         stream_telemetry(conn, addr)
@@ -1032,17 +1002,18 @@ def handle_client(conn, addr):
     if codec == 'h264':
         # Hardware H.264 path: relay the NVENC byte-stream over this connection and
         # return to accept() when the client disconnects (or the encoder dies).
-        stream_h264(conn, addr, width, height, h264_bitrate,
-                    scan_telemetry=scan_telemetry)
+        stream_h264(conn, addr, h264_bitrate, scan_telemetry=scan_telemetry)
         conn.close()
         return
 
+    if not color_only:
+        conn.sendall(rs_geometry.greeting_line(make_greeting()))
+
     while True:
         if color_only:
-            # Fast path: skip align (depth->color) AND the spatial depth filter
-            # entirely — they cost the Nano ~a second per frame and we're throwing
-            # depth away anyway. Just grab the raw color frame. (align leaves color
-            # unchanged, so intrinsics/detection are identical to the full path.)
+            # Fast path: skip the depth filters entirely — they cost the Nano ~a
+            # second per frame and we're throwing depth away anyway. Just grab the
+            # raw color frame.
             frames = read_frames()
             color_frame = frames.get_color_frame()
             if not color_frame:
@@ -1051,7 +1022,7 @@ def handle_client(conn, addr):
             timestamp = frames.get_timestamp()
             depth_compressed = b''
         else:
-            depth, color, timestamp = getFrames(align, depth_filters)
+            depth, color, timestamp = getFrames(depth_filters)
             if depth is None or color is None:
                 continue
             depth_buffer = io.BytesIO()
@@ -1086,7 +1057,7 @@ def _write_all(stream, data):
         mv = mv[n:]
 
 
-def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
+def stream_h264(conn, addr, bitrate_kbps, scan_telemetry=False):
     """Encode the live color stream with the Nano's hardware H.264 encoder (NVENC)
     and relay the resulting Annex-B byte-stream over ``conn``.
 
@@ -1103,6 +1074,7 @@ def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
     PPS are inlined (``insert-sps-pps``/``config-interval=-1``) so a client that
     connects mid-stream can start decoding at the next IDR.
     """
+    width, height = COLOR_SIZE
     cmd = [
         'gst-launch-1.0', '-q',
         'fdsrc', 'fd=0', '!',
@@ -1144,8 +1116,8 @@ def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
                             intr = depth_profile.intrinsics
                             color_intr = color_profile.intrinsics
                             depth_to_color = depth_profile.get_extrinsics_to(color_profile)
-                            R_dc = np.asarray(depth_to_color.rotation, dtype=float).reshape(3, 3)
-                            t_dc_mm = np.asarray(depth_to_color.translation, dtype=float) * 1000.0
+                            R_vec = STATIC_GEOMETRY.R_dc          # row-major, asserted at start
+                            t_dc_mm = STATIC_GEOMETRY.t_dc_mm
                             pointcloud = rs.pointcloud()
                             depth_points = pointcloud.calculate(depth)
                             depth_vertices_mm = (
@@ -1157,40 +1129,20 @@ def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
                             def overlay_project(p):
                                 color_point = rs.rs2_transform_point_to_point(
                                     depth_to_color, [float(x) for x in p])
-                                return rs.rs2_project_point_to_pixel(
-                                    color_intr, color_point)
+                                return rs.rs2_project_point_to_pixel(color_intr, color_point)
 
                             def project_color_points(points_color):
                                 cp = np.asarray(points_color, float)
                                 zc = cp[:, 2]
                                 return np.column_stack([
-                                    cp[:, 0] * float(color_intr.fx) / zc
-                                    + float(color_intr.ppx),
-                                    cp[:, 1] * float(color_intr.fy) / zc
-                                    + float(color_intr.ppy),
-                                ])
-
-                            valid_vertices = depth_vertices_mm.reshape(-1, 3)
-                            valid_vertices = valid_vertices[
-                                np.isfinite(valid_vertices).all(axis=1)
-                                & (valid_vertices[:, 2] > 0)]
-                            if len(valid_vertices):
-                                sample = valid_vertices[::max(1, len(valid_vertices) // 8)][:8]
-                                sdk_px = np.asarray([overlay_project(p) for p in sample], float)
-                                cand_a = project_color_points(sample @ R_dc.T + t_dc_mm)
-                                cand_b = project_color_points(sample @ R_dc + t_dc_mm)
-                                R_vec = R_dc.T if (
-                                    np.nanmean(np.linalg.norm(cand_a - sdk_px, axis=1))
-                                    <= np.nanmean(np.linalg.norm(cand_b - sdk_px, axis=1))
-                                ) else R_dc
-                            else:
-                                R_vec = R_dc.T
+                                    cp[:, 0] * float(color_intr.fx) / zc + float(color_intr.ppx),
+                                    cp[:, 1] * float(color_intr.fy) / zc + float(color_intr.ppy)])
 
                             def overlay_project_points(points):
-                                return project_color_points(np.asarray(points, float) @ R_vec + t_dc_mm)
+                                return project_color_points(np.asarray(points, float) @ R_vec.T + t_dc_mm)
 
                             def overlay_transform_points(points):
-                                return np.asarray(points, float) @ R_vec + t_dc_mm
+                                return np.asarray(points, float) @ R_vec.T + t_dc_mm
 
                             def depth_deproject_points(pixels, depths_mm):
                                 uv = np.rint(np.asarray(pixels, float)).astype(int)
@@ -1274,14 +1226,14 @@ def _recv_line(conn, maxlen=64):
 
 
 def stream_burst(conn, addr, max_frames=64):
-    """Burst capture: buffer aligned depth+color frames on the Jetson, then transfer
+    """Burst capture: buffer native depth+color frames on the Jetson, then transfer
     them all in one burst — so the robot tour isn't stalled by a per-pose depth
     transfer over the cell's Wi-Fi (a full depth+color frame can take 6-11 s).
 
     Protocol on this connection (newline-terminated commands; length-prefixed replies):
 
-        (server first sends ``BURST READY\\n`` so the client can confirm support)
-        CAP    -> grab + align + filter + compress ONE frame into a RAM buffer; reply
+        (server first sends BURST READY\\n then the protocol-2 greeting line)
+        CAP    -> grab + filter + compress ONE frame into a RAM buffer; reply
                   ``<I idx><I thumb_len><thumb JPEG>`` (a small color thumbnail for the
                   client's live per-pose strip). thumb_len=0 signals a skip.
         GET    -> reply ``<I count>`` then each buffered frame as
@@ -1297,6 +1249,7 @@ def stream_burst(conn, addr, max_frames=64):
     buffer = []   # list of (depth_compressed: bytes, color_jpeg: bytes, ts: float)
     try:
         conn.sendall(b'BURST READY\n')
+        conn.sendall(rs_geometry.greeting_line(make_greeting()))
     except OSError:
         return
     print(f"Burst session opened with {addr}")
@@ -1313,7 +1266,7 @@ def stream_burst(conn, addr, max_frames=64):
                 depth = color = None
                 tries = 0
                 while (depth is None or color is None) and tries < 10:
-                    depth, color, _ts = getFrames(align, depth_filters)
+                    depth, color, _ts = getFrames(depth_filters)
                     tries += 1
                 if depth is None or color is None or len(buffer) >= max_frames:
                     # signal a skip (no frame / buffer full) — index still advances
@@ -1357,14 +1310,13 @@ def stream_burst(conn, addr, max_frames=64):
 
 
 def setup_depth_filters():
-    # Full-resolution scan data: do NOT decimate. Work in disparity space for the
-    # filters that benefit from roughly uniform stereo noise, then return to depth.
-    depth_to_disparity = rs.disparity_transform(True)
-    spatial = rs.spatial_filter()
-    temporal = rs.temporal_filter()
-    disparity_to_depth = rs.disparity_transform(False)
-    hole_filling = rs.hole_filling_filter()
-    return [depth_to_disparity, spatial, temporal, disparity_to_depth, hole_filling]
+    """threshold -> disparity -> spatial -> temporal -> disparity_inv, on NATIVE depth.
+    No decimation (full-resolution scan data) and NO hole filling: a filled pixel is
+    fabricated depth, and it was fabricated exactly where the metrology cares
+    (surface edges). Threshold first so background is never smoothed into an edge."""
+    threshold = rs.threshold_filter(RS_DEPTH_MIN_M, RS_DEPTH_MAX_M)
+    return [threshold, rs.disparity_transform(True), rs.spatial_filter(),
+            rs.temporal_filter(), rs.disparity_transform(False)]
 
 def _serve_client(conn, addr):
     """Run handle_client for one client and ALWAYS close its socket.
@@ -1408,14 +1360,12 @@ def main():
                          daemon=True).start()
 
 if __name__ == '__main__':
-    print(f"Initiating Jetson-Realsense Wi-Fi Server with resolution {width}x{height}")
+    print(f"Initiating Jetson-Realsense Wi-Fi Server: depth {DEPTH_SIZE}, colour {COLOR_SIZE}, protocol 2")
     try:
-        pipeline, align = openPipeline()
-        depth_unit_mm = (
-            pipeline.get_active_profile().get_device().first_depth_sensor().get_depth_scale()
-            * 1000.0)
+        pipeline = openPipeline()
+        depth_unit_mm = (pipeline.get_active_profile().get_device()
+                         .first_depth_sensor().get_depth_scale() * 1000.0)
         depth_filters = setup_depth_filters()
-
         main()
     except Exception as e:
         print(f"Unexpected error: {e}")
