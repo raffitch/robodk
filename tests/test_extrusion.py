@@ -312,7 +312,10 @@ def test_api_centres_on_the_scanned_surface_and_gates_when_absent(tmp_path, monk
     assert stale["all_ok"] is False and stale["surface"]["ok"] is False
 
 
-def test_api_registers_module_and_invalidates_preflight_on_regeneration():
+def test_api_registers_module_and_invalidates_preflight_on_regeneration(tmp_path, monkeypatch):
+    # Hermetic: without this the module reads the developer's own runs/extrusion
+    # and restores a plan from whatever measurement session is newest there.
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
     client = TestClient(create_app(AppConfig()))
     modules = client.get("/api/modules").json()["modules"]
     assert "extrusion" in {module["id"] for module in modules}

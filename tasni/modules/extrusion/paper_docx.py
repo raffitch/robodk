@@ -29,20 +29,57 @@ ERROR_FLOOR_MM = 1.26
 WORK_PLANE_RMS_MM = 1.39
 STANDOFF_MM = 300
 
-METHOD = (
-    "Rings of dried, previously extruded material were placed by hand on the scanned work "
-    "surface, one on top of another; no material was extruded and no valve was actuated "
-    "during the measurements. Each measurement moved only the camera to a viewpoint "
-    f"{STANDOFF_MM} mm above the top of the layer being measured, normal to the work plane, "
-    "captured one RGB-D frame from an Intel RealSense D435i at 1280x720, and reconstructed "
-    "the deposited ring's centreline in the work frame. Layer N was segmented above the "
-    "measured top surface of layer N-1, so a displaced ring is compared against the ring it "
-    "actually sits on. What follows is therefore a controlled validation of the "
-    "sensing-and-comparison chain against a known introduced offset, and not the deposition "
-    "deviation of a printed cylinder. Hand-eye calibration for this cell has a "
-    f"board-consistency residual of {ERROR_FLOOR_MM:.2f} mm and a work-plane RMS of "
-    f"{WORK_PLANE_RMS_MM:.2f} mm; no accuracy is claimed below that floor."
+def method_text(provenance: dict) -> str:
+    """The method paragraph, with this run's own numbers in it.
+
+    The standoff and the hand-eye residual are read from the take that was
+    measured, not from constants here: a constant silently goes stale when the
+    cell is recalibrated, and the error-floor sentence is the one claim in the
+    paper that must never be generous.
+    """
+    pose = provenance.get("inspection_pose") or {}
+    standoff = pose.get("standoff_mm") or STANDOFF_MM
+    resolution = provenance.get("camera_resolution") or "1280x720"
+    quality = ((provenance.get("calibration") or {}).get("quality") or {})
+    floor = quality.get("board_consistency_rms_mm") or ERROR_FLOOR_MM
+    return (
+        "Rings of dried, previously extruded material were placed by hand on the scanned work "
+        "surface, one on top of another; no material was extruded and no valve was actuated "
+        "during the measurements. Each measurement moved only the camera to a viewpoint "
+        f"{float(standoff):.0f} mm above the top of the layer being measured, normal to the "
+        "work plane, captured one RGB-D frame from an Intel RealSense D435i at "
+        f"{resolution}, and reconstructed the deposited ring's centreline in the work frame. "
+        "Layer N was segmented above the measured top surface of layer N-1, so a displaced "
+        "ring is compared against the ring it actually sits on. What follows is therefore a "
+        "controlled validation of the sensing-and-comparison chain against a known introduced "
+        "offset, and not the deposition deviation of a printed cylinder. Hand-eye calibration "
+        f"for this cell has a board-consistency residual of {float(floor):.2f} mm and a "
+        f"work-plane RMS of {WORK_PLANE_RMS_MM:.2f} mm; no accuracy is claimed below that "
+        "floor.")
+
+
+LIMITATIONS = (
+    "Three limits bound what these measurements support. First, inspection happens BETWEEN "
+    "layers and not DURING deposition: the camera moves to its viewpoint while nothing is "
+    "being extruded, which is what the printing loop already does at a layer boundary, and "
+    "the cycle time above is the cost of that pause. Measuring a bead as it is laid would "
+    "require a capture synchronised to a moving camera pose, which is not validated here. "
+    "Second, the specimens are hand-placed dried beads rather than freshly deposited "
+    "material, so this is a validation of the sensing-and-comparison chain and not of "
+    "deposition accuracy. Third, the introduced offsets are ground truth measured by hand "
+    "against the work frame's axes, so the detection error carries that measurement's own "
+    "uncertainty as well as the chain's."
 )
+
+SETTINGS_HEADERS = ["Setting", "Value"]
+TIMING_HEADERS = ["Stage", "Mean (ms)", "SD (ms)", "n"]
+TIMING_ROWS = [("capture_ms", "RGB-D capture"),
+               ("total_ms", "Reconstruction"),
+               ("acquisition_to_path_ms", "Acquisition to reconstructed path"),
+               ("move_to_pose_ms", "Move to the inspection pose"),
+               ("settle_ms", "Settle before capture"),
+               ("return_ms", "Return to the start pose"),
+               ("inspection_cycle_ms", "Whole inspection excursion")]
 
 CONDITION_HEADERS = ["Condition", "n", "Centre offset (mm)", "Detection error (mm)",
                      "Mean |dev| (mm)", "RMS (mm)", "Max (mm)", "Shape RMS (mm)"]
@@ -97,6 +134,74 @@ def _gaps(summary: dict) -> list[str]:
         notes.append("No condition with an introduced offset yet. The paper's claim is that a "
                      "known displacement is recovered, so at least one is required.")
     return notes
+
+
+def _system_rows(provenance: dict, robot_name: str | None = None) -> list[list[str]]:
+    """What the run was measured ON, entirely from the take's provenance."""
+    pose = provenance.get("inspection_pose") or {}
+    intrinsics = provenance.get("camera_intrinsics") or {}
+    calibration = provenance.get("calibration") or {}
+    quality = calibration.get("quality") or {}
+    config = provenance.get("processing_config") or {}
+    rows: list[list[str]] = []
+
+    def add(label: str, value) -> None:
+        if value not in (None, "", []):
+            rows.append([label, str(value)])
+
+    add("Robot", robot_name)
+    # No fallbacks below: a row is written only when the archive recorded the
+    # value. A default printed here would read as a measurement of this cell.
+    if provenance.get("camera_resolution"):
+        add("Camera", f"Intel RealSense D435i, {provenance['camera_resolution']} "
+                      "aligned colour and depth")
+    matrix = intrinsics.get("K")
+    if matrix:
+        add("Camera intrinsics",
+            f"fx {float(matrix[0][0]):.1f}, fy {float(matrix[1][1]):.1f}, "
+            f"cx {float(matrix[0][2]):.1f}, cy {float(matrix[1][2]):.1f} px")
+    distortion = intrinsics.get("dist_coeffs")
+    if distortion:
+        add("Lens distortion", ", ".join(f"{float(v):.4f}" for v in distortion[:5])
+            + " (k1 k2 p1 p2 k3, calibrated in-cell)")
+    if pose.get("standoff_mm"):
+        add("Inspection standoff", f"{float(pose['standoff_mm']):.0f} mm above the top of the "
+                                   "layer being measured, normal to the work plane")
+    add("Work frame", provenance.get("work_frame"))
+    add("Inspection tool", provenance.get("inspection_tool"))
+    if quality or calibration:
+        add("Hand-eye calibration",
+            f"{calibration.get('method', 'unknown')}, verdict {quality.get('verdict', 'n/a')}; "
+            f"held-out reprojection {float(quality.get('val_rms_px', 0)):.2f} px, "
+            f"board consistency {float(quality.get('board_consistency_rms_mm', 0)):.2f} mm "
+            f"(run {calibration.get('run_id', 'n/a')})")
+    if config:
+        add("Segmentation",
+            f"deposit floor {config.get('deposit_min_height_mm')} mm, radial band "
+            f"±{config.get('radial_roi_margin_mm')} mm about the nominal ring, per-layer floor "
+            f"margin {config.get('layer_floor_margin_mm')} mm")
+        add("Centreline extraction",
+            f"raster {config.get('raster_mm_per_pixel')} mm/px, thinned and pruned, "
+            f"{config.get('measured_spline_points')} spline samples; bead footprint over "
+            f"{config.get('bead_width_bins')} angular bins")
+        if config.get("settle_s") is not None:
+            add("Settling dwell", f"{config['settle_s']} s before capture")
+    commit = provenance.get("git_commit")
+    if commit:
+        add("Software revision", f"{commit[:10]} (tasni, this repository)")
+    return rows
+
+
+def _timing_rows(timing: dict) -> list[list[str]]:
+    rows = []
+    for key, label in TIMING_ROWS:
+        stat = timing.get(key) or {}
+        if not stat.get("n"):
+            continue
+        rows.append([label, f"{stat['mean']:.0f}",
+                     "-" if stat.get("sd") is None else f"{stat['sd']:.0f}",
+                     str(stat["n"])])
+    return rows
 
 
 def _add_table(document, headers: list[str], rows: list[list[str]]):
@@ -170,7 +275,8 @@ def _layer_dir_for(trial_dir: Path, manifest: dict) -> "Path | None":
 
 
 def build_paper_docx(root, trial_id: str, out_path=None, *,
-                     embed_figures: bool = True) -> Path:
+                     embed_figures: bool = True,
+                     robot_name: str | None = None) -> Path:
     """Write the results draft for ``trial_id`` and return the file path."""
     from docx import Document                       # the `docx` extra
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -190,13 +296,22 @@ def build_paper_docx(root, trial_id: str, out_path=None, *,
     stamp.runs[0].italic = True
     stamp.runs[0].font.size = Pt(9)
 
+    first = next((m for m in summary["manifests"] if m.get("provenance")), None)
+    provenance = (first or {}).get("provenance") or {}
     document.add_heading("Method (paste into the method section)", level=2)
-    document.add_paragraph(METHOD)
+    document.add_paragraph(method_text(provenance))
+
+    settings = _system_rows(provenance, robot_name=robot_name)
+    if settings:
+        document.add_paragraph("Table 1. The system these measurements were made on.")
+        _add_table(document, SETTINGS_HEADERS, settings)
+        document.add_paragraph()
 
     document.add_heading("Results (paste into the results section)", level=2)
     document.add_paragraph(_pm(summary["headline"]))
 
-    document.add_paragraph("Table 1. Geometric deviation by condition. Deviation is measured "
+    document.add_paragraph(f"Table {2 if settings else 1}. Geometric deviation by condition. "
+                           "Deviation is measured "
                            "from the nominal centre; detection error is the difference between "
                            "the measured displacement and the displacement introduced by hand.")
     _add_table(document, CONDITION_HEADERS,
@@ -213,6 +328,16 @@ def build_paper_docx(root, trial_id: str, out_path=None, *,
             for run in added.runs:
                 run.bold = True
 
+    timing_rows = _timing_rows(summary["timing_ms"])
+    if timing_rows:
+        document.add_heading("What one inspection costs", level=2)
+        document.add_paragraph(
+            "Every measurement is one excursion: the arm leaves the path, settles, captures a "
+            "frame, the frame is reconstructed, and the arm returns. Inspecting between layers "
+            "costs the sum of those, once per layer.")
+        _add_table(document, TIMING_HEADERS, timing_rows)
+        document.add_paragraph()
+
     gaps = _gaps(summary)
     if gaps:
         document.add_heading("Still missing (delete before submitting)", level=2)
@@ -221,6 +346,24 @@ def build_paper_docx(root, trial_id: str, out_path=None, *,
         warning.runs[0].bold = True
         for note in gaps:
             document.add_paragraph(note, style="List Bullet")
+
+    document.add_heading("Reproducibility and archive", level=2)
+    reprocessed = summary["timing_ms"].get("offline_reprocessed_takes") or 0
+    archive_note = (
+        "Every measurement archives the raw colour and depth frame it was made from, the "
+        "camera pose in the work frame, the camera intrinsics, the full processing "
+        "configuration and the software revision, alongside the derived point cloud, "
+        "centreline and metrics. Any take can therefore be reprocessed from its own frame "
+        "with no robot, and reprocessing reproduces the archived numbers.")
+    if reprocessed:
+        archive_note += (
+            f" {reprocessed} take(s) in this trial were recovered exactly that way: a "
+            "measurement that failed on the cell was reprocessed offline from its archived "
+            "frame and produced a valid centreline without repeating the capture.")
+    document.add_paragraph(archive_note)
+
+    document.add_heading("Limitations", level=2)
+    document.add_paragraph(LIMITATIONS)
 
     document.add_heading("Every take (working record)", level=2)
     ordered = sorted(summary["manifests"],

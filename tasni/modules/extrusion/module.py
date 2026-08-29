@@ -885,7 +885,8 @@ class ExtrusionModule(WorkflowModule):
             if not (root / trial / "trial.json").is_file():
                 raise HTTPException(404, f"trial does not exist: {trial}")
             try:
-                path = build_paper_docx(root, trial)
+                path = build_paper_docx(
+                    root, trial, robot_name=services.config.robodk.robot_name or None)
             except ImportError as exc:
                 raise HTTPException(
                     503, "the Word draft needs python-docx "

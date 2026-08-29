@@ -1402,7 +1402,8 @@ def test_the_word_draft_puts_the_measured_numbers_in_a_real_table(tmp_path):
 
     assert out.is_file() and out.suffix == ".docx"
     paragraphs, tables = _docx_content(out)
-    conditions = tables[0]
+    # By header, not by position: the draft grows sections over time.
+    conditions = next(t for t in tables if t[0][0] == "Condition")
     assert conditions[0][0] == "Condition"
     rows = {row[0]: row for row in conditions[1:]}
     assert "layer 1 - noise floor" in rows
@@ -1459,7 +1460,7 @@ def test_every_take_is_listed_so_the_appendix_needs_no_transcription(tmp_path):
 
     out = build_paper_docx(root, trial_id, tmp_path / "draft.docx", embed_figures=False)
 
-    takes_table = _docx_content(out)[1][1]
+    takes_table = next(t for t in _docx_content(out)[1] if t[0][0] == "Layer")
     assert takes_table[0][:4] == ["Layer", "Take", "Phase", "Introduced (mm)"]
     assert len(takes_table) == 7                        # header + six takes
     assert [row[0] for row in takes_table[1:]] == ["1", "1", "1", "3", "3", "3"]
@@ -1614,3 +1615,94 @@ def test_an_archived_take_rebuilds_the_plan_it_was_measured_against():
     assert plan.recipe.radius_mm == 42.6
     assert plan.setup.center_x_mm == pytest.approx(214.6, abs=0.01)
     assert plan.setup.center_y_mm == pytest.approx(146.7, abs=0.01)
+
+
+def _take_with_provenance(root, trial_id, **extra):
+    """A take carrying the provenance a real capture records."""
+    _write_take(root, trial_id, 1, 1, offset=None, offset_norm=0.4, rms=0.5, mean_abs=0.4,
+                maximum=1.1, acq_ms=1000, phase="noise floor", **extra)
+    path = root / trial_id / "layer-001" / "manifest.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["provenance"] = {
+        "git_commit": "c48b1ab08a25bb0fa8fb2f6f3b9d3a52f77960e2",
+        "camera_resolution": "1280x720",
+        "camera_intrinsics": {"K": [[889.87, 0, 648.98], [0, 890.81, 362.0], [0, 0, 1]],
+                              "dist_coeffs": [0.1148, -0.2, 0.0, 0.0, 0.0]},
+        "calibration": {"run_id": "20260629-130945", "method": "HORAUD",
+                        "quality": {"verdict": "borderline", "val_rms_px": 1.115,
+                                    "board_consistency_rms_mm": 1.2602}},
+        "processing_config": {"deposit_min_height_mm": 0.5, "radial_roi_margin_mm": 30.0,
+                              "layer_floor_margin_mm": 2.0, "raster_mm_per_pixel": 1.0,
+                              "measured_spline_points": 180, "bead_width_bins": 36,
+                              "settle_s": 1.0},
+        "inspection_pose": {"standoff_mm": 300.0},
+        "work_frame": "Tasni Work Frame", "inspection_tool": "Realsense"}
+    payload["processing"]["timings_ms"].update(
+        {"move_to_pose_ms": 6100.0, "return_ms": 5400.0, "settle_ms": 1000.0,
+         "inspection_cycle_ms": 14460.0})
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_the_draft_states_the_system_it_was_measured_on(tmp_path):
+    """A reviewer has to be able to reproduce the setup, not guess at it.
+
+    Every value comes from the take's own provenance -- including the hand-eye
+    residual the error-floor claim rests on, which was previously a constant in
+    the source and could drift from the calibration actually in use.
+    """
+    pytest.importorskip("docx")
+    from tasni.modules.extrusion.paper_docx import build_paper_docx
+
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    _take_with_provenance(root, trial_id)
+
+    out = build_paper_docx(root, trial_id, tmp_path / "draft.docx", embed_figures=False)
+
+    paragraphs, tables = _docx_content(out)
+    settings = {row[0]: row[1] for table in tables for row in table if len(row) == 2}
+    assert "1280x720" in settings["Camera"]
+    assert "300" in settings["Inspection standoff"]
+    assert "889.9" in settings["Camera intrinsics"]          # fx from the archived K
+    assert "1.26" in settings["Hand-eye calibration"] and "borderline" in settings["Hand-eye calibration"]
+    assert "20260629-130945" in settings["Hand-eye calibration"]
+    assert settings["Work frame"] == "Tasni Work Frame"
+    assert "c48b1ab" in settings["Software revision"]
+    assert "1.26" in "\n".join(paragraphs)                    # the floor, in the method text
+
+
+def test_the_draft_breaks_down_what_one_inspection_costs(tmp_path):
+    """Requirement 3 is a cycle time; a reviewer will ask what it is made of."""
+    pytest.importorskip("docx")
+    from tasni.modules.extrusion.paper_docx import build_paper_docx
+
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    _take_with_provenance(root, trial_id)
+
+    out = build_paper_docx(root, trial_id, tmp_path / "draft.docx", embed_figures=False)
+
+    tables = _docx_content(out)[1]
+    timing = next(t for t in tables if t[0][0] == "Stage")
+    stages = {row[0]: row for row in timing[1:]}
+    assert "Move to the inspection pose" in stages
+    assert "6100" in stages["Move to the inspection pose"][1]
+    assert "Whole inspection excursion" in stages
+    assert "14460" in stages["Whole inspection excursion"][1]
+
+
+def test_the_draft_states_its_own_limitations(tmp_path):
+    """The claims this experiment cannot support, written down before review."""
+    pytest.importorskip("docx")
+    from tasni.modules.extrusion.paper_docx import build_paper_docx
+
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    _take_with_provenance(root, trial_id)
+
+    text = "\n".join(_docx_content(
+        build_paper_docx(root, trial_id, tmp_path / "d.docx", embed_figures=False))[0])
+
+    assert "between layers" in text and "during deposition" in text
+    assert "Limitations" in text
+    assert "reprocess" in text.lower()          # the archive claim, with its evidence
