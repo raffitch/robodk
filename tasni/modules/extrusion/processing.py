@@ -307,14 +307,37 @@ def _deposit_clusters(points: np.ndarray, config, counts: dict) -> list[np.ndarr
     return clusters
 
 
-def _filter_deposit(points: np.ndarray, config, counts: dict) -> np.ndarray:
+def _filter_deposit(points: np.ndarray, config, counts: dict, *,
+                    assemble_arcs: bool = False,
+                    search_center_xy: np.ndarray | None = None) -> np.ndarray:
     """Voxel -> statistical -> radius outliers -> largest DBSCAN cluster (Open3D).
 
     Everything the deposit IS, flanks included -- the bead's full footprint. The
     upward-facing crest is a further selection made by :func:`_top_surface`; bead
     width has to be measured before that selection throws the flanks away.
+
+    ``assemble_arcs`` rejoins clusters that are arcs of one ring, for the single
+    isolated ring a characterization looks at. It stays OFF for layer
+    measurement: there the ROI deliberately spans the ring beneath, and fusing a
+    displaced ring to the crescent of its neighbour would destroy the very
+    displacement the measurement exists to report.
     """
-    points = _deposit_clusters(points, config, counts)[0]
+    clusters = _deposit_clusters(points, config, counts)
+    if assemble_arcs and len(clusters) > 1 and search_center_xy is not None:
+        try:
+            selected, selector = _select_ring_cluster(
+                clusters, np.asarray(search_center_xy, dtype=float), counts)
+        except RuntimeError as exc:
+            # Refinement must not invent a failure the coarse pass did not have:
+            # fall back to the largest arc and let the completeness metric report
+            # how much of the ring it actually covers.
+            counts["assembly_skipped"] = str(exc)[:120]
+        else:
+            counts["assembled_clusters"] = next(
+                (c["cluster_count"] for c in selector["candidates"]
+                 if c.get("selected")), 1)
+            return selected
+    points = clusters[0]
     counts["after_largest_cluster"] = len(points)
     return points
 
@@ -348,6 +371,78 @@ def _radial_trim(points: np.ndarray, schedule_mm, counts: dict, *,
     return kept
 
 
+_ASSEMBLY_MAX_CLUSTERS = 12
+
+
+def _ring_shape(points: np.ndarray, angular_bins: int) -> dict:
+    """The circle fit and the two shape statistics the ring gate is built on."""
+    center, radius = fit_circle_xy(points)
+    radii = np.linalg.norm(points[:, :2] - center, axis=1)
+    theta = np.mod(np.arctan2(points[:, 1] - center[1],
+                              points[:, 0] - center[0]), 2 * math.pi)
+    occupied = len(np.unique(np.floor(theta / (2 * math.pi) * angular_bins).astype(int)))
+    span = float(np.percentile(radii, 97.5) - np.percentile(radii, 2.5))
+    return {"center": center, "radius": float(radius), "occupied": int(occupied),
+            "coverage": occupied / angular_bins, "span": span,
+            "span_ratio": span / max(float(radius), 1e-9)}
+
+
+def _assemble_ring_arcs(clusters: list[np.ndarray], shapes: list[dict | None], *,
+                        angular_bins: int, min_coverage: float,
+                        max_span_ratio: float, min_radius_mm: float) -> list[tuple[int, ...]]:
+    """Group clusters that are arcs of ONE ring.
+
+    A bead that dips under the ROI height floor -- or is occluded, or glares --
+    reaches DBSCAN as two or more arcs of the same circle. Graded separately none
+    of them need span 70% of the circumference, so a fully captured ring could be
+    rejected outright: the 2026-08-29 low-relief capture arrived as a 48/72 arc
+    and a 25/72 arc that together cover 71/72.
+
+    A merge is accepted only when the union stays as tight radially as the gate
+    already demands AND spans more of the circle than before, so unrelated blobs
+    -- which blow the radial span apart -- can never join. Assembly is attempted
+    only from an incomplete seed, and any group containing a cluster that is
+    already a complete ring on its own is discarded: a frame that works today
+    must keep selecting exactly what it selects today.
+    """
+    groups: list[tuple[int, ...]] = []
+    complete = {i for i, s in enumerate(shapes)
+                if s is not None and s["coverage"] >= min_coverage
+                and s["radius"] >= min_radius_mm and s["span_ratio"] <= max_span_ratio}
+    # The search is cubic in the cluster count, and a ring only ever arrives in a
+    # handful of arcs; clusters are size-ordered, so the tail is speckle.
+    considered = min(len(clusters), _ASSEMBLY_MAX_CLUSTERS)
+    for seed in range(considered):
+        shape = shapes[seed]
+        if shape is None or seed in complete or shape["radius"] < min_radius_mm:
+            continue
+        members = [seed]
+        while True:
+            best: tuple[int, dict] | None = None
+            for other in range(considered):
+                if other in members or shapes[other] is None:
+                    continue
+                try:
+                    trial = _ring_shape(
+                        np.vstack([clusters[i] for i in (*members, other)]), angular_bins)
+                except (RuntimeError, ValueError, np.linalg.LinAlgError):
+                    continue
+                if (trial["radius"] < min_radius_mm
+                        or trial["span_ratio"] > max_span_ratio
+                        or trial["occupied"] <= shape["occupied"]):
+                    continue
+                if best is None or trial["occupied"] > best[1]["occupied"]:
+                    best = (other, trial)
+            if best is None:
+                break
+            members.append(best[0])
+            shape = best[1]
+        key = tuple(sorted(members))
+        if len(members) > 1 and not complete.intersection(members) and key not in groups:
+            groups.append(key)
+    return groups
+
+
 def _select_ring_cluster(clusters: list[np.ndarray], search_center_xy: np.ndarray,
                          counts: dict) -> tuple[np.ndarray, dict]:
     """Choose a complete annulus, not simply the largest above-plane residual.
@@ -356,6 +451,10 @@ def _select_ring_cluster(clusters: list[np.ndarray], search_center_xy: np.ndarra
     a patch can contain more points than the deposited ring, but it has a much
     larger radial spread after a circle fit. A ring must cover most angular bins
     and keep its central 95% radial span below 80% of its fitted radius.
+
+    Completeness is judged on the assembled ring, never on one connected
+    component: see :func:`_assemble_ring_arcs` for why a ring can arrive in
+    pieces and why joining them cannot admit anything that is not ring-shaped.
     """
     angular_bins = 72
     min_coverage = 0.70
@@ -363,34 +462,49 @@ def _select_ring_cluster(clusters: list[np.ndarray], search_center_xy: np.ndarra
     min_radius_mm = 5.0
     diagnostics: list[dict] = []
     eligible: list[tuple[float, int, np.ndarray]] = []
-    for index, cluster in enumerate(clusters):
-        record: dict = {"candidate": index + 1, "points": int(len(cluster))}
+
+    shapes: list[dict | None] = []
+    for cluster in clusters:
         try:
-            center, radius = fit_circle_xy(cluster)
-            radii = np.linalg.norm(cluster[:, :2] - center, axis=1)
-            theta = np.mod(np.arctan2(cluster[:, 1] - center[1],
-                                      cluster[:, 0] - center[0]), 2 * math.pi)
-            occupied = len(np.unique(np.floor(theta / (2 * math.pi) * angular_bins).astype(int)))
-            coverage = occupied / angular_bins
-            radial_span = float(np.percentile(radii, 97.5) - np.percentile(radii, 2.5))
-            span_ratio = radial_span / max(float(radius), 1e-9)
+            shapes.append(_ring_shape(cluster, angular_bins))
+        except (RuntimeError, ValueError, np.linalg.LinAlgError):
+            shapes.append(None)
+    groups = _assemble_ring_arcs(clusters, shapes, angular_bins=angular_bins,
+                                 min_coverage=min_coverage,
+                                 max_span_ratio=max_span_ratio,
+                                 min_radius_mm=min_radius_mm)
+    members: list[tuple[int, ...]] = [(i,) for i in range(len(clusters))] + groups
+
+    for index, member in enumerate(members):
+        points = (clusters[member[0]] if len(member) == 1
+                  else np.vstack([clusters[i] for i in member]))
+        record: dict = {"candidate": index + 1, "points": int(len(points)),
+                        "cluster_count": len(member),
+                        "cluster_indices": [i + 1 for i in member]}
+        try:
+            shape = (shapes[member[0]] if len(member) == 1
+                     else _ring_shape(points, angular_bins))
+            if shape is None:
+                raise RuntimeError("circle fit failed")
+            center, radius = shape["center"], shape["radius"]
+            coverage, span_ratio = shape["coverage"], shape["span_ratio"]
             center_offset = float(np.linalg.norm(center - search_center_xy))
             is_eligible = (radius >= min_radius_mm and coverage >= min_coverage
                            and span_ratio <= max_span_ratio)
-            score = math.sqrt(len(cluster)) * coverage / max(span_ratio, 0.05)
+            score = math.sqrt(len(points)) * coverage / max(span_ratio, 0.05)
             record.update({
                 "center_mm": [float(center[0]), float(center[1])],
                 "center_offset_mm": center_offset,
                 "radius_mm": float(radius),
-                "angular_bins_occupied": int(occupied),
+                "angular_bins_occupied": shape["occupied"],
                 "angular_coverage": float(coverage),
-                "radial_span_95_mm": radial_span,
+                "radial_span_95_mm": shape["span"],
                 "radial_span_ratio": float(span_ratio),
                 "eligible": bool(is_eligible),
                 "score": float(score),
             })
             if is_eligible:
-                eligible.append((score, index, cluster))
+                eligible.append((score, index, points))
         except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
             record.update({"eligible": False, "rejection": str(exc)})
         diagnostics.append(record)
@@ -400,6 +514,7 @@ def _select_ring_cluster(clusters: list[np.ndarray], search_center_xy: np.ndarra
         "minimum_angular_coverage": min_coverage,
         "maximum_radial_span_ratio": max_span_ratio,
         "minimum_radius_mm": min_radius_mm,
+        "assembled_candidates": [[i + 1 for i in group] for group in groups],
         "candidates": diagnostics,
     }
     if not eligible:
@@ -463,7 +578,8 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
                         T_work_camera: np.ndarray, K: np.ndarray,
                         plan: CylinderPlan, layer: LayerPath, config,
                         floor_profile: np.ndarray | None = None,
-                        stages: dict | None = None) -> ProcessingResult:
+                        stages: dict | None = None,
+                        assemble_arcs: bool = False) -> ProcessingResult:
     """Reconstruct one layer from exactly one saved synchronized RGB-D frame.
 
     ``floor_profile`` is the previous layer's measured centreline (Nx3, work
@@ -472,6 +588,10 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     lets a DISPLACED ring be measured without the exposed crescent of the ring
     beneath it being dragged into the same skeleton. Omitted, behaviour is
     exactly as before.
+
+    ``assemble_arcs`` rejoins ring arcs that the height floor or an occlusion
+    split apart; see :func:`_filter_deposit` for why only a characterization
+    turns it on.
 
     ``stages``, when a dict is passed, is filled with a copy of the cloud at
     each step of the chain (backprojected, work_roi, above_floor,
@@ -546,7 +666,9 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
             f"(need {config.cluster_min_points}); {json.dumps(roi_diag)}")
 
     mark = time.perf_counter()
-    deposit = _filter_deposit(points, config, counts)
+    deposit = _filter_deposit(points, config, counts, assemble_arcs=assemble_arcs,
+                              search_center_xy=np.array([setup.center_x_mm,
+                                                         setup.center_y_mm]))
     keep("deposit_cluster", deposit)
     # Before the crest is picked and before the bead width is read from the
     # flanks: both must see the bead alone, not the board fused to it.
@@ -597,9 +719,14 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     ordered_xy = ordered_xy * config.raster_mm_per_pixel + lo
     _, nearest = cKDTree(points[:, :2]).query(ordered_xy)
     ordered_xyz = np.column_stack((ordered_xy, points[nearest, 2]))
+    # A skeleton with endpoints is an ARC, not a loop. Splining it periodically
+    # would bridge the two ends and report the invented span as measured
+    # geometry -- and because a periodic curve is 100% complete by construction,
+    # compare_circle's completeness guard could never fire. Measure what was
+    # seen; let the gap reach the metrics.
     closed = len(_graph(final_skeleton)) > 2 and not any(
         len(v) == 1 for v in _graph(final_skeleton).values())
-    measured = _fit_spline(ordered_xyz, config.measured_spline_points, closed=True)
+    measured = _fit_spline(ordered_xyz, config.measured_spline_points, closed=closed)
     nominal_center = (setup.center_x_mm, setup.center_y_mm)
     metrics = compare_circle(measured, recipe.radius_mm,
                              nominal_center_mm=nominal_center)
@@ -608,7 +735,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
                              build_plane_z_mm=setup.build_plane_z_mm,
                              bins=config.bead_width_bins)
     corrected = None
-    if recipe.correction_enabled and metrics.valid:
+    if recipe.correction_enabled and metrics.valid and closed:
         corrected = corrected_circle(
             measured, recipe.radius_mm, layer.nominal_z_mm,
             nominal_center_mm=nominal_center,
@@ -628,6 +755,8 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
         "counts": counts, "timings_ms": timings, "branch_guard_attempts": attempts,
         "floor": floor, "geometry": geometry.model_dump(mode="json"),
         "coordinate_frame": plan.setup.work_frame, "units": "mm",
+        "closed": bool(closed),
+        "measured_path_completeness": float(metrics.path_completeness),
         "valid": metrics.valid, "warnings": metrics.warnings,
     }
     return ProcessingResult(measured, corrected, metrics, final_mask,
@@ -706,7 +835,8 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, T_work_camera: np
         center_y_mm=float(coarse_center[1]))
     plan = generate_cylinder_plan(recipe, setup)
     refined = process_observation(color=color, depth=depth, T_work_camera=T_work_camera,
-                                  K=K, plan=plan, layer=plan.layers[0], config=config)
+                                  K=K, plan=plan, layer=plan.layers[0], config=config,
+                                  assemble_arcs=True)
     geometry = refined.geometry
     report = {**refined.report, "coarse": coarse, "counts_coarse": counts,
               "ring_selector": selector,

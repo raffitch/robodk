@@ -274,7 +274,7 @@ def test_bead_width_profile_on_an_ideal_annulus():
 
 # ------------------------------------------------- characterize a ring (Task 6)
 
-from tasni.modules.extrusion.processing import characterize_ring
+from tasni.modules.extrusion.processing import characterize_ring, fit_circle_xy
 
 
 def test_characterize_recovers_a_ring_the_recipe_got_wrong():
@@ -355,7 +355,105 @@ def test_characterize_real_checkerboard_capture_selects_the_visible_ring():
     assert not largest["eligible"]
 
 
+def _thin_at(mean_mm: float, dips_deg, width_deg: float = 12.0, floor_mm: float = 1.0):
+    """A ring that all but vanishes at ``dips_deg`` -- the real low-relief failure.
+
+    The 2026-08-29 capture had a hand-placed dried ring 2-11 mm tall whose two
+    thinnest arcs fell under the ROI height floor, so one loop reached DBSCAN as
+    two disconnected arcs and the per-cluster shape gate rejected both.
+    """
+    def height(theta):
+        h = np.full_like(theta, float(mean_mm), dtype=float)
+        for dip in dips_deg:
+            d = np.abs(np.mod(np.degrees(theta) - dip + 180.0, 360.0) - 180.0)
+            h = np.where(d <= width_deg, float(floor_mm), h)
+        return h
+    return height
+
+
+def test_characterize_assembles_one_ring_from_arcs_the_height_floor_broke():
+    pytest.importorskip("open3d")
+    # One physical ring, thinned to nothing at 125 deg and 245 deg: the ROI floor
+    # erases those arcs, so DBSCAN yields two clusters neither of which spans
+    # 70% of the circumference on its own.
+    center = (CENTER[0] + 3.0, CENTER[1] - 1.0)
+    T = syn.inspection_camera_T([CENTER[0], CENTER[1], 6.0], 300.0)
+    ring = syn.RingSpec(40.0, 10.0, center,
+                        height_fn=_thin_at(7.0, (125.0, 245.0)))
+    depth = syn.render_scene([ring], T, plane_center_xy_mm=CENTER)
+    color = np.zeros((720, 1280, 3), np.uint8)
+
+    found = characterize_ring(
+        color=color, depth=depth, T_work_camera=T, K=syn.K_720P,
+        search_center_mm=CENTER, work_frame="Tasni Work Frame",
+        config=ExtrusionConfig())
+
+    selector = found.report["ring_selector"]
+    selected = next(c for c in selector["candidates"] if c.get("selected"))
+    # The winner must be the ASSEMBLED ring, not either arc on its own.
+    assert selected["cluster_count"] >= 2
+    # 2 x 24 deg of the ring is genuinely erased, so ~0.87 is the honest ceiling;
+    # what matters is that it clears the 0.70 gate no single arc could.
+    assert selected["angular_coverage"] >= 0.85
+    assert max(c["angular_coverage"] for c in selector["candidates"]
+               if c["cluster_count"] == 1) < 0.70
+    assert found.radius_mm == pytest.approx(40.0, abs=1.5)
+    assert found.center_mm == pytest.approx(center, abs=1.5)
+
+
+def test_characterize_real_low_relief_capture_is_not_rejected():
+    pytest.importorskip("open3d")
+    # trial 20260829-151445-acb42814/characterize-01: a 2-11 mm dried ring whose
+    # thin arcs fell under the floor. Every cluster failed the old per-cluster
+    # gate (best 48/72 bins = 0.667) though together they cover 71/72.
+    fixture = np.load(Path(__file__).parent / "fixtures" / "extrusion" / "ring1"
+                      / "ring1_low_relief_20260829.npz")
+    depth = fixture["depth"]
+    color = np.zeros((*depth.shape, 3), np.uint8)
+
+    found = characterize_ring(
+        color=color, depth=depth, T_work_camera=fixture["T_work_camera"],
+        K=fixture["K"], search_center_mm=fixture["search_center_mm"],
+        work_frame="Tasni Work Frame", config=ExtrusionConfig())
+
+    assert found.radius_mm == pytest.approx(42.0, abs=2.0)
+    selected = next(c for c in found.report["ring_selector"]["candidates"]
+                    if c.get("selected"))
+    assert selected["cluster_count"] == 2
+    assert selected["angular_coverage"] >= 0.90
+
+
+def test_a_ring_measured_only_in_part_is_not_closed_into_a_full_one():
+    pytest.importorskip("open3d")
+    # Same broken ring, but through the layer pipeline: the centreline must cover
+    # only what was actually measured, and the report must say so.
+    center = (CENTER[0], CENTER[1])
+    plan = scene_plan(radius=40.0, bead=10.0, layer_height=7.0)
+    T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, 1), 300.0)
+    ring = syn.RingSpec(40.0, 10.0, center, height_fn=_thin_at(7.0, (200.0,), width_deg=35.0))
+    depth = syn.render_scene([ring], T, plane_center_xy_mm=CENTER)
+    color = np.zeros((720, 1280, 3), np.uint8)
+
+    result = process_observation(color=color, depth=depth, T_work_camera=T,
+                                 K=syn.K_720P, plan=plan, layer=plan.layers[0],
+                                 config=ExtrusionConfig())
+
+    measured = np.asarray(result.measured_xyz, dtype=float)
+    fitted, _ = fit_circle_xy(measured)
+    theta = np.mod(np.arctan2(measured[:, 1] - fitted[1],
+                              measured[:, 0] - fitted[0]), 2 * np.pi)
+    occupied = len(set((theta / (2 * np.pi) * 72).astype(int).tolist()))
+    assert occupied < 68                       # the gap must survive into the output
+    # compare_circle already guards completeness; forcing the spline closed made
+    # it blind, because a periodic curve is always 100% complete.
+    assert result.report["closed"] is False
+    assert result.metrics.path_completeness < 0.95
+    assert result.metrics.maximum_angular_gap_deg > 30.0
+    assert result.metrics.valid is False
+    assert any("completeness" in w or "angular gap" in w for w in result.metrics.warnings)
+
 # ------------------------------------------------------------- archive (Task 7)
+
 
 from tasni.modules.extrusion.archive import ExtrusionArchive
 from tasni.modules.extrusion.models import LayerManifest
