@@ -160,6 +160,15 @@ the host defaults `depth_scale=1000.0` in seven signatures (`config.py:647`,
 The filter deltas are unaffected (disparity domain); `threshold_filter`, `depth_min_m`,
 `depth_max_m`, and any host threshold in raw units must be re-read.
 
+Two extrusion-specific consequences, checked against `e0b78d7` (the 2026-08-29 figures
+merge): (a) each take's **archive manifest must carry `depth_unit_mm`**, because
+`figures.py` re-runs `depth_to_work_points` on *archived* depth with the default scale —
+a post-R2 take rendered without it would come out 10× too far away; (b) the extrusion
+chain **voxel-downsamples at 2 mm** (`ExtrusionConfig.voxel_size_m`, `config.py:809`),
+which `docs/extrusion-current-handoff.md` correctly calls the measurement's resolution —
+so R2 reaches the ring numbers only once that voxel is lowered with it (the multi-view
+inspection spec already flagged the same cap).
+
 **Fix.** Add a versioned handshake (`MODE FULL2` → server replies one JSON line with
 `depth_unit_mm`, depth intrinsics, depth→colour extrinsics — the same greeting R3 needs);
 carry `depth_scale` on the host `Frame`; make the config field the fallback for the old
@@ -391,7 +400,8 @@ after service start) exists as a figure.
 R4.1 record as-found JSON            (read-only, hours, do FIRST — makes the 08-13 record reproducible)
 R12  log temperatures                (trivial, same commit)
 R1   Release+CUDA rebuild of 2.55.1  (unblocks everything; keep old build dir for rollback)
-R2   depth_units 0.1 mm + greeting   (needs the greeting; host depth_scale plumbing)
+R2   depth_units 0.1 mm + greeting   (needs the greeting; host depth_scale plumbing;
+                                      archive manifest; extrusion 2 mm voxel lowered with it)
 R3   raw depth + host-side mapping   (same greeting; closes audit A1; ~2x points per view)
 R5   drop hole_filling, add threshold (falls out of R3: fill host-side or not at all)
 R10  848x480 A/B                     (one characterisation run, after R4.1 so it is comparable)
