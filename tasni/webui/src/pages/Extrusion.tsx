@@ -324,11 +324,31 @@ export default function Extrusion() {
   const [offsetY, setOffsetY] = useState(0);
   const [measureNote, setMeasureNote] = useState("");
   const [phase, setPhase] = useState<string>("noise floor");
-  const [guideOpen, setGuideOpen] = useState(true);
+  const [guideOpen, setGuideOpen] = useState(false);
+  // Two workflows share this page and need almost nothing from each other. The
+  // measuring run is the one on the clock, so it opens by default and the print
+  // controls stay out of the way until they are asked for.
+  const [mode, setMode] = useState<"measure" | "print">(() => {
+    try { return localStorage.getItem("extrusion.mode") === "print" ? "print" : "measure"; }
+    catch { return "measure"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("extrusion.mode", mode); } catch { /* private mode */ }
+  }, [mode]);
+  const guideDialog = useRef<HTMLDialogElement>(null);
+  useEffect(() => {
+    const dialog = guideDialog.current;
+    if (!dialog) return;
+    if (guideOpen && !dialog.open) dialog.showModal();
+    if (!guideOpen && dialog.open) dialog.close();
+  }, [guideOpen]);
   const [confirmMotion, setConfirmMotion] = useState(false);
   const [paper, setPaper] = useState<string | null>(null);
   const [openTake, setOpenTake] = useState<string | null>(null);
   const [showStack, setShowStack] = useState(false);
+  // Eight columns answer "did that take work?"; the rest are for writing the
+  // paper afterwards and only get in the way at the cell.
+  const [allColumns, setAllColumns] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   const refreshStatus = useCallback(() => {
@@ -765,8 +785,22 @@ export default function Extrusion() {
   const nextStep = guide.findIndex((step) => !step.done);
 
   return <div>
-    <h1 className="page-title">Cylinder Test</h1>
-    <p className="page-sub">Top-down toolpath review → complete RoboDK dry run → layer print → one RGB-D inspection → archive.</p>
+    <div className="page-head">
+      <div>
+        <h1 className="page-title">{mode === "measure" ? "Ring stack" : "Cylinder print"}</h1>
+        <p className="page-sub">{mode === "measure"
+          ? "Hand-placed rings, measured one layer at a time. The camera moves; nothing is extruded."
+          : "Top-down toolpath review → complete RoboDK dry run → layer print → one RGB-D inspection → archive."}</p>
+      </div>
+      <div className="mode-switch" role="group" aria-label="Workflow">
+        <button type="button" className={mode === "measure" ? "on" : ""}
+                aria-pressed={mode === "measure"}
+                onClick={() => setMode("measure")}>Measure rings</button>
+        <button type="button" className={mode === "print" ? "on" : ""}
+                aria-pressed={mode === "print"}
+                onClick={() => setMode("print")}>Print cylinder</button>
+      </div>
+    </div>
 
     <div className={`card conn-banner ${connected ? "ready" : ""}`}>
       <div className="conn-row"><span className="conn-label">RoboDK station</span>
@@ -775,6 +809,19 @@ export default function Extrusion() {
       </div>
     </div>
 
+    {/* One status line for the page: it used to live inside the print-only card,
+        where a measuring run could not see its own errors. */}
+    <div className="run-status">
+      <p className="status-line">{message}</p>
+      {(busy || status?.running) && <><div className="progress"><div style={{ width: `${pct}%` }} /></div>
+        <div className="status-line">{progress.message}</div></>}
+    </div>
+
+    <details className="setup-fold" open={mode === "print"}>
+      <summary>Setup — station, recipe and plan
+        <span className="hint">{plan
+          ? `r ${plan.recipe.radius_mm} · bead ${plan.recipe.bead_diameter_mm} · ${plan.layers.length} layer${plan.layers.length === 1 ? "" : "s"} · ${plan.setup.work_frame}`
+          : "no plan generated yet"}</span></summary>
     <div className="extrusion-layout">
       <div className="card">
         <h2>Station & motion</h2>
@@ -874,16 +921,15 @@ export default function Extrusion() {
           <button className="secondary" disabled={!connected || busy || status?.running} onClick={resetGenerated}>Reset / clean RoboDK path</button></div>
       </div>
     </div>
+    </details>
 
-    <div className={`card extrusion-safety ${status?.live_print_enabled ? "ready" : "locked"}`}>
+    {mode === "print" && <div className={`card extrusion-safety ${status?.live_print_enabled ? "ready" : "locked"}`}>
       <h2>Safety workflow</h2>
       <div className="workflow-steps"><span className={plan ? "done" : ""}>1 Generate</span>
         <span className={preflight?.all_ok && stationReady ? "done" : ""}>2 Preflight</span>
         <span className={status?.quick_sim_passed ? "done" : ""}>3a Visual simulation</span>
         <span className={status?.dry_run_passed ? "done" : ""}>3b Collision-validated dry run</span>
         <span className={result?.kind === "cylinder_print" ? "done" : ""}>4 Print & record</span></div>
-      <p className="status-line">{message}</p>
-      {(busy || status?.running) && <><div className="progress"><div style={{ width: `${pct}%` }} /></div><div className="status-line">{progress.message}</div></>}
       {config && <div className="io-note">Valve: <code>{config.integration.valve_outputs.join(" + ")}</code> via {config.integration.air_on_program}/{config.integration.air_off_program}. Hardware approval: <b>{config.integration.hardware_io_test_approved ? "APPROVED" : "NOT APPROVED"}</b>.</div>}
       {preflight?.surface && <div className={`io-note ${preflight.surface.ok ? "" : "warn-text"}`}>
         Placement: <b>{preflight.surface.placement === "scan_surface" ? "scanned surface" : "manual"}</b>
@@ -953,83 +999,63 @@ export default function Extrusion() {
         I confirm the selected tool/frame/orientation, cell clearance, material system, and live extrusion run.</label>
       <button className="live-print-btn" disabled={!plan || !status?.live_print_enabled || !confirmLive || busy || status?.running} onClick={() => startJob("print")}>Print & record — LIVE ROBOT · collisions {liveCollisionCheck ? "ON" : "OFF"}</button>
       <div className="log" ref={logRef}>{logs.length ? logs.map((line, i) => <div key={i} className={line.startsWith("ERROR") ? "err" : ""}>{line}</div>) : "Job timeline will appear here."}</div>
-    </div>
+    </div>}
 
-    <div className="card">
-      <h2>Ring stack — measure only (no extrusion)</h2>
-      <p className="hint">Hand-placed dried rings. Each press moves ONLY the camera to the derived
-        inspection pose, takes one RGB-D frame, measures it and returns. No layer program, no valve.
-        Archived as <code>MEASURE_ONLY</code>, never counted as a print.</p>
-      <div className="io-note warn-text">Collision validation is OFF for these moves: the hand-placed
-        ring stack is not in the station model, so RoboDK's check only reports the cell furniture and
-        was rejecting otherwise good inspection poses. The pose is still IK-checked and reachable, and
-        the camera stops ≥300 mm above the ring — but nothing screens the path against the real cell.
-        Keep hands clear and watch the first move.</div>
-      <details className="ring-guide" open={guideOpen}
-               onToggle={(e) => setGuideOpen((e.target as HTMLDetailsElement).open)}>
-        <summary>Run guide — the protocol, in order
-          <span className="hint">{nextStep < 0 ? "every step done"
-            : `next: ${guide[nextStep].title}`}</span></summary>
-        <ol className="guide-steps">
-          {guide.map((step, i) => <li key={step.title}
-            className={step.done ? "done" : i === nextStep ? "current" : ""}>
-            <b>{step.title}</b>{step.progress && <em>{step.progress}</em>}
-            <span>{step.detail}</span>
-          </li>)}
-        </ol>
-        <div className="io-note">
-          <b>Placing the rings.</b> Displace only the <b>TOP</b> ring: layer N is measured
-          above layer N−1's latest take, so moving a ring underneath corrupts everything
-          stacked on it. Keep every offset ≤ 25 mm (the search band is ±30 mm). The work
-          frame's axes run along the board edges, so a steel rule laid along an edge IS the
-          frame axis: mark where the ring sits, slide it along the rule, and type the distance
-          you actually achieved. Do <b>not</b> count ChArUco squares — this board's are 40 mm,
-          past the 25 mm cap, and the ring would fall outside the search band. Take one
-          throwaway measurement first to learn which edge is +X: the reported offset tells you
-          the sign.
+    {mode === "measure" && <div className="card ring-card">
+      <h2 className="visually-hidden">Ring stack — measure only</h2>
+      <div className="ring-head">
+        <div className="next-step">
+          <span className="k">Next</span>
+          <b>{nextStep < 0 ? "All steps done — take the paper summary."
+                           : guide[nextStep].title}</b>
+          {nextStep >= 0 && guide[nextStep].progress && <em>{guide[nextStep].progress}</em>}
         </div>
-        <div className="io-note">
-          <b>What the numbers mean.</b> A pure shift of d reads centre offset ≈ d, max ≈ d,
-          mean ≈ 0.64 d, RMS ≈ 0.71 d — the summary checks that relation for you and warns
-          if it disagrees. This cell's error floor is 1.26 mm (hand-eye board consistency),
-          so nothing sub-millimetre can be claimed. Nothing here is extruded: this is a
-          controlled validation of the sensing-and-comparison chain, not print deviation.
-        </div>
-      </details>
-      <div className="btn-row">
-        <input placeholder="session / ring note" value={measureNote} onChange={(e) => setMeasureNote(e.target.value)} />
-        <button className="secondary" disabled={!plan || busy || status?.running} onClick={newMeasureSession}>New session</button>
-        <span className="hint">{measureSession ? `session ${measureSession.trial_id}`
-          : plan ? "no session yet (one is created on first measure)"
-            : "New session needs a plan: run Generate coordinates & fingerprint above — a session records the plan it measures against"}</span>
+        <button type="button" className="secondary guide-btn"
+                onClick={() => setGuideOpen(true)}>Run guide</button>
       </div>
-      {plan?.restored_from && <div className="hint">Plan restored from session
-        <code> {plan.restored_from} </code>after a backend restart — the characterization it
-        applied (r {applied?.recipe.radius_mm} mm, bead {applied?.recipe.bead_diameter_mm} mm,
-        {" "}{applied?.recipe.layer_count} layers) is back. You do not need to press Apply again.</div>}
+
+      <div className="ring-row">
+        <span className="k">Session</span>
+        <b className="mono">{measureSession ? measureSession.trial_id : "none yet"}</b>
+        {plan && <span className="hint">r {plan.recipe.radius_mm} · bead {plan.recipe.bead_diameter_mm}
+          {" "}· {plan.layers.length} layer{plan.layers.length === 1 ? "" : "s"}</span>}
+        <span className="spacer" />
+        <input className="note-input" placeholder="note" value={measureNote}
+               onChange={(e) => setMeasureNote(e.target.value)} />
+        <button className="secondary" disabled={!plan || busy || status?.running}
+                onClick={newMeasureSession}>New session</button>
+      </div>
+
+      {!plan && <p className="hint warn-text">Open <b>Setup</b> above and press
+        <b> Generate coordinates &amp; fingerprint</b> — a session records the plan it measures against.</p>}
+      {plan && plan.layers.length < 3 && <p className="hint warn-text">This plan has
+        {" "}{plan.layers.length} layer{plan.layers.length === 1 ? "" : "s"}. Set <b>Layers</b> to 3 in
+        Setup and generate again before measuring a stack — Apply never changes the layer count.</p>}
+      {plan?.restored_from && <p className="hint">Plan restored from session
+        <code> {plan.restored_from} </code>after a restart — no need to press Apply.</p>}
       {applied && !planIsApplied && <div className="io-note warn-text">
-        <b>The current plan is not the one this session applied.</b> It measures against the
-        ring characterized at r {applied.recipe.radius_mm} mm, centre
-        ({applied.setup.center_x_mm.toFixed(1)}, {applied.setup.center_y_mm.toFixed(1)}).
-        Press <b>Apply to recipe &amp; placement</b> before measuring — scoring a take against
-        a plan the ring was never placed on is the stale-plan artifact, and Measure will refuse.
+        <b>This is not the plan the session applied</b> (ring characterized at r {applied.recipe.radius_mm} mm,
+        centre {applied.setup.center_x_mm.toFixed(1)}, {applied.setup.center_y_mm.toFixed(1)}).
+        Press <b>Apply to recipe &amp; placement</b> below before measuring.
       </div>}
-      <label><input type="checkbox" checked={confirmMotion} onChange={(e) => setConfirmMotion(e.target.checked)} />
-        I confirm the robot may move the camera to the inspection pose with collision validation off
-        (hands clear of the cell).</label>
-      <div className="btn-row">
-        <button disabled={!plan || !connected || !confirmMotion || busy || status?.running} onClick={characterize}>Characterize ring 1 — ROBOT MOVES · collisions OFF</button>
+
+      <div className="ring-row">
+        <span className="k">Ring 1</span>
+        <button disabled={!plan || !connected || !confirmMotion || busy || status?.running}
+                onClick={characterize}>Characterize</button>
         {measureSession?.characterizations?.length ? (() => {
           const c = measureSession.characterizations[measureSession.characterizations.length - 1];
           return <>
-            <span className="hint">measured: r {c.radius_mm.toFixed(1)} mm · bead {c.bead_width_mm.toFixed(1)} mm ·
-              height {c.top_z_min_mm.toFixed(1)}–{c.top_z_max_mm.toFixed(1)} (mean {c.top_z_mean_mm.toFixed(1)}) mm ·
-              centre ({c.center_mm[0].toFixed(1)}, {c.center_mm[1].toFixed(1)})</span>
-            <button className="secondary" disabled={busy || status?.running} onClick={applyCharacterization}>Apply to recipe &amp; placement</button>
+            <span className="hint">r {c.radius_mm.toFixed(1)} · bead {c.bead_width_mm.toFixed(1)} ·
+              height {c.top_z_min_mm.toFixed(1)}–{c.top_z_max_mm.toFixed(1)} mm</span>
+            <button className={planIsApplied ? "secondary" : ""} disabled={busy || status?.running}
+                    onClick={applyCharacterization}>Apply to recipe &amp; placement</button>
           </>;
-        })() : null}
+        })() : <span className="hint">measures the physical ring and sets the recipe from it</span>}
       </div>
-      <div className="btn-row">
+
+      <div className="ring-row">
+        <span className="k">Measure</span>
         <label>Layer <select value={measureLayer} onChange={(e) => setMeasureLayer(Number(e.target.value))}>
           {(plan?.layers ?? []).map((l) => <option key={l.layer_index} value={l.layer_index}>{l.layer_index}</option>)}
         </select></label>
@@ -1037,36 +1063,49 @@ export default function Extrusion() {
           <option value="">(none)</option>
           {PHASES.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
         </select></label>
-        <label>Introduced offset X <input type="number" step={1} value={offsetX} onChange={(e) => setOffsetX(Number(e.target.value))} /> mm</label>
-        <label>Y <input type="number" step={1} value={offsetY} onChange={(e) => setOffsetY(Number(e.target.value))} /> mm</label>
+        <label>Offset X <input type="number" step={1} value={offsetX}
+          onChange={(e) => setOffsetX(Number(e.target.value))} /></label>
+        <label>Y <input type="number" step={1} value={offsetY}
+          onChange={(e) => setOffsetY(Number(e.target.value))} /></label>
+        <span className="hint">mm</span>
         {(offsetX !== 0 || offsetY !== 0) && <button className="secondary"
-          onClick={() => { setOffsetX(0); setOffsetY(0); }}>Clear offset</button>}
+          onClick={() => { setOffsetX(0); setOffsetY(0); }}>Clear</button>}
       </div>
-      <div className="hint">{PHASES.find((p) => p.value === phase)?.hint
-        || "No phase recorded: takes of this layer will be grouped only by the offset you typed."}</div>
+
       {/* The ground truth every detection-error number is measured against. It is
           sticky between presses, so it is echoed where the operator is looking. */}
       <div className={`take-echo ${offsetX || offsetY ? "shifted" : ""}`}>
-        <span className="k">This press records</span>
+        <span className="k">Records</span>
         <b>{annotationLabel()}</b>
         {(offsetX !== 0 || offsetY !== 0) &&
-          <span className="warn-text">move the TOP ring by exactly this before pressing</span>}
+          <span className="warn-text">move the TOP ring by exactly this first</span>}
       </div>
-      {!floorReady && <div className="io-note warn-text">
-        <b>Measure layer {measureLayer - 1} first.</b> Layer {measureLayer}'s measurement floor
-        IS layer {measureLayer - 1}'s latest measured take; without it a stacked ring blends
-        into the ring beneath. Measure will refuse.
-      </div>}
-      <div className="btn-row">
-        <button disabled={!plan || !connected || !confirmMotion || busy || status?.running
+      {!floorReady && <p className="hint warn-text">Measure layer {measureLayer - 1} first — it is
+        the measurement floor for layer {measureLayer}.</p>}
+
+      <div className="go-row">
+        <label className="go-confirm"><input type="checkbox" checked={confirmMotion}
+          onChange={(e) => setConfirmMotion(e.target.checked)} />
+          Hands clear — the robot may move the camera (collision validation off)</label>
+        <button className="go-btn" disabled={!plan || !connected || !confirmMotion || busy || status?.running
                           || !planIsApplied || !floorReady}
-                onClick={measure}>Measure layer {measureLayer} — ROBOT MOVES · collisions OFF</button>
+                onClick={measure}>Measure layer {measureLayer}</button>
         {(busy || status?.running) && <button className="secondary" onClick={cancel}>Cancel</button>}
       </div>
       {logs.length > 0 && <div className="log measure-log">{logs.slice(-6).map((line, i) =>
         <div key={i} className={line.startsWith("ERROR") ? "err" : ""}>{line}</div>)}</div>}
+      {takes.length ? <div className="take-head">
+        <span className="hint">{takes.length} take{takes.length === 1 ? "" : "s"} ·
+          {" "}{validTakes.length} valid · click a row for its figures</span>
+        <button type="button" className="secondary" onClick={() => setAllColumns(!allColumns)}>
+          {allColumns ? "Fewer columns" : "All columns"}</button>
+      </div> : null}
       {takes.length ? <table className="metrics">
-        <thead><tr><th>Layer</th><th>Take</th><th>Phase</th><th>Introduced</th><th>Offset dx/dy (|d|)</th><th>Detected</th><th>Mean |dev|</th><th>RMS</th><th>Max</th><th>Shape RMS</th><th>Height min/mean/max</th><th>Bead</th><th>Acq→path</th><th>Valid</th></tr></thead>
+        <thead><tr><th>Layer</th><th>Take</th><th>Phase</th><th>Introduced</th>
+          <th>Measured |d|</th><th>Detection error</th>
+          {allColumns && <><th>dx / dy</th><th>Mean |dev|</th><th>Max</th><th>Shape RMS</th>
+            <th>Height min/mean/max</th><th>Bead</th><th>Acq→path</th></>}
+          <th>RMS</th><th>Valid</th></tr></thead>
         <tbody>{takes.map((r) => {
           const truth = r.annotation?.introduced_offset_mm;
           // How far the measured displacement lands from the one that was typed:
@@ -1082,16 +1121,19 @@ export default function Extrusion() {
             <td>{r.layer_index}</td><td>{r.take}{r.reprocessed && <sup title="reprocessed offline from the archived frame">R</sup>}</td>
             <td>{r.annotation?.phase || "—"}</td>
             <td>{truth ? `(${truth.join(", ")}) mm` : "—"}</td>
-            <td className="num">{r.metrics ? `${r.metrics.center_offset_mm[0].toFixed(1)} / ${r.metrics.center_offset_mm[1].toFixed(1)} (${r.metrics.center_offset_norm_mm.toFixed(2)})` : "—"}</td>
+            <td className="num">{r.metrics ? r.metrics.center_offset_norm_mm.toFixed(2) : "—"}</td>
             <td className="num">{detection === null ? "—" : detection.toFixed(2)}</td>
-            <td className="num">{r.metrics ? r.metrics.mean_absolute_mm.toFixed(2) : "—"}</td>
+            {allColumns && <>
+              <td className="num">{r.metrics ? `${r.metrics.center_offset_mm[0].toFixed(1)} / ${r.metrics.center_offset_mm[1].toFixed(1)}` : "—"}</td>
+              <td className="num">{r.metrics ? r.metrics.mean_absolute_mm.toFixed(2) : "—"}</td>
+              <td className="num">{r.metrics ? r.metrics.maximum_mm.toFixed(2) : "—"}</td>
+              <td className="num">{r.metrics ? r.metrics.shape_rms_mm.toFixed(2) : "—"}</td>
+              <td className="num">{r.geometry ? `${r.geometry.height_min_mm.toFixed(1)} / ${r.geometry.height_mean_mm.toFixed(1)} / ${r.geometry.height_max_mm.toFixed(1)}` : "—"}</td>
+              <td className="num">{r.geometry ? r.geometry.bead_width_mean_mm.toFixed(1) : "—"}</td>
+              <td className="num">{r.timings_ms?.acquisition_to_path_ms
+                ? `${Math.round(r.timings_ms.acquisition_to_path_ms)} ms` : "—"}</td>
+            </>}
             <td className="num">{r.metrics ? r.metrics.rms_mm.toFixed(2) : "—"}</td>
-            <td className="num">{r.metrics ? r.metrics.maximum_mm.toFixed(2) : "—"}</td>
-            <td className="num">{r.metrics ? r.metrics.shape_rms_mm.toFixed(2) : "—"}</td>
-            <td className="num">{r.geometry ? `${r.geometry.height_min_mm.toFixed(1)} / ${r.geometry.height_mean_mm.toFixed(1)} / ${r.geometry.height_max_mm.toFixed(1)}` : "—"}</td>
-            <td className="num">{r.geometry ? r.geometry.bead_width_mean_mm.toFixed(1) : "—"}</td>
-            <td className="num">{r.timings_ms?.acquisition_to_path_ms
-              ? `${Math.round(r.timings_ms.acquisition_to_path_ms)} ms` : "—"}</td>
             <td><span className={`badge ${r.valid ? "good" : "bad"}`}>{r.valid ? "VALID" : "INVALID"}</span>
               {!r.valid && <button className="secondary reprocess-btn" disabled={busy || status?.running}
                 onClick={(e) => { e.stopPropagation(); reprocessTake(r); }}>Reprocess</button>}</td>
@@ -1103,11 +1145,9 @@ export default function Extrusion() {
         with no robot motion. {takes.filter((t) => !t.valid).map((t) =>
           `L${t.layer_index} take ${t.take}: ${t.error || "invalid"}`).join(" · ")}
       </p> : null}
-      {takes.length ? <p className="hint">
-        Click a take to see its figures. They are drawn from the archived frame, so a take
-        measured before figures existed renders on its first view — the robot never moves.
-        A take marked <sup>R</sup> was reprocessed offline; its capture time is real, its
-        processing time is not, and the summary keeps it out of the cycle statistic.
+      {takes.some((t) => t.reprocessed) ? <p className="hint">
+        <sup>R</sup> = reprocessed offline from the archived frame: its capture time is real,
+        its processing time is not, and the summary keeps it out of the cycle statistic.
       </p> : null}
       {openTake && measureSession ? (() => {
         const take = measureSession.records.find((r) => layerDirName(r) === openTake);
@@ -1137,9 +1177,9 @@ export default function Extrusion() {
         </figcaption>
       </figure> : null}
       {paper && <pre className="log" style={{ whiteSpace: "pre-wrap" }}>{paper}</pre>}
-    </div>
+    </div>}
 
-    {headlineMetrics.length > 0 && <div className="card"><h2>Measured layers</h2>
+    {mode === "print" && headlineMetrics.length > 0 && <div className="card"><h2>Measured layers</h2>
       <table className="metrics"><thead><tr><th>Layer</th><th>Mean |dev|</th><th>RMS</th><th>Maximum</th><th>Completeness</th><th>Valid</th></tr></thead>
         <tbody>{headlineMetrics.map((item: any) => <tr key={item.layer_index}><td>{item.layer_index}</td>
           <td className="num">{item.metrics.mean_absolute_mm.toFixed(2)} mm</td><td className="num">{item.metrics.rms_mm.toFixed(2)} mm</td>
@@ -1148,5 +1188,49 @@ export default function Extrusion() {
       {result?.correction_available && <div className="btn-row"><button onClick={applyCorrection} disabled={busy || status?.running}>Create corrected cylinder plan</button>
         <span className="hint">Creates a new fingerprint; correction is not executed until it passes another dry run.</span></div>}
     </div>}
+
+    {/* The protocol, out of the way until it is wanted. Clicking the backdrop or
+        pressing Escape closes it; the page behind keeps its state. */}
+    <dialog className="guide-modal" ref={guideDialog} onClose={() => setGuideOpen(false)}
+            onClick={(e) => { if (e.target === guideDialog.current) setGuideOpen(false); }}>
+      <div className="guide-body">
+        <div className="guide-top">
+          <h2>Run guide</h2>
+          <button type="button" className="secondary" onClick={() => setGuideOpen(false)}>Close</button>
+        </div>
+        <ol className="guide-steps">
+          {guide.map((step, i) => <li key={step.title}
+            className={step.done ? "done" : i === nextStep ? "current" : ""}>
+            <b>{step.title}</b>{step.progress && <em>{step.progress}</em>}
+            <span>{step.detail}</span>
+          </li>)}
+        </ol>
+        <div className="io-note">
+          <b>Placing the rings.</b> Displace only the <b>TOP</b> ring: layer N is measured
+          above layer N−1's latest take, so moving a ring underneath corrupts everything
+          stacked on it. Keep every offset ≤ 25 mm (the search band is ±30 mm). The work
+          frame's axes run along the board edges, so a steel rule laid along an edge IS the
+          frame axis: mark where the ring sits, slide it along the rule, and type the distance
+          you actually achieved. Do <b>not</b> count ChArUco squares — this board's are 40 mm,
+          past the 25 mm cap, and the ring would fall outside the search band. Take one
+          throwaway measurement first to learn which edge is +X: the reported offset tells you
+          the sign.
+        </div>
+        <div className="io-note">
+          <b>What the numbers mean.</b> A pure shift of d reads centre offset ≈ d, max ≈ d,
+          mean ≈ 0.64 d, RMS ≈ 0.71 d — the summary checks that relation for you and warns
+          if it disagrees. This cell's error floor is 1.26 mm (hand-eye board consistency),
+          so nothing sub-millimetre can be claimed. Nothing here is extruded: this is a
+          controlled validation of the sensing-and-comparison chain, not print deviation.
+        </div>
+        <div className="io-note warn-text">
+          <b>Collision validation is OFF</b> for these moves: the hand-placed stack is not in
+          the station model, so RoboDK's check only sees the cell furniture and was rejecting
+          good inspection poses. The pose is still IK-checked and reachable and the camera
+          stops 300 mm above the ring, but nothing screens the path against the real cell.
+          Keep hands clear and watch the first move.
+        </div>
+      </div>
+    </dialog>
   </div>;
 }
