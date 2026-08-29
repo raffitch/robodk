@@ -82,9 +82,10 @@ TIMING_ROWS = [("capture_ms", "RGB-D capture"),
                ("inspection_cycle_ms", "Whole inspection excursion")]
 
 CONDITION_HEADERS = ["Condition", "n", "Centre offset (mm)", "Detection error (mm)",
+                     "Paired detection error (mm)",
                      "Mean |dev| (mm)", "RMS (mm)", "Max (mm)", "Shape RMS (mm)"]
 TAKE_HEADERS = ["Layer", "Take", "Phase", "Introduced (mm)", "Measured offset (mm)",
-                "Detection error (mm)", "RMS (mm)", "Acq to path (ms)",
+                "Detection error (mm)", "Paired error (mm)", "RMS (mm)", "Acq to path (ms)",
                 "Layer cost (s)", "Valid"]
 
 
@@ -113,6 +114,12 @@ def _detection_error(manifest: dict) -> "float | None":
     return detection_error_mm(manifest)
 
 
+def _paired_error(manifest: dict, manifests: list[dict]) -> "float | None":
+    from .measure import paired_detection
+    paired = paired_detection(manifest, manifests)
+    return None if paired is None else paired["detection_error_mm"]
+
+
 def _gaps(summary: dict) -> list[str]:
     """What this run still owes the paper, in the operator's terms."""
     notes: list[str] = []
@@ -125,11 +132,19 @@ def _gaps(summary: dict) -> list[str]:
         if invalid:
             notes.append(f"{condition['condition']}: {invalid} take(s) invalid and excluded "
                          "from every average. Reprocess them or repeat them.")
-    recorded = summary["takes"]
-    if recorded < MEASUREMENTS_FOR_TIMING:
-        notes.append(f"{recorded} measurement(s) recorded; the acquisition-to-path mean and "
+        if condition["introduced_norm_mm"] > 0 and condition["valid"] \
+                and not condition["paired_detection_error_mm"]["n"]:
+            notes.append(f"{condition['condition']}: no zero-offset take of layer "
+                         f"{condition['layer_index']} precedes it, so its detection error is "
+                         "scored against the plan centre only (that includes the ring's "
+                         "placement error). Measure the ring in place before displacing it.")
+    # Requirement 3 is the time measured ON THE CELL: a take reprocessed offline
+    # is a measurement but not a live one, so it does not count here.
+    live = int(summary["timing_ms"]["acquisition_to_path_ms"]["n"] or 0)
+    if live < MEASUREMENTS_FOR_TIMING:
+        notes.append(f"{live} live measurement(s) recorded; the acquisition-to-path mean and "
                      f"standard deviation needs {MEASUREMENTS_FOR_TIMING} -- "
-                     f"{MEASUREMENTS_FOR_TIMING - recorded} more.")
+                     f"{MEASUREMENTS_FOR_TIMING - live} more.")
     if not any(c["introduced_norm_mm"] > 0 for c in summary["conditions"]):
         notes.append("No condition with an introduced offset yet. The paper's claim is that a "
                      "known displacement is recovered, so at least one is required.")
@@ -313,10 +328,15 @@ def build_paper_docx(root, trial_id: str, out_path=None, *,
     document.add_paragraph(f"Table {2 if settings else 1}. Geometric deviation by condition. "
                            "Deviation is measured "
                            "from the nominal centre; detection error is the difference between "
-                           "the measured displacement and the displacement introduced by hand.")
+                           "the measured displacement and the displacement introduced by hand. "
+                           "The paired detection error scores the shift against the ring's own "
+                           "last measured position before it was moved, which removes the "
+                           "hand-placement error of the undisplaced position; it is the "
+                           "figure the claim rests on.")
     _add_table(document, CONDITION_HEADERS,
                [[c["condition"], str(c["takes"]),
                  _stat_cell(c["center_offset_norm_mm"]), _stat_cell(c["detection_error_mm"]),
+                 _stat_cell(c["paired_detection_error_mm"]),
                  _stat_cell(c["mean_absolute_mm"]), _stat_cell(c["rms_mm"]),
                  _stat_cell(c["maximum_mm"]), _stat_cell(c["shape_rms_mm"])]
                 for c in summary["conditions"]])
@@ -373,6 +393,7 @@ def build_paper_docx(root, trial_id: str, out_path=None, *,
         metrics = manifest.get("metrics") or {}
         timings = (manifest.get("processing") or {}).get("timings_ms") or {}
         error = _detection_error(manifest)
+        paired = _paired_error(manifest, summary["manifests"])
         acq = timings.get("acquisition_to_path_ms")
         rows.append([
             str(manifest.get("layer_index", "")), str(manifest.get("take", 1)),
@@ -380,6 +401,7 @@ def build_paper_docx(root, trial_id: str, out_path=None, *,
             _offset_cell((manifest.get("annotation") or {}).get("introduced_offset_mm")),
             f"{metrics['center_offset_norm_mm']:.2f}" if metrics.get("center_offset_norm_mm") is not None else "-",
             f"{error:.2f}" if error is not None else "-",
+            f"{paired:.2f}" if paired is not None else "-",
             f"{metrics['rms_mm']:.2f}" if metrics.get("rms_mm") is not None else "-",
             f"{acq:.0f}" if acq else "-",
             f"{timings['inspection_cycle_ms'] / 1000:.1f}" if timings.get("inspection_cycle_ms") else "-",

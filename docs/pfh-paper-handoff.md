@@ -101,8 +101,12 @@ Restart the backend first (it caches imported modules; check `/api/health` →
    true → Measure L3 (×3).
 7. **Introduced offsets — on the TOP ring only** (phase `top ring shifted`). Type
    the value into *introduced offset X/Y* **before** pressing Measure, so ground
-   truth is archived beside the result. Shift the top ring **10 mm** along frame +X
-   → Measure ×3; then **15 mm** → Measure ×3. Optional: prop one side for a tilt case.
+   truth is archived beside the result. Mark where the ring sits, shift the top ring
+   **10 mm** along frame +X → Measure ×3; then **15 mm from the same marks** (not 5 mm
+   further) → Measure ×3. Optional: prop one side for a tilt case. The shift is scored
+   **paired** against this layer's last undisplaced take (step 6's `stacked true`
+   takes), so those must exist before the ring is moved — see *Paired detection
+   error* below.
 8. **Paper summary** → copy the Markdown block, or **Word draft** → a `.docx` with
    the method paragraph, the condition table and the per-take table as real Word
    tables plus the figures, ready to paste into the manuscript. Both are rebuilt from
@@ -163,6 +167,28 @@ introduced offset at ~18 mm). If a take still fails, its raw RGB-D is archived a
 - **Three takes per condition, not one.** `paper-summary` reports mean ± sd per
   condition; a single take has no sd, and requirement #3 needs ≥ 12 measurements in
   total anyway.
+
+### Paired detection error — the number the claim rests on (2026-08-29)
+
+A ring "placed true" by eye on the stack is 1–3 mm from the plan centre before
+anything is introduced, and the steel rule measures the shift **from where the ring
+sat**, not from the plan centre. So the summary now scores every displaced take two
+ways and the paper quotes the second:
+
+- *detection error* — `|measured centre − plan centre − typed offset|`; carries the
+  hand-placement error of the undisplaced position.
+- **paired detection error** — `|(centre after − centre of the same layer's last
+  zero-offset take before the shift) − typed offset|`; the chain alone. The reference
+  is the latest earlier valid take of that layer with no offset typed, excluding the
+  `axis check` throwaway (a ring moved an untyped amount). A zero-offset take taken
+  *after* the shift (ring put back) is never the reference.
+
+Consequences for the protocol: the `stacked true` takes of the top ring must exist
+before it is displaced (step 6 before step 7 — the guide already orders it that way);
+the +X throwaway is recorded with phase `axis check` and must be put back on its
+marks; and the 15 mm condition is measured from the original marks. A displaced
+condition with no undisplaced take of its layer before it is listed under *Still
+missing* in the Word draft and its sentence says "scored against the plan centre only".
 
 ### Getting the ground truth right — the weakest link
 
@@ -229,9 +255,11 @@ Constraints and expectations:
   introduced offset**, timing mean ± sd, height/bead stats and valid X/N, already
   worded correctly. Invalid takes are counted but excluded from every average, and
   offline-reprocessed takes are kept out of the cycle-time statistic. It also reports
-  the **detection error** — `|measured centre offset − the offset you typed|` — which is
-  the claim the paper actually makes, and a sentence per condition ("a 10.0 mm introduced
-  offset was recovered as 10.05 ± 0.28 mm"). A take archived before that field existed
+  the **detection error** — `|measured centre offset − the offset you typed|` — and the
+  **paired detection error** (against the ring's own pre-shift take, see §3), which is
+  the claim the paper actually makes, with a sentence per condition ("a 10.0 mm
+  introduced offset was recovered as 10.05 ± 0.28 mm … measured against the ring's own
+  last measured position before it was moved"). A take archived before that field existed
   is left out of the score rather than counted as a perfect measurement.
 - Copy the first good capture's `color.png` + `depth.npy` into
   `tests/fixtures/extrusion/ring1/` as a regression fixture if it is better than the

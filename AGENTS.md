@@ -110,6 +110,18 @@ correctness traps (deposit-band colour range; FITTED not averaged nominal centre
 > — the continuation handoff: current state, the full decision tree for each bisect
 > outcome, where the code is, and the fallback options with their real costs.
 
+**2026-08-29 — detection error is PAIRED.** A top ring "placed true" by eye sits 1–3 mm
+from the plan centre before anything is introduced, so scoring a shift against the plan
+centre folds the operator's placement error into what the paper calls the chain's error.
+`paper_summary` now also reports the **paired detection error** — the measured shift
+relative to the same layer's last valid zero-offset take *before* the displacement,
+against the typed vector — and the prose/Word draft quote that one ("measured against
+the ring's own last measured position before it was moved"). The Run guide's "which way
+is +X" throwaway is recorded with phase `axis check` and is never a pairing reference;
+the 15 mm condition is 15 mm from the *original* marks. The draft's timing gap now counts
+LIVE measurements (an offline reprocess owes one more). See
+`docs/pfh-paper-handoff.md` §3 *Paired detection error*.
+
 **2026-08-28 — the summary is scored against ground truth.** `paper_summary` now reports
 **detection error** (`|measured centre offset − the offset the operator typed|`) per
 condition and machine-checks the pure-shift relation (`max = d`, `mean = 2d/pi`,

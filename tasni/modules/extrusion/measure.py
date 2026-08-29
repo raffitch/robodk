@@ -676,6 +676,64 @@ def detection_error_mm(manifest: dict) -> "float | None":
     return float(math.hypot(float(measured[0]) - truth[0], float(measured[1]) - truth[1]))
 
 
+# The Run guide's "which way is +X" take: the ring deliberately moved an amount
+# nobody typed. It is a zero-offset take on paper and a displaced ring in fact,
+# so it can never stand in for where the ring sat before a shift.
+AXIS_CHECK_PHASE = "axis check"
+
+
+def pre_shift_reference(manifest: dict, manifests: list[dict]) -> "dict | None":
+    """The ring's last valid measurement before THIS take displaced it.
+
+    Same layer, no introduced offset, a lower take number, a fitted centre, and
+    not the axis-check take. A zero-offset take AFTER the shift is the ring put
+    back, not where it was moved from, so only earlier takes qualify.
+    """
+    layer = int(manifest.get("layer_index") or 0)
+    take = int(manifest.get("take") or 1)
+    earlier = []
+    for other in manifests:
+        metrics = other.get("metrics") or {}
+        phase = str((other.get("annotation") or {}).get("phase") or "").strip()
+        if (int(other.get("layer_index") or 0) == layer
+                and int(other.get("take") or 1) < take
+                and introduced_offset_mm(other) == (0.0, 0.0)
+                and phase != AXIS_CHECK_PHASE
+                and metrics.get("valid") and metrics.get("measured_center_mm")):
+            earlier.append(other)
+    return max(earlier, key=lambda m: int(m.get("take") or 1), default=None)
+
+
+def paired_detection(manifest: dict, manifests: list[dict]) -> "dict | None":
+    """The introduced shift scored against the ring's OWN position before it moved.
+
+    The steel rule measures the displacement from where the ring sat, so the
+    chain is scored the same way: fitted centre after the shift minus the fitted
+    centre of the last zero-offset take of the same layer, against the vector
+    the operator typed. Scored against the plan centre instead, a top ring
+    "placed true" by eye carries its placement error into what the paper calls
+    the chain's error. ``None`` when nothing was introduced, the take is
+    invalid, or no earlier zero-offset take of this layer exists to pair with.
+    """
+    truth = introduced_offset_mm(manifest)
+    if not any(truth):
+        return None
+    metrics = manifest.get("metrics") or {}
+    after = metrics.get("measured_center_mm")
+    if not metrics.get("valid") or not after or len(after) != 2:
+        return None
+    reference = pre_shift_reference(manifest, manifests)
+    if reference is None:
+        return None
+    before = reference["metrics"]["measured_center_mm"]
+    shift = (float(after[0]) - float(before[0]), float(after[1]) - float(before[1]))
+    return {"reference_take": int(reference.get("take") or 1),
+            "measured_shift_mm": [shift[0], shift[1]],
+            "measured_shift_norm_mm": float(math.hypot(*shift)),
+            "detection_error_mm": float(math.hypot(shift[0] - truth[0],
+                                                   shift[1] - truth[1]))}
+
+
 def _condition_name(manifest: dict) -> str:
     """Layer + the phase the operator recorded + the ground truth they typed.
 
@@ -752,6 +810,7 @@ def paper_summary(root: Path, trial_id: str) -> dict:
         deviation = {"mean_absolute_mm": _stat(x.get("mean_absolute_mm") for x in metrics),
                      "rms_mm": _stat(x.get("rms_mm") for x in metrics),
                      "maximum_mm": _stat(x.get("maximum_mm") for x in metrics)}
+        paired = [p for p in (paired_detection(m, takes) for m in measured) if p]
         conditions.append({
             "condition": name, "takes": len(items),
             "valid": sum(1 for x in metrics if x.get("valid")),
@@ -761,6 +820,11 @@ def paper_summary(root: Path, trial_id: str) -> dict:
             "phase": str((items[0].get("annotation") or {}).get("phase") or "") or None,
             "center_offset_norm_mm": _stat(x.get("center_offset_norm_mm") for x in metrics),
             "detection_error_mm": _stat(detection_error_mm(m) for m in measured),
+            # The claim proper: the shift as the ring itself moved, not as it
+            # sits relative to a plan centre it was never exactly placed on.
+            "paired_shift_norm_mm": _stat(p["measured_shift_norm_mm"] for p in paired),
+            "paired_detection_error_mm": _stat(p["detection_error_mm"] for p in paired),
+            "paired_reference_takes": sorted({p["reference_take"] for p in paired}),
             **deviation,
             "shape_rms_mm": _stat(x.get("shape_rms_mm") for x in metrics),
             "shift_consistency": shift_consistency(
@@ -793,10 +857,24 @@ def paper_summary(root: Path, trial_id: str) -> dict:
     # so the Markdown block and the Word draft can never word it differently.
     prose: list[str] = []
     for c in conditions:
-        if c["introduced_norm_mm"] > 0:
+        if c["introduced_norm_mm"] > 0 and c["paired_detection_error_mm"]["n"]:
+            refs = c["paired_reference_takes"]
+            ref_text = (f"take {refs[0]}" if len(refs) == 1
+                        else "takes " + ", ".join(str(r) for r in refs))
+            prose.append(f"A {c['introduced_norm_mm']:.1f} mm introduced offset was recovered "
+                         f"as {_fmt(c['paired_shift_norm_mm'])} mm over "
+                         f"{c['paired_detection_error_mm']['n']} take(s), measured against the "
+                         f"ring's own last measured position before it was moved (layer "
+                         f"{c['layer_index']} {ref_text}); detection error "
+                         f"{_fmt(c['paired_detection_error_mm'])} mm (against the plan centre: "
+                         f"{_fmt(c['detection_error_mm'])} mm).")
+        elif c["introduced_norm_mm"] > 0:
             prose.append(f"A {c['introduced_norm_mm']:.1f} mm introduced offset was recovered "
                          f"as {_fmt(c['center_offset_norm_mm'])} mm over {c['takes']} take(s); "
-                         f"detection error {_fmt(c['detection_error_mm'])} mm.")
+                         f"detection error {_fmt(c['detection_error_mm'])} mm, scored against "
+                         f"the plan centre only - no zero-offset take of layer "
+                         f"{c['layer_index']} precedes it to pair with, so this includes the "
+                         "ring's placement error.")
         else:
             prose.append(f"With no offset introduced the chain read a centre offset of "
                          f"{_fmt(c['center_offset_norm_mm'])} mm over {c['takes']} take(s) - "
@@ -841,11 +919,13 @@ def paper_summary(root: Path, trial_id: str) -> dict:
 
     lines = [f"**{headline}**", "",
              "| Condition | n | centre offset (mm) | detection error (mm) | "
+             "paired detection error (mm) | "
              "mean abs dev (mm) | RMS (mm) | max (mm) | shape RMS (mm) |",
-             "|---|---|---|---|---|---|---|---|"]
+             "|---|---|---|---|---|---|---|---|---|"]
     for c in conditions:
         lines.append(f"| {c['condition']} | {c['takes']} | {_fmt(c['center_offset_norm_mm'])} | "
                      f"{_fmt(c['detection_error_mm'])} | "
+                     f"{_fmt(c['paired_detection_error_mm'])} | "
                      f"{_fmt(c['mean_absolute_mm'])} | {_fmt(c['rms_mm'])} | "
                      f"{_fmt(c['maximum_mm'])} | {_fmt(c['shape_rms_mm'])} |")
     for paragraph in prose:

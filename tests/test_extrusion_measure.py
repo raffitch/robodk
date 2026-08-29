@@ -753,6 +753,10 @@ def _write_take(root, trial_id, layer_index, take, *, offset, rms, mean_abs, max
         measured_offset = (float(offset_norm or 0.0), 0.0)
     if offset_norm is None:
         offset_norm = float(np.hypot(*measured_offset))
+    # As the chain reports it: the fitted centre IS the plan centre plus the offset.
+    setup = auto_plan().setup
+    measured_center = (setup.center_x_mm + float(measured_offset[0]),
+                       setup.center_y_mm + float(measured_offset[1]))
     annotation = {"introduced_offset_mm": offset}
     if phase is not None:
         annotation["phase"] = phase
@@ -761,7 +765,7 @@ def _write_take(root, trial_id, layer_index, take, *, offset, rms, mean_abs, max
         recipe=auto_plan().recipe, toolpath_fingerprint="f" * 64,
         annotation=annotation,
         metrics=DeviationMetrics(mean_absolute_mm=mean_abs, rms_mm=rms, maximum_mm=maximum,
-                                 measured_center_mm=(0, 0), measured_radius_mm=40,
+                                 measured_center_mm=measured_center, measured_radius_mm=40,
                                  path_completeness=0.99, maximum_angular_gap_deg=4, valid=valid,
                                  center_offset_mm=tuple(float(v) for v in measured_offset),
                                  center_offset_norm_mm=offset_norm, shape_rms_mm=0.4),
@@ -1706,3 +1710,153 @@ def test_the_draft_states_its_own_limitations(tmp_path):
     assert "between layers" in text and "during deposition" in text
     assert "Limitations" in text
     assert "reprocess" in text.lower()          # the archive claim, with its evidence
+
+
+# ------------------------------------------------ paired detection error (2026-08-29)
+# The steel rule measures the shift FROM WHERE THE RING SAT, so the chain's error
+# must be scored the same way: against the ring's own last measured position
+# before it was moved, not against the plan centre (which folds the operator's
+# "placed true" bias into what the paper calls the chain's error).
+
+
+def _stacked_then_shifted(root, *, bias=(1.5, -0.8), shift=(10.2, 0.1), typed=(10, 0)):
+    """Ring 3 placed 'true' with a placement bias, measured 3x, then displaced."""
+    trial_id = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    for take in (1, 2, 3):
+        _write_take(root, trial_id, 3, take, offset=None, measured_offset=list(bias),
+                    rms=1.2, mean_abs=1.0, maximum=1.8, acq_ms=1000, phase="stacked true")
+    after = [bias[0] + shift[0], bias[1] + shift[1]]
+    for take in (4, 5, 6):
+        _write_take(root, trial_id, 3, take, offset=list(typed), measured_offset=after,
+                    rms=7.1, mean_abs=6.4, maximum=10.2, acq_ms=1000, phase="top ring shifted")
+    return trial_id
+
+
+def test_the_introduced_shift_is_scored_against_the_rings_own_position_before_it_moved(tmp_path):
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = _stacked_then_shifted(root)
+
+    by_name = {c["condition"]: c for c in paper_summary(root, trial_id)["conditions"]}
+    shifted = by_name["layer 3 - top ring shifted - introduced offset (10, 0) mm"]
+
+    # Against the plan centre the 1.5/-0.8 placement bias pollutes the score ...
+    assert shifted["detection_error_mm"]["mean"] == pytest.approx(np.hypot(1.7, -0.7), abs=1e-9)
+    # ... paired against the ring's last pre-shift measurement it is the chain alone.
+    assert shifted["paired_detection_error_mm"]["n"] == 3
+    assert shifted["paired_detection_error_mm"]["mean"] == pytest.approx(np.hypot(0.2, 0.1), abs=1e-9)
+    assert shifted["paired_shift_norm_mm"]["mean"] == pytest.approx(np.hypot(10.2, 0.1), abs=1e-9)
+    assert shifted["paired_reference_takes"] == [3]
+    assert by_name["layer 3 - stacked true"]["paired_detection_error_mm"]["n"] == 0
+
+
+def test_the_pre_shift_reference_is_the_last_zero_offset_take_before_it_never_after(tmp_path):
+    """A ring put back after the shift is a later zero-offset take; it is not the reference."""
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = _stacked_then_shifted(root)
+    _write_take(root, trial_id, 3, 7, offset=None, measured_offset=[4.0, 4.0],
+                rms=1.2, mean_abs=1.0, maximum=1.8, acq_ms=1000, phase="stacked true")
+
+    shifted = {c["condition"]: c for c in paper_summary(root, trial_id)["conditions"]}[
+        "layer 3 - top ring shifted - introduced offset (10, 0) mm"]
+
+    assert shifted["paired_reference_takes"] == [3]
+    assert shifted["paired_detection_error_mm"]["mean"] == pytest.approx(np.hypot(0.2, 0.1), abs=1e-9)
+
+
+def test_a_shift_with_no_prior_measurement_of_that_layer_is_scored_against_the_plan_centre_only(tmp_path):
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    _write_take(root, trial_id, 3, 1, offset=[10, 0], measured_offset=[10.4, 0.3],
+                rms=7.0, mean_abs=6.3, maximum=9.9, acq_ms=1000, phase="top ring shifted")
+
+    summary = paper_summary(root, trial_id)
+    shifted = summary["conditions"][0]
+
+    assert shifted["paired_detection_error_mm"]["n"] == 0
+    assert shifted["paired_reference_takes"] == []
+    assert shifted["detection_error_mm"]["mean"] == pytest.approx(0.5, abs=1e-9)
+    assert any("plan centre only" in p for p in summary["prose"])
+
+
+def test_the_markdown_and_prose_state_the_paired_recovery(tmp_path):
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = _stacked_then_shifted(root)
+
+    summary = paper_summary(root, trial_id)
+
+    assert "paired detection error (mm)" in summary["markdown"]
+    recovered = next(p for p in summary["prose"] if "10.0 mm introduced offset" in p)
+    assert "10.20" in recovered and "0.22" in recovered
+    assert "own last measured position" in recovered and "take 3" in recovered
+
+
+def test_the_word_draft_carries_the_paired_detection_error(tmp_path):
+    pytest.importorskip("docx")
+    from tasni.modules.extrusion.paper_docx import build_paper_docx
+
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = _stacked_then_shifted(root)
+
+    out = build_paper_docx(root, trial_id, tmp_path / "draft.docx", embed_figures=False)
+
+    paragraphs, tables = _docx_content(out)
+    conditions = next(t for t in tables if t[0][0] == "Condition")
+    column = conditions[0].index("Paired detection error (mm)")
+    rows = {row[0]: row for row in conditions[1:]}
+    assert "0.22" in rows["layer 3 - top ring shifted - introduced offset (10, 0) mm"][column]
+    assert rows["layer 3 - stacked true"][column] == "-"
+    takes = next(t for t in tables if t[0][0] == "Layer")
+    assert "Paired error (mm)" in takes[0]
+
+
+def test_the_draft_asks_for_a_pre_shift_measurement_when_a_shift_has_none(tmp_path):
+    pytest.importorskip("docx")
+    from tasni.modules.extrusion.paper_docx import build_paper_docx
+
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    for take in (1, 2, 3):
+        _write_take(root, trial_id, 3, take, offset=[10, 0], measured_offset=[10.4, 0.3],
+                    rms=7.0, mean_abs=6.3, maximum=9.9, acq_ms=1000, phase="top ring shifted")
+
+    text = "\n".join(_docx_content(
+        build_paper_docx(root, trial_id, tmp_path / "d.docx", embed_figures=False))[0])
+
+    assert "measure the ring in place before displacing it" in text.lower()
+
+
+def test_the_timing_requirement_counts_live_measurements_not_takes(tmp_path):
+    """An offline reprocess has no live acquisition-to-path time, so it owes one more."""
+    pytest.importorskip("docx")
+    from tasni.modules.extrusion.paper_docx import build_paper_docx
+
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    _write_take(root, trial_id, 1, 1, offset=None, offset_norm=0.4, rms=0.5, mean_abs=0.4,
+                maximum=1.1, acq_ms=1000, phase="noise floor", offline=True)
+
+    text = "\n".join(_docx_content(
+        build_paper_docx(root, trial_id, tmp_path / "d.docx", embed_figures=False))[0])
+
+    assert "0 live measurement(s) recorded" in text and "12 more" in text
+
+
+def test_the_axis_check_take_is_never_the_pre_shift_reference(tmp_path):
+    """The 'which way is +X' take moved the ring an untyped amount: not where it sat."""
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = MeasureSession.create(root, auto_plan(), note="rings").trial_id
+    for take in (1, 2, 3):
+        _write_take(root, trial_id, 3, take, offset=None, measured_offset=[1.5, -0.8],
+                    rms=1.2, mean_abs=1.0, maximum=1.8, acq_ms=1000, phase="stacked true")
+    # The throwaway: ring slid ~9 mm to learn the axis, nothing typed.
+    _write_take(root, trial_id, 3, 4, offset=None, measured_offset=[1.5 + 9.0, -0.8],
+                rms=6.0, mean_abs=5.5, maximum=9.0, acq_ms=1000, phase="axis check")
+    for take in (5, 6, 7):
+        _write_take(root, trial_id, 3, take, offset=[10, 0], measured_offset=[11.7, -0.7],
+                    rms=7.1, mean_abs=6.4, maximum=10.2, acq_ms=1000, phase="top ring shifted")
+
+    shifted = {c["condition"]: c for c in paper_summary(root, trial_id)["conditions"]}[
+        "layer 3 - top ring shifted - introduced offset (10, 0) mm"]
+
+    assert shifted["paired_reference_takes"] == [3]
+    assert shifted["paired_detection_error_mm"]["mean"] == pytest.approx(np.hypot(0.2, 0.1), abs=1e-9)

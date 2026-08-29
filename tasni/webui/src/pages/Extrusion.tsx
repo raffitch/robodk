@@ -979,9 +979,11 @@ export default function Extrusion() {
         : `Displace the top ring — about ${shift10 < 3 ? 10 : 15} mm`,
       hands: !axisKnown
         ? "Slide the TOP ring roughly 10 mm along one board edge, measure once, then read the "
-          + "Offset column below to see which axis moved and in which direction. Put it back after."
+          + "Offset column below to see which axis moved and in which direction. Put it back "
+          + "on its marks after."
         : `Mark where the top ring sits, slide it along a board edge, and measure what you `
-          + `actually moved with a steel rule. Type that number — 12 mm scores as well as 10.`,
+          + `actually moved with a steel rule, from those marks. Type that number — 12 mm scores `
+          + `as well as 10. The 15 mm condition is 15 mm from the SAME marks, not 5 mm further.`,
       done: shift10 >= 3 && shift15 >= 3,
       progress: axisKnown ? { have: shift10 < 3 ? shift10 : shift15, need: 3 } : undefined,
       button: !axisKnown ? "Take one throwaway measurement"
@@ -989,13 +991,14 @@ export default function Extrusion() {
       records: axisKnown ? annotationLabel(topLayer, "top ring shifted", offsetVector) : undefined,
       onRun: () => measure(axisKnown
         ? { layer: topLayer, phase: "top ring shifted", offset: offsetVector }
-        : { layer: topLayer, phase: "", offset: [0, 0] }),
+        : { layer: topLayer, phase: "axis check", offset: [0, 0] }),
       moves: true, disabled: Boolean(motionBlocked) || busy || Boolean(status?.running),
       blocked: motionBlocked,
       offsetInput: axisKnown,
       axisAck: true,
       note: "Displace the TOP ring only — a ring underneath is the measurement floor for everything "
-        + "above it. Keep it under 25 mm.",
+        + "above it. Keep it under 25 mm. The shift is scored against this layer's last undisplaced "
+        + "take (the 'stacked true' takes above), so those must come first.",
     }),
     runStep({
       id: "summary", label: "Summary", title: "Take the numbers",

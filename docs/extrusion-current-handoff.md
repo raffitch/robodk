@@ -361,10 +361,12 @@ paper figure:
 
 Cell protocol: scan surface applied → Center on scanned surface → Generate → place
 ring 1 → Characterize → Apply → Generate → Measure L1 ×5 (noise floor) → re-place
-×3 → ring 2 true → Measure L2 → ring 3 true → Measure L3 → shift a ring 10 mm
-(type it in) → Measure → shift 15 mm → Measure → Paper summary. Keep offsets
-≤ 25 mm (radial ROI ±30 mm). Expected for a pure shift d: offset ≈ d, max ≈ d,
-mean ≈ 0.64 d, RMS ≈ 0.71 d.
+×3 → ring 2 true → Measure L2 ×3 → ring 3 true → Measure L3 ×3 → mark where ring 3
+sits, shift it 10 mm (type it in) → Measure ×3 → 15 mm from the SAME marks → Measure
+×3 → Paper summary. Keep offsets ≤ 25 mm (radial ROI ±30 mm). Expected for a pure
+shift d: offset ≈ d, max ≈ d, mean ≈ 0.64 d, RMS ≈ 0.71 d. The shift is scored
+**paired** against the layer's last undisplaced take (so the L3 "true" takes must
+precede it) — `docs/pfh-paper-handoff.md` §3.
 
 Proven on synthetic RGB-D before any robot motion (`tests/extrusion_synthetic.py`
 renders rings through the cell's real 720p intrinsics from the pose the job
