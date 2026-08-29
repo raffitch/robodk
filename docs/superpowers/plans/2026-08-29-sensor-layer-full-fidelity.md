@@ -22,7 +22,7 @@
 - `ScanConfig.depth_scale` is DELETED. No code may default a depth unit to 1000 or 1 mm. The only fallback is the archive read-side `CameraGeometry.legacy_aligned(...)` for takes without `camera_geometry` (spec 4.4).
 - `ExtrusionConfig.voxel_size_m` default 0.002 -> 0.001 (spec 4.4).
 - The RoboDK-embedded macros (`macros/3DScan.py`, `AutoCalibrate.py`, `3DScanParam.py`, `ArucoToPlane.py`) and `server/robodk_*.py` speak the old wire and WILL be refused. They are superseded by the app (CLAUDE.md north star). Do not port them; say so in the docs (Task 13).
-- Working agreement: commit AND push after every task. Anything touching `server/` is deployed to the Jetson in Task 13 only (one deploy), never piecemeal.
+- **Branch: `sensor-layer-v2`, cut from `main` before Task 1.** The Jetson auto-pulls `main` every ~2 min and restarts the camera whenever `server/` changed, so a server commit on `main` deploys ITSELF. Every task commits and pushes to `sensor-layer-v2`; Task 13 merges to `main` and is the ONE deploy. Never push `server/` changes to `main` before Task 13.
 - Windows traps: use `py -3.10`; never round-trip source files through PowerShell `Get-Content`/`Set-Content` (mojibake); after host code changes the Tasni backend must be restarted before any cell test (it caches imports).
 - Order is fixed: Task 1 -> 2 -> 3 -> (4..12 in order) -> 13. Task 2 MUST precede any change to `depth_units` (the depth table is part of the as-found JSON). Task 3 MUST be verified on the OLD protocol before Task 13 deploys the new one.
 
@@ -78,7 +78,7 @@ Expected: 3 PASS
 ```bash
 git add tasni/modules/extrusion/processing.py tests/test_extrusion_measure.py tests/fixtures/extrusion/ring1/README.md tests/fixtures/extrusion/ring1/ring1_low_relief_20260829.npz
 git commit -m "feat(extrusion): assemble a ring from arcs the height floor split apart"
-git push origin main
+git push origin sensor-layer-v2
 ```
 
 ---
@@ -175,7 +175,7 @@ Expected: `active`, `LISTENING`
 ```bash
 git add tools/jetson_dump_asfound.py server/presets/custom-as-found-2026-08-29.json
 git commit -m "feat(realsense): record the as-found ASIC configuration (audit R4.1)"
-git push origin main
+git push origin sensor-layer-v2
 ```
 
 ---
@@ -262,7 +262,7 @@ Run: `py -3.10 tools/characterize_distance.py --help` and run one stop at the us
 ```bash
 git add docs/jetson-librealsense-rebuild.md
 git commit -m "docs(jetson): librealsense 2.55.1 Release+CUDA rebuild runbook with before/after (audit R1)"
-git push origin main
+git push origin sensor-layer-v2
 ```
 
 ---
@@ -632,7 +632,7 @@ Expected: 8 PASS
 ```bash
 git add server/handshake.py server/rs_config.py tests/test_handshake.py tests/test_rs_config.py
 git commit -m "feat(camera server): pure handshake parser + device config with read-back, depth_units 0.1 mm"
-git push origin main
+git push origin sensor-layer-v2
 ```
 
 ---
@@ -848,7 +848,7 @@ Expected: 3 PASS
 ```bash
 git add server/rs_geometry.py tests/test_rs_geometry.py
 git commit -m "feat(camera server): depth/colour geometry with an asserted row-major extrinsic, greeting builder"
-git push origin main
+git push origin sensor-layer-v2
 ```
 
 ---
@@ -1113,7 +1113,7 @@ Run: `py -3.10 -m pytest tests/test_camera_wire.py -v` — expected: PASS (the c
 ```bash
 git add server/server_unicast_syncronous.py tests/test_camera_wire.py
 git commit -m "feat(camera server): protocol 2 - raw unaligned 0.1 mm depth behind MODE FULL V2 with a JSON greeting; align, hole_filling and IR removed; colour 1080p"
-git push origin main
+git push origin sensor-layer-v2
 ```
 
 ---
@@ -1591,7 +1591,7 @@ Expected: 7 PASS. If `test_color_registered_selects_by_colour_region` fails on `
 ```bash
 git add tasni/core/depth_geometry.py tests/geometry_fixtures.py tests/test_depth_geometry.py
 git commit -m "feat(core): depth_geometry - one back-projection from native depth into the colour camera frame"
-git push origin main
+git push origin sensor-layer-v2
 ```
 
 ---
@@ -1926,7 +1926,7 @@ Expected: all PASS
 ```bash
 git add tasni/core/camera.py tasni/core/config.py tools/probe_depth_quantisation.py tests/test_camera_wire.py tests/test_scan_config.py
 git commit -m "feat(core): camera client speaks protocol 2 (V2 hello, greeting, Frame.geometry); config drops depth_scale, defaults 1080p, migrates K"
-git push origin main
+git push origin sensor-layer-v2
 ```
 
 ---
@@ -2088,7 +2088,7 @@ Expected: all PASS. `grep -rn "depth_scale\|K=services.config.camera.K" tasni/mo
 ```bash
 git add tasni/modules/extrusion tasni/core/config.py tests/test_extrusion_processing.py tests/test_extrusion_measure.py tests/test_extrusion_figures.py tests/test_extrusion_job.py tests/extrusion_synthetic.py
 git commit -m "feat(extrusion): back-project native depth through the greeting geometry; archive it; figures keep one legacy fallback; 1 mm voxel"
-git push origin main
+git push origin sensor-layer-v2
 ```
 
 ---
@@ -2246,7 +2246,7 @@ Expected: all PASS (open3d-dependent ones skip cleanly if it is absent, as today
 ```bash
 git add tasni/modules/scan tests/test_scan_depth_gate.py tests/test_scan_survey.py tests/test_corner_evidence.py tests/test_scan_reconstruct.py tests/test_scan_job.py tests/test_five_position.py
 git commit -m "feat(scan): native depth through the greeting geometry - colour-registered gate/survey/corner evidence, depth-only TSDF, saved views carry camera_geometry"
-git push origin main
+git push origin sensor-layer-v2
 ```
 
 ---
@@ -2325,7 +2325,7 @@ Expected: PASS; help shows `--corner-disc-px`.
 ```bash
 git add tools/characterize_distance.py tools/__init__.py tests/test_characterize.py
 git commit -m "feat(characterize): colour-detected corners read depth through registered discs; trial records camera_geometry"
-git push origin main
+git push origin sensor-layer-v2
 ```
 
 ---
@@ -2356,7 +2356,7 @@ Expected: build succeeds with no type errors.
 ```bash
 git add tasni/webui/src/pages/AimHud.tsx
 git commit -m "docs(hud): the viewBox is a normalised canvas, not the camera resolution"
-git push origin main
+git push origin sensor-layer-v2
 ```
 
 ---
@@ -2367,6 +2367,13 @@ git push origin main
 - Modify: `docs/realsense-capability-audit-2026-08-29.md` (append "## 7. Results" with the measured table), `docs/jetson-scanner.md` (`:30` librealsense row; the streams/filters paragraph), `AGENTS.md` (open items + the macros note), `CLAUDE.md` (the stale "High-Accuracy preset" sentence under Roadmap; the macros table note), `docs/agent-debug-map.md` (protocol 2 pointer)
 
 **Preconditions:** Tasks 1-12 pushed on `main`; Task 3's rebuild in place; the cell free; the operator present (the arm moves for the hand-eye validation).
+
+- [ ] **Step 0: Merge to main**
+
+```bash
+git checkout main && git pull origin main && git merge --no-ff sensor-layer-v2 -m "feat(realsense): sensor layer at full fidelity (protocol 2)" && git push origin main
+```
+The Jetson's auto-pull will now pick this up within ~2 min on its own; the explicit deploy below just makes it immediate and restarts the service.
 
 - [ ] **Step 1: Deploy the server and restart the backend**
 
@@ -2421,7 +2428,7 @@ Append `## 7. Results (2026-08-3x)` to `docs/realsense-capability-audit-2026-08-
 ```bash
 git add docs/realsense-capability-audit-2026-08-29.md docs/jetson-scanner.md AGENTS.md CLAUDE.md docs/agent-debug-map.md
 git commit -m "docs(realsense): protocol-2 results on the cell; scanner/agent docs updated; macros marked superseded"
-git push origin main
+git push origin main    # Task 13 runs on main after the Step 0 merge
 ```
 Report: the pushed hashes, `jetson_deploy status` output, and the results table.
 
