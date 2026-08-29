@@ -518,3 +518,25 @@ def test_the_mesh_figure_drops_the_scene_panel_when_there_is_no_frame(tmp_path):
     assert [p.key for p in panels] == ["deposit"]
     written = render_layer_figures(layer_dir, only="mesh")
     assert {p.name for p in written} == {"mesh.png", "mesh.pdf"}
+
+
+def test_a_frame_with_nothing_near_the_work_plane_gets_no_scene_panel(tmp_path):
+    """A frame that never had the work surface in view must not be surfaced.
+
+    The failed cell take 20260828-124136 back-projects 12 x 16 m with ZERO
+    points inside the work band -- the pose was wrong. Sizing the panel from
+    that frame drew a 32 m window holding 32 triangles at a 222 mm pitch and
+    a -800..-200 mm colour scale: a picture of the room, captioned as the work
+    surface. The window is anchored on the deposit or the commanded ring
+    instead, and a frame with nothing in the band gets no panel.
+    """
+    from tasni.modules.extrusion.figures import load_take, mesh_panels
+
+    layer_dir = write_take(tmp_path, layer_index=1)
+    depth = np.load(layer_dir / "depth.npy")
+    np.save(layer_dir / "depth.npy", np.full_like(depth, 20_000))   # all metres away
+
+    assert [p.key for p in mesh_panels(load_take(layer_dir))] == ["deposit"]
+
+    (layer_dir / "height-or-pointcloud.npy").unlink()
+    assert mesh_panels(load_take(layer_dir)) == [], "nothing measurable, nothing drawn"

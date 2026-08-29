@@ -36,6 +36,12 @@ TRIAL_FIGURES = ("stack", "tube")
 FORMATS = ("png", "pdf")
 DPI = 300
 
+# Heights that can plausibly belong to the work surface, in mm about the build
+# plane. A raw D435i frame reaches the rest of the room: the failed take
+# 20260828-124136 back-projects 12 m wide with NOTHING inside this band. Points
+# outside it must never set a colour scale or the extent of a panel.
+WORK_BAND_MM = (-15.0, 60.0)
+
 # One palette for every figure, chosen to survive greyscale printing: the
 # measured path is the darkest line, the nominal is dashed, the cloud is light.
 CLOUD = "#98a2b3"
@@ -318,7 +324,7 @@ def _deposit_band(z) -> tuple[float, float]:
     flattens to a single colour.
     """
     z = np.asarray(z, dtype=float)
-    band = z[(z > -15.0) & (z < 60.0)]
+    band = z[(z > WORK_BAND_MM[0]) & (z < WORK_BAND_MM[1])]
     if not band.size:
         band = z
     lo, hi = (float(v) for v in np.percentile(band, [2, 99.5]))
@@ -812,12 +818,20 @@ def mesh_panels(take: TakeData) -> list[MeshPanel]:
         frame = _scene_points(take)
         if frame is not None and frame is take.cloud:
             frame = None      # the re-projection came back empty; this is its fallback
-        if frame is not None and len(frame):
-            window = _work_window(deposit if deposit is not None else frame, take.radius)
+        # The window is anchored on something the RECIPE knows about -- the
+        # deposit, else the ring that was commanded. Never on the frame itself:
+        # a raw frame's extent is the room, and the failed take 20260828-124136
+        # sized a 32 m panel from one (32 triangles at a 222 mm pitch).
+        anchor = deposit if deposit is not None else take.nominal
+        if frame is not None and len(frame) and anchor is not None and len(anchor):
+            window = _work_window(anchor, take.radius)
             near = _within(frame, window)
+            # The work band, not the room. A frame with nothing in it never had
+            # the work surface in view, and gets no panel at all.
+            near = near[(near[:, 2] > WORK_BAND_MM[0]) & (near[:, 2] < WORK_BAND_MM[1])]
             if len(near) > 50:
-                # Clipped to the deposit band: a dropout 400 mm below the plane
-                # is not part of the surface, it is the absence of one.
+                # A dropout 400 mm below the plane is not part of the surface,
+                # it is the absence of one.
                 lo, hi = _deposit_band(near[:, 2])
                 near = near[(near[:, 2] > lo - 5.0) & (near[:, 2] < hi + 15.0)]
             if len(near) > 50:

@@ -391,6 +391,13 @@ surface (work surface, then deposit only), each drawn from above and rotated.
   stores the CREST the centreline was thinned from (578 points on the first cell
   ring, flanks already discarded); the chain's own deposit cluster is the same bead
   with its sides on, which is what closes into a surface with a width.
+- **The window is anchored on the deposit or the commanded ring, never on the
+  frame.** A raw frame's extent is the room. The failed take `20260828-124136`
+  back-projects 12 × 16 m with **zero** points inside `WORK_BAND_MM` (−15…60 mm) —
+  the pose was wrong — and sizing a panel from it drew a 32 m window holding 32
+  triangles at a 222 mm pitch, on a −800…−200 mm colour scale: a picture of the
+  room, captioned as the work surface. A frame with nothing in the band now gets no
+  panel, and a take with no panels draws no figure (the endpoint already 404s).
 - **The stated exaggeration is the real one.** `set_box_aspect` stretches Z whatever
   the data says — a flat `(1, 1, .55)` box exaggerated this bead ~6× while the axis
   claimed ×2. The box now carries the data's own proportions, so the ×N on the axis
