@@ -4,7 +4,10 @@
 transform and the applied recipe/centre of trial
 `20260828-204846-5b455377/layer-001` (300 mm standoff, ring characterized and
 applied minutes earlier: r 42.6 mm, bead 12.8 mm, centre (214.6, 146.7)). Colour is
-omitted: the measurement is geometric and must not depend on bead colour.
+omitted, on the since-disproved rule that the measurement is geometric and must
+not depend on bead colour -- see `../ring1/README.md`. It now serves the other
+half of that contract: with no chroma the gate must ABSTAIN, leaving this frame
+measured exactly as it was before the gate existed.
 
 On the cell this take FAILED with `branch guard exhausted`. Measured unfiltered,
 the bare board's depth sits at z p50 0.8 / p99 4.8 mm, so 22.7% of it clears the

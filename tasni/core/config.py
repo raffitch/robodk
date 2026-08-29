@@ -805,7 +805,16 @@ class ExtrusionConfig(_Model):
     hardware_io_test_approved: bool = False
 
     # Legacy single-frame processing defaults (metres where suffixed ``_m``).
-    plane_distance_threshold_m: float = Field(default=0.0025, gt=0)
+    # Doubles as the deposit floor (``max`` with deposit_min_height_mm). It was
+    # 2.5 mm only to outrun bare-board depth noise; ``deposit_min_saturation``
+    # now removes the board by COLOUR, so the floor can drop to where it stops
+    # amputating the bead. Cell 2026-08-29, ring 1: at 2.5 mm a 45 deg sector
+    # whose crest reads 2.9-4.9 mm fell out of the deposit cluster entirely
+    # (completeness 0.87, angular gap 46 deg, every take invalid); at 1.5 mm all
+    # four takes close at 0.992 with a 2.7-2.9 deg gap. Lowering this WITHOUT the
+    # colour gate is catastrophic -- the mask doubles to ~8000 px and all four
+    # takes exhaust the branch guard.
+    plane_distance_threshold_m: float = Field(default=0.0015, gt=0)
     voxel_size_m: float = Field(default=0.002, gt=0)
     statistical_neighbors: int = Field(default=20, ge=3)
     statistical_std_ratio: float = Field(default=2.0, gt=0)
@@ -817,6 +826,23 @@ class ExtrusionConfig(_Model):
     normal_cluster_eps_m: float = Field(default=0.02, gt=0)
     branch_guard_max_attempts: int = Field(default=3, ge=1, le=20)
     deposit_min_height_mm: float = Field(default=0.5, ge=0, le=100)
+    # Bead-vs-board discriminator. Height cannot do it: depth is quantised at
+    # 1 mm and the bare ChArUco board reads 1-3 LSB above the work plane, so no
+    # floor a real bead clears excludes the board too. Saturation separates them
+    # ~20:1 -- the clay is chromatic, the printed board is not. Measured over the
+    # four cell frames of 2026-08-29: bead S median 106-114 (0.74-0.80 above 60),
+    # off-ring contamination S median 15-16 (0.04 above 60), bare board S median
+    # 5-25 with 0.00 above 60. 0 disables the gate.
+    deposit_min_saturation: int = Field(default=60, ge=0, le=255)
+    # Below this chromatic fraction the colour frame is treated as carrying no
+    # usable chroma (RGB dropout, or a depth-only synthetic fixture) and the gate
+    # abstains rather than erasing the deposit. Real cell frames sit at 0.086-0.091.
+    deposit_min_chroma_fraction: float = Field(default=0.005, ge=0, le=1)
+    # The floor to fall back to when the gate abstains. The low floor above is
+    # EARNED by the colour gate; without it 1.5 mm floods the chain with board
+    # and every take exhausts the branch guard, so an abstention must restore
+    # the pre-2026-08-29 conservative value rather than crash.
+    deposit_min_height_no_chroma_mm: float = Field(default=2.5, ge=0, le=100)
     deposit_height_margin_mm: float = Field(default=15.0, gt=0, le=100)
     radial_roi_margin_mm: float = Field(default=30.0, gt=0, le=200)
     raster_mm_per_pixel: float = Field(default=1.0, gt=0, le=10)

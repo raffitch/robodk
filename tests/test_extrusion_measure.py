@@ -214,6 +214,102 @@ def test_real_frame_with_board_noise_measures_the_applied_ring():
     assert not (r > 55.0).any(), "the board lobe at r 55-72 mm must be gone (was 21% of points)"
 
 
+# ------------------------------------------- chroma gate: bead vs board by colour
+
+from tasni.modules.extrusion.processing import chroma_gated_depth, deposit_floor_mm
+
+RING1_TAKE04 = (Path(__file__).parent / "fixtures" / "extrusion" / "ring1"
+                / "ring1_take04_branchguard_20260829.npz")
+
+
+def _ring1_take04() -> dict:
+    """Cell trial 20260829-165938, layer 1 take 4: the frame that crashed."""
+    import cv2
+    fixture = np.load(RING1_TAKE04)
+    centre = tuple(float(v) for v in fixture["nominal_center_mm"])
+    return {
+        "depth": fixture["depth"], "K": fixture["K"],
+        "T_work_camera": fixture["T_work_camera"], "centre": centre,
+        "color": cv2.imdecode(fixture["color_jpeg"], cv2.IMREAD_COLOR),
+        "plan": scene_plan(radius=float(fixture["recipe_radius_mm"]),
+                           bead=float(fixture["recipe_bead_mm"]),
+                           layer_height=float(fixture["recipe_layer_height_mm"]),
+                           center=centre),
+    }
+
+
+def test_chroma_gate_clears_the_board_lobe_that_exhausted_the_branch_guard():
+    """The 2026-08-29 13:03 cell frame. Board patch welded to the ring's +X flank."""
+    pytest.importorskip("open3d")
+    f = _ring1_take04()
+
+    out = process_observation(color=f["color"], depth=f["depth"], K=f["K"],
+                              T_work_camera=f["T_work_camera"], plan=f["plan"],
+                              layer=f["plan"].layers[0], config=ExtrusionConfig())
+
+    m = out.metrics
+    assert m.valid, m.warnings
+    assert out.report["counts"]["chroma_gate_applied"] == 1
+    # Takes 1-3 of the same trial measured this ring as an arc with a 41-46 deg
+    # hole; with the board gone and the floor it earns, the ring closes.
+    assert out.report["closed"]
+    assert m.path_completeness >= 0.98
+    assert m.maximum_angular_gap_deg < 5.0
+    # Characterization of this ring, minutes earlier: r 42.2 mm.
+    assert m.measured_radius_mm == pytest.approx(42.2, abs=1.0)
+    cluster = np.asarray(out.filtered_xyz)
+    r = np.linalg.norm(cluster[:, :2] - np.asarray(f["centre"]), axis=1)
+    # The patch sat on the ring's +X flank at r 50-54 mm (raw, out to r 71 mm);
+    # 285 of its points reached the deposit cluster and 22 the crest, where they
+    # dilated into the 17 and 22 px skeleton arms the guard refused.
+    assert not ((cluster[:, 0] > 254.0) & (r > 47.0)).any(), "the +X board patch must be gone"
+    assert r.max() < 54.0, "nothing may survive past the bead's own outer flank"
+
+
+def test_the_same_frame_still_fails_with_the_chroma_gate_disabled():
+    """Locks the CAUSE. Without colour the frame reproduces the cell crash exactly.
+
+    Guards against 'fixing' this by loosening the branch guard instead: the guard
+    was right, and takes 1-3 carried the same contamination into radii biased
+    0.6-0.7 mm large precisely because their topology let them through.
+    """
+    pytest.importorskip("open3d")
+    f = _ring1_take04()
+    with pytest.raises(RuntimeError, match="branch guard exhausted"):
+        process_observation(color=f["color"], depth=f["depth"], K=f["K"],
+                            T_work_camera=f["T_work_camera"], plan=f["plan"],
+                            layer=f["plan"].layers[0],
+                            config=ExtrusionConfig(deposit_min_saturation=0))
+
+
+def test_chroma_gate_keeps_the_chromatic_bead_and_blanks_the_achromatic_board():
+    depth = np.full((40, 40), 300, np.uint16)
+    color = np.dstack([np.full((40, 40), 40, np.uint8)] * 3)      # black checker
+    color[10:30, 10:30] = (40, 110, 190)                          # tan clay
+
+    gated, applied = chroma_gated_depth(color, depth, ExtrusionConfig())
+
+    assert applied
+    assert (gated[15:25, 15:25] > 0).all()
+    assert (gated[:5, :5] == 0).all()
+
+
+def test_chroma_gate_abstains_on_an_achromatic_frame_and_restores_the_floor():
+    """An RGB dropout must not erase the deposit, nor drop the floor it earned."""
+    config = ExtrusionConfig()
+    depth = np.full((8, 8), 300, np.uint16)
+
+    gated, applied = chroma_gated_depth(np.zeros((8, 8, 3), np.uint8), depth, config)
+    assert not applied and np.array_equal(gated, depth)
+    assert deposit_floor_mm(config, False) == pytest.approx(2.5)
+
+    saturated = np.zeros((8, 8, 3), np.uint8)
+    saturated[:, :, 2] = 200
+    gated, applied = chroma_gated_depth(saturated, depth, config)
+    assert applied and np.array_equal(gated, depth)
+    assert deposit_floor_mm(config, True) == pytest.approx(1.5)
+
+
 def test_floor_from_previous_layer_keeps_the_ring_below_out_of_the_measurement():
     pytest.importorskip("open3d")
     plan = scene_plan(layers=2, layer_height=6.0)

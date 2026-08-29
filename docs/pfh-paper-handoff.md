@@ -72,6 +72,22 @@ Paths: `runs/extrusion/<trial>/layer-NNN/figures/*.pdf` and
 
 ## 3. What is left — the cell run
 
+> **2026-08-29 — the noise-floor phase was re-run after a measurement-chain fix.**
+> Trial `20260829-165938-8bef1770` aborted at take 4/5 with `branch guard
+> exhausted`, and takes 1–3 were `valid: false` besides (completeness 0.873–0.885
+> against the 0.900 gate; angular gap 41–46° against 30°). Root cause: bare black
+> ChArUco squares read 1–3 depth LSB above the plane — depth is quantised at 1 mm
+> — so **height cannot separate bead from board**. A patch of it welded to the
+> ring's +X flank crashed take 4 and biased takes 2–3 large by 0.6–0.7 mm in
+> radius, i.e. **more than the ~0.6 mm offsets this experiment is trying to
+> resolve.** Fixed by discriminating on *colour* (saturation, ~20:1 separation)
+> and lowering the deposit floor that only existed to outrun the board. All four
+> archived frames now measure valid and closed — completeness 0.992, angular gap
+> 2.7–2.9°, radius spread 0.32 mm (was 0.65 mm). **Any take measured before this
+> fix must be reprocessed or re-run before it is cited.** The raw RGB-D is
+> archived per take, so reprocessing needs no robot.
+
+
 **The app now carries this protocol.** The Extrusion page's *Ring stack — measure
 only* card opens with a **Run guide** listing every step below with live progress
 (`3/5` takes done, etc.), the traps beside the buttons, and the ground truth echoed

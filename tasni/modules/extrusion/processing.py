@@ -49,6 +49,72 @@ def depth_to_work_points(depth: np.ndarray, K: np.ndarray,
     return transform_points(T_work_camera, camera), int(valid.sum())
 
 
+def deposit_floor_mm(config, chroma_gated: bool) -> float:
+    """Lowest height above the work plane a point may have and still be deposit.
+
+    Coupled to the colour gate on purpose: the low floor is EARNED by it. With
+    the board removed by chroma, 1.5 mm stops amputating the bead; without it,
+    1.5 mm lets the board flood in and every take exhausts the branch guard
+    (measured on all four cell frames of 2026-08-29). So an abstaining gate --
+    an RGB dropout, a depth-only fixture -- also restores the conservative floor
+    rather than handing the chain a cloud it cannot survive.
+    """
+    floor = max(config.deposit_min_height_mm, config.plane_distance_threshold_m * 1000.0)
+    if chroma_gated:
+        return float(floor)
+    return float(max(floor, getattr(config, "deposit_min_height_no_chroma_mm", 0.0)))
+
+
+def chroma_gated_depth(color: np.ndarray | None, depth: np.ndarray, config,
+                       counts: dict | None = None) -> tuple[np.ndarray, bool]:
+    """Blank depth wherever the colour frame says "board" rather than "bead".
+
+    Height cannot make that call. Depth here is quantised at 1 mm and the bare
+    ChArUco board reads 1-3 LSB above the work plane, so every floor a real bead
+    clears passes board with it. Cell 2026-08-29 take 4: a 22-point patch of
+    black checker 12 mm outside the ring survived the radial trim, dilated into a
+    17-22 px arm (the spur limit is 15) and exhausted the branch guard -- while
+    takes 1-3 carried the SAME patch and passed, biased 0.6-0.7 mm large in
+    radius, because their skeleton topology happened to stay benign. The guard is
+    topological, so it catches contamination only by luck; the fix is to not feed
+    it any.
+
+    Saturation separates the two ~20:1 (the clay is chromatic, the printed board
+    is not), which is also what lets the deposit floor drop -- see
+    ``plane_distance_threshold_m``.
+
+    Abstains, returning ``depth`` untouched, when the colour frame carries no
+    usable chroma: an RGB dropout or a depth-only synthetic fixture would
+    otherwise have its deposit erased instead of its board.
+    """
+    def note(key: str, value: int) -> None:
+        if counts is not None:
+            counts[key] = value
+
+    depth = np.asarray(depth)
+    threshold = int(getattr(config, "deposit_min_saturation", 0) or 0)
+    if threshold <= 0 or color is None:
+        note("chroma_gate_applied", 0)
+        return depth, False
+    image = np.asarray(color)
+    if image.ndim != 3 or image.shape[2] != 3 or image.shape[:2] != depth.shape[:2]:
+        note("chroma_gate_applied", 0)
+        return depth, False
+    saturation = cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_BGR2HSV)[:, :, 1]
+    keep = (saturation > threshold).astype(np.uint8)
+    note("chroma_gate_kept_pixels", int(keep.sum()))
+    floor = float(getattr(config, "deposit_min_chroma_fraction", 0.0))
+    if float(keep.mean()) < floor:
+        note("chroma_gate_applied", 0)
+        return depth, False
+    # Speckle inside the bead would otherwise punch holes through it.
+    keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    note("chroma_gate_applied", 1)
+    gated = depth.copy()
+    gated[keep == 0] = 0
+    return gated, True
+
+
 def _largest_label(points: np.ndarray, labels: np.ndarray) -> np.ndarray:
     good = labels >= 0
     if not np.any(good):
@@ -608,6 +674,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     counts: dict[str, int] = {}
 
     mark = time.perf_counter()
+    depth, chroma_gated = chroma_gated_depth(color, depth, config, counts)
     points, counts["raw_depth_pixels"] = depth_to_work_points(
         depth, K, T_work_camera, depth_scale=1000.0)
     timings["backproject_ms"] = (time.perf_counter() - mark) * 1000
@@ -617,8 +684,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     max_z = layer.nominal_z_mm + recipe.bead_diameter_mm / 2 + config.deposit_height_margin_mm
     # The selected work frame defines the build plane at Z=0, so deterministic
     # height subtraction is more reproducible than fitting a new plane per frame.
-    min_z = max(config.deposit_min_height_mm,
-                config.plane_distance_threshold_m * 1000.0)
+    min_z = deposit_floor_mm(config, chroma_gated)
     in_height = (points[:, 2] >= min_z) & (points[:, 2] <= max_z)
     r_lo = recipe.radius_mm - config.radial_roi_margin_mm
     r_hi = recipe.radius_mm + config.radial_roi_margin_mm
@@ -803,9 +869,12 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, T_work_camera: np
     """
     started = time.perf_counter()
     counts: dict[str, int] = {}
+    # The same gate as the layer measurements: characterization defines the
+    # recipe they are then judged against, so the two must see the same cloud.
+    depth, chroma_gated = chroma_gated_depth(color, depth, config, counts)
     points, counts["raw_depth_pixels"] = depth_to_work_points(depth, K, T_work_camera)
     center = np.asarray(search_center_mm, dtype=float)
-    min_z = max(config.deposit_min_height_mm, config.plane_distance_threshold_m * 1000.0)
+    min_z = deposit_floor_mm(config, chroma_gated)
     radial = np.linalg.norm(points[:, :2] - center, axis=1)
     roi = ((points[:, 2] >= min_z) & (points[:, 2] <= config.characterize_max_height_mm)
            & (radial <= config.characterize_search_radius_mm))
