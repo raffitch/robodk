@@ -836,6 +836,21 @@ class ExtrusionConfig(_Model):
     layer_floor_margin_mm: float = Field(default=2.0, ge=0, le=20)
     characterize_search_radius_mm: float = Field(default=150.0, gt=0, le=1000)
     characterize_max_height_mm: float = Field(default=40.0, gt=0, le=200)
+    # -- side photo for the paper ------------------------------------------
+    # After a layer's capture completes, one RGB photo of the stack from the
+    # side. TAUGHT targets, not a derived pose: the operator taught these around
+    # the real obstacles in the cell, and nothing in the station model knows
+    # where those are. The approach target is MANDATORY in both directions --
+    # neutral -> approach -> side, and side -> approach -> neutral -- because
+    # the straight-line joint move between neutral and the side pose is the one
+    # that bumps into things.
+    side_capture_target: str = "SideCapture"
+    side_capture_approach_target: str = "TowardsSideCapture"
+    # A missing target skips the photo with a warning; it never fails a
+    # measurement. The measured frame is irreplaceable (the operator cannot
+    # re-place a ring exactly); a photo for a figure is not.
+    side_capture_enabled: bool = True
+    side_capture_settle_s: float = Field(default=0.6, ge=0, le=30)
     # A depth frame must describe the pose it was taken at: looking down at the
     # work plane, the median depth IS the camera's height above it. This is how
     # far below the plane that median may sit before the frame is refused (the

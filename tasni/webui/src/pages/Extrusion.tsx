@@ -87,6 +87,10 @@ interface MeasureTake {
     move_to_pose_ms?: number; settle_ms?: number; return_ms?: number;
     /** Out of the path, settle, capture, reconstruct, back: what one inspection costs. */
     inspection_cycle_ms?: number };
+  /** One side-on RGB photo of the stack, taken after this layer's capture. */
+  side_view?: { captured: boolean; image_file?: string | null; target?: string | null;
+                approach_target?: string | null; excursion_ms?: number | null;
+                error?: string | null } | null;
   error?: string | null;
   reprocessed?: boolean;
 }
@@ -185,6 +189,20 @@ function TakeFigures({ trialId, take }: { trialId: string; take: MeasureTake }) 
       </a>
       <figcaption><strong>Segmentation</strong> <span className="hint">raster the centreline came from</span></figcaption>
     </figure>
+    {/* Only the last take of a press carries the photo -- the ring does not move
+        between the frames of one capture, so the others would repeat it. */}
+    {take.side_view?.captured && <figure className="figure-card">
+      <a href={`${base}/files/side.png`} target="_blank" rel="noreferrer">
+        <img src={`${base}/files/side.png`} alt={`The stack seen from the side after layer ${take.layer_index}`} loading="lazy" />
+      </a>
+      <figcaption><strong>Side view</strong> <span className="hint">
+        the stack from {take.side_view.target ?? "the taught side pose"} — a photo for the
+        paper, measured from nothing</span></figcaption>
+    </figure>}
+    {take.side_view && !take.side_view.captured && <figure className="figure-card empty">
+      <figcaption><strong>Side view</strong> <span className="hint warn-text">
+        {take.side_view.error ?? "not captured"}</span></figcaption>
+    </figure>}
   </div>;
 }
 
@@ -1679,12 +1697,22 @@ export default function Extrusion() {
           so nothing sub-millimetre can be claimed. Nothing here is extruded: this is a
           controlled validation of the sensing-and-comparison chain, not print deviation.
         </div>
+        <div className="io-note">
+          <b>The side photo.</b> After a layer's capture finishes and the arm is home, it goes
+          out once more for one RGB photo of the stack from the side — the picture the paper
+          shows next to the numbers. It routes <b>neutral → TowardsSideCapture → SideCapture</b>
+          and comes back the same way in reverse; the approach target is taught around the
+          things standing near the cell, so it is used in <b>both</b> directions. One photo per
+          press, filed with that press's last take. It measures nothing, its cost is kept out
+          of the inspection-cycle figure, and if either taught target is missing it is skipped
+          with a note rather than failing the measurement.
+        </div>
         <div className="io-note warn-text">
           <b>Collision validation is OFF</b> for these moves: the hand-placed stack is not in
           the station model, so RoboDK's check only sees the cell furniture and was rejecting
           good inspection poses. The pose is still IK-checked and reachable and the camera
           stops 300 mm above the ring, but nothing screens the path against the real cell.
-          Keep hands clear and watch the first move.
+          Keep hands clear and watch the first move — including the trip to the side pose.
         </div>
       </div>
     </dialog>

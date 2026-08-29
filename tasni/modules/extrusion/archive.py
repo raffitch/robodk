@@ -98,6 +98,32 @@ class ExtrusionArchive:
             manifest.model_dump_json(indent=2), encoding="utf-8")
         return layer
 
+    def write_side_view(self, layer_dir, *, color, record) -> dict:
+        """Add the side photo to a take that is ALREADY archived, and say so in its manifest.
+
+        The photo is taken after the measurement is on disk -- a measurement must
+        survive a failure on the way to the side pose -- so, like the return
+        timing, it is patched in afterwards. Nothing derived is touched.
+
+        A record with ``captured`` False (a missing taught target, a refused
+        move) is still written: the manifest has to be able to say why a take
+        that should carry a photo does not.
+        """
+        layer_dir = Path(layer_dir)
+        manifest_file = layer_dir / "manifest.json"
+        if not manifest_file.is_file():
+            raise FileNotFoundError(f"no archived take at {layer_dir}")
+        payload = json.loads(manifest_file.read_text(encoding="utf-8"))
+        entry = dict(record)
+        if color is not None:
+            import cv2
+            if not cv2.imwrite(str(layer_dir / "side.png"), np.asarray(color)):
+                raise OSError("failed to write side.png")
+            entry["image_file"] = "side.png"
+        payload["side_view"] = entry
+        manifest_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return entry
+
     def write_characterization(self, trial_id: str, index: int, *, color, depth, measured_xyz,
                                derived_images: dict[str, np.ndarray], report: dict) -> Path:
         """Archive one ring characterization beside the trial's layers.

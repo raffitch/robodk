@@ -407,6 +407,78 @@ def add_return_timing(layer_dir, return_ms: float, *, whole_excursion: bool = Tr
     return timings
 
 
+def side_capture_requirements(rdk: RdkIO, config) -> dict:
+    """Are the two taught side-photo targets in the station?
+
+    Reported, never enforced: the photo is a figure for the paper and the
+    measurement is irreplaceable, so a station without these targets must still
+    be able to measure.
+    """
+    names = [("side_capture_target", config.side_capture_target),
+             ("side_capture_approach_target", config.side_capture_approach_target)]
+    items = [{"role": role, "name": name, "type": "target",
+              "present": bool(name) and rdk.item_exists_as(name, "target")}
+             for role, name in names]
+    return {"ready": all(item["present"] for item in items), "items": items,
+            "missing": [item for item in items if not item["present"]]}
+
+
+def capture_side_photo(services, ctx: JobContext, *, start_joints) -> dict:
+    """One RGB photo of the stack from the side, via the taught approach target.
+
+    The route is neutral -> approach -> side, and back side -> approach ->
+    neutral. The approach target is not a nicety: the operator taught it because
+    the direct joint move between the neutral pose and the side pose sweeps the
+    arm through the things standing around the cell, and nothing in the station
+    model knows they are there. So it is used in BOTH directions, and the return
+    leg runs even when the capture failed -- an arm left out at the side pose is
+    the worst outcome available here.
+
+    Never raises. A missing target, a refused move or a dead camera returns a
+    record saying so; the measurement it belongs to is already on disk and is
+    not put at risk for a figure.
+    """
+    rdk: RdkIO = services.rdk
+    ecfg = services.config.extrusion
+    side, approach = ecfg.side_capture_target, ecfg.side_capture_approach_target
+    record = {"captured": False, "target": side, "approach_target": approach,
+              "excursion_ms": None, "error": None, "image_file": None}
+    required = side_capture_requirements(rdk, ecfg)
+    if not required["ready"]:
+        missing = ", ".join(f"target {item['name']!r}" for item in required["missing"])
+        record["error"] = f"side photo skipped: {missing} is not in the station"
+        ctx.log(record["error"])
+        return record
+    departed = time.perf_counter()
+    reached = False
+    try:
+        ctx.log(f"side photo: {approach} -> {side}")
+        rdk.move_j(approach)
+        rdk.move_j(side)
+        reached = True
+        time.sleep(ecfg.side_capture_settle_s)
+        with _camera_hold(services, "extrusion-side-photo"):
+            frame = services.camera.grab(color_only=True, timeout=ecfg.grab_timeout_s)
+        record["color"] = frame.color
+        record["captured"] = True
+        ok, jpeg = cv2.imencode(".jpg", frame.color)
+        if ok:
+            ctx.frame(jpeg.tobytes())
+    except Exception as exc:
+        record["error"] = f"side photo failed: {exc}"
+        ctx.log(record["error"])
+    finally:
+        # Back the way we came, whatever happened on the way out.
+        try:
+            if reached:
+                rdk.move_j(approach)
+            rdk.move_j_joints(start_joints)
+        except Exception as exc:
+            ctx.log(f"WARNING side photo: could not retrace to the neutral pose: {exc}")
+        record["excursion_ms"] = (time.perf_counter() - departed) * 1000.0
+    return record
+
+
 class RingMeasureJob:
     """Measure a hand-placed ring: inspect, capture, process, archive, return.
 
@@ -433,7 +505,8 @@ class RingMeasureJob:
                  layer_index: int, *, annotation: dict | None = None,
                  check_collisions: bool = True,
                  close_range_tool_clear: bool = False,
-                 repeats: int = 1, excursions: int = 1):
+                 repeats: int = 1, excursions: int = 1,
+                 side_photo: bool | None = None):
         if not 1 <= layer_index <= len(plan.layers):
             raise ValueError(f"layer_index {layer_index} outside 1..{len(plan.layers)}")
         self.services = services
@@ -445,6 +518,8 @@ class RingMeasureJob:
         self.close_range_tool_clear = bool(close_range_tool_clear)
         self.repeats = max(1, int(repeats))
         self.excursions = max(1, int(excursions))
+        self.side_photo = (services.config.extrusion.side_capture_enabled
+                           if side_photo is None else bool(side_photo))
         self.results: list[dict] = []
         self.result: dict | None = None
 
@@ -463,6 +538,7 @@ class RingMeasureJob:
             self._one_excursion(ctx, layer=layer, inspection_name=inspection_name,
                                 archive=archive, start_joints=start_joints,
                                 excursion=excursion, total=total)
+        side = self._side_photo(ctx, archive=archive, start_joints=start_joints)
         self.result = {"kind": "ring_measure", "mode": MODE,
                        "trial_id": self.session.trial_id,
                        "fingerprint": self.plan.fingerprint,
@@ -470,8 +546,47 @@ class RingMeasureJob:
                        # The batch as a whole, so a caller that asked for five
                        # takes can tell five happened from the result alone.
                        "takes_recorded": [r["take"] for r in self.results],
-                       "excursions": self.excursions, "repeats": self.repeats}
+                       "excursions": self.excursions, "repeats": self.repeats,
+                       "side_view": side}
         return self.result
+
+    # -- the paper's photo, once the layer's capture is complete -------------
+    def _side_photo(self, ctx: JobContext, *, archive: ExtrusionArchive,
+                    start_joints) -> dict | None:
+        """One side-on RGB photo of the stack, attached to this press's last take.
+
+        Once per press, not once per take: the ring has not moved between the
+        frames of a capture, so a photo per frame would be the same photo. It
+        runs LAST, after every measurement is archived and the arm is home, and
+        it cannot fail the job -- capture_side_photo swallows its own errors and
+        the archive write is guarded here.
+
+        Its cost is deliberately kept out of the take's timings: the paper's
+        "what one inspection costs" figure is the price of measuring a layer,
+        and a photo for a figure is not part of that.
+        """
+        if not self.side_photo or not self.results:
+            return None
+        ctx.progress(len(self.results), len(self.results),
+                     "side photo of the stack for the paper")
+        record = capture_side_photo(self.services, ctx, start_joints=start_joints)
+        color = record.pop("color", None)
+        last = self.results[-1]
+        try:
+            entry = archive.write_side_view(Path(last["layer_dir"]),
+                                            color=color, record=record)
+        except Exception as exc:
+            ctx.log(f"side photo not archived (the measurement stands): {exc}")
+            return record
+        # The operator's table reads the session, not the manifest.
+        for row in (last, *(r for r in self.session.records
+                            if r.get("layer_name") == last.get("layer_name"))):
+            row["side_view"] = entry
+        self.session.save()
+        if entry.get("captured"):
+            ctx.log(f"side photo archived beside take {last['take']} "
+                    f"({record['excursion_ms']:.0f} ms, not counted in the cycle)")
+        return entry
 
     # -- one trip out and back ---------------------------------------------
     def _one_excursion(self, ctx: JobContext, *, layer, inspection_name: str,

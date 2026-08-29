@@ -81,6 +81,10 @@ class MeasureLayerBody(FingerprintBody):
     # cannot commit the cell to a quarter of an hour of unattended motion.
     repeats: int = Field(default=1, ge=1, le=10)
     excursions: int = Field(default=1, ge=1, le=10)
+    # One side-on RGB photo of the stack after the capture, via the taught
+    # SideCapture / TowardsSideCapture targets. None = follow the configured
+    # default (on); pass false to skip it for a take that does not need one.
+    side_photo: bool | None = None
     # Escape hatch for a layer whose floor can never be measured (every take of
     # the layer below failed). Deliberately not in the UI: the floor is
     # load-bearing, and skipping it silently would produce a number the paper
@@ -717,7 +721,8 @@ class ExtrusionModule(WorkflowModule):
                 services, self._plan, session, body.layer_index,
                 annotation=body.annotation, check_collisions=body.collision_check_enabled,
                 close_range_tool_clear=body.confirm_close_range_tool_clear,
-                repeats=body.repeats, excursions=body.excursions)
+                repeats=body.repeats, excursions=body.excursions,
+                side_photo=body.side_photo)
             try:
                 services.jobs.start(self._active_measure_job, name="extrusion-measure")
             except JobBusy as exc:
@@ -786,6 +791,8 @@ class ExtrusionModule(WorkflowModule):
                                     "valid": bool((manifest.get("metrics") or {}).get("valid")),
                                     "layer_dir": manifest_path.parent.name,
                                     "has_comparison": (manifest_path.parent / "comparison.png").is_file(),
+                                    "has_side_view": (manifest_path.parent / "side.png").is_file(),
+                                    "side_view": manifest.get("side_view"),
                                     "has_figures": (manifest_path.parent / "figures").is_dir(),
                                 })
                             except (OSError, ValueError, json.JSONDecodeError):
@@ -813,7 +820,10 @@ class ExtrusionModule(WorkflowModule):
         # Deliberately narrow: depth.npy and manifest.json are data, not pictures,
         # and reach the UI through /trials instead.
         SERVED_FILES = {"color.png": "image/png", "comparison.png": "image/png",
-                        "segmentation.png": "image/png", "skeleton.png": "image/png"}
+                        "segmentation.png": "image/png", "skeleton.png": "image/png",
+                        # The side-on photo of the stack: a figure for the paper,
+                        # taken after the layer's capture from the taught pose.
+                        "side.png": "image/png"}
         FIGURE_TYPES = {"png": "image/png", "pdf": "application/pdf"}
 
         def _layer_directory(trial_id: str, layer_dir: str):

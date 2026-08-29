@@ -130,6 +130,41 @@ The rail runs this order for you and sets layer, phase and offset per step, so n
 control can be left on a stale value. Finishing a step advances the run by itself;
 clicking a chip goes back to any step without losing your place.
 
+### The side photo (2026-08-29)
+
+After a layer's capture completes and the arm is home, it goes out once more for
+**one RGB photo of the stack from the side** — the picture the manuscript shows next
+to the numbers measured from above.
+
+It uses **taught targets**, not a derived pose, because the operator taught them
+around the objects standing near the cell and nothing in the station model knows
+those are there. The route is:
+
+```
+neutral -> TowardsSideCapture -> SideCapture -> (photo) -> TowardsSideCapture -> neutral
+```
+
+The approach target is **mandatory in both directions**: the direct joint move
+between the neutral pose and the side pose is the one that bumps into things, going
+out *and* coming back. The return leg runs even when the capture failed — an arm left
+parked at the side pose is the worst outcome available.
+
+- **Once per press**, not once per take: the ring does not move between the frames of
+  one capture, so a photo per frame would be the same photo. It is filed with that
+  press's last take as `side.png` and recorded in that take's `side_view` manifest
+  block; the take gallery shows it.
+- **It measures nothing.** RGB only, no depth, nothing derived, and its cost is kept
+  out of `inspection_cycle_ms` — that figure is the price of measuring a layer, and a
+  photo for a figure is not part of it.
+- **It can never fail a measurement.** A missing taught target skips it *before any
+  motion*, with the reason archived in the manifest; a failed move or a dead camera is
+  caught and recorded the same way. The measured frame is irreplaceable (the ring
+  cannot be re-placed exactly); a photo is not.
+- Targets and the on/off switch are `ExtrusionConfig.side_capture_target`,
+  `side_capture_approach_target`, `side_capture_enabled` (default on),
+  `side_capture_settle_s`. The API accepts `side_photo: true|false|null` per take
+  (`null` = follow the config).
+
 ### Two repeatabilities, and why the run buys them differently
 
 A take can be bought two ways, and they cost and mean different things:

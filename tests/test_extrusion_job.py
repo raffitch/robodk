@@ -44,11 +44,12 @@ class Ctx:
 
 class FakeRdk:
     def __init__(self):
-        self.mode = 6; self.events = []; self.created = []; self.deleted = []
+        self.mode = 6; self.absent: set[str] = set(); self.events = []; self.created = []; self.deleted = []
         self.station_calls = 0; self.fail_station_call = None
         self.targets = []; self.unreachable_targets = 0; self.bad_inspections = 0
         self.flipped_inspections = 0
-    def item_exists_as(self, name, kind): return bool(name)
+    def item_exists_as(self, name, kind): return name not in self.absent and bool(name)
+    def move_j(self, name): self.events.append(("move-target", name))
     def program_instructions(self, name):
         return (["Set IO_508=1", "Set IO_601=1"] if name == "AirOn"
                 else ["Set IO_508=0", "Set IO_601=0"] if name == "AirOff" else [])

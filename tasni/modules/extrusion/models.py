@@ -128,6 +128,27 @@ class RingGeometry(_Record):
     bead_width_bins: int
 
 
+class SideViewRecord(_Record):
+    """One RGB photo of the stack taken from the side, for the paper's figures.
+
+    Not a measurement: no depth, nothing derived from it, and its cost is kept
+    out of the inspection cycle. It exists so the manuscript can show what the
+    ring stack actually looked like next to the numbers measured from above.
+
+    ``error`` set (with ``captured`` False) is the normal record of a photo that
+    was skipped or failed -- a missing taught target, a refused move. The
+    measurement it belongs to still stands, so the reason has to be archived
+    rather than raised.
+    """
+
+    captured: bool = False
+    image_file: str | None = None
+    target: str | None = None
+    approach_target: str | None = None
+    excursion_ms: float | None = None
+    error: str | None = None
+
+
 class LayerManifest(_Record):
     schema_version: str = "1.0"
     trial_id: str
@@ -155,4 +176,7 @@ class LayerManifest(_Record):
     processing: dict[str, Any] = Field(default_factory=dict)
     provenance: dict[str, Any] = Field(default_factory=dict)
     valve_transitions: list[dict[str, Any]] = Field(default_factory=list)
+    # The side photo belongs to the layer's capture as a whole, so only the last
+    # take of a press carries one.
+    side_view: SideViewRecord | None = None
     warnings: list[str] = Field(default_factory=list)

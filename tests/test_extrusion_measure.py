@@ -428,9 +428,14 @@ def fake_measure_processing(**kwargs):
 fake_measure_processing.calls = []
 
 
-def measure_env(tmp_path, monkeypatch, *, hardware_approved=False):
+def measure_env(tmp_path, monkeypatch, *, hardware_approved=False, side_photo=False):
     svc, rdk, camera = services(tmp_path)
     svc.config.extrusion.hardware_io_test_approved = hardware_approved
+    # The side photo is ON in the cell (it is part of the protocol) but OFF for
+    # the tests that count grabs and moves: it would add one of each to every
+    # assertion about the MEASUREMENT path, which is not what they are about.
+    # The tests that own it turn it back on.
+    svc.config.extrusion.side_capture_enabled = side_photo
     monkeypatch.setattr(measure_mod, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(measure_mod, "process_observation", fake_measure_processing)
     monkeypatch.setattr(measure_mod, "_git_commit", lambda: "abc123")
@@ -2178,3 +2183,144 @@ def test_the_teardown_pairs_each_ring_against_its_own_post_lift_baseline(tmp_pat
     # Scored against the plan centre instead, the lift's 3 mm would show up as
     # detection error the chain never made.
     assert shifted["detection_error_mm"]["mean"] == pytest.approx(3.0, abs=0.01)
+
+
+# -- the side photo for the paper --------------------------------------------
+# One RGB photo of the stack from the side after a layer's capture completes.
+# TAUGHT targets, because the operator taught them around the real obstacles in
+# the cell and nothing in the station model knows those are there.
+
+def test_the_side_photo_goes_out_and_back_through_the_approach_target(tmp_path, monkeypatch):
+    """Neutral -> approach -> side, and side -> approach -> neutral.
+
+    The approach target is not a nicety: the direct joint move between the
+    neutral pose and the side pose is the one that sweeps the arm through the
+    things standing around the cell. Skipping it on the way BACK would bump into
+    them just as hard as skipping it on the way out.
+    """
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch, side_photo=True)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    out = RingMeasureJob(svc, plan, session, 1, check_collisions=False, repeats=2)(Ctx())
+
+    route = [e for e in rdk.events if e[0] in {"move-target", "move-joints"}]
+    assert route[-4:] == [("move-target", "TowardsSideCapture"),
+                          ("move-target", "SideCapture"),
+                          ("move-target", "TowardsSideCapture"),
+                          ("move-joints", START_JOINTS)]
+    assert out["side_view"]["captured"] is True
+    assert camera.witness_grabs == 1, "the side photo is RGB only -- it measures nothing"
+
+
+def test_the_side_photo_is_taken_once_per_press_and_lands_on_the_last_take(tmp_path, monkeypatch):
+    """The ring does not move between the frames of one capture, so one photo.
+
+    It is archived beside the take it belongs to, so a reader of the archive
+    finds the picture next to the numbers rather than in a separate pile.
+    """
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch, side_photo=True)
+    plan = auto_plan()
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, plan)
+
+    RingMeasureJob(svc, plan, session, 1, check_collisions=False, repeats=3)(Ctx())
+
+    assert len([e for e in rdk.events if e == ("move-target", "SideCapture")]) == 1
+    trial = root / session.trial_id
+    assert (trial / "layer-001-take03" / "side.png").is_file()
+    assert not (trial / "layer-001" / "side.png").exists()
+    manifest = json.loads((trial / "layer-001-take03" / "manifest.json").read_text())
+    assert manifest["side_view"]["captured"] is True
+    assert manifest["side_view"]["image_file"] == "side.png"
+    assert manifest["side_view"]["target"] == "SideCapture"
+    assert manifest["side_view"]["approach_target"] == "TowardsSideCapture"
+    # Not folded into what the paper says an inspection costs.
+    assert "side" not in json.dumps(manifest["processing"]["timings_ms"])
+    assert session.records[-1]["side_view"]["captured"] is True
+
+
+def test_a_missing_taught_target_skips_the_photo_and_never_moves(tmp_path, monkeypatch):
+    """A station without the targets must still be able to measure.
+
+    And it must not set off toward a target that is not there: the skip has to
+    happen BEFORE any motion, not as a failed move.
+    """
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch, side_photo=True)
+    rdk.absent.add("TowardsSideCapture")
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    out = RingMeasureJob(svc, plan, session, 1, check_collisions=False)(Ctx())
+
+    assert out["valid"] is True, "the measurement stands"
+    assert not any(e[0] == "move-target" for e in rdk.events)
+    side = out["side_view"]
+    assert side["captured"] is False
+    assert "TowardsSideCapture" in side["error"] and "not in the station" in side["error"]
+    # Archived anyway: the manifest has to be able to say why there is no photo.
+    manifest = json.loads((Path(out["layer_dir"]) / "manifest.json").read_text())
+    assert manifest["side_view"]["captured"] is False and manifest["side_view"]["error"]
+
+
+def test_a_failure_at_the_side_pose_still_retraces_and_keeps_the_measurement(tmp_path, monkeypatch):
+    """An arm left parked out at the side pose is the worst outcome available.
+
+    So the return leg runs even when the capture failed -- and the measurement,
+    which is already on disk, is not put at risk for a figure.
+    """
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch, side_photo=True)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    def dead_camera(**kwargs):
+        if kwargs.get("color_only"):
+            raise RuntimeError("camera stopped answering")
+        return FakeCamera.grab(camera, **kwargs)
+
+    monkeypatch.setattr(camera, "grab", dead_camera)
+    out = RingMeasureJob(svc, plan, session, 1, check_collisions=False)(Ctx())
+
+    assert out["valid"] is True
+    assert out["side_view"]["captured"] is False
+    assert "camera stopped answering" in out["side_view"]["error"]
+    route = [e for e in rdk.events if e[0] in {"move-target", "move-joints"}]
+    assert route[-2:] == [("move-target", "TowardsSideCapture"),
+                          ("move-joints", START_JOINTS)]
+
+
+def test_the_side_photo_is_part_of_the_protocol_by_default(tmp_path, monkeypatch):
+    """It is a step of the run, not an opt-in: the paper needs one per layer."""
+    from tasni.core.config import AppConfig
+    from tasni.modules.extrusion.module import MeasureLayerBody
+
+    config = AppConfig().extrusion
+    assert config.side_capture_enabled is True
+    assert config.side_capture_target == "SideCapture"
+    assert config.side_capture_approach_target == "TowardsSideCapture"
+    assert MeasureLayerBody(fingerprint="f", layer_index=1).side_photo is None
+
+
+def test_the_side_photo_is_served_to_the_browser_and_listed(tmp_path, monkeypatch):
+    """A photo the operator cannot see is a photo they cannot check was framed."""
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch, side_photo=True)
+    plan = auto_plan()
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, plan)
+    RingMeasureJob(svc, plan, session, 1, check_collisions=False)(Ctx())
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    client = TestClient(create_app(AppConfig()))
+
+    served = client.get(f"/api/modules/extrusion/trials/{session.trial_id}"
+                        "/layers/layer-001/files/side.png")
+    assert served.status_code == 200 and served.headers["content-type"] == "image/png"
+
+    listed = client.get("/api/modules/extrusion/trials").json()
+    take = next(t for i in listed["trials"] if i["trial_id"] == session.trial_id
+                for t in i["layers"])
+    assert take["has_side_view"] is True
+    assert take["side_view"]["captured"] is True
+
+    # A path that is not on the whitelist is still refused.
+    assert client.get(f"/api/modules/extrusion/trials/{session.trial_id}"
+                      "/layers/layer-001/files/depth.npy").status_code == 404
