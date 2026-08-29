@@ -111,10 +111,71 @@ def test_unknown_scan_key_rejected():
     print("[guard] unknown scan key -> KeyError (typo is an error, not a no-op)")
 
 
+# -- protocol 2: depth_scale removed, 1080p default, K migration ------------
+def test_depth_scale_is_gone_and_a_stale_override_is_dropped_with_a_warning(tmp_path, capsys):
+    from tasni.core.config import ScanConfig, load_config
+    assert "depth_scale" not in ScanConfig.model_fields
+    p = tmp_path / "tasni.config.json"
+    p.write_text('{"scan": {"depth_scale": 1000.0, "voxel_size_m": 0.002}}', encoding="utf-8")
+    cfg = load_config(p)
+    assert cfg.scan.voxel_size_m == 0.002
+    assert "scan.depth_scale" in capsys.readouterr().out
+
+
+def test_calibrated_720p_intrinsics_migrate_to_1080p_by_exact_scale():
+    from tasni.core.config import CameraConfig, migrate_camera_intrinsics, _DEFAULT_INTRINSICS
+    cam = CameraConfig()
+    assert cam.resolution == "1920x1080"
+    cal = [[889.8742, 0.0, 648.9804], [0.0, 890.8099, 362.0046], [0.0, 0.0, 1.0]]
+    cam.intrinsics = {**cam.intrinsics, "1280x720": cal}
+    assert migrate_camera_intrinsics(cam) is True
+    K = cam.K
+    assert abs(K[0, 0] - 889.8742 * 1.5) < 1e-6 and abs(K[1, 2] - 362.0046 * 1.5) < 1e-6
+    assert migrate_camera_intrinsics(cam) is False                      # idempotent
+    fresh = CameraConfig()
+    assert migrate_camera_intrinsics(fresh) is False                    # factory 720p: nothing to carry
+    assert fresh.intrinsics["1920x1080"] == _DEFAULT_INTRINSICS["1920x1080"]
+
+
+def test_explicit_path_migration_never_writes_the_repo_root_override_file(tmp_path, monkeypatch):
+    """Ruling R5's most safety-critical branch, otherwise uncovered: an EXPLICIT
+    path (a test's tmp_path config here; in real life an operator-specified
+    alternate config) whose data DOES trigger the K migration must still never
+    overwrite tasni.config.json at the repo root -- only load_config(path=None)
+    (the default file) may call save_overrides(). The other two migration tests
+    don't exercise this: the depth_scale-drop test's JSON never triggers a
+    migration, and the direct migrate_camera_intrinsics() test bypasses
+    load_config's file-writing entirely. Monkeypatching save_overrides is
+    cleaner than comparing the real repo-root file's mtime and never touches
+    the operator's actual config."""
+    import tasni.core.config as config_mod
+
+    p = tmp_path / "tasni.config.json"
+    p.write_text(json.dumps({"camera": {"intrinsics": {
+        "1280x720": [[889.8742, 0.0, 648.9804],
+                     [0.0, 890.8099, 362.0046],
+                     [0.0, 0.0, 1.0]],
+        "1920x1080": config_mod._DEFAULT_INTRINSICS["1920x1080"],  # still factory
+    }}}), encoding="utf-8")
+
+    calls = []
+    monkeypatch.setattr(config_mod, "save_overrides", lambda updates: calls.append(updates))
+
+    cfg = config_mod.load_config(p)
+
+    assert abs(cfg.camera.intrinsics["1920x1080"][0][0] - 889.8742 * 1.5) < 1e-6, (
+        "the migration must still apply IN MEMORY even though it is not persisted")
+    assert calls == [], (
+        "an explicit path must never trigger save_overrides -- doing so would "
+        "silently overwrite the repo-root config with THIS file's content")
+    print("[R5] explicit-path migration applies in memory but never calls save_overrides")
+
+
 if __name__ == "__main__":
     test_defaults_present_and_sane()
     test_collision_hard_fail_is_default()
     test_json_override_merges_only_targeted_fields()
     test_compact_guard_uv_is_satisfiable_at_the_recommended_standoff()
     test_unknown_scan_key_rejected()
+    test_calibrated_720p_intrinsics_migrate_to_1080p_by_exact_scale()
     print("\nScanConfig tests passed.")

@@ -5,15 +5,21 @@ the calibrated camera pose provide METRIC geometry (spec §11). Samples are
 inset a few pixels toward the surface interior so depth is read on the
 platform, not in the discontinuity at its edge.
 
-Units: ``depth`` is a ``(H, W)`` array in **millimetres** (RealSense uint16
-convention); ``polygon_uv`` is normalized ``(N, 2)`` image coordinates;
-``T_base_cam`` is the 4x4 base<-camera pose in millimetres. All outputs
-(``corner_base_mm``, ``edge_points_base``) are millimetres in the robot base
-frame.
+Units: ``registered`` (a :class:`~tasni.core.depth_geometry.ColorRegistered`, Task 7)
+carries the colour-registered depth points already converted to **millimetres**
+through the frame's own ``CameraGeometry.depth_unit_mm``; ``polygon_uv`` is
+normalized ``(N, 2)`` image coordinates; ``T_base_cam`` is the 4x4 base<-camera pose
+in millimetres. All outputs (``corner_base_mm``, ``edge_points_base``) are
+millimetres in the robot base frame.
 
-This module deliberately does NOT reuse ``service._backproject_depth`` (which
-has ambiguous units) -- it is self-contained so its mm convention is
-unambiguous end to end.
+This module now DOES go through the same ``backproject`` primitive
+``service._backproject_depth`` wraps (Task 7's ``core.depth_geometry``) --
+indirectly, via the ``ColorRegistered`` the caller builds. The reason it used to
+opt out no longer applies: the old raw-depth-is-mm convention was ambiguous by
+construction (a caller had to know the frame's units), whereas ``CameraGeometry``
+now makes the unit explicit and SHARED by every consumer (this module, the scan
+gate, the TSDF fuse). ``median_z_near`` reads the median of the ALREADY-mm points
+registered near a colour pixel -- there is nothing left to duplicate.
 
 Interior direction (which side of a boundary segment is "the surface"):
 derived PURELY LOCALLY, never from the mean of the whole polygon's vertices.
@@ -54,18 +60,6 @@ _MIN_POLY_SPAN_PX = 2.0
 # fires once theta exceeds ~171.4 degrees (arms within ~8.6 degrees of exactly
 # collinear) -- i.e. not a real corner, just a point on a near-straight run.
 _MIN_ARM_BISECTOR_NORM = 0.15
-
-
-def _median_depth(depth, px, py, window_px: int) -> float:
-    h, w = depth.shape
-    x0, x1 = max(0, px - window_px), min(w, px + window_px + 1)
-    y0, y1 = max(0, py - window_px), min(h, py + window_px + 1)
-    patch = np.asarray(depth[y0:y1, x0:x1], dtype=float)
-    vals = patch[patch > 0]  # NaN and <=0 both excluded (NaN > 0 is False)
-    if len(vals) == 0:
-        return 0.0
-    z = float(np.median(vals))
-    return z if np.isfinite(z) else 0.0
 
 
 def _deproject_base(u_px, v_px, z_mm, K, T_base_cam) -> np.ndarray:
@@ -159,10 +153,10 @@ def _walk_arm(poly_px, start_idx, step, arm_len_px, n_samples, *,
     return pts_arr, normals_arr
 
 
-def extract_corner_evidence(depth, K, polygon_uv, T_base_cam, *,
+def extract_corner_evidence(registered, K, polygon_uv, T_base_cam, *,
                              corner_hint_uv=(0.5, 0.5), arm_frac: float = 0.35,
                              samples_per_arm: int = 40, inset_px: float = 4.0,
-                             window_px: int = 2, min_valid_frac: float = 0.3,
+                             window_px: int = 3, min_valid_frac: float = 0.3,
                              min_points_per_arm: int = 4,
                              max_arm_turn_deg: float = 60.0,
                              closed: bool = False):
@@ -197,11 +191,18 @@ def extract_corner_evidence(depth, K, polygon_uv, T_base_cam, *,
     and a corner genuinely at an array end, the missing arm's evidence is
     zero and the function correctly returns None rather than presenting
     single-arm data as pooled.
+
+    ``registered`` (new): a :class:`~tasni.core.depth_geometry.ColorRegistered` --
+    the caller's colour-registered depth points for this frame -- REPLACES the raw
+    ``depth`` array. ``window_px`` is therefore a search RADIUS over those points'
+    own (float, sub-pixel) colour positions (``ColorRegistered.median_z_near``), not
+    a pixel BOX on the depth image; its default moved 2 -> 3 because native depth is
+    coarser than colour and sparser once registered, so a slightly wider radius is
+    needed to reliably find neighbours near a sample point.
     """
-    depth = np.asarray(depth, dtype=float)
-    if depth.ndim != 2:
+    if registered is None or len(registered) == 0:
         return None
-    h, w = depth.shape
+    w, h = registered.color_size
     poly = np.asarray(polygon_uv, dtype=float).reshape(-1, 2)
     if len(poly) < 3 or not np.all(np.isfinite(poly)):
         return None
@@ -252,8 +253,8 @@ def extract_corner_evidence(depth, K, polygon_uv, T_base_cam, *,
             px, py = int(round(sample[0])), int(round(sample[1]))
             if not (0 <= px < w and 0 <= py < h):
                 continue
-            z = _median_depth(depth, px, py, window_px)
-            if z <= 0 or not np.isfinite(z):
+            z = registered.median_z_near(px, py, window_px)
+            if not np.isfinite(z) or z <= 0:
                 continue
             point = _deproject_base(sample[0], sample[1], z, K, T_base_cam)
             if not np.all(np.isfinite(point)):
@@ -290,8 +291,8 @@ def extract_corner_evidence(depth, K, polygon_uv, T_base_cam, *,
         corner_sample = corner_px + inset_px * corner_bisector
         cpx, cpy = int(round(corner_sample[0])), int(round(corner_sample[1]))
         if 0 <= cpx < w and 0 <= cpy < h:
-            zc = _median_depth(depth, cpx, cpy, window_px)
-            if zc > 0 and np.isfinite(zc):
+            zc = registered.median_z_near(cpx, cpy, window_px)
+            if np.isfinite(zc) and zc > 0:
                 cb = _deproject_base(corner_sample[0], corner_sample[1], zc, K, T_base_cam)
                 if np.all(np.isfinite(cb)):
                     corner_base = tuple(float(v) for v in cb)

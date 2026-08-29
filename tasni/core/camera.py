@@ -1,9 +1,22 @@
 """RealSense-over-TCP client (the Jetson camera server on port 1024).
 
-Reuses the wire format and decode logic from the original macros:
+Protocol 2 (Tasks 4-7): the per-frame wire header is unchanged --
 
     16-byte header  ``<I depth_len><I color_len><d timestamp>``
     then ``depth`` (lz4-compressed ``.npy``) + ``color`` (JPEG)
+
+-- but a depth-carrying connection now opens with ``MODE FULL V2`` (or
+``MODE BURST V2``), answered by ONE newline-terminated JSON *greeting* line
+before any frame bytes: the depth intrinsics, the depth->colour extrinsic, and
+the depth unit (0.1 mm; see :mod:`.depth_geometry`). Depth itself is NATIVE
+(1280x720) and UNALIGNED to colour, so ``Frame.geometry`` carries that greeting
+and every depth consumer must backproject through it rather than assume
+aligned 1 mm depth. A server that refuses (still on the old protocol, or the
+host never restarted) answers with an ``ERR`` line instead of the greeting,
+which we turn into a loud :class:`CameraError` — the whole point being that
+misreading that JSON line as a raw frame length must never just hang.
+``MODE COLOR`` paths are unchanged: no V2 token is sent, no greeting is read,
+``Frame.geometry`` stays ``None``.
 
 The server is unicast/synchronous, so — like the macros — we open one socket per
 grab. ``turbojpeg``/``lz4`` are imported lazily with an OpenCV fallback for JPEG,
@@ -23,8 +36,14 @@ from dataclasses import dataclass
 import numpy as np
 
 from .config import CameraConfig
+from .depth_geometry import CameraGeometry
 
 _HEADER = struct.Struct("<IId")  # depth_len, color_len, timestamp
+# Protocol-2 handshake tokens. A depth-carrying connection sends one of these
+# instead of nothing (the pre-V2 default); MODE COLOR is unchanged (see
+# _request_color_only) since color-only frames never need the depth greeting.
+_HELLO_FULL = b"MODE FULL V2\n"
+_HELLO_BURST = b"MODE BURST V2\n"
 
 
 def _set_nodelay(sock: socket.socket) -> None:
@@ -39,9 +58,10 @@ def _set_nodelay(sock: socket.socket) -> None:
 @dataclass
 class Frame:
     color: np.ndarray              # HxWx3 BGR
-    depth: np.ndarray | None       # HxW depth (uint16/float) or None if not decoded
+    depth: np.ndarray | None       # HxW NATIVE depth (uint16, geometry.depth_unit_mm per step) or None
     timestamp: float
     telemetry: dict | None = None
+    geometry: "CameraGeometry | None" = None   # the connection's greeting; None on colour-only paths
 
 
 class CameraError(RuntimeError):
@@ -55,6 +75,7 @@ class CameraClient:
         self.config = config
         self._jpeg = None
         self._host: str | None = None      # last host that actually connected
+        self.geometry: CameraGeometry | None = None   # last-parsed protocol-2 greeting
 
     # -- host selection -----------------------------------------------------
     @property
@@ -164,6 +185,54 @@ class CameraClient:
             buf.extend(packet)
         return bytes(buf)
 
+    @staticmethod
+    def _read_line(sock: socket.socket, maxlen: int = 65536) -> bytes:
+        """Read one newline-terminated line, byte-by-byte, from an
+        already-connected socket. Used only for the protocol-2 greeting, which is
+        a single short JSON line -- there is no framing to tell us its length in
+        advance, so we cannot use ``_recv_exact``. Every caller of a depth path
+        expects a :class:`CameraError` (mirrors ``_read_raw``'s wrapping below),
+        so a dropped connection during the greeting (``ConnectionResetError`` /
+        ``BrokenPipeError`` -- both ``OSError``, neither ``socket.timeout``) must
+        not surface as a raw ``OSError``."""
+        buf = bytearray()
+        while len(buf) < maxlen:
+            try:
+                ch = sock.recv(1)
+            except socket.timeout as e:
+                raise CameraError("camera timeout waiting for the protocol-2 greeting") from e
+            except OSError as e:
+                raise CameraError(f"camera socket error while reading the greeting: {e}") from e
+            if not ch:
+                raise CameraError("connection closed by camera server before the greeting")
+            buf.extend(ch)
+            if ch == b"\n":
+                return bytes(buf)
+        raise CameraError("camera greeting exceeded 64 KB")
+
+    def _read_greeting(self, sock: socket.socket) -> CameraGeometry:
+        """Protocol 2: one JSON line before any frame. A refusal line means the
+        server changed protocol under a host that never restarted."""
+        line = self._read_line(sock)
+        if line.startswith(b"ERR"):
+            raise CameraError(
+                f"camera server refused the depth stream: {line.decode(errors='replace').strip()} "
+                "- restart the Tasni backend (it is speaking an older protocol)")
+        try:
+            geom = CameraGeometry.from_greeting(json.loads(line.decode("utf-8")))
+        except UnicodeDecodeError as e:
+            # Binary frame bytes where greeting belongs = server is still pre-protocol-2.
+            # Measured live on 2026-08-29 during deploy window (host v2, server old).
+            raise CameraError(
+                f"camera server sent binary frame bytes where the protocol-2 greeting should be "
+                f"(byte 0x{line[0]:02x} at position 0) — the server is still on the old protocol. "
+                f"Deploy the new server and restart it: `py -3.10 tools/jetson_deploy.py deploy`"
+            ) from e
+        except (ValueError, json.JSONDecodeError) as e:
+            raise CameraError(f"invalid camera greeting: {e}") from e
+        self.geometry = geom
+        return geom
+
     def _read_raw(self, sock: socket.socket) -> "tuple[bytes, bytes, float]":
         """Read one frame's raw bytes (depth_raw, color_raw, timestamp) from an
         already-connected socket, without decoding. The server always sends depth
@@ -181,12 +250,15 @@ class CameraClient:
             raise CameraError(f"camera socket error: {e}") from e
         return depth_raw, color_raw, timestamp
 
-    def _read_frame(self, sock: socket.socket, with_depth: bool) -> Frame:
-        """Read + decode exactly one frame from an already-connected socket."""
+    def _read_frame(self, sock: socket.socket, with_depth: bool,
+                    geometry: CameraGeometry | None = None) -> Frame:
+        """Read + decode exactly one frame from an already-connected socket.
+        ``geometry`` is the greeting already read for this connection (None on a
+        colour-only path, which never reads one)."""
         depth_raw, color_raw, timestamp = self._read_raw(sock)
         color = self._decode_color(color_raw)
         depth = self._decode_depth(depth_raw) if with_depth else None
-        return Frame(color=color, depth=depth, timestamp=timestamp)
+        return Frame(color=color, depth=depth, timestamp=timestamp, geometry=geometry)
 
     @staticmethod
     def _request_color_only(sock: socket.socket, quality: int | None = None,
@@ -223,13 +295,18 @@ class CameraClient:
         One-shot: used for the authoritative gate grab and per-pose capture (which
         leave ``quality`` at the server default — high — for crisp ChArUco corners).
         ``timeout`` overrides the configured socket timeout. ``color_only`` asks
-        the server to skip the (unused-for-calibration) depth payload. For
+        the server to skip the (unused-for-calibration) depth payload — and skips
+        the V2 handshake entirely, since there is no depth greeting to read. For
         continuous live preview use :meth:`stream` — re-connecting per frame is slow."""
         with self._connect(timeout)[0] as s:
+            geometry = None
             if color_only:
                 self._request_color_only(s, quality)
+            else:
+                s.sendall(_HELLO_FULL)
+                geometry = self._read_greeting(s)
             try:
-                return self._read_frame(s, with_depth)
+                return self._read_frame(s, with_depth, geometry=geometry)
             finally:
                 try:
                     s.shutdown(socket.SHUT_RDWR)
@@ -260,13 +337,29 @@ class CameraClient:
         telemetry_reader = None
         if scan_telemetry:
             telemetry_reader = _TelemetryReader(host, cfg.port, timeout_s=timeout)
+        geometry = None
         if color_only or h264:                       # h264 is inherently color-only
             self._request_color_only(
                 s, quality, codec=codec, bitrate=bitrate,
                 scan_telemetry=scan_telemetry)
+        else:
+            s.sendall(_HELLO_FULL)
+            # A refusal/close here happens BEFORE the try/finally below, so it
+            # would otherwise leak this socket (and the telemetry side-channel)
+            # on every retry of a live preview against a stale backend --
+            # exactly the failure protocol 2's loud-refusal contract exists to
+            # avoid. Close what we opened, then let the same CameraError through
+            # unchanged.
+            try:
+                geometry = self._read_greeting(s)
+            except Exception:
+                if telemetry_reader is not None:
+                    telemetry_reader.close()
+                s.close()
+                raise
         try:
             yield (_H264Stream(s, telemetry_reader=telemetry_reader) if h264
-                   else _CameraStream(self, s, telemetry_reader=telemetry_reader))
+                   else _CameraStream(self, s, telemetry_reader=telemetry_reader, geometry=geometry))
         finally:
             if telemetry_reader is not None:
                 telemetry_reader.close()
@@ -289,23 +382,46 @@ class CameraClient:
         from stalling on a per-pose depth transfer over Wi-Fi while preserving the
         exact same per-frame data the per-pose path uses (so fusion is identical).
 
-        Negotiates support first: sends ``MODE BURST`` and expects ``BURST READY``.
-        A server that predates burst would instead start a full stream, so the ack
-        check fails and we raise :class:`CameraError` — letting the caller fall back
-        to per-pose :meth:`grab`. Unicast: stop any other camera user first."""
+        Negotiates support first: sends ``MODE BURST V2`` and expects
+        ``BURST READY``, immediately followed by the protocol-2 greeting (same as
+        :meth:`grab`/:meth:`stream` — burst frames are still depth+color and need
+        the same depth intrinsics/extrinsic to interpret). A server that predates
+        burst would instead start a full stream, so the ack check fails and we
+        raise :class:`CameraError` — letting the caller fall back to per-pose
+        :meth:`grab`. A server that predates V2 but still speaks burst would answer
+        with the protocol refusal line instead of ``BURST READY``, which the same
+        ack check turns into the same :class:`CameraError`. Unicast: stop any other
+        camera user first."""
         s = self._connect(timeout)[0]
         ready = b""
         try:
-            s.sendall(b"MODE BURST\n")
+            s.sendall(_HELLO_BURST)
             ready = self._recv_exact(s, len(b"BURST READY\n"))
         except (CameraError, OSError) as e:
             s.close()
             raise CameraError(f"burst handshake failed (old server?): {e}") from e
         if not ready.startswith(b"BURST READY"):
             s.close()
+            if ready.startswith(b"ERR"):
+                # A protocol-2 server refusing MODE BURST V2 (host never
+                # restarted) looks identical to "no burst support" unless we
+                # check for the ERR prefix here -- give the operator the same
+                # actionable hint grab()/stream() give instead of the generic
+                # fallback message.
+                raise CameraError(
+                    "camera server refused the burst stream (protocol mismatch) "
+                    "- restart the Tasni backend (it is speaking an older protocol)")
             raise CameraError("camera server does not support burst capture")
+        # Same leak concern as stream(): a refusal/close here happens BEFORE the
+        # try/finally below, so close what we opened before letting the error
+        # through unchanged.
         try:
-            yield _BurstSession(self, s)
+            geometry = self._read_greeting(s)
+        except Exception:
+            s.close()
+            raise
+        try:
+            yield _BurstSession(self, s, geometry)
         finally:
             try:
                 s.shutdown(socket.SHUT_RDWR)
@@ -319,9 +435,11 @@ class _BurstSession:
     :meth:`fetch_all`; :meth:`clear` drops that buffer (so nothing is left on the
     Jetson). Commands are newline-terminated; replies are length-prefixed."""
 
-    def __init__(self, client: "CameraClient", sock: socket.socket):
+    def __init__(self, client: "CameraClient", sock: socket.socket,
+                 geometry: CameraGeometry | None = None):
         self._client = client
         self._sock = sock
+        self._geometry = geometry
 
     def capture(self) -> bytes | None:
         """Tell the server to grab + buffer one depth+color frame. Returns a small
@@ -339,7 +457,7 @@ class _BurstSession:
         framing is identical to the normal stream, so decode is shared)."""
         self._sock.sendall(b"GET\n")
         count = struct.unpack("<I", self._client._recv_exact(self._sock, 4))[0]
-        return [self._client._read_frame(self._sock, with_depth=True)
+        return [self._client._read_frame(self._sock, with_depth=True, geometry=self._geometry)
                 for _ in range(count)]
 
     def clear(self) -> None:
@@ -407,10 +525,12 @@ class _CameraStream:
     """A held-open camera connection; ``read()`` returns the next frame."""
 
     def __init__(self, client: "CameraClient", sock: socket.socket,
-                 telemetry_reader: _TelemetryReader | None = None):
+                 telemetry_reader: _TelemetryReader | None = None,
+                 geometry: CameraGeometry | None = None):
         self._client = client
         self._sock = sock
         self._telemetry_reader = telemetry_reader
+        self._geometry = geometry
 
     def read(self, *, with_depth: bool = False, drain: bool = False) -> Frame:
         """Return the next frame. With ``drain=True``, first skip any frames
@@ -429,7 +549,8 @@ class _CameraStream:
         depth = self._client._decode_depth(depth_raw) if with_depth else None
         telemetry = (self._telemetry_reader.latest()
                      if self._telemetry_reader is not None else None)
-        return Frame(color=color, depth=depth, timestamp=ts, telemetry=telemetry)
+        return Frame(color=color, depth=depth, timestamp=ts, telemetry=telemetry,
+                     geometry=self._geometry)
 
 
 class _H264Stream:

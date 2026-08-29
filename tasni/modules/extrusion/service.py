@@ -13,6 +13,7 @@ import numpy as np
 from ...core import runs
 from ...core.build_info import build_info, staleness_warning
 from ...core.config import ExtrusionConfig
+from ...core.depth_geometry import CameraGeometry
 from ...core.jobrunner import JobContext
 from ...core.logging import REPO_ROOT, new_run_dir
 from ...core.rdk_io import RdkIO
@@ -992,7 +993,17 @@ class CylinderPrintJob:
                         if frame.depth is None:
                             raise RuntimeError(
                                 f"layer {layer.layer_index}: RGB-D capture returned no depth")
-                        standoff = standoff_report(T_work_camera, aim, frame.depth)
+                        # Checked before standoff_report ever reads frame.depth as
+                        # millimetres: a missing greeting means the unit is unknown,
+                        # and defaulting to 1.0 mm/word on a 0.1 mm-unit frame reads
+                        # a true ~300 mm standoff as ~3000 mm -- a loud failure that
+                        # blames the robot's arrival instead of naming the real cause.
+                        if frame.geometry is None:
+                            raise RuntimeError(
+                                f"layer {layer.layer_index}: depth frame arrived without "
+                                "a protocol-2 greeting")
+                        standoff = standoff_report(T_work_camera, aim, frame.depth,
+                                                   unit_mm=frame.geometry.depth_unit_mm)
                         arrival_fault = standoff_fault(
                             standoff, ecfg.inspection_standoff_tolerance_mm)
                         if arrival_fault is None and not snapshot.stationary:
@@ -1022,7 +1033,12 @@ class CylinderPrintJob:
                                     "inspection_target": inspect["target"],
                                     "inspection_pose": inspect["pose"],
                                     "T_work_camera": np.asarray(
-                                        T_work_camera, dtype=float).tolist()},
+                                        T_work_camera, dtype=float).tolist(),
+                                    # The frame's own greeting -- see
+                                    # figures.geometry_for_take, the only place
+                                    # a take without one falls back to the
+                                    # legacy aligned 1 mm convention.
+                                    "camera_geometry": frame.geometry.to_dict()},
                         valve_transitions=[v for v in valve if v.get("layer_index") in
                                            (None, layer.layer_index)])
                     try:
@@ -1031,9 +1047,10 @@ class CylinderPrintJob:
                         base_manifest["provenance"]["standoff"] = standoff
                         if arrival_fault:
                             raise RuntimeError(arrival_fault)
+                        camera_cfg = services.config.camera
                         processed = process_observation(
-                            color=frame.color, depth=frame.depth,
-                            T_work_camera=T_work_camera, K=services.config.camera.K,
+                            color=frame.color, depth=frame.depth, geometry=frame.geometry,
+                            T_work_camera=T_work_camera, K=camera_cfg.K, dist=camera_cfg.dist,
                             plan=self.plan, layer=layer, config=ecfg)
                     except Exception as exc:
                         manifest = LayerManifest(**base_manifest,
@@ -1146,6 +1163,15 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
     if color is None:
         raise RuntimeError("archived color image could not be decoded")
     depth = np.load(depth_path, allow_pickle=False)
+    geom_dict = provenance.get("camera_geometry")
+    if geom_dict is not None and not geom_dict.get("legacy_aligned"):
+        geometry = CameraGeometry.from_greeting(geom_dict)
+    else:
+        # Pre-protocol-2 archive (or one written before this field existed):
+        # depth was aligned to colour, 1 mm units -- see figures.geometry_for_take,
+        # the only other place this fallback is allowed to happen.
+        geometry = CameraGeometry.legacy_aligned(
+            np.asarray(intrinsics["K"], float), (depth.shape[1], depth.shape[0]))
     # Score the take against the plan it was MEASURED against, not the plan the
     # trial was created with. A measure-only session is created before
     # Characterize -> Apply, so trial.json carries the pre-Apply recipe and centre
@@ -1169,9 +1195,20 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
     if layer_index > len(plan.layers):
         raise RuntimeError("archived layer index exceeds the stored recipe")
     processed = process_observation(
-        color=color, depth=depth,
+        color=color, depth=depth, geometry=geometry,
         T_work_camera=np.asarray(transform, dtype=float),
         K=np.asarray(intrinsics["K"], dtype=float),
+        # A legacy archive's registration is the IDENTITY (depth K == colour K,
+        # zero extrinsic -- see CameraGeometry.legacy_aligned). Handing
+        # project_to_color the CALIBRATED distortion anyway breaks that: it
+        # re-projects through the distortion map, so uv != (u, v) and the gate
+        # is sampled off-pixel (this checkout's k1=0.1148/k2=-0.2386 moves it a
+        # few px at the ring's radius, tens near the frame edge) -- and
+        # figures._compute_stages already passes dist=None for the same take,
+        # so the reprocess button and the figure would gate it differently.
+        # Protocol-2 takes keep the calibrated distortion, same as a live
+        # capture (Task 9 review, Important 4).
+        dist=None if geometry.legacy else intrinsics.get("dist_coeffs"),
         plan=plan, layer=plan.layers[layer_index - 1],
         config=ExtrusionConfig.model_validate(processing_payload))
     reprocessed_at = _utcnow()

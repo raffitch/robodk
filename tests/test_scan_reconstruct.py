@@ -17,10 +17,13 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tasni.core.geometry import Rt_to_T  # noqa: E402
 from tasni.modules.scan import reconstruct as rc  # noqa: E402
 from tasni.modules.scan.plane import work_plane_from_points  # noqa: E402
+
+import geometry_fixtures as gf  # noqa: E402
 
 # Small synthetic camera (keeps the test fast); units are mm (RoboDK base units).
 W, H = 320, 240
@@ -67,10 +70,11 @@ def test_fuse_and_plane_end_to_end():
     poses = [_look_at((0, 0, 500), (0, 0, 0)),
              _look_at((120, 0, 520), (0, 0, 0)),
              _look_at((0, 120, 520), (0, 0, 0))]
-    views = [rc.ScanView(*_render(T), pose_T=T) for T in poses]
+    views = [rc.ScanView(*_render(T), pose_T=T, geometry=gf.aligned(K, (W, H)))
+             for T in poses]
 
-    res = rc.fuse_views(views, K, W, H, voxel_size_m=0.005, sdf_trunc_m=0.02,
-                        depth_scale=1000.0, depth_min_m=0.2, depth_max_m=1.5)
+    res = rc.fuse_views(views, voxel_size_m=0.005, sdf_trunc_m=0.02,
+                        depth_min_m=0.2, depth_max_m=1.5)
     assert res.n_views == 3
     pts = rc.cloud_points_m(res.cloud)
     assert len(pts) > 500, f"fused cloud nearly empty ({len(pts)} pts)"
@@ -96,6 +100,43 @@ def test_fuse_and_plane_end_to_end():
     print("[fuse] views 3 ->", len(pts), "pts; size",
           tuple(round(s, 3) for s in wp.size), "m; inliers",
           f"{wp.inlier_frac:.0%}; planar preview", len(flat_pp))
+
+
+def test_fuse_handles_0_1mm_native_units():
+    """R24: fuse_views must scale by the VIEW'S OWN geometry.depth_unit_mm, not a
+    hard-coded 1000 (uint16-mm) constant -- protocol 2 streams native 0.1 mm raw
+    depth. Re-quantizing the SAME synthetic scene at 0.1 mm units (10x the raw
+    integer value, same real-world mm) must fuse to the same plane."""
+    try:
+        import open3d  # noqa: F401
+    except Exception:
+        print("[skip] open3d not installed — `pip install -e .[scan]`")
+        return
+
+    poses = [_look_at((0, 0, 500), (0, 0, 0)),
+             _look_at((120, 0, 520), (0, 0, 0)),
+             _look_at((0, 120, 520), (0, 0, 0))]
+    geom = gf.aligned(K, (W, H), depth_unit_mm=0.1)
+    views = []
+    for T in poses:
+        color, depth = _render(T)
+        depth10 = (depth.astype(np.uint32) * 10).astype(np.uint16)
+        views.append(rc.ScanView(color, depth10, pose_T=T, geometry=geom))
+
+    res = rc.fuse_views(views, voxel_size_m=0.005, sdf_trunc_m=0.02,
+                        depth_min_m=0.2, depth_max_m=1.5)
+    assert res.n_views == 3
+    pts = rc.cloud_points_m(res.cloud)
+    assert len(pts) > 500, f"fused cloud nearly empty ({len(pts)} pts)"
+
+    wp = work_plane_from_points(pts, distance=0.006, min_inlier_frac=0.5)
+    normal_err_deg = float(np.degrees(np.arccos(np.clip(wp.normal @ [0, 0, 1], -1.0, 1.0))))
+    assert normal_err_deg < 1.0, normal_err_deg          # plane normal +Z within 1 deg
+    expect_m = 2.0 * SQUARE_HALF_MM / 1000.0
+    assert abs(wp.size[0] - expect_m) / expect_m < 0.05, wp.size   # extent within 5%
+    assert abs(wp.size[1] - expect_m) / expect_m < 0.05, wp.size
+    print("[fuse 0.1mm] native 0.1mm-unit view fuses to the same plane, normal err",
+          round(normal_err_deg, 3), "deg; size", tuple(round(s, 3) for s in wp.size))
 
 
 def test_measured_mesh_cleaner_drops_disconnected_island():
@@ -128,7 +169,6 @@ def test_measured_mesh_cleaner_drops_disconnected_island():
         min_support_views=2,
         min_support_ratio=0.35,
         min_normal_dot=0.35,
-        depth_scale=1000.0,
         depth_min_m=0.2,
         depth_max_m=1.5,
         keep_largest_component=True,
@@ -144,5 +184,6 @@ def test_measured_mesh_cleaner_drops_disconnected_island():
 
 if __name__ == "__main__":
     test_fuse_and_plane_end_to_end()
+    test_fuse_handles_0_1mm_native_units()
     test_measured_mesh_cleaner_drops_disconnected_island()
     print("\nreconstruct.py fusion chain test passed.")

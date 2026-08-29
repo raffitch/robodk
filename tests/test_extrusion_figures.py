@@ -7,15 +7,20 @@ the contract under test, not the processing chain.
 from __future__ import annotations
 
 import json
+import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-import extrusion_synthetic as syn
-from tasni.core.config import ExtrusionConfig
-from tasni.modules.extrusion.archive import ExtrusionArchive
-from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup, LayerManifest
-from tasni.modules.extrusion.toolpath import generate_cylinder_plan
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import extrusion_synthetic as syn  # noqa: E402
+import geometry_fixtures as gf  # noqa: E402
+from tasni.core.config import ExtrusionConfig  # noqa: E402
+from tasni.modules.extrusion.archive import ExtrusionArchive  # noqa: E402
+from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup, LayerManifest  # noqa: E402
+from tasni.modules.extrusion.toolpath import generate_cylinder_plan  # noqa: E402
 
 CENTER = (200.0, 150.0)
 RADIUS = 60.0
@@ -540,3 +545,30 @@ def test_a_frame_with_nothing_near_the_work_plane_gets_no_scene_panel(tmp_path):
 
     (layer_dir / "height-or-pointcloud.npy").unlink()
     assert mesh_panels(load_take(layer_dir)) == [], "nothing measurable, nothing drawn"
+
+
+# --------------------------------------------------- camera geometry (Task 9)
+
+def test_a_take_without_camera_geometry_renders_as_legacy_aligned(tmp_path):
+    from tasni.modules.extrusion import figures
+    layer_dir = write_take(tmp_path)                       # write_take records no camera_geometry
+    take = figures.load_take(layer_dir)
+    assert take.geometry is not None and take.geometry.legacy
+    assert take.geometry.depth_size == (1280, 720)
+    assert "legacy aligned" in take.label
+    assert figures._scene_points(take) is not None
+
+
+def test_a_protocol_2_take_uses_its_recorded_geometry(tmp_path):
+    import geometry_fixtures as gf
+    from tasni.modules.extrusion import figures
+    geom = gf.offset(color_K=syn.K_720P, color_size=syn.SIZE_720P,
+                     depth_K=syn.K_720P, depth_size=syn.SIZE_720P)
+    layer_dir = write_take(tmp_path, trial_id="t-v2")
+    manifest_file = layer_dir / "manifest.json"
+    payload = json.loads(manifest_file.read_text(encoding="utf-8"))
+    payload["provenance"]["camera_geometry"] = geom.to_dict()
+    manifest_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    take = figures.load_take(layer_dir)
+    assert take.geometry.legacy is False and take.geometry.depth_unit_mm == 0.1
+    assert "legacy" not in take.label

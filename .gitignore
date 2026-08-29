@@ -29,3 +29,6 @@ characterization/
 # Fetch with `tools/download_sam.py`. See models/README.md.
 models/*.onnx
 models/*.pt
+
+# Claude Code session worktrees (git worktrees nested in the checkout)
+.claude/worktrees/

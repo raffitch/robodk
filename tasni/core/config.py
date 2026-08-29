@@ -61,9 +61,10 @@ class CameraConfig(_Model):
     # when off-LAN, not to wait out a full connect timeout on every attempt.
     connect_probe_timeout_s: float = 1.5
     port: int = 1024
-    # The server streams color at 1280x720 (server_unicast_syncronous.py), so the
-    # intrinsics must be the 720p K — a 1080p setting would skew distance/tilt.
-    resolution: str = "1280x720"
+    # The server streams colour at 1920x1080 (server_unicast_syncronous.py
+    # COLOR_SIZE); K is picked by this key. Depth has its own model, carried in
+    # the per-connection greeting (core/depth_geometry.py).
+    resolution: str = "1920x1080"
     timeout_s: float = 10.0
     # resolution -> 3x3 color intrinsics K
     intrinsics: dict[str, list[list[float]]] = Field(
@@ -644,7 +645,6 @@ class ScanConfig(_Model):
     # a 3D weighted average -> denoised mesh. voxel_size drives resolution/cost.
     voxel_size_m: float = 0.0015        # 1.5 mm TSDF voxel fallback
     sdf_trunc_m: float = 0.008          # truncation distance (~4-8 voxels)
-    depth_scale: float = 1000.0         # RealSense depth units -> metres (uint16 mm)
     depth_min_m: float = 0.2            # ignore depth nearer than this
     depth_max_m: float = 1.5            # ignore depth farther than this (table standoff)
     preview_max_points: int = 300000    # decimate the cloud before streaming to the viewer
@@ -815,7 +815,7 @@ class ExtrusionConfig(_Model):
     # colour gate is catastrophic -- the mask doubles to ~8000 px and all four
     # takes exhaust the branch guard.
     plane_distance_threshold_m: float = Field(default=0.0015, gt=0)
-    voxel_size_m: float = Field(default=0.002, gt=0)
+    voxel_size_m: float = Field(default=0.001, gt=0)
     statistical_neighbors: int = Field(default=20, ge=3)
     statistical_std_ratio: float = Field(default=2.0, gt=0)
     radius_neighbors: int = Field(default=16, ge=2)
@@ -965,6 +965,27 @@ def save_overrides(updates: dict[str, Any]) -> Path:
     return path
 
 
+LEGACY_CONFIG_KEYS = {("scan", "depth_scale")}   # removed with protocol 2; the greeting carries the unit
+
+
+def migrate_camera_intrinsics(cam: CameraConfig) -> bool:
+    """Carry a CALIBRATED 720p K into the 1080p slot when that slot is still factory.
+    The D435i's 1080p RGB mode is an exact 1.5x scale of 720p (factory table:
+    1362.15/908.10 = 1.5000), and distortion coefficients are normalised, so this
+    is a pure rescale -- the hand-eye is a physical transform and stays valid."""
+    factory = _DEFAULT_INTRINSICS
+    cur720 = cam.intrinsics.get("1280x720")
+    cur1080 = cam.intrinsics.get("1920x1080")
+    if cur720 is None or cur1080 is None:
+        return False
+    if np.allclose(cur720, factory["1280x720"]) or not np.allclose(cur1080, factory["1920x1080"]):
+        return False
+    K = np.asarray(cur720, float).copy()
+    K[0, 0] *= 1.5; K[1, 1] *= 1.5; K[0, 2] *= 1.5; K[1, 2] *= 1.5
+    cam.intrinsics = {**cam.intrinsics, "1920x1080": K.tolist()}
+    return True
+
+
 def load_config(path: str | Path | None = None) -> AppConfig:
     """Build an :class:`AppConfig`, overlaying an optional JSON file.
 
@@ -972,10 +993,26 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     uses it if present; otherwise returns pure defaults.
     """
     cfg = AppConfig()
+    # ``path is None`` means "the default config file" -- that is the one
+    # save_overrides() below always writes to, so a migration triggered by it
+    # is safe to persist. A caller that deliberately passed a DIFFERENT path
+    # (e.g. a test's tmp_path config) gets migrated in memory but never has
+    # that file silently overwritten with the repo-root override file's
+    # content -- only an explicit path that happens to resolve to the same
+    # file is also saved.
+    save_to_default_file = path is None
     if path is None:
         candidate = Path(__file__).resolve().parents[2] / "tasni.config.json"
         path = candidate if candidate.exists() else None
     if path is not None:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+        for section, key in LEGACY_CONFIG_KEYS:
+            if isinstance(data.get(section), dict) and key in data[section]:
+                data[section].pop(key)
+                print(f"config: dropped legacy key {section}.{key} (removed with camera protocol 2)")
         _merge(cfg, data)
+        if migrate_camera_intrinsics(cfg.camera):
+            print("config: migrated calibrated 1280x720 intrinsics to 1920x1080 (x1.5)")
+            if save_to_default_file or Path(path).resolve() == config_file_path().resolve():
+                save_overrides({"camera": {"intrinsics": cfg.camera.intrinsics}})
     return cfg

@@ -372,55 +372,35 @@ def test_latest_characterization_skips_malformed_file(tmp_path):
 # depth/K fixtures, the same style test_scan_job.py already uses.
 
 from tools.characterize_distance import (  # noqa: E402
-    _backproject_valid_mm, _corner_point_mm, _parse_distances, _reference_corner_pair,
+    _board_hull_uv_norm, _corner_point_mm, _parse_distances, _reference_corner_pair,
 )
 
 
-def test_backproject_valid_mm_keeps_only_positive_depth_and_projects_correctly():
-    depth = np.zeros((4, 4), dtype=np.uint16)
-    depth[1, 1] = 500      # one valid pixel
-    depth[2, 2] = 600      # a second, distinct valid pixel
-    K = np.array([[100.0, 0, 2.0], [0, 100.0, 2.0], [0, 0, 1.0]])
-
-    pts = _backproject_valid_mm(depth, K, depth_scale=1000.0)
-
-    assert pts.shape == (2, 3)
-    assert sorted(pts[:, 2].tolist()) == [500.0, 600.0]
-    row_500 = pts[np.isclose(pts[:, 2], 500.0)][0]
-    # pixel (u=1, v=1), K principal point (2, 2), fx=fy=100, z=500:
-    # x = (u - cx) / fx * z = (1 - 2) / 100 * 500 = -5.0 (same for y).
-    assert row_500[0] == pytest.approx(-5.0)
-    assert row_500[1] == pytest.approx(-5.0)
+def test_board_hull_uv_norm_divides_by_colour_size_not_depth_size():
+    """The caution behind the loop rewrite: the hull must be normalised by the
+    COLOUR frame size (corners are detected in frame.color), never the depth
+    image's -- getting this backwards silently shrinks or inflates the board
+    region every downstream plane statistic is computed from."""
+    corners_px = np.array([[10.0, 20.0], [110.0, 20.0], [110.0, 220.0], [10.0, 220.0]])
+    hull = _board_hull_uv_norm(corners_px, w=200, h=400)
+    assert hull.shape[1] == 2
+    assert np.isclose(hull[:, 0].min(), 10.0 / 200)
+    assert np.isclose(hull[:, 0].max(), 110.0 / 200)
+    assert np.isclose(hull[:, 1].min(), 20.0 / 400)
+    assert np.isclose(hull[:, 1].max(), 220.0 / 400)
 
 
-def test_backproject_valid_mm_empty_when_no_valid_depth():
-    depth = np.zeros((4, 4), dtype=np.uint16)
-    pts = _backproject_valid_mm(depth, np.eye(3), depth_scale=1000.0)
-    assert pts.shape == (0, 3)
+def test_corner_point_mm_returns_none_when_no_registered_depth_nearby():
+    """No registered points anywhere near (u, v) -- median_z_near returns NaN
+    -- must read as "no measurement", not a 0.0mm-looking point."""
+    from tasni.core.depth_geometry import ColorRegistered
 
-
-def test_corner_point_mm_uses_window_median_and_resists_a_single_outlier():
-    """The median window must both (a) recover from the corner pixel itself
-    having no depth (a common ChArUco-corner artefact -- correlation dips
-    right at a checkerboard edge) and (b) not be dragged toward a single wild
-    outlier elsewhere in the window -- proving it is really a median, not a
-    mean, over the window."""
-    depth = np.full((10, 10), 500, dtype=np.uint16)
-    depth[5, 5] = 0          # the corner pixel itself: no depth
-    depth[4, 4] = 9000       # one wild outlier inside the 5x5 window
-    K = np.array([[200.0, 0, 5.0], [0, 200.0, 5.0], [0, 0, 1.0]])
-
-    pt = _corner_point_mm(depth, K, u=5.0, v=5.0, depth_scale=1000.0, window=2)
-
-    assert pt is not None
-    assert pt[2] == pytest.approx(500.0)   # median resists the 9000 outlier
-    assert pt[0] == pytest.approx(0.0)     # (u,v) == principal point -> x=y=0
-    assert pt[1] == pytest.approx(0.0)
-
-
-def test_corner_point_mm_returns_none_when_window_has_no_valid_depth():
-    depth = np.zeros((10, 10), dtype=np.uint16)
-    assert _corner_point_mm(depth, np.eye(3), u=5.0, v=5.0) is None
+    reg = ColorRegistered(
+        pts_mm=np.zeros((0, 3)), uv=np.zeros((0, 2)), uv_depth=np.zeros((0, 2), int),
+        color_size=(320, 240), depth_size=(160, 120), stride=1,
+        depth_K=np.eye(3), color_K_factory=np.eye(3))
+    K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
+    assert _corner_point_mm(reg, 200.0, 150.0, K, None, disc_px=6) is None
 
 
 def test_reference_corner_pair_is_genuinely_diagonally_opposite_on_a_real_board():
@@ -468,3 +448,28 @@ def test_parse_distances_parses_normal_input():
 
 def test_parse_distances_tolerates_stray_whitespace_and_trailing_comma():
     assert _parse_distances(" 300, 400,500, ") == [300.0, 400.0, 500.0]
+
+
+# --- Task 11: colour-detected corners read depth through registered discs (not
+# an aligned-image assumption, not a hardcoded 1mm depth unit). Proves
+# _corner_point_mm and _board_points_mm against a synthetic offset (protocol-2,
+# 0.1mm) registration built the same way tests/test_depth_geometry.py does.
+
+def test_corner_point_reads_depth_through_the_colour_disc():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import geometry_fixtures as gf
+    from tasni.core.depth_geometry import ColorRegistered
+    from tools.characterize_distance import _corner_point_mm, _board_points_mm
+    K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
+    geom = gf.offset(color_K=K, color_size=(320, 240))
+    xs, ys = np.meshgrid(np.linspace(-120, 120, 97), np.linspace(-90, 90, 73))
+    plane = np.column_stack([xs.ravel(), ys.ravel(), np.full(xs.size, 450.0)])
+    depth = gf.render_depth_in_depth_camera(plane, geom)
+    reg = ColorRegistered.build(depth, geom, K, None)
+    p = _corner_point_mm(reg, 200.0, 150.0, K, None, disc_px=6)
+    assert p is not None and abs(p[2] - 450.0) < 1.0
+    np.testing.assert_allclose(p[:2], [(200 - 160) / 300 * p[2], (150 - 120) / 300 * p[2]], atol=1e-6)
+    board = _board_points_mm(reg, [[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]])
+    assert len(board) > 100 and np.all(np.abs(board[:, 2] - 450.0) < 1.5)

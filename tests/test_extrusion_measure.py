@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-import extrusion_synthetic as syn
-from tasni.modules.extrusion.processing import depth_to_work_points
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import extrusion_synthetic as syn  # noqa: E402
+import geometry_fixtures as gf  # noqa: E402
+from tasni.modules.extrusion.processing import depth_to_work_points  # noqa: E402
 
 
 def test_renderer_puts_a_ring_where_it_says_at_the_height_it_says():
@@ -17,7 +21,7 @@ def test_renderer_puts_a_ring_where_it_says_at_the_height_it_says():
     depth = syn.render_scene([syn.RingSpec(60.0, 8.0, center, height_fn=syn.flat(6.0))], T,
                              plane_center_xy_mm=center, noise_mm=0.0)
     assert depth.dtype == np.uint16 and depth.shape == (720, 1280)
-    points, raw = depth_to_work_points(depth, syn.K_720P, T)
+    points, raw = depth_to_work_points(depth, gf.aligned(syn.K_720P, syn.SIZE_720P), T)
     assert raw > 100_000                                  # plane + ring both rendered
     ring = points[points[:, 2] > 3.0]
     radii = np.linalg.norm(ring[:, :2] - np.array(center), axis=1)
@@ -85,7 +89,9 @@ def observe(plan, layer_index, rings, *, config=None, floor_profile=None, seed=0
     kwargs = {} if floor_profile is None else {"floor_profile": floor_profile}
     if stages is not None:
         kwargs["stages"] = stages
-    return process_observation(color=color, depth=depth, T_work_camera=T, K=syn.K_720P,
+    return process_observation(color=color, depth=depth,
+                               geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
+                               T_work_camera=T, K=syn.K_720P, dist=None,
                                plan=plan, layer=layer, config=config or ExtrusionConfig(),
                                **kwargs)
 
@@ -141,7 +147,9 @@ def observe_with_board_bias(plan, layer_index, rings, patch, *, seed=0):
     parts += [ring.surface_points() for ring in rings]
     depth = syn.render_depth(np.vstack(parts), T, seed=seed)
     color = np.zeros((syn.SIZE_720P[1], syn.SIZE_720P[0], 3), np.uint8)
-    return process_observation(color=color, depth=depth, T_work_camera=T, K=syn.K_720P,
+    return process_observation(color=color, depth=depth,
+                               geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
+                               T_work_camera=T, K=syn.K_720P, dist=None,
                                plan=plan, layer=layer, config=ExtrusionConfig())
 
 
@@ -199,9 +207,11 @@ def test_real_frame_with_board_noise_measures_the_applied_ring():
     depth = fixture["depth"]
     color = np.zeros((*depth.shape, 3), np.uint8)
 
-    out = process_observation(color=color, depth=depth, T_work_camera=fixture["T_work_camera"],
-                              K=fixture["K"], plan=plan, layer=plan.layers[0],
-                              config=ExtrusionConfig())
+    out = process_observation(
+        color=color, depth=depth,
+        geometry=gf.aligned(fixture["K"], (depth.shape[1], depth.shape[0])),
+        T_work_camera=fixture["T_work_camera"], K=fixture["K"], dist=None,
+        plan=plan, layer=plan.layers[0], config=ExtrusionConfig())
 
     m = out.metrics
     assert m.valid, m.warnings
@@ -216,7 +226,8 @@ def test_real_frame_with_board_noise_measures_the_applied_ring():
 
 # ------------------------------------------- chroma gate: bead vs board by colour
 
-from tasni.modules.extrusion.processing import chroma_gated_depth, deposit_floor_mm
+from tasni.core.depth_geometry import ColorRegistered
+from tasni.modules.extrusion.processing import chroma_gate_mask, deposit_floor_mm
 
 RING1_TAKE04 = (Path(__file__).parent / "fixtures" / "extrusion" / "ring1"
                 / "ring1_take04_branchguard_20260829.npz")
@@ -243,9 +254,21 @@ def test_chroma_gate_clears_the_board_lobe_that_exhausted_the_branch_guard():
     pytest.importorskip("open3d")
     f = _ring1_take04()
 
-    out = process_observation(color=f["color"], depth=f["depth"], K=f["K"],
+    # This fixture is a pre-protocol-2 capture with 1 mm depth WORDS, so it is
+    # processed at the 2 mm voxel it was captured under. The new 1 mm default
+    # (spec 4.4) sits at this archive's quantisation floor, where it merges
+    # nothing and lets noise through -- it flips this frame's branch-guard
+    # outcome in BOTH directions across the two archived takes. On protocol-2
+    # depth (0.1 mm words) 1 mm spans ten quantisation steps, which is the point.
+    # Pinned here too (Ruling R23): this is the gate-ENABLED half of the pair
+    # below (test_the_same_frame_still_fails_with_the_chroma_gate_disabled) --
+    # the pair's whole claim, "crashes with the gate off, survives with it on",
+    # only holds if both halves measure the SAME frame at the SAME voxel.
+    out = process_observation(color=f["color"], depth=f["depth"],
+                              geometry=gf.aligned(f["K"], (1280, 720)), K=f["K"], dist=None,
                               T_work_camera=f["T_work_camera"], plan=f["plan"],
-                              layer=f["plan"].layers[0], config=ExtrusionConfig())
+                              layer=f["plan"].layers[0],
+                              config=ExtrusionConfig(voxel_size_m=0.002))
 
     m = out.metrics
     assert m.valid, m.warnings
@@ -275,38 +298,56 @@ def test_the_same_frame_still_fails_with_the_chroma_gate_disabled():
     """
     pytest.importorskip("open3d")
     f = _ring1_take04()
+    # This fixture is a pre-protocol-2 capture with 1 mm depth WORDS, so it is
+    # processed at the 2 mm voxel it was captured under. The new 1 mm default
+    # (spec 4.4) sits at this archive's quantisation floor, where it merges
+    # nothing and lets noise through -- it flips this frame's branch-guard
+    # outcome in BOTH directions across the two archived takes. On protocol-2
+    # depth (0.1 mm words) 1 mm spans ten quantisation steps, which is the point.
     with pytest.raises(RuntimeError, match="branch guard exhausted"):
-        process_observation(color=f["color"], depth=f["depth"], K=f["K"],
+        process_observation(color=f["color"], depth=f["depth"],
+                            geometry=gf.aligned(f["K"], (1280, 720)), K=f["K"], dist=None,
                             T_work_camera=f["T_work_camera"], plan=f["plan"],
                             layer=f["plan"].layers[0],
-                            config=ExtrusionConfig(deposit_min_saturation=0))
+                            config=ExtrusionConfig(deposit_min_saturation=0,
+                                                   voxel_size_m=0.002))
 
 
 def test_chroma_gate_keeps_the_chromatic_bead_and_blanks_the_achromatic_board():
+    K = np.array([[400.0, 0, 20.0], [0, 400.0, 20.0], [0, 0, 1.0]])
     depth = np.full((40, 40), 300, np.uint16)
     color = np.dstack([np.full((40, 40), 40, np.uint8)] * 3)      # black checker
     color[10:30, 10:30] = (40, 110, 190)                          # tan clay
+    reg = ColorRegistered.build(depth, gf.aligned(K, (40, 40)), K, None)
 
-    gated, applied = chroma_gated_depth(color, depth, ExtrusionConfig())
+    keep, applied = chroma_gate_mask(color, reg, ExtrusionConfig())
 
-    assert applied
-    assert (gated[15:25, 15:25] > 0).all()
-    assert (gated[:5, :5] == 0).all()
+    assert applied and keep.shape == (len(reg),)
+    # Aligned/identity registration: uv_depth (the depth pixel that made the
+    # point) and its projected colour pixel are the same (v, u) -- the region
+    # selectors below are just the pixel test's crops, restated on points.
+    on_clay = ((reg.uv_depth[:, 1] >= 15) & (reg.uv_depth[:, 1] < 25)
+              & (reg.uv_depth[:, 0] >= 15) & (reg.uv_depth[:, 0] < 25))
+    off_clay = (reg.uv_depth[:, 1] < 5) & (reg.uv_depth[:, 0] < 5)
+    assert keep[on_clay].all()
+    assert not keep[off_clay].any()
 
 
 def test_chroma_gate_abstains_on_an_achromatic_frame_and_restores_the_floor():
     """An RGB dropout must not erase the deposit, nor drop the floor it earned."""
     config = ExtrusionConfig()
+    K = np.array([[400.0, 0, 4.0], [0, 400.0, 4.0], [0, 0, 1.0]])
     depth = np.full((8, 8), 300, np.uint16)
+    reg = ColorRegistered.build(depth, gf.aligned(K, (8, 8)), K, None)
 
-    gated, applied = chroma_gated_depth(np.zeros((8, 8, 3), np.uint8), depth, config)
-    assert not applied and np.array_equal(gated, depth)
+    keep, applied = chroma_gate_mask(np.zeros((8, 8, 3), np.uint8), reg, config)
+    assert not applied and keep.all()
     assert deposit_floor_mm(config, False) == pytest.approx(2.5)
 
     saturated = np.zeros((8, 8, 3), np.uint8)
     saturated[:, :, 2] = 200
-    gated, applied = chroma_gated_depth(saturated, depth, config)
-    assert applied and np.array_equal(gated, depth)
+    keep, applied = chroma_gate_mask(saturated, reg, config)
+    assert applied and keep.all()
     assert deposit_floor_mm(config, True) == pytest.approx(1.5)
 
 
@@ -383,7 +424,9 @@ def test_characterize_recovers_a_ring_the_recipe_got_wrong():
     depth = syn.render_scene([syn.RingSpec(60.0, 8.0, true_center, height_fn=syn.flat(6.0))], T,
                              plane_center_xy_mm=CENTER)
     color = np.zeros((720, 1280, 3), np.uint8)
-    found = characterize_ring(color=color, depth=depth, T_work_camera=T, K=syn.K_720P,
+    found = characterize_ring(color=color, depth=depth,
+                              geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
+                              T_work_camera=T, K=syn.K_720P, dist=None,
                               search_center_mm=CENTER, work_frame="Tasni Work Frame",
                               config=ExtrusionConfig())
     assert found.radius_mm == pytest.approx(60.0, abs=1.0)
@@ -412,7 +455,8 @@ def test_characterize_selects_ring_instead_of_larger_raised_patch():
     color = np.zeros((720, 1280, 3), np.uint8)
 
     found = characterize_ring(
-        color=color, depth=depth, T_work_camera=T, K=syn.K_720P,
+        color=color, depth=depth, geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
+        T_work_camera=T, K=syn.K_720P, dist=None,
         search_center_mm=CENTER, work_frame="Tasni Work Frame",
         config=ExtrusionConfig())
 
@@ -432,10 +476,18 @@ def test_characterize_real_checkerboard_capture_selects_the_visible_ring():
     depth = fixture["depth"]
     color = np.zeros((*depth.shape, 3), np.uint8)
 
+    # This fixture is a pre-protocol-2 capture with 1 mm depth WORDS, so it is
+    # processed at the 2 mm voxel it was captured under. The new 1 mm default
+    # (spec 4.4) sits at this archive's quantisation floor, where it merges
+    # nothing and lets noise through -- it flips this frame's branch-guard
+    # outcome in BOTH directions across the two archived takes. On protocol-2
+    # depth (0.1 mm words) 1 mm spans ten quantisation steps, which is the point.
     found = characterize_ring(
-        color=color, depth=depth, T_work_camera=fixture["T_work_camera"],
-        K=fixture["K"], search_center_mm=fixture["search_center_mm"],
-        work_frame="Tasni Work Frame", config=ExtrusionConfig())
+        color=color, depth=depth,
+        geometry=gf.aligned(fixture["K"], (depth.shape[1], depth.shape[0])),
+        T_work_camera=fixture["T_work_camera"], K=fixture["K"], dist=None,
+        search_center_mm=fixture["search_center_mm"],
+        work_frame="Tasni Work Frame", config=ExtrusionConfig(voxel_size_m=0.002))
 
     assert found.radius_mm == pytest.approx(39.17, abs=0.5)
     assert found.center_mm == pytest.approx((217.94, 150.44), abs=0.5)
@@ -480,7 +532,8 @@ def test_characterize_assembles_one_ring_from_arcs_the_height_floor_broke():
     color = np.zeros((720, 1280, 3), np.uint8)
 
     found = characterize_ring(
-        color=color, depth=depth, T_work_camera=T, K=syn.K_720P,
+        color=color, depth=depth, geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
+        T_work_camera=T, K=syn.K_720P, dist=None,
         search_center_mm=CENTER, work_frame="Tasni Work Frame",
         config=ExtrusionConfig())
 
@@ -508,8 +561,10 @@ def test_characterize_real_low_relief_capture_is_not_rejected():
     color = np.zeros((*depth.shape, 3), np.uint8)
 
     found = characterize_ring(
-        color=color, depth=depth, T_work_camera=fixture["T_work_camera"],
-        K=fixture["K"], search_center_mm=fixture["search_center_mm"],
+        color=color, depth=depth,
+        geometry=gf.aligned(fixture["K"], (depth.shape[1], depth.shape[0])),
+        T_work_camera=fixture["T_work_camera"], K=fixture["K"], dist=None,
+        search_center_mm=fixture["search_center_mm"],
         work_frame="Tasni Work Frame", config=ExtrusionConfig())
 
     assert found.radius_mm == pytest.approx(42.0, abs=2.0)
@@ -530,8 +585,10 @@ def test_a_ring_measured_only_in_part_is_not_closed_into_a_full_one():
     depth = syn.render_scene([ring], T, plane_center_xy_mm=CENTER)
     color = np.zeros((720, 1280, 3), np.uint8)
 
-    result = process_observation(color=color, depth=depth, T_work_camera=T,
-                                 K=syn.K_720P, plan=plan, layer=plan.layers[0],
+    result = process_observation(color=color, depth=depth,
+                                 geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
+                                 T_work_camera=T, K=syn.K_720P, dist=None,
+                                 plan=plan, layer=plan.layers[0],
                                  config=ExtrusionConfig())
 
     measured = np.asarray(result.measured_xyz, dtype=float)
@@ -2069,6 +2126,30 @@ def test_the_axis_check_take_is_never_the_pre_shift_reference(tmp_path):
 
 # ------------- the depth must be of the pose it was taken at (cell, 2026-08-29)
 
+def test_depth_plane_check_scales_raw_depth_words_by_the_frames_own_unit():
+    """Task 9 review, Critical 1: ``depth`` is raw camera WORDS, not millimetres.
+
+    Protocol 2 native depth is 0.1 mm/word. Left at the unit-blind default this
+    reads a real ~312 mm standoff as ~3120 mm, fails loudly, and blames the work
+    frame or a frozen camera -- the wrong cause -- on every single measure and
+    characterize take.
+    """
+    from tasni.modules.extrusion.measure import depth_plane_check
+    T = np.eye(4)
+    T[2, 3] = 312.0                                   # camera 312 mm above the plane
+    depth_words = np.full((8, 8), 3120, np.uint16)     # 3120 words * 0.1 mm/word = 312 mm
+
+    scaled = depth_plane_check(depth_words, T, ExtrusionConfig(), unit_mm=0.1)
+    assert scaled["observed_depth_mm"] == pytest.approx(312.0)
+    assert scaled["agrees"] is True
+
+    # The old, unit-blind call (no unit_mm) reads the same words as 3120 mm --
+    # this is the regression the review measured on the checkout.
+    unscaled = depth_plane_check(depth_words, T, ExtrusionConfig())
+    assert unscaled["observed_depth_mm"] == pytest.approx(3120.0)
+    assert unscaled["agrees"] is False
+
+
 class StaleThenFreshCamera:
     """The Jetson's temporal depth filter blends across frames.
 
@@ -2091,7 +2172,8 @@ class StaleThenFreshCamera:
         value = self.stale_mm if self.grabs <= self.stale_frames + 1 else self.fresh_mm
         from tasni.core.camera import Frame
         return Frame(color=np.zeros((16, 16, 3), np.uint8),
-                     depth=np.full((16, 16), value, np.uint16), timestamp=1.0)
+                     depth=np.full((16, 16), value, np.uint16), timestamp=1.0,
+                     geometry=gf.aligned(syn.K_720P, (16, 16)))
 
 
 def test_a_depth_frame_from_the_wrong_pose_is_grabbed_again(tmp_path, monkeypatch):
