@@ -190,10 +190,19 @@ class CameraClient:
         """Read one newline-terminated line, byte-by-byte, from an
         already-connected socket. Used only for the protocol-2 greeting, which is
         a single short JSON line -- there is no framing to tell us its length in
-        advance, so we cannot use ``_recv_exact``."""
+        advance, so we cannot use ``_recv_exact``. Every caller of a depth path
+        expects a :class:`CameraError` (mirrors ``_read_raw``'s wrapping below),
+        so a dropped connection during the greeting (``ConnectionResetError`` /
+        ``BrokenPipeError`` -- both ``OSError``, neither ``socket.timeout``) must
+        not surface as a raw ``OSError``."""
         buf = bytearray()
         while len(buf) < maxlen:
-            ch = sock.recv(1)
+            try:
+                ch = sock.recv(1)
+            except socket.timeout as e:
+                raise CameraError("camera timeout waiting for the protocol-2 greeting") from e
+            except OSError as e:
+                raise CameraError(f"camera socket error while reading the greeting: {e}") from e
             if not ch:
                 raise CameraError("connection closed by camera server before the greeting")
             buf.extend(ch)
@@ -204,10 +213,7 @@ class CameraClient:
     def _read_greeting(self, sock: socket.socket) -> CameraGeometry:
         """Protocol 2: one JSON line before any frame. A refusal line means the
         server changed protocol under a host that never restarted."""
-        try:
-            line = self._read_line(sock)
-        except socket.timeout as e:
-            raise CameraError("camera timeout waiting for the protocol-2 greeting") from e
+        line = self._read_line(sock)
         if line.startswith(b"ERR"):
             raise CameraError(
                 f"camera server refused the depth stream: {line.decode(errors='replace').strip()} "
@@ -330,7 +336,19 @@ class CameraClient:
                 scan_telemetry=scan_telemetry)
         else:
             s.sendall(_HELLO_FULL)
-            geometry = self._read_greeting(s)
+            # A refusal/close here happens BEFORE the try/finally below, so it
+            # would otherwise leak this socket (and the telemetry side-channel)
+            # on every retry of a live preview against a stale backend --
+            # exactly the failure protocol 2's loud-refusal contract exists to
+            # avoid. Close what we opened, then let the same CameraError through
+            # unchanged.
+            try:
+                geometry = self._read_greeting(s)
+            except Exception:
+                if telemetry_reader is not None:
+                    telemetry_reader.close()
+                s.close()
+                raise
         try:
             yield (_H264Stream(s, telemetry_reader=telemetry_reader) if h264
                    else _CameraStream(self, s, telemetry_reader=telemetry_reader, geometry=geometry))
@@ -376,8 +394,24 @@ class CameraClient:
             raise CameraError(f"burst handshake failed (old server?): {e}") from e
         if not ready.startswith(b"BURST READY"):
             s.close()
+            if ready.startswith(b"ERR"):
+                # A protocol-2 server refusing MODE BURST V2 (host never
+                # restarted) looks identical to "no burst support" unless we
+                # check for the ERR prefix here -- give the operator the same
+                # actionable hint grab()/stream() give instead of the generic
+                # fallback message.
+                raise CameraError(
+                    "camera server refused the burst stream (protocol mismatch) "
+                    "- restart the Tasni backend (it is speaking an older protocol)")
             raise CameraError("camera server does not support burst capture")
-        geometry = self._read_greeting(s)
+        # Same leak concern as stream(): a refusal/close here happens BEFORE the
+        # try/finally below, so close what we opened before letting the error
+        # through unchanged.
+        try:
+            geometry = self._read_greeting(s)
+        except Exception:
+            s.close()
+            raise
         try:
             yield _BurstSession(self, s, geometry)
         finally:

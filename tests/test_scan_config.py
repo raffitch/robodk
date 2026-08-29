@@ -137,6 +137,40 @@ def test_calibrated_720p_intrinsics_migrate_to_1080p_by_exact_scale():
     assert fresh.intrinsics["1920x1080"] == _DEFAULT_INTRINSICS["1920x1080"]
 
 
+def test_explicit_path_migration_never_writes_the_repo_root_override_file(tmp_path, monkeypatch):
+    """Ruling R5's most safety-critical branch, otherwise uncovered: an EXPLICIT
+    path (a test's tmp_path config here; in real life an operator-specified
+    alternate config) whose data DOES trigger the K migration must still never
+    overwrite tasni.config.json at the repo root -- only load_config(path=None)
+    (the default file) may call save_overrides(). The other two migration tests
+    don't exercise this: the depth_scale-drop test's JSON never triggers a
+    migration, and the direct migrate_camera_intrinsics() test bypasses
+    load_config's file-writing entirely. Monkeypatching save_overrides is
+    cleaner than comparing the real repo-root file's mtime and never touches
+    the operator's actual config."""
+    import tasni.core.config as config_mod
+
+    p = tmp_path / "tasni.config.json"
+    p.write_text(json.dumps({"camera": {"intrinsics": {
+        "1280x720": [[889.8742, 0.0, 648.9804],
+                     [0.0, 890.8099, 362.0046],
+                     [0.0, 0.0, 1.0]],
+        "1920x1080": config_mod._DEFAULT_INTRINSICS["1920x1080"],  # still factory
+    }}}), encoding="utf-8")
+
+    calls = []
+    monkeypatch.setattr(config_mod, "save_overrides", lambda updates: calls.append(updates))
+
+    cfg = config_mod.load_config(p)
+
+    assert abs(cfg.camera.intrinsics["1920x1080"][0][0] - 889.8742 * 1.5) < 1e-6, (
+        "the migration must still apply IN MEMORY even though it is not persisted")
+    assert calls == [], (
+        "an explicit path must never trigger save_overrides -- doing so would "
+        "silently overwrite the repo-root config with THIS file's content")
+    print("[R5] explicit-path migration applies in memory but never calls save_overrides")
+
+
 if __name__ == "__main__":
     test_defaults_present_and_sane()
     test_collision_hard_fail_is_default()

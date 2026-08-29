@@ -72,6 +72,7 @@ class FakeSocket:
         self._pos = 0
         self._chunk = chunk
         self.sent = bytearray()
+        self.closed = False        # so a leak-on-refusal test can prove close() ran
 
     def recv(self, n: int) -> bytes:
         if self._pos >= len(self._buf):
@@ -89,7 +90,7 @@ class FakeSocket:
     def setsockopt(self, *_a): pass
     def connect(self, *_a): pass
     def shutdown(self, *_a): pass
-    def close(self): pass
+    def close(self): self.closed = True
     def __enter__(self): return self
     def __exit__(self, *a): return False
 
@@ -409,6 +410,54 @@ def test_grab_with_depth_sends_v2_and_reads_the_greeting_first():
     print("[v2] grab sent MODE FULL V2, parsed the greeting, attached geometry")
 
 
+def test_stream_with_depth_sends_v2_and_reads_the_greeting_before_the_first_frame():
+    """The live-preview path (stream()) is the most exposed to a wire desync --
+    it's long-lived and retried against a real camera, unlike the one-shot
+    grab(). Mirrors test_grab_with_depth_sends_v2_and_reads_the_greeting_first
+    but through stream()/_CameraStream.read()."""
+    client = CameraClient(CameraConfig())
+    color = _make_color()
+    depth = (np.arange(64 * 48, dtype=np.uint16).reshape(48, 64) * 3)
+    frame_bytes, _ = _server_encode(color, depth, 7.0)
+    sock = FakeSocket(_greeting_bytes() + frame_bytes)
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        with client.stream() as feed:
+            frame = feed.read(with_depth=True)
+    finally:
+        camera_mod.socket.socket = orig
+    assert bytes(sock.sent) == b"MODE FULL V2\n"
+    assert isinstance(frame.geometry, CameraGeometry)
+    assert frame.geometry.depth_unit_mm == 0.1 and frame.geometry.T_color_depth[0, 3] == 14.7
+    np.testing.assert_array_equal(frame.depth, depth)
+    print("[v2] stream sent MODE FULL V2, read the greeting before the first frame, attached geometry")
+
+
+def test_stream_greeting_failure_closes_the_socket_instead_of_leaking_it():
+    """Important-1 fix: unlike grab() (safe via ``with ... as s:``), stream()
+    opens its socket with a bare ``s, host = self._connect(...)`` and only
+    closed it in the finally of the LATER ``try: yield ... finally:`` block --
+    a refusal/parse-failure while reading the greeting happened before that
+    block was ever entered, so the socket leaked. stream() is the long-lived,
+    retried live-preview path, so a leak here compounds on every retry against
+    a stale backend."""
+    client = CameraClient(CameraConfig())
+    sock = FakeSocket(b"ERR protocol 2 required; send MODE FULL V2\n")
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        try:
+            with client.stream():
+                pass
+        except CameraError as e:
+            assert "restart the Tasni backend" in str(e)
+        else:
+            raise AssertionError("a refusal must raise CameraError")
+    finally:
+        camera_mod.socket.socket = orig
+    assert sock.closed, "the socket must be closed before the refusal propagates"
+    print("[v2] stream refusal closes the socket instead of leaking it")
+
+
 def test_refusal_is_a_clear_error_not_a_hang():
     client = CameraClient(CameraConfig())
     sock = FakeSocket(b"ERR protocol 2 required; send MODE FULL V2\n")
@@ -462,6 +511,50 @@ def test_burst_reads_ready_then_greeting():
     print("[v2] burst reads BURST READY then the greeting before any frame")
 
 
+def test_burst_refusal_carries_the_restart_hint_not_a_generic_message():
+    """A protocol-2 server refusing MODE BURST V2 (host never restarted) answers
+    the same ERR line grab()/stream() would see, in place of BURST READY -- it
+    must not be swallowed into the generic "no burst support" message, which
+    gives the operator no actionable hint."""
+    client = CameraClient(CameraConfig())
+    sock = FakeSocket(b"ERR protocol 2 required; send MODE FULL V2\n")
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        try:
+            with client.burst():
+                pass
+        except CameraError as e:
+            assert "restart the Tasni backend" in str(e)
+        else:
+            raise AssertionError("a burst refusal must raise CameraError")
+    finally:
+        camera_mod.socket.socket = orig
+    print("[v2] burst refusal raises the same restart-hint CameraError as grab/stream")
+
+
+def test_burst_greeting_parse_failure_after_ready_closes_the_socket():
+    """Important-1 fix, burst() side: BURST READY can arrive fine and THEN the
+    greeting itself fail to parse -- a genuinely malformed line, distinct from
+    the ERR-refusal case already caught by the READY-mismatch check above --
+    and that failure happened before burst()'s later ``try: yield ... finally``
+    block, so the socket leaked. Must close before the CameraError propagates."""
+    client = CameraClient(CameraConfig())
+    sock = FakeSocket(b"BURST READY\nnot valid json\n")
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        try:
+            with client.burst():
+                pass
+        except CameraError as e:
+            assert "invalid camera greeting" in str(e)
+        else:
+            raise AssertionError("an invalid greeting must raise CameraError")
+    finally:
+        camera_mod.socket.socket = orig
+    assert sock.closed, "the socket must be closed before the parse failure propagates"
+    print("[v2] burst greeting-parse failure closes the socket instead of leaking it")
+
+
 if __name__ == "__main__":
     test_full_frame_roundtrip()
     test_color_only_means_depth_len_zero()
@@ -474,7 +567,11 @@ if __name__ == "__main__":
     test_burst_session_roundtrip()
     test_burst_handshake_rejected_on_old_server()
     test_grab_with_depth_sends_v2_and_reads_the_greeting_first()
+    test_stream_with_depth_sends_v2_and_reads_the_greeting_before_the_first_frame()
+    test_stream_greeting_failure_closes_the_socket_instead_of_leaking_it()
     test_refusal_is_a_clear_error_not_a_hang()
     test_color_only_grab_has_no_geometry_and_no_v2_token()
     test_burst_reads_ready_then_greeting()
+    test_burst_refusal_carries_the_restart_hint_not_a_generic_message()
+    test_burst_greeting_parse_failure_after_ready_closes_the_socket()
     print("\nCamera wire-format round-trip tests passed.")
