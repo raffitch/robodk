@@ -163,7 +163,13 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
 
         @app.get("/{full_path:path}")
         def spa(full_path: str):
-            # Anything not matched above falls back to index.html (client routing).
+            # Anything not matched above falls back to index.html (client routing)
+            # -- except an API path. Serving the app for an unmatched /api route
+            # turns "this endpoint does not exist" into a 200 with an HTML body,
+            # which a download link happily saves under whatever name it asked
+            # for: a web page named paper-draft.docx, and no error anywhere.
+            if full_path == "api" or full_path.startswith("api/"):
+                raise HTTPException(404, f"no such API endpoint: /{full_path}")
             candidate = DIST_DIR / full_path
             if full_path and candidate.is_file():
                 return FileResponse(candidate)

@@ -665,6 +665,43 @@ export default function Extrusion() {
       refreshMeasure();
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
+  /** Fetch the .docx and save it, refusing to write anything that is not one.
+   *
+   * An <a download> saves whatever the server returns, including an HTML error
+   * page, under the name it asked for -- which is how a missing endpoint became
+   * a 496-byte "Word file" with no error shown anywhere.
+   */
+  const downloadWordDraft = async () => {
+    if (!measureSession) return;
+    setBusy(true); setMessage("Building the Word draft from the archive…");
+    try {
+      const url = `/api/modules/extrusion/trials/`
+        + `${encodeURIComponent(measureSession.trial_id)}/paper-draft.docx`;
+      const response = await fetch(url);
+      const kind = response.headers.get("content-type") || "";
+      if (!response.ok || !kind.includes("wordprocessingml")) {
+        let detail = `${response.status} ${response.statusText}`;
+        try {
+          const body = await response.json();
+          if (body?.detail) detail = body.detail;
+        } catch { /* not JSON: keep the status line */ }
+        throw new Error(kind.includes("text/html")
+          ? "The backend answered with the web app, which means it is running older "
+            + "code without this endpoint. Restart Tasni and try again."
+          : `The draft could not be built: ${detail}`);
+      }
+      const blob = await response.blob();
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `${measureSession.trial_id}-paper-draft.docx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(link.href);
+      setMessage(`Word draft saved (${Math.round(blob.size / 1024)} KB) — method, condition `
+        + "table, per-take table and figures, ready to paste into the manuscript.");
+    } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
+  };
   const showPaper = async () => {
     if (!measureSession) return;
     try {
@@ -1315,9 +1352,8 @@ export default function Extrusion() {
       })() : null}
       <div className="btn-row">
         <button className="secondary" disabled={!measureSession} onClick={showPaper}>Paper summary</button>
-        {measureSession && <a className="secondary btn-link"
-          href={`/api/modules/extrusion/trials/${encodeURIComponent(measureSession.trial_id)}/paper-draft.docx`}
-          download>Word draft</a>}
+        <button className="secondary" disabled={!measureSession || busy}
+                onClick={downloadWordDraft}>Word draft (.docx)</button>
         <button className="secondary" disabled={!measureSession}
                 onClick={() => setShowStack(!showStack)}>
           {showStack ? "Hide" : "Show"} stack figure

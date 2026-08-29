@@ -1547,3 +1547,20 @@ def test_the_summary_reports_what_inspection_costs_per_layer(tmp_path):
     markdown = summary["markdown"]
     assert "Inspecting one layer cost 15000" in markdown
     assert "rather than during deposition" in markdown
+
+
+def test_an_unknown_api_path_fails_as_an_api_not_as_the_web_app(tmp_path, monkeypatch):
+    """A missing API route must not answer with the single-page app.
+
+    The catch-all that serves client-side routes was answering /api paths too,
+    with index.html and status 200. The Word-draft download link saved that web
+    page as a .docx -- a 496-byte HTML file named like a document, with no error
+    raised anywhere. A route that does not exist has to say so.
+    """
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    client = TestClient(create_app(AppConfig()))
+
+    missing = client.get("/api/modules/extrusion/there-is-no-such-endpoint")
+
+    assert missing.status_code == 404
+    assert "text/html" not in missing.headers.get("content-type", "")
