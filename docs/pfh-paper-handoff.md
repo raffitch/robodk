@@ -267,6 +267,14 @@ Constraints and expectations:
 - Discard every `runs/extrusion/20260828-*-f088cf48` trial: those predate the ring
   selector fix and measure an empty board. Keep their raw frames as evidence only.
 
+## 4b. Designed, not yet built: multi-view capture + side photo
+
+For the thin mock rings the operator wants the top view plus three tilted views merged
+into one registered cloud, and a side RGB photo per ring for the paper — both optional
+toggles, default OFF, so nothing above changes until they are switched on. Design and the
+on-cell A/B that decides whether merged takes go in the paper:
+`docs/superpowers/specs/2026-08-29-multiview-inspection-design.md`.
+
 ## 5. Known-good numbers you can already cite
 
 From `20260828-192115-47fb78ea` (characterization + one measure):

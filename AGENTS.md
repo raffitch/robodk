@@ -110,6 +110,14 @@ correctness traps (deposit-band colour range; FITTED not averaged nominal centre
 > — the continuation handoff: current state, the full decision tree for each bisect
 > outcome, where the code is, and the fallback options with their real costs.
 
+**2026-08-29 — multi-view inspection + side photo: DESIGNED, not built.** The mock rings are
+thin and one top-down frame under-samples them, so the operator wants (as optional toggles,
+default OFF) a top + three 20°-tilted views at 120° azimuths merged into one registered
+work-frame cloud, and a separately-timed near-horizontal RGB side photo per ring for the
+paper. Spec: `docs/superpowers/specs/2026-08-29-multiview-inspection-design.md` (poses,
+levelling + centre registration, archive layout, reprocess `top_only`, capture-mode timing
+groups, the on-cell A/B in §8, ten implementation tasks). Next step: `writing-plans` from it.
+
 **2026-08-29 — detection error is PAIRED.** A top ring "placed true" by eye sits 1–3 mm
 from the plan centre before anything is introduced, so scoring a shift against the plan
 centre folds the operator's placement error into what the paper calls the chain's error.
