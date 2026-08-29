@@ -34,26 +34,47 @@ aligned to a `(720, 1280, 3)` colour frame; valid fraction 0.9994 → 0.9995; di
 values in a 120×120 centre patch 11 → 13 (both still 1 mm quantisation, because
 `depth_units` has not changed yet — that is protocol 2's job, not this task's).
 
-Geometry sanity (`tools/characterize_distance.py`, one stop, measured 449 mm, incidence 0.8°):
-`rms=1.255 mm  plane_max=8.408 mm  length_err=0.314 mm  coverage=100%`.
+### Geometry sanity
 
-Read that against the **2026-08-13 baseline's own repeatability**, not against a single row
-of it. That session captured the *same* 310 mm standoff twice:
+`tools/characterize_distance.py`, two stops, against the 2026-08-13 baseline.
 
-| same session, same 310 mm | `plane_rms_mm` | `plane_max_mm` | `length_err_mm` |
+The comparison that matters is the **328 mm** stop, because it reproduces the baseline's
+distance *and* its incidence (0.9° against 0.99°). Read it against the baseline's own
+**same-distance repeatability**, not against a single row of it — that session happened to
+capture the same 310 mm standoff twice, once in the main sweep and once in the incidence
+sweep, and the two disagree wildly:
+
+| | `plane_rms_mm` | `plane_max_mm` | `length_err_mm` |
 |---|---|---|---|
-| main sweep | 0.934 | 24.654 | 0.003 |
-| incidence sweep @ 0.99° | 0.650 | 2.594 | 0.036 |
+| baseline @ 310 mm, main sweep | 0.934 | 24.654 | 0.003 |
+| baseline @ 310 mm, incidence sweep @ 0.99° | 0.650 | 2.594 | 0.036 |
+| **after the rebuild, @ 328 mm, 0.9°** | **0.786** | **5.164** | **0.023** |
 
-So the cell's own fixed-distance scatter was ±44 % in plane RMS and ~10× in `plane_max`.
-The new numbers sit inside it, and `plane_max` 8.408 is well below the baseline's own worst.
-**`length_err_mm` is the metric that would expose a CUDA rounding change in the depth path,
-and it is flat: 0.314 vs 0.316 @ 400 mm and 0.364 @ 498 mm.**
+Every metric falls *between* the baseline's own two captures, at 18 mm further out where
+slightly more noise is expected. The cell's fixed-distance scatter was ±44 % in plane RMS
+and ~10× in `plane_max`, so this is as close to "unchanged" as this rig can demonstrate.
+`height_repeat=0.024 mm`, `normal_repeat=0.03°`, `length_spread=0.025 mm`, `coverage=100%`.
+
+A second stop at a measured **449 mm** (incidence 0.8°) gave
+`rms=1.255  plane_max=8.408  length_err=0.314  coverage=100%`. Interpolating the baseline
+to 449 mm suggests ~1.05 / ~5.1, so that stop reads high — but it is inside the same-distance
+scatter above, `plane_max` 8.408 is below the baseline's own worst (24.654), and
+`length_err` 0.314 matches 0.316 @ 400 mm and 0.364 @ 498 mm almost exactly.
+
+**`length_err_mm` is the metric that would expose a CUDA rounding change in the depth
+geometry** — it is the only one referenced to a known physical length (the board's own
+squares) rather than to a plane fit — and it is flat at both stops.
 
 > The tool's `=== verdict === NO distance passed every budget criterion` line is **not** a
 > result. `DEFAULT_BUDGET` is a placeholder (see the comment at
-> `tools/characterize_distance.py:613`) and its `max_plane_max_mm=3.0` is failed by the
-> 2026-08-13 baseline at every single stop.
+> `tools/characterize_distance.py:613`). At the 328 mm stop every criterion passes except
+> `max_plane_max_mm=3.0` — which the 2026-08-13 baseline also fails at **all five** of its
+> stops (4.085, 6.156, 6.277, 8.105, 24.654). Derive a real budget from
+> `achieved_envelope` before gating anything on it.
+
+> `coverage_frac` counts **inner corners detected**, not framing margin, so `coverage=100%`
+> does not prove the board was uncropped. And the baseline's `incidence_range_deg` only ever
+> reached `[0.99°, 9.14°]` — there is no 25° incidence reference to compare against.
 
 Verified in the binary: 157 CUDA symbols, three GPU kernels compiled
 (`cuda-align.cu.o`, `cuda-pointcloud.cu.o`, `cuda-conversion.cu.o`), and `libgomp.so.1`
