@@ -423,3 +423,24 @@ def test_the_tube_figure_draws_the_bead_as_a_pipe_at_each_layer_height(tmp_path)
     radii = np.linalg.norm(np.stack(surface, axis=-1)[:, :, :2]
                            - np.array([CENTER[0], CENTER[1]]), axis=-1)
     assert radii.max() - radii.min() == pytest.approx(8.0, abs=0.5)
+
+
+def test_the_measured_bead_width_is_read_from_the_take_that_measured_it(tmp_path):
+    """Intended and outcome are different widths, and only one of them is a guess.
+
+    The commanded bead comes from the recipe; the deposited bead was measured
+    (10.77 mm against a commanded 12.8 mm on the first real capture). Drawing
+    the measurement at the commanded width would show a comparison that was
+    never made.
+    """
+    from tasni.modules.extrusion.figures import load_take, measured_bead_mm
+
+    layer_dir = write_take(tmp_path, layer_index=1)
+    take = load_take(layer_dir)
+
+    assert measured_bead_mm(take) == pytest.approx(8.0)      # the helper's geometry
+
+    bare = json.loads((layer_dir / "manifest.json").read_text(encoding="utf-8"))
+    bare.pop("geometry", None)
+    (layer_dir / "manifest.json").write_text(json.dumps(bare), encoding="utf-8")
+    assert measured_bead_mm(load_take(layer_dir)) is None

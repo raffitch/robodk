@@ -649,6 +649,48 @@ def _tube(centreline: np.ndarray, bead_mm: float, *, sides: int = 20):
     return surface[:, :, 0], surface[:, :, 1], surface[:, :, 2]
 
 
+def measured_bead_mm(take: TakeData) -> "float | None":
+    """The bead footprint this take actually measured, if it measured one.
+
+    The commanded bead comes from the recipe; the deposited bead is a
+    measurement (10.8 mm against a commanded 12.8 mm on the first real
+    capture). Drawing the outcome at the commanded width would show a
+    comparison that was never made.
+    """
+    geometry = take.manifest.get("geometry") or {}
+    width = geometry.get("bead_width_mean_mm")
+    try:
+        width = float(width)
+    except (TypeError, ValueError):
+        return None
+    return width if width > 0 else None
+
+
+def _ribbon(centreline: np.ndarray, width_mm: float):
+    """A flat band of ``width_mm`` laid along a centreline, in the XY plane.
+
+    The measured bead width is a RADIAL FOOTPRINT -- the extent of the deposit
+    cloud per angular bin -- not a cross-section diameter. Sweeping it as a pipe
+    would draw a vertical extent that was never measured (and, on a bead whose
+    crest wanders by 8 mm, tangles into spikes). A ribbon at the measured height
+    is exactly what the measurement says.
+    """
+    path = np.asarray(centreline, dtype=float).reshape(-1, 3)
+    if len(path) < 3:
+        return None
+    if not np.allclose(path[0], path[-1]):
+        path = np.vstack([path, path[:1]])
+    tangent = np.gradient(path[:, :2], axis=0)
+    norms = np.linalg.norm(tangent, axis=1, keepdims=True)
+    tangent = tangent / np.where(norms == 0, 1.0, norms)
+    side = np.column_stack((-tangent[:, 1], tangent[:, 0])) * (float(width_mm) / 2.0)
+    inner, outer = path[:, :2] - side, path[:, :2] + side
+    x = np.column_stack((inner[:, 0], outer[:, 0]))
+    y = np.column_stack((inner[:, 1], outer[:, 1]))
+    z = np.column_stack((path[:, 2], path[:, 2]))
+    return x, y, z
+
+
 def _figure_tube(plt, takes: list[TakeData], trial_id: str):
     """The stack as it is actually deposited: a bead with thickness, per layer.
 
@@ -667,17 +709,29 @@ def _figure_tube(plt, takes: list[TakeData], trial_id: str):
         bead = 8.0
     fig = plt.figure(figsize=(7.4, 6.0))
     ax = fig.add_subplot(111, projection="3d")
+    deposited: list[float] = []
     for take in drawable:
         if take.nominal is not None and len(take.nominal) >= 3:
             pipe = _tube(take.nominal, bead)
             if pipe is not None:
-                ax.plot_surface(*pipe, color=NOMINAL, alpha=.22, linewidth=0,
+                ax.plot_surface(*pipe, color=NOMINAL, alpha=.16, linewidth=0,
                                 shade=True, rstride=2, cstride=1)
+        # The deposited bead at the width it was measured at, not the commanded
+        # one: the two footprints are the comparison.
+        width = measured_bead_mm(take)
+        if width:
+            deposited.append(width)
+            laid = _ribbon(take.measured, width)
+            if laid is not None:
+                ax.plot_surface(*laid, color=MEASURED, alpha=.55, linewidth=0,
+                                shade=False, rstride=1, cstride=1)
         ax.plot(take.measured[:, 0], take.measured[:, 1], take.measured[:, 2],
-                color=MEASURED, linewidth=2.0)
+                color=MEASURED, linewidth=1.6)
     ax.plot([], [], color=NOMINAL, linewidth=6, alpha=.35,
             label=f"commanded bead (Ø {bead:g} mm)")
-    ax.plot([], [], color=MEASURED, linewidth=2, label="measured centreline")
+    ax.plot([], [], color=MEASURED, linewidth=6, alpha=.55,
+            label=("measured footprint (%.1f mm wide)" % (sum(deposited) / len(deposited))
+                   if deposited else "measured centreline"))
     ax.set_xlabel("X (mm)", fontsize=9)
     ax.set_ylabel("Y (mm)", fontsize=9)
     ax.set_zlabel("Z (mm)", fontsize=9)
@@ -688,8 +742,12 @@ def _figure_tube(plt, takes: list[TakeData], trial_id: str):
         ax.set_box_aspect((1, 1, .55))
     except Exception:
         pass
-    fig.text(.5, .015, "True scale: the pipe is the commanded bead diameter and each layer "
-                       "sits at its own height.", ha="center", fontsize=7.5, color="#4b5563")
+    caption = "True scale. Each layer sits at its own height."
+    if deposited:
+        caption += (" Commanded bead Ø %.1f mm; measured footprint %.1f mm wide."
+                    % (bead, sum(deposited) / len(deposited)))
+    fig.text(.5, .02, wrap_caption(caption), ha="center", va="bottom",
+             fontsize=7.5, color="#4b5563")
     fig.tight_layout(rect=(0, .035, 1, 1))
     return fig
 

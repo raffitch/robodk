@@ -198,7 +198,8 @@ const recipeFields: Array<{ key: keyof Recipe; label: string; min: number; max: 
   { key: "points_per_circle", label: "Curve samples", min: 24, max: 720, step: 12, unit: "pts" },
 ];
 
-function BirdseyeStack({ plan, selectedLayer, onSelect, measured, showBead }: {
+function BirdseyeStack({ plan, selectedLayer, onSelect, measured, showBead,
+                        measuredBead }: {
   plan: Plan; selectedLayer: number; onSelect: (layer: number) => void;
   // Measured centrelines by layer index, in work-frame mm: what is actually
   // on the table, drawn over what was commanded.
@@ -207,6 +208,10 @@ function BirdseyeStack({ plan, selectedLayer, onSelect, measured, showBead }: {
   // is deposited is a bead with a footprint, and the curve alone hides the
   // quantity the inspection measures.
   showBead?: boolean;
+  // Layer index -> the bead footprint that layer's latest take MEASURED, in mm.
+  // The commanded width is a setting, this one is a result; drawing the result
+  // at the commanded width would show a comparison that was never made.
+  measuredBead?: Record<string, number>;
 }) {
   const width = 640, height = 440, pad = 38;
   const { radius_mm: radius, layer_height_mm: layerHeight } = plan.recipe;
@@ -307,6 +312,14 @@ function BirdseyeStack({ plan, selectedLayer, onSelect, measured, showBead }: {
               strokeLinecap="round" strokeLinejoin="round" />
         {selected && <circle cx={start.x} cy={start.y} r="5" fill="#f0a45d" />}
       </g>;
+    })}
+    {showBead && projectedMeasured.map(({ layerIndex, rawPoints }) => {
+      const width = measuredBead?.[String(layerIndex)];
+      if (!width) return null;
+      return <path key={`measured-bead-${layerIndex}`} d={path(rawPoints)} fill="none"
+        stroke="#f0616d" strokeOpacity={layerIndex === selectedLayer ? .38 : .26}
+        strokeWidth={Math.max(2, width * scale * .866)}
+        strokeLinecap="round" strokeLinejoin="round" />;
     })}
     {projectedMeasured.map(({ layerIndex, rawPoints }) => <path
       key={`measured-${layerIndex}`} d={path(rawPoints)} fill="none" stroke="#f0616d"
@@ -834,6 +847,20 @@ export default function Extrusion() {
            && offsetNorm(t) === 0).length;
   const countOffset = (millimetres: number) => validTakes.filter(
     (t) => Math.abs(offsetNorm(t) - millimetres) < 0.51).length;
+  // The bead each layer's newest VALID take measured. An invalid take measured
+  // no footprint, so it must not contribute one.
+  const measuredBeadByLayer = useMemo(() => {
+    const widths: Record<string, number> = {};
+    for (const take of measureSession?.records ?? []) {
+      const width = take.geometry?.bead_width_mean_mm;
+      if (!take.valid || !width) continue;
+      widths[String(take.layer_index)] = width;
+    }
+    return widths;
+  }, [measureSession]);
+  const beadWidths = Object.values(measuredBeadByLayer);
+  const beadSummary = beadWidths.length
+    ? (beadWidths.reduce((sum, v) => sum + v, 0) / beadWidths.length).toFixed(1) : null;
   const applied = measureSession?.applied ?? null;
   const characterization = measureSession?.characterizations?.length
     ? measureSession.characterizations[measureSession.characterizations.length - 1] : null;
@@ -1105,12 +1132,15 @@ export default function Extrusion() {
         <div className="birdseye-tools">
           <label className="bead-toggle"><input type="checkbox" checked={showBead}
             onChange={(e) => setShowBead(e.target.checked)} />
-            Bead width{recipe ? ` · Ø ${recipe.bead_diameter_mm} mm` : ""}</label>
+            Bead{recipe ? ` · commanded Ø ${recipe.bead_diameter_mm} mm` : ""}
+            {beadSummary && <span className="measured-bead"> · measured Ø {beadSummary} mm</span>}
+          </label>
           {layer && <div className="layer-readout">LAYER {layer.layer_index}<b>Z {layer.nominal_z_mm.toFixed(2)} mm</b></div>}
         </div></div>
       {visualPlan && layer ? <div className="birdseye-layout">
         <BirdseyeStack plan={visualPlan} selectedLayer={visualSelectedLayer} onSelect={setSelectedLayer}
-                       measured={measureSession?.tops} showBead={showBead} />
+                       measured={measureSession?.tops} showBead={showBead}
+                       measuredBead={measuredBeadByLayer} />
         <div className="layer-rail">{visualPlan.layers.map((item) => <button key={item.layer_index}
           className={`layer-tile ${item.layer_index === visualSelectedLayer ? "selected" : ""}`}
           onClick={() => setSelectedLayer(item.layer_index)}>
