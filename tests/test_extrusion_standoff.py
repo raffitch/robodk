@@ -81,3 +81,24 @@ def test_a_depth_frame_with_no_valid_samples_is_a_fault_not_a_pass():
 
 def test_tolerance_default_is_tight_enough_to_have_caught_the_cell_failure():
     assert 0 < ExtrusionConfig().inspection_standoff_tolerance_mm < 142
+
+
+def test_report_scales_raw_depth_words_by_the_frames_own_unit():
+    """Task 9 review, Critical 1: ``depth`` is raw camera WORDS, not millimetres.
+
+    Protocol 2 native depth is 0.1 mm/word. Left at the unit-blind default this
+    reads a real ~312 mm standoff as ~3120 mm and raises a standoff fault on
+    every layer, naming a robot-arrival problem that was never there.
+    """
+    depth_words = _depth(3120, shape=(8, 8))          # 3120 words * 0.1 mm/word = 312 mm
+
+    scaled = standoff_report(_T([0.0, 0.0, 312.0]), [0.0, 0.0, 0.0], depth_words,
+                             unit_mm=0.1)
+    assert scaled["measured_mm"] == 312.0
+    assert scaled["delta_mm"] == 0.0
+
+    # The old, unit-blind call (no unit_mm) reads the same words as 3120 mm --
+    # this is the regression the review measured on the checkout.
+    unscaled = standoff_report(_T([0.0, 0.0, 312.0]), [0.0, 0.0, 0.0], depth_words)
+    assert unscaled["measured_mm"] == 3120.0
+    assert unscaled["delta_mm"] == 2808.0

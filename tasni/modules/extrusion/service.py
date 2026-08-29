@@ -993,7 +993,17 @@ class CylinderPrintJob:
                         if frame.depth is None:
                             raise RuntimeError(
                                 f"layer {layer.layer_index}: RGB-D capture returned no depth")
-                        standoff = standoff_report(T_work_camera, aim, frame.depth)
+                        # Checked before standoff_report ever reads frame.depth as
+                        # millimetres: a missing greeting means the unit is unknown,
+                        # and defaulting to 1.0 mm/word on a 0.1 mm-unit frame reads
+                        # a true ~300 mm standoff as ~3000 mm -- a loud failure that
+                        # blames the robot's arrival instead of naming the real cause.
+                        if frame.geometry is None:
+                            raise RuntimeError(
+                                f"layer {layer.layer_index}: depth frame arrived without "
+                                "a protocol-2 greeting")
+                        standoff = standoff_report(T_work_camera, aim, frame.depth,
+                                                   unit_mm=frame.geometry.depth_unit_mm)
                         arrival_fault = standoff_fault(
                             standoff, ecfg.inspection_standoff_tolerance_mm)
                         if arrival_fault is None and not snapshot.stationary:
@@ -1006,8 +1016,6 @@ class CylinderPrintJob:
                             ctx.log(f"layer {layer.layer_index}: inspection pose not "
                                     f"confirmed (attempt {attempt}/{attempts}): {arrival_fault}")
                             time.sleep(ecfg.inspection_arrival_retry_s)
-                    if frame.geometry is None:
-                        raise RuntimeError("depth frame arrived without a protocol-2 greeting")
                     ok, jpeg = __import__("cv2").imencode(".jpg", frame.color)
                     if ok:
                         ctx.frame(jpeg.tobytes())
@@ -1190,7 +1198,17 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
         color=color, depth=depth, geometry=geometry,
         T_work_camera=np.asarray(transform, dtype=float),
         K=np.asarray(intrinsics["K"], dtype=float),
-        dist=intrinsics.get("dist_coeffs"),
+        # A legacy archive's registration is the IDENTITY (depth K == colour K,
+        # zero extrinsic -- see CameraGeometry.legacy_aligned). Handing
+        # project_to_color the CALIBRATED distortion anyway breaks that: it
+        # re-projects through the distortion map, so uv != (u, v) and the gate
+        # is sampled off-pixel (this checkout's k1=0.1148/k2=-0.2386 moves it a
+        # few px at the ring's radius, tens near the frame edge) -- and
+        # figures._compute_stages already passes dist=None for the same take,
+        # so the reprocess button and the figure would gate it differently.
+        # Protocol-2 takes keep the calibrated distortion, same as a live
+        # capture (Task 9 review, Important 4).
+        dist=None if geometry.legacy else intrinsics.get("dist_coeffs"),
         plan=plan, layer=plan.layers[layer_index - 1],
         config=ExtrusionConfig.model_validate(processing_payload))
     reprocessed_at = _utcnow()

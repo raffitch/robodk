@@ -200,7 +200,7 @@ class MeasureSession:
         return summary
 
 
-def depth_plane_check(depth, T_work_camera, config) -> dict:
+def depth_plane_check(depth, T_work_camera, config, *, unit_mm: float = 1.0) -> dict:
     """Does this depth frame describe the pose it was taken at?
 
     Looking straight down at the work plane, the median depth over the frame is
@@ -217,11 +217,17 @@ def depth_plane_check(depth, T_work_camera, config) -> dict:
     Restarting the camera service cleared it. That frame failed loudly because
     everything landed outside the search region; a smaller residual would have
     passed every gate and quietly moved a paper number instead.
+
+    ``depth`` is raw camera WORDS, not millimetres -- ``unit_mm`` converts
+    (protocol 2's native depth is 0.1 mm/word; the caller passes
+    ``frame.geometry.depth_unit_mm``). Left at the 1.0 mm/word default this
+    reads a 0.1 mm-unit frame's true ~300 mm standoff as ~3000 mm, which fails
+    loudly but points at the work frame or a frozen camera -- the wrong cause.
     """
     camera_z = float(np.asarray(T_work_camera, dtype=float)[2, 3])
     values = np.asarray(depth)
     valid = values[values > 0]
-    observed = float(np.median(valid)) if valid.size else float("nan")
+    observed = float(np.median(valid)) * float(unit_mm) if valid.size else float("nan")
     ceiling = float(getattr(config, "characterize_max_height_mm", 40.0))
     slack = float(getattr(config, "depth_plane_slack_mm", 15.0))
     low, high = camera_z - ceiling, camera_z + slack
@@ -289,11 +295,19 @@ def _capture_at_pose(services, ctx: JobContext, T_work_camera) -> dict:
     capture_ms = (time.perf_counter() - started) * 1000.0
     if frame.depth is None:
         raise RuntimeError("RGB-D capture returned no depth")
+    # Checked right here, before the plane check ever reads frame.depth as
+    # millimetres: a missing greeting means the unit is unknown, and letting
+    # depth_plane_check default to 1.0 mm/word on a 0.1 mm-unit frame reads a
+    # true ~300 mm standoff as ~3000 mm -- a loud failure that blames the work
+    # frame or a frozen camera instead of naming the real cause.
+    if frame.geometry is None:
+        raise RuntimeError("depth frame arrived without a protocol-2 greeting")
     # Throw away a depth frame that still describes the pose before the move.
     # Each grab pulls a new frame through the Jetson's temporal filter, so a
     # retry is what lets it converge on where the camera actually is now.
     attempts = int(getattr(ecfg, "depth_stale_retries", 2))
-    check = depth_plane_check(frame.depth, T_work_camera, ecfg)
+    check = depth_plane_check(frame.depth, T_work_camera, ecfg,
+                              unit_mm=frame.geometry.depth_unit_mm)
     retries, frozen = 0, False
     while not check["agrees"] and retries < attempts:
         retries += 1
@@ -306,12 +320,15 @@ def _capture_at_pose(services, ctx: JobContext, T_work_camera) -> dict:
         capture_ms = (time.perf_counter() - started) * 1000.0
         if frame.depth is None:
             raise RuntimeError("RGB-D capture returned no depth")
+        if frame.geometry is None:
+            raise RuntimeError("depth frame arrived without a protocol-2 greeting")
         # A stalled stream hands back the SAME buffer every time. That is a
         # different fault from a wrong one, and it has a different remedy, so it
         # is worth telling apart rather than reporting as "still disagrees".
         if np.array_equal(previous, frame.depth):
             frozen = True
-        check = depth_plane_check(frame.depth, T_work_camera, ecfg)
+        check = depth_plane_check(frame.depth, T_work_camera, ecfg,
+                                  unit_mm=frame.geometry.depth_unit_mm)
     check["retries"] = retries
     check["frozen_stream"] = frozen
     if not check["agrees"]:
@@ -330,8 +347,6 @@ def _capture_at_pose(services, ctx: JobContext, T_work_camera) -> dict:
             f"{check['camera_z_mm']:.0f} mm above the work plane (expected "
             f"{check['accepted_range_mm'][0]:.0f}-{check['accepted_range_mm'][1]:.0f} mm), "
             f"after {retries} retry(s). " + detail)
-    if frame.geometry is None:
-        raise RuntimeError("depth frame arrived without a protocol-2 greeting")
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:
         ctx.frame(jpeg.tobytes())
@@ -861,7 +876,12 @@ class RingCharacterizeJob:
                 index = archive.next_characterization_index(self.session.trial_id)
                 provenance = {**_provenance(services),
                               "T_work_camera": np.asarray(
-                                  captured["T_work_camera"], dtype=float).tolist()}
+                                  captured["T_work_camera"], dtype=float).tolist(),
+                              # Without this a characterization directory -- exactly
+                              # where the archived ring1_*.npz fixtures came from --
+                              # records native, unaligned, 0.1 mm depth with nothing
+                              # saying so (Task 9 review, Important 5).
+                              "camera_geometry": frame.geometry.to_dict()}
                 camera_cfg = services.config.camera
                 try:
                     found = characterize_ring(

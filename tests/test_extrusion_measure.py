@@ -254,10 +254,21 @@ def test_chroma_gate_clears_the_board_lobe_that_exhausted_the_branch_guard():
     pytest.importorskip("open3d")
     f = _ring1_take04()
 
+    # This fixture is a pre-protocol-2 capture with 1 mm depth WORDS, so it is
+    # processed at the 2 mm voxel it was captured under. The new 1 mm default
+    # (spec 4.4) sits at this archive's quantisation floor, where it merges
+    # nothing and lets noise through -- it flips this frame's branch-guard
+    # outcome in BOTH directions across the two archived takes. On protocol-2
+    # depth (0.1 mm words) 1 mm spans ten quantisation steps, which is the point.
+    # Pinned here too (Ruling R23): this is the gate-ENABLED half of the pair
+    # below (test_the_same_frame_still_fails_with_the_chroma_gate_disabled) --
+    # the pair's whole claim, "crashes with the gate off, survives with it on",
+    # only holds if both halves measure the SAME frame at the SAME voxel.
     out = process_observation(color=f["color"], depth=f["depth"],
                               geometry=gf.aligned(f["K"], (1280, 720)), K=f["K"], dist=None,
                               T_work_camera=f["T_work_camera"], plan=f["plan"],
-                              layer=f["plan"].layers[0], config=ExtrusionConfig())
+                              layer=f["plan"].layers[0],
+                              config=ExtrusionConfig(voxel_size_m=0.002))
 
     m = out.metrics
     assert m.valid, m.warnings
@@ -2114,6 +2125,30 @@ def test_the_axis_check_take_is_never_the_pre_shift_reference(tmp_path):
 
 
 # ------------- the depth must be of the pose it was taken at (cell, 2026-08-29)
+
+def test_depth_plane_check_scales_raw_depth_words_by_the_frames_own_unit():
+    """Task 9 review, Critical 1: ``depth`` is raw camera WORDS, not millimetres.
+
+    Protocol 2 native depth is 0.1 mm/word. Left at the unit-blind default this
+    reads a real ~312 mm standoff as ~3120 mm, fails loudly, and blames the work
+    frame or a frozen camera -- the wrong cause -- on every single measure and
+    characterize take.
+    """
+    from tasni.modules.extrusion.measure import depth_plane_check
+    T = np.eye(4)
+    T[2, 3] = 312.0                                   # camera 312 mm above the plane
+    depth_words = np.full((8, 8), 3120, np.uint16)     # 3120 words * 0.1 mm/word = 312 mm
+
+    scaled = depth_plane_check(depth_words, T, ExtrusionConfig(), unit_mm=0.1)
+    assert scaled["observed_depth_mm"] == pytest.approx(312.0)
+    assert scaled["agrees"] is True
+
+    # The old, unit-blind call (no unit_mm) reads the same words as 3120 mm --
+    # this is the regression the review measured on the checkout.
+    unscaled = depth_plane_check(depth_words, T, ExtrusionConfig())
+    assert unscaled["observed_depth_mm"] == pytest.approx(3120.0)
+    assert unscaled["agrees"] is False
+
 
 class StaleThenFreshCamera:
     """The Jetson's temporal depth filter blends across frames.

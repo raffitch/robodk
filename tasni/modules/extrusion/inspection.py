@@ -255,7 +255,7 @@ def order_candidates_seed_first(candidates: list[dict], seed: dict | None) -> li
 
 
 def standoff_report(T_work_camera, aim_point_xyz_mm, depth, *,
-                    patch_frac: float = 0.06) -> dict:
+                    patch_frac: float = 0.06, unit_mm: float = 1.0) -> dict:
     """Distance the pose says vs the distance the camera sees, to the aim point.
 
     The inspection pose is commanded to put the camera a known distance from the
@@ -267,9 +267,12 @@ def standoff_report(T_work_camera, aim_point_xyz_mm, depth, *,
     deposited-geometry points" failures with no hint of the cause.
 
     ``measured_mm`` is the median of the valid depth in a central patch (the pose
-    aims the optical axis at the aim point, so the frame centre is that point).
-    Zero/invalid depth pixels are excluded; a patch with none yields NaN, which
-    :func:`standoff_fault` treats as a fault rather than a pass.
+    aims the optical axis at the aim point, so the frame centre is that point),
+    scaled by ``unit_mm`` -- ``depth`` is raw camera WORDS, not millimetres
+    (protocol 2's native depth is 0.1 mm/word; the caller passes
+    ``frame.geometry.depth_unit_mm``). Zero/invalid depth pixels are excluded; a
+    patch with none yields NaN, which :func:`standoff_fault` treats as a fault
+    rather than a pass.
     """
     T = np.asarray(T_work_camera, dtype=float)
     camera = T[:3, 3]
@@ -279,7 +282,7 @@ def standoff_report(T_work_camera, aim_point_xyz_mm, depth, *,
     ph, pw = max(1, int(h * patch_frac)), max(1, int(w * patch_frac))
     patch = d[h // 2 - ph:h // 2 + ph, w // 2 - pw:w // 2 + pw]
     valid = patch[np.isfinite(patch) & (patch > 0)]
-    measured = float(np.median(valid)) if valid.size else float("nan")
+    measured = float(np.median(valid)) * float(unit_mm) if valid.size else float("nan")
     return {"expected_mm": round(expected, 1), "measured_mm": round(measured, 1),
             "delta_mm": round(measured - expected, 1), "samples": int(valid.size)}
 
