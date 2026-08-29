@@ -85,11 +85,35 @@ def test_no_surface_not_detected():
 
 def test_gate_reads_the_reticle_through_the_colour_model_not_the_depth_centre():
     """With a real (offset) registration the depth image centre is NOT the colour
-    reticle. Put the plane only under the colour reticle and prove the gate sees it."""
-    geom = gf.offset(color_K=K, color_size=(W, H), depth_size=(160, 120))
+    reticle. Put the plane only under the colour reticle and prove the gate sees it.
+
+    Review finding (Important 2): with ``gf.offset``'s default 14.7 mm baseline the
+    plane's depth-image footprint (u 61..93) still overlapped the depth image's OWN
+    naive centre patch (u 64..96 at frac=0.2) -- so a hypothetical wrong
+    implementation that gets the UNIT conversion right but never applies
+    ``T_color_depth`` (selects the centre patch on the raw depth image instead of
+    the colour-registered points) would ALSO pass every assertion below (measured:
+    499.8 mm / 0.50 deg). That made the test prove only the unit conversion, not
+    its own headline claim (colour registration). A 200 mm baseline pushes the same
+    colour-centred plane's depth-frame footprint (u 13..44) entirely clear of the
+    depth image's naive centre patch -- asserted directly below -- so a
+    registration-blind implementation now finds NOTHING there and correctly fails
+    ``detected``, while the real (correct) gate still finds the plane through the
+    colour model and reports the true standoff/tilt."""
+    geom = gf.offset(color_K=K, color_size=(W, H), depth_size=(160, 120),
+                     t_mm=(200.0, -0.2, 0.3))
     xs, ys = np.meshgrid(np.linspace(-60, 60, 41), np.linspace(-45, 45, 31))
     plane = np.column_stack([xs.ravel(), ys.ravel(), np.full(xs.size, 500.0)])   # colour frame
     depth = gf.render_depth_in_depth_camera(plane, geom)
+
+    # Discriminating check: the depth image's OWN naive centre patch (what a
+    # registration-blind implementation would sample) sees no surface at all.
+    w_d, h_d = geom.depth_size
+    cw, ch = int(w_d * 0.2), int(h_d * 0.2)
+    x0, x1 = (w_d - cw) // 2, (w_d - cw) // 2 + cw
+    y0, y1 = (h_d - ch) // 2, (h_d - ch) // 2 + ch
+    assert np.count_nonzero(depth[y0:y1, x0:x1]) == 0, "fixture is not discriminating"
+
     r = evaluate_depth_gate(depth, geom, K, None, ScanGateThresholds(center_patch_frac=0.2,
                                                                      min_valid_depth_frac=0.2))
     assert r.detected and abs(r.distance_mm - 500.0) < 1.0 and r.tilt_deg < 1.0

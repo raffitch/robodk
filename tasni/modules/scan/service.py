@@ -221,6 +221,30 @@ def _registered(frame, cfg, stride: int = 1) -> ColorRegistered:
                                  cfg.camera.dist, stride=stride)
 
 
+def _colour_frame_valid_frac(frame, cfg, *, stride: int = 8) -> float:
+    """Fraction of the COLOUR frame that has valid registered depth (Task 10
+    review, Important 1).
+
+    ``np.mean(frame.depth > 0)`` on the raw NATIVE depth image equalled this under
+    the pre-protocol-2 aligned stream (depth == colour image, 1:1). Under protocol
+    2 the depth FOV (~87x58deg) is far wider than colour's (~69x42deg), so a
+    platform that completely fills the colour view fills only
+    ~(69/87)*(42/58) ~= 0.57 of the raw depth frame -- a raw-depth-frame fraction
+    silently made every ``>= 0.95`` "the whole view is surface" gate downstream
+    (``lock_scan_surface``'s ``LargeSurfaceRequired`` invariant AND
+    ``_planned_surface_aim``'s quality-mode shortcut) unreachable, degrading
+    silently to their softer fallback paths.
+
+    ``valid_frac_in_center_patch(1.0)`` (frac=1.0 selects the WHOLE colour frame,
+    not a centre patch) reuses the same colour-registered, analytically-corrected
+    (R25) machinery the gate/survey already use for "how much of the centre patch
+    has depth" -- just answering the same question for the whole frame.
+    """
+    if frame.depth is None or getattr(frame, "geometry", None) is None:
+        return 0.0
+    return min(1.0, _registered(frame, cfg, stride=stride).valid_frac_in_center_patch(1.0))
+
+
 def _plane_rms_mm(frame, cfg, *, stride: int = 8, outline_uv=None) -> float | None:
     """Plane-fit RMS (mm) of the SURVEYED surface, for the quality report.
 
@@ -473,8 +497,7 @@ def lock_scan_surface(services, *, force_crop: bool = False,
     declared_region = force_crop or surface_scope == SCOPE_DECLARED_REGION
     frame, n_frames, reading, survey, snapshot, raw_frames = _authoritative_acquisition(
         services, owner="scan-surface-lock")
-    depth = np.asarray(frame.depth) if frame.depth is not None else np.zeros((0, 0))
-    full_frame_valid_frac = float(np.mean(depth > 0)) if depth.size else 0.0
+    full_frame_valid_frac = _colour_frame_valid_frac(frame, cfg)
     surface_overruns_view = bool(
         survey.detected and not survey.fully_framed and full_frame_valid_frac >= 0.95)
     if surface_overruns_view and not declared_region:

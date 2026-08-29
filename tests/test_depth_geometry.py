@@ -132,6 +132,32 @@ def test_color_registered_selects_by_colour_region():
     assert np.isnan(reg.median_z_near(5, 5, 0.1))
 
 
+def test_valid_frac_in_center_patch_reads_near_1_for_full_coverage_r25():
+    """R25: ``_density_ratio`` used to ESTIMATE the depth-px/colour-px ratio from
+    the registered points' own footprint, which read 0.25 against the true
+    0.1878 for this fixture's intrinsics -- a genuinely 100%-covered centre patch
+    read ~0.73 instead of 1.0. The analytic ratio (fx_d*fy_d)/(fx_c*fy_c) fixes
+    that: a fully covered patch must read close to 1.0 regardless of the
+    registration's baseline/offset -- this is the property min_valid_depth_frac
+    (tuned when depth WAS the colour image) relies on."""
+    # legacy_aligned: depth_K == color_K -> ratio is exactly 1.0, and a fully
+    # populated depth image maps 1:1 onto the colour image -> exactly 1.0.
+    g = gf.aligned(K_C, SIZE_C)
+    depth = np.full((SIZE_C[1], SIZE_C[0]), 500, dtype=np.uint16)
+    reg = dg.ColorRegistered.build(depth, g, K_C, DIST0)
+    assert reg.valid_frac_in_center_patch(0.25) == pytest.approx(1.0, abs=1e-6)
+
+    # a real (offset) registration, depth image saturated -- same fixture as
+    # test_color_registered_selects_by_colour_region, which the analytic ratio
+    # must also put near 1.0, not the ~0.76 the old footprint estimate gave it.
+    g2 = gf.offset(color_K=K_C, color_size=SIZE_C)
+    xs, ys = np.meshgrid(np.linspace(-150, 150, 150), np.linspace(-110, 110, 110))
+    plane = np.column_stack([xs.ravel(), ys.ravel(), np.full(xs.size, 400.0)])
+    depth2 = gf.render_depth_in_depth_camera(plane, g2)
+    reg2 = dg.ColorRegistered.build(depth2, g2, K_C, DIST0)
+    assert abs(reg2.valid_frac_in_center_patch(0.25) - 1.0) < 0.1
+
+
 def test_legacy_geometry_flags_itself():
     g = gf.aligned(K_C, SIZE_C)
     assert g.legacy is True and g.depth_unit_mm == 1.0

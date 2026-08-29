@@ -611,6 +611,44 @@ def test_entire_platform_overrun_refuses_instead_of_auto_cropping():
     print("[scope] entire-platform overrun -> refused:", payload["message"][:60])
 
 
+def test_full_frame_valid_frac_uses_colour_registration_not_raw_depth_r_important1():
+    """Task 10 review, Important 1: ``lock_scan_surface`` used to take
+    ``full_frame_valid_frac`` (the >= 0.95 "the whole view is surface" signal that
+    gates the ``LargeSurfaceRequired`` invariant above, and ``_planned_surface_aim``'s
+    quality-mode shortcut) as ``np.mean(depth > 0)`` on the RAW native depth image.
+    That equalled "fraction of the colour view with depth" only under the old
+    aligned stream (depth == colour image, 1:1); protocol 2's depth FOV is wider
+    than colour's, so a platform that fills the ENTIRE colour view can leave the
+    wider native depth image's periphery unfilled (background/out of range),
+    silently making both >= 0.95 gates unreachable.
+
+    Builds a REAL (offset) registration where a bounded plane fully covers the
+    colour camera's FOV (so the colour-registered fraction must read ~1.0) but
+    stops well inside the (deliberately much wider) native depth FOV, leaving its
+    periphery genuinely empty -- reproducing the exact geometry of the defect: a
+    platform that overruns nothing from the colour view's perspective still reads
+    well under 0.95 raw-depth-frame coverage. Proves ``_colour_frame_valid_frac``
+    (not ``np.mean(depth > 0)``) is what backs the >= 0.95 decision."""
+    depth_K = np.array([[90.0, 0, 80.0], [0, 90.0, 60.0], [0, 0, 1.0]])
+    geom = gf.offset(color_K=K, color_size=(W, H), depth_K=depth_K, depth_size=(160, 120))
+    half_x, half_y = 300.0, 220.0     # covers the colour FOV (~267x200mm at z=500) with margin
+    xs, ys = np.meshgrid(np.linspace(-half_x, half_x, 200), np.linspace(-half_y, half_y, 160))
+    plane = np.column_stack([xs.ravel(), ys.ravel(), np.full(xs.size, 500.0)])
+    depth = gf.render_depth_in_depth_camera(plane, geom)
+
+    raw_frac = float(np.mean(depth > 0))
+    assert raw_frac < 0.95, (
+        f"fixture is not discriminating -- raw depth-frame fraction {raw_frac} "
+        f"must be BELOW the 0.95 gate for this test to prove anything")
+
+    frame = SimpleNamespace(depth=depth, geometry=geom)
+    cfg = SimpleNamespace(camera=SimpleNamespace(K=K, dist=None))
+    colour_frac = scan_service._colour_frame_valid_frac(frame, cfg, stride=8)
+    assert colour_frac >= 0.95, (colour_frac, raw_frac)   # the FIX must clear the gate
+    print("[full-frame frac] raw depth-frame", round(raw_frac, 3),
+          "vs colour-registered", round(colour_frac, 3), "-> gate now correctly reachable")
+
+
 def test_declared_region_still_crops_the_same_overrun_surface():
     """The other half of Task 3: the crop is not gone, it is now OPT-IN.
 

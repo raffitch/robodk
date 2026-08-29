@@ -146,13 +146,20 @@ def ray_point(u, v, z_mm, K_color, dist_color) -> np.ndarray:
 class ColorRegistered:
     """One frame's valid depth points with their positions in the colour image."""
 
-    def __init__(self, pts_mm, uv, uv_depth, color_size, depth_size, stride):
+    def __init__(self, pts_mm, uv, uv_depth, color_size, depth_size, stride,
+                 depth_K, color_K_factory):
         self.pts_mm = np.asarray(pts_mm, float)
         self.uv = np.asarray(uv, float)
         self.uv_depth = np.asarray(uv_depth, int)
         self.color_size = (int(color_size[0]), int(color_size[1]))
         self.depth_size = (int(depth_size[0]), int(depth_size[1]))
         self.stride = int(stride)
+        # R25: the geometry's own depth/colour K matrices, so _density_ratio can
+        # compute the depth-px/colour-px ratio ANALYTICALLY instead of estimating
+        # it from the registered points' footprint (which was biased ~27% low --
+        # see _density_ratio's docstring).
+        self._depth_K = np.asarray(depth_K, float)
+        self._color_K = np.asarray(color_K_factory, float)
         self._tree = None
 
     @classmethod
@@ -161,7 +168,8 @@ class ColorRegistered:
         pts, uv_depth = backproject(depth, geom, stride=stride)
         uv = project_to_color(pts, K_color, dist_color)
         d = np.asarray(depth)
-        return cls(pts, uv, uv_depth, geom.color_size, (d.shape[1], d.shape[0]), stride)
+        return cls(pts, uv, uv_depth, geom.color_size, (d.shape[1], d.shape[0]), stride,
+                   geom.depth_K, geom.color_K_factory)
 
     def __len__(self) -> int:
         return len(self.pts_mm)
@@ -201,23 +209,43 @@ class ColorRegistered:
         return float(self.in_center_patch(frac).sum()) / (area_color * self._density_ratio())
 
     def _density_ratio(self) -> float:
-        """ESTIMATE of depth pixels per colour pixel, from the registered points'
-        own footprint (total depth pixels after stride, over the colour-image area
-        they actually cover) -- not a measurement, only good enough to feed
-        valid_frac_in_center_patch's threshold. depth pixels per colour pixel from
-        the two images' sizes and FOVs alone is not known here (the colour FOV/crop
-        relative to depth is not carried in the greeting), so a partially valid
-        frame does not inflate the ratio: it uses the points' own spread, not the
-        full sensor geometry."""
-        w_c, h_c = self.color_size
-        w_d, h_d = self.depth_size
-        n_depth = (w_d // self.stride) * (h_d // self.stride)
-        if len(self.uv) == 0:
-            return n_depth / float(w_c * h_c)
-        span_u = max(1.0, float(np.ptp(self.uv[:, 0])))
-        span_v = max(1.0, float(np.ptp(self.uv[:, 1])))
-        cover = min(float(w_c * h_c), span_u * span_v * n_depth / max(len(self.uv), 1))
-        return n_depth / max(cover, 1.0)
+        """The depth-pixels-per-colour-pixel ratio, ANALYTIC (R25) not estimated.
+
+        For a fronto-parallel surface at distance z, one depth pixel subtends
+        ``(z/fx_d)*(z/fy_d)`` of world area and one colour pixel subtends
+        ``(z/fx_c)*(z/fy_c)``; z cancels, so the ratio is exactly
+        ``(fx_d*fy_d)/(fx_c*fy_c)`` -- a constant of the two cameras' intrinsics,
+        independent of distance or how much of the frame is actually covered.
+        For ``legacy_aligned`` geometry ``depth_K == color_K`` so this is exactly
+        1.0, matching the pre-protocol-2 convention (depth pixel == colour pixel)
+        by construction.
+
+        This REPLACES a footprint-based estimate (total depth pixels after stride,
+        over the colour-image area the registered points' own bounding box
+        covered) that R19 accepted as "inside the test's band" without checking
+        whether that band was the right answer: measured on a fully-covered centre
+        patch it returned 0.25 against the true 0.1878 for the depth_gate test
+        fixture, biasing valid_frac to ~0.73 for a 100%-covered patch that should
+        read 1.0 (R25). Approximate only insofar as the surface is tilted (a
+        tilted patch's true footprint differs from the fronto-parallel constant
+        by a small, tilt-dependent factor) -- the same approximation the old
+        estimate made, but centred correctly at zero tilt instead of biased low
+        there too.
+
+        Divided by ``stride**2``: a caller that builds this registration with
+        ``stride > 1`` (``evaluate_depth_gate``'s stride=2, cheap for the live HUD)
+        only samples 1-in-``stride**2`` native depth pixels, so the number of
+        REGISTERED points expected to fill a fully-covered patch drops by that
+        same factor -- exactly what the old footprint estimate's own
+        ``n_depth = (w_d // stride) * (h_d // stride)`` accounted for and a
+        stride-naive analytic formula would silently drop (caught by re-running
+        the full Step-9 suite after this fix: stride=2 callers went from
+        ``detected`` to not-detected until this factor was restored)."""
+        fx_d, fy_d = float(self._depth_K[0, 0]), float(self._depth_K[1, 1])
+        fx_c, fy_c = float(self._color_K[0, 0]), float(self._color_K[1, 1])
+        if fx_c <= 0.0 or fy_c <= 0.0:
+            return 1.0
+        return (fx_d * fy_d) / (fx_c * fy_c) / float(self.stride ** 2)
 
     def near(self, u_px, v_px, radius_px) -> np.ndarray:
         if len(self.uv) == 0:
