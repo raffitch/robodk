@@ -211,10 +211,10 @@ def depth_plane_check(depth, T_work_camera, config) -> dict:
 
     On the cell (2026-08-29) a capture came back with a correct colour frame of
     the board at 312 mm and a depth frame reading 447 mm -- the height the arm
-    had been parked at. The Jetson filters depth through ``rs.temporal_filter``,
-    which blends each frame with previous ones, so the first depth after a move
-    is still weighted toward where the camera used to be. Colour carries no such
-    filter, which is why the two disagreed. That frame failed loudly because
+    had been parked at. The depth stream had STALLED: every grab returned a
+    byte-identical depth buffer for over an hour while colour stayed live, so
+    the camera kept reporting the distance it had last managed to measure.
+    Restarting the camera service cleared it. That frame failed loudly because
     everything landed outside the search region; a smaller residual would have
     passed every gate and quietly moved a paper number instead.
     """
@@ -280,28 +280,42 @@ def _inspect_and_capture(services, ctx: JobContext, plan: CylinderPlan, layer, *
     # retry is what lets it converge on where the camera actually is now.
     attempts = int(getattr(ecfg, "depth_stale_retries", 2))
     check = depth_plane_check(frame.depth, T_work_camera, ecfg)
-    retries = 0
+    retries, frozen = 0, False
     while not check["agrees"] and retries < attempts:
         retries += 1
         ctx.log(f"depth said {check['observed_depth_mm']:.0f} mm with the camera "
                 f"{check['camera_z_mm']:.0f} mm above the work plane - discarding it and "
                 f"grabbing again ({retries}/{attempts})")
+        previous = frame.depth
         started = time.perf_counter()
         frame = services.camera.grab(with_depth=True, timeout=ecfg.grab_timeout_s)
         capture_ms = (time.perf_counter() - started) * 1000.0
         if frame.depth is None:
             raise RuntimeError("RGB-D capture returned no depth")
+        # A stalled stream hands back the SAME buffer every time. That is a
+        # different fault from a wrong one, and it has a different remedy, so it
+        # is worth telling apart rather than reporting as "still disagrees".
+        if np.array_equal(previous, frame.depth):
+            frozen = True
         check = depth_plane_check(frame.depth, T_work_camera, ecfg)
     check["retries"] = retries
+    check["frozen_stream"] = frozen
     if not check["agrees"]:
+        detail = (
+            "every grab returned a byte-identical depth buffer, so the camera's depth stream "
+            "is FROZEN - it keeps serving the last frame it managed to measure while colour "
+            "stays live. Restart it with `py -3.10 tools/jetson_deploy.py restart`, then "
+            "measure again."
+            if frozen else
+            "the depth is changing but does not match this pose. Check that the work frame "
+            "still sits on the physical surface, and that nothing has been placed under or "
+            "over the board.")
         raise RuntimeError(
             f"the depth frame does not describe this pose: median depth "
             f"{check['observed_depth_mm']:.0f} mm with the camera "
             f"{check['camera_z_mm']:.0f} mm above the work plane (expected "
             f"{check['accepted_range_mm'][0]:.0f}-{check['accepted_range_mm'][1]:.0f} mm), "
-            f"after {retries} retry(s). The Jetson blends depth across frames "
-            "(rs.temporal_filter), so a stale depth reads as the previous standoff; if it "
-            "persists, check that the work frame still sits on the physical surface.")
+            f"after {retries} retry(s). " + detail)
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:
         ctx.frame(jpeg.tobytes())

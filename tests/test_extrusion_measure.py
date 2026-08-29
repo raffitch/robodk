@@ -1917,5 +1917,8 @@ def test_a_depth_frame_that_never_matches_the_pose_fails_loudly(tmp_path, monkey
 
     message = str(failure.value)
     assert "640" in message and "506" in message, message
-    assert "temporal" in message.lower() or "stale" in message.lower(), message
+    # The frames were byte-identical, which is what a stalled stream looks like:
+    # the operator is told that, and the one command that clears it.
+    assert "frozen" in message.lower(), message
+    assert "jetson_deploy.py restart" in message, message
     assert rdk.events[-1] == ("move-joints", START_JOINTS)          # still comes home
