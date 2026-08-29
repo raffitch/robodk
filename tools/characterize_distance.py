@@ -55,6 +55,7 @@ if str(_REPO) not in sys.path:
 from tasni.core.characterize import (  # noqa: E402
     CHARACTERIZATION_DIR, choose_dstar, latest_characterization, summarize_distance_trial)
 from tasni.core.config import load_config  # noqa: E402
+from tasni.core.depth_geometry import ColorRegistered, ray_point  # noqa: E402
 from tasni.modules.calibration.charuco import CharucoTarget  # noqa: E402
 from tasni.modules.scan.survey_contract import camera_calibration_id  # noqa: E402
 
@@ -107,29 +108,36 @@ def _subsample_for_plane_fit(pts: np.ndarray,
     return pts[::int(np.ceil(n / max_points))]
 
 
-def _board_region_mask(shape, corners_px, *, margin_px: float = 6.0) -> np.ndarray:
-    """Boolean mask of the detected ChArUco region, slightly dilated.
+def _board_hull_uv_norm(corners_px, w: int, h: int) -> np.ndarray:
+    """Convex hull of THIS frame's detected ChArUco corners (colour pixels),
+    normalised to [0,1] colour coordinates for :func:`_board_points_mm` /
+    :meth:`~tasni.core.depth_geometry.ColorRegistered.in_polygon`.
 
     THE critical step for a distance sweep. Every metric here is meant to describe
     the BOARD, but a frame also contains the table, the floor and the far wall, and
     the board's share of it shrinks as the square of the standoff: ~33% of frame
-    area at 300 mm, ~1% at 1.5 m. Fit a plane to the unmasked frame and at range you
-    are measuring the ROOM -- the residual becomes the scene's depth spread (hundreds
+    area at 300 mm, ~1% at 1.5 m. Skip this restriction and at range you are
+    measuring the ROOM -- the residual becomes the scene's depth spread (hundreds
     of mm) and the median depth becomes the background, not the board. Both then
     degrade smoothly with distance, which looks exactly like a real physical result.
+
+    Normalised by ``w, h`` -- the COLOUR frame size (``cfg.camera.size``), since
+    the corners are detected in ``frame.color`` and ``in_polygon`` compares
+    against colour-pixel coordinates. Normalising by the depth image's size
+    instead would silently shrink or inflate the board region every downstream
+    plane statistic is computed from.
     """
     import cv2
 
     pts = np.asarray(corners_px, dtype=np.float32).reshape(-1, 1, 2)
-    hull = cv2.convexHull(pts)
-    if margin_px:
-        c = hull.reshape(-1, 2).mean(axis=0)
-        v = hull.reshape(-1, 2) - c
-        norms = np.linalg.norm(v, axis=1, keepdims=True)
-        hull = (c + v * (1.0 + margin_px / np.maximum(norms, 1e-6))).reshape(-1, 1, 2)
-    mask = np.zeros(tuple(shape[:2]), dtype=np.uint8)
-    cv2.fillConvexPoly(mask, hull.astype(np.int32), 1)
-    return mask.astype(bool)
+    hull = cv2.convexHull(pts).reshape(-1, 2)
+    return hull / np.array([float(w), float(h)])
+
+
+def _board_points_mm(registered: ColorRegistered, board_polygon_uv_norm) -> np.ndarray:
+    """Every registered depth point whose COLOUR projection lies inside the detected
+    board polygon (normalised colour coords), colour-frame mm."""
+    return registered.pts_mm[registered.in_polygon(board_polygon_uv_norm)]
 
 
 def _reject_off_board_points(pts: np.ndarray, *, band_mm: float = 25.0, k_sigma: float = 6.0):
@@ -170,40 +178,6 @@ def _reject_off_board_points(pts: np.ndarray, *, band_mm: float = 25.0, k_sigma:
         band_mm = max(float(band_mm), k_sigma * sigma)
     keep = res <= float(band_mm)                      # NaN -> False -> rejected
     return p[keep], int((~keep).sum()), plane
-
-
-def _backproject_valid_mm(depth, K, depth_scale: float = 1000.0,
-                          mask: "np.ndarray | None" = None, dist=None) -> np.ndarray:
-    """Every valid (>0) depth pixel, backprojected to camera-frame millimetres.
-
-    Mirrors modules/scan/service.py's own ``_backproject_depth`` convention:
-    the raw uint16 depth array is already in millimetres, and dividing by
-    ``depth_scale`` (default 1000.0, RealSense's metres-per-unit) then
-    multiplying back by 1000.0 is an identity unless the server ever reports a
-    different scale — kept explicit so this stays correct if that changes.
-
-    ``mask``, when given, restricts the result to those pixels — pass the board
-    region (see :func:`_board_region_mask`) so the metrics describe the board
-    rather than whatever else is in frame.
-    """
-    d = np.asarray(depth, dtype=float)
-    fx, fy = float(K[0, 0]), float(K[1, 1])
-    cx, cy = float(K[0, 2]), float(K[1, 2])
-    valid = d > 0
-    if mask is not None:
-        valid &= np.asarray(mask, dtype=bool)
-    ys, xs = np.nonzero(valid)
-    if dist is not None and len(ys):
-        # Matters for a TILTED capture: with the plane fronto-parallel a lateral
-        # x/y error leaves z unchanged, so the residual is blind to it, but once the
-        # plane is inclined that same error maps straight into the residual.
-        z_mm = d[ys, xs] / float(depth_scale) * 1000.0
-        xy = _undistort_uv(np.column_stack([xs, ys]).astype(np.float64), K, dist)
-        return np.column_stack([xy[:, 0] * z_mm, xy[:, 1] * z_mm, z_mm])
-    if len(ys) == 0:
-        return np.zeros((0, 3), dtype=float)
-    z_mm = d[ys, xs] / float(depth_scale) * 1000.0
-    return np.column_stack([(xs - cx) / fx * z_mm, (ys - cy) / fy * z_mm, z_mm])
 
 
 def _undistort_uv(uv, K, dist) -> np.ndarray:
@@ -252,26 +226,22 @@ def _corner_on_plane_mm(u: float, v: float, K, dist, plane) -> "np.ndarray | Non
     return ray * (float(c @ n) / denom)
 
 
-def _corner_point_mm(depth, K, u: float, v: float, depth_scale: float = 1000.0,
-                     window: int = 2, dist=None) -> "np.ndarray | None":
-    """Backproject one ChArUco corner pixel to camera-frame mm, using the
-    median valid depth in a small window around it (robust to a single noisy
-    pixel landing exactly on a corner)."""
-    d = np.asarray(depth, dtype=float)
-    h, w = d.shape
-    y0, y1 = max(0, int(round(v)) - window), min(h, int(round(v)) + window + 1)
-    x0, x1 = max(0, int(round(u)) - window), min(w, int(round(u)) + window + 1)
-    patch = d[y0:y1, x0:x1]
-    valid = patch[patch > 0]
-    if valid.size == 0:
+def _corner_point_mm(registered: ColorRegistered, u: float, v: float, K, dist, *,
+                     disc_px: float = 6.0) -> "np.ndarray | None":
+    """One ChArUco corner (colour pixel) -> colour-frame mm: the median depth of the
+    registered points within ``disc_px`` of it, placed on the corner's undistorted ray.
+
+    Used only as the FALLBACK when this frame has no usable board plane
+    (:func:`_corner_on_plane_mm` is preferred whenever one exists — it is accurate
+    to well under depth's own quantum). The median-of-neighbours-in-the-colour-image
+    robustness this replaces (a corner sits on a black/white edge where stereo
+    matching is least reliable) now lives in
+    :meth:`~tasni.core.depth_geometry.ColorRegistered.median_z_near`.
+    """
+    z = registered.median_z_near(u, v, disc_px)
+    if not np.isfinite(z) or z <= 0:
         return None
-    z_mm = float(np.median(valid)) / float(depth_scale) * 1000.0
-    if dist is not None:
-        x, y = _undistort_uv([[float(u), float(v)]], K, dist)[0]
-        return np.array([x * z_mm, y * z_mm, z_mm])
-    fx, fy = float(K[0, 0]), float(K[1, 1])
-    cx, cy = float(K[0, 2]), float(K[1, 2])
-    return np.array([(float(u) - cx) / fx * z_mm, (float(v) - cy) / fy * z_mm, z_mm])
+    return ray_point(u, v, z, K, dist)
 
 
 def _reference_corner_pair(board: CharucoTarget):
@@ -293,7 +263,8 @@ def _reference_corner_pair(board: CharucoTarget):
 
 def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float,
                            n_frames: int, *, timeout: float,
-                           frame_interval_s: float = 0.0, sleep=time.sleep) -> "object":
+                           frame_interval_s: float = 0.0, sleep=time.sleep,
+                           corner_disc_px: float = 6.0) -> "object":
     """Grab ``n_frames`` RGB-D pairs at the current (operator-jogged) standoff
     and fold them into one :class:`~tasni.core.characterize.DistanceTrial`.
 
@@ -313,8 +284,13 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
 
     Returns ``(trial, measured_tilt_deg)`` — the incidence angle is measured for the
     same reason, and is ``None`` only if no capture yielded a fittable plane.
+
+    ``corner_disc_px`` sizes the registered-depth disc :func:`_corner_point_mm`
+    reads around a corner when it must fall back to raw depth (no usable board
+    plane this frame) -- see ``--corner-disc-px``.
     """
-    K, depth_scale = cfg.camera.K, cfg.scan.depth_scale
+    K = cfg.camera.K
+    W, H = cfg.camera.size
     id_a, id_b, true_mm = _reference_corner_pair(board)
     total_corners = len(board.all_obj_points)
 
@@ -347,7 +323,7 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
 
         # Detect FIRST: the detection defines which pixels are board, and every
         # plane metric below must be restricted to those. Without that restriction
-        # the fit describes the whole scene (see _board_region_mask).
+        # the fit describes the whole scene (see _board_hull_uv_norm).
         found = board.detect_points(frame.color, min_corners=1)
         if found is None:
             coverage_samples.append(0.0)
@@ -357,10 +333,12 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
         ids_flat = [int(v) for v in ids.flatten().tolist()]
         coverage_samples.append(len(ids_flat) / float(total_corners))
 
-        mask = _board_region_mask(np.asarray(frame.depth).shape, corners.reshape(-1, 2))
-        pts = _subsample_for_plane_fit(
-            _backproject_valid_mm(frame.depth, K, depth_scale, mask=mask,
-                                  dist=cfg.camera.dist))
+        # Colour-registered depth (Task 7/8): every valid depth pixel, projected
+        # into the colour image through the greeting's own depth<->colour geometry
+        # -- not an aligned-on-the-Jetson image, and not a hardcoded 1 mm unit.
+        reg = ColorRegistered.build(frame.depth, frame.geometry, K, cfg.camera.dist)
+        hull_uv = _board_hull_uv_norm(corners.reshape(-1, 2), W, H)
+        pts = _subsample_for_plane_fit(_board_points_mm(reg, hull_uv))
         pts, n_rejected, board_plane = _reject_off_board_points(pts)
         rejected_fracs.append(n_rejected / max(n_rejected + len(pts), 1))
         if len(pts) >= 3:
@@ -376,11 +354,11 @@ def capture_distance_trial(camera, board: CharucoTarget, cfg, distance_mm: float
             if board_plane is not None:
                 pa = _corner_on_plane_mm(*px_by_id[id_a], K, cfg.camera.dist, board_plane)
                 pb = _corner_on_plane_mm(*px_by_id[id_b], K, cfg.camera.dist, board_plane)
-            else:   # no usable plane this frame — fall back to raw corner depth
-                pa = _corner_point_mm(frame.depth, K, *px_by_id[id_a], depth_scale,
-                                      dist=cfg.camera.dist)
-                pb = _corner_point_mm(frame.depth, K, *px_by_id[id_b], depth_scale,
-                                      dist=cfg.camera.dist)
+            else:   # no usable plane this frame — fall back to a registered-depth disc
+                pa = _corner_point_mm(reg, *px_by_id[id_a], K, cfg.camera.dist,
+                                      disc_px=corner_disc_px)
+                pb = _corner_point_mm(reg, *px_by_id[id_b], K, cfg.camera.dist,
+                                      disc_px=corner_disc_px)
             if pa is not None and pb is not None:
                 # ACCUMULATE across frames into one sample. Emitting one sample per
                 # frame made length_spread_mm structurally zero: it is the std of the
@@ -675,6 +653,11 @@ def _parse_args(argv=None) -> argparse.Namespace:
                         "frames of a static scene are near-identical and the "
                         "repeatability metrics read as ~0. Spacing them samples slower "
                         "drift. 0 restores the old back-to-back behaviour")
+    p.add_argument("--corner-disc-px", type=float, default=6.0,
+                   help="radius (colour px) of the registered-depth disc a ChArUco "
+                        "corner's depth is read from when no board plane could be "
+                        "fitted this frame (the fallback path -- normally the plane "
+                        "intersection is used instead)")
     p.add_argument("--tilt", type=float, default=25.0,
                    help="worst planned tilt (deg) for the oblique-incidence sanity check "
                         "(ignored when --tilts is given)")
@@ -781,7 +764,7 @@ def main(argv=None) -> None:
                 f"ChArUco board.")
             trial, tilt_now = capture_distance_trial(
                 camera, board, cfg, d, args.frames, timeout=cfg.camera.timeout_s,
-                frame_interval_s=args.frame_interval)
+                frame_interval_s=args.frame_interval, corner_disc_px=args.corner_disc_px)
             trials.append(trial)
             pose = None
             if rdk_io is not None:
@@ -824,7 +807,8 @@ def main(argv=None) -> None:
                 "only at normal incidence.")
             trial, measured_tilt = capture_distance_trial(
                 camera, board, cfg, oblique_distance, args.frames,
-                timeout=cfg.camera.timeout_s, frame_interval_s=args.frame_interval)
+                timeout=cfg.camera.timeout_s, frame_interval_s=args.frame_interval,
+                corner_disc_px=args.corner_disc_px)
             passed = choose_dstar([trial], **budget) is not None
             # The MEASURED angle is authoritative, for the same reason the standoff is:
             # reporting a permitted band at angles that were never actually tested
@@ -896,6 +880,15 @@ def main(argv=None) -> None:
                 "trial": oblique_trial_dict, "passed": oblique_passed,
             },
             "robot_camera_T_mm": camera_T_per_distance,
+            # The connection's own protocol-2 greeting (depth intrinsics, depth->colour
+            # extrinsic, depth unit, temps, laser/visual preset) -- so a characterization
+            # file states the exact configuration it was measured under, rather than
+            # relying on the reader to assume today's config still matches. Set on the
+            # camera client by the first successful depth grab of the sweep; None only
+            # if every distance in the sweep somehow failed before that (in which case
+            # capture_distance_trial would already have raised).
+            "camera_geometry": (camera.geometry.to_dict()
+                                if camera.geometry is not None else None),
             "board": {
                 "dictionary": cfg.board.dictionary, "squares_x": cfg.board.squares_x,
                 "squares_y": cfg.board.squares_y, "square_size_mm": cfg.board.square_size_mm,
