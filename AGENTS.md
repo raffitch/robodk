@@ -184,6 +184,16 @@ the raw frame as regression evidence; do not use its metrics in the paper. The f
 300 mm retry was rejected by the ring-shape gate and predated failed-frame archiving, so
 it produced no `characterize-02` directory and is also not evidence.
 
+**Sensor layer (opened 2026-08-29, nothing started):**
+[docs/realsense-capability-audit-2026-08-29.md](docs/realsense-capability-audit-2026-08-29.md)
+measured that the Jetson service loads an **unoptimised, non-CUDA librealsense 2.53.1 debug
+build** (not the apt 2.55.1), delivers depth quantised to **1 mm** where the sensor resolves
+~0.2 mm at the working standoff, discards ~50 % of the depth field by aligning to colour on
+the Jetson, and runs an **unrecorded Custom preset** that nobody can reproduce. Twelve
+findings R1-R12 with a dependency-ordered sequence; R4.1 (record the as-found advanced-mode
+JSON) is read-only and should go first because it makes the 2026-08-13 characterisation
+reproducible. Nothing else there lands on the cell before the 1 Sep paper deadline.
+
 ## 5. How to work here
 
 - **Measure before theorising.** Most of the time lost on this project has gone to

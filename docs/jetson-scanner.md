@@ -27,7 +27,7 @@ probed on **2026-06-19** via `tools/jetson_probe.py`.
 | Kernel | 4.9.337-tegra, aarch64 |
 | System Python | 3.6.9 (`/usr/bin/python3`) |
 | Built-from-source Python | 3.10.11 (`~/Python-3.10.11`) — used by the server venv `ethenv` |
-| **librealsense** | **2.55.1** (`2.55.1-0~realsense.3335`) — recent, late 2024 |
+| **librealsense** | apt: 2.55.1 (`2.55.1-0~realsense.3335`) — but the **service loads a source build of 2.53.1** from `~/librealsense/build_py310` (unoptimised, no CUDA/OpenMP). See [realsense-capability-audit-2026-08-29.md](realsense-capability-audit-2026-08-29.md) R1. |
 | pyrealsense2 | installed (old binding, no `__version__`) |
 
 > Jetson Nano is EOL at JetPack 4.6.x — R32.7.6 is effectively the latest it can run.
