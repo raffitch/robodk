@@ -166,8 +166,11 @@ you drive the real cell, not an empty station). Run it on Windows with
   bird's-eye height map, oblique and unrolled profile per take + a per-trial stack, all
   rendered from the archive with no robot — `pip install -e .[figures]`.
 - Then integrate the rest into the same app: scan (with **TSDF fusion** — biggest quality
-  win), ArUco-to-plane, target generation. RealSense High-Accuracy preset + filter order
-  live in `server/server_unicast_syncronous.py`. Tailscale (off-LAN) deferred.
+  win), ArUco-to-plane, target generation. The RealSense options + filter chain live in
+  `server/server_unicast_syncronous.py` (device runs a Custom preset, NOT High Accuracy;
+  what is left unused — CUDA build, 0.1 mm depth units, advanced mode, IR, IMU — is in
+  [docs/realsense-capability-audit-2026-08-29.md](docs/realsense-capability-audit-2026-08-29.md)).
+  Tailscale (off-LAN) deferred.
 - ✅ **Two-path workframe survey implemented** (17-task plan, all merged to
   `calibration-improvements`, 393 tests green): compact single-view lock, a guided
   five-position (center + four corners) survey for platforms too large for one camera
