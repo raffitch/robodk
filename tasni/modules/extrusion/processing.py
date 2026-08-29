@@ -755,6 +755,33 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     keep("top_surface", points)
     timings["filter_ms"] = (time.perf_counter() - mark) * 1000
 
+    # The spur-pruning tolerance below has to match the bead the code is
+    # ACTUALLY looking at, not whatever the caller's recipe claims. A recipe
+    # can overstate the true bead (a fresh trial's generic default, an
+    # operator's optimistic guess) -- and an overstated bead inflates the
+    # tolerance, which prunes a LONGER twig without asking whether it is
+    # real. That is the dangerous direction: it is how takes 1-3 of the
+    # 2026-08-29 cell run measured contamination as bead and landed a radius
+    # biased 0.6-0.7 mm large without the branch guard ever firing to say so.
+    # An understated recipe only makes the guard stricter (more false
+    # rejections, never a false accept), so the fix is one-sided: never let
+    # the tolerance be inflated beyond what THIS frame's own deposit
+    # footprint supports. ``deposit`` (post radial-trim, pre top-surface) is
+    # the same footprint characterize_ring's own coarse pass measures from,
+    # so a caller that already re-measured the bead (as a post-characterize
+    # layer recipe does) sees no change here -- this only clamps a stale or
+    # never-measured recipe value down to reality.
+    spur_bead_mm = recipe.bead_diameter_mm
+    try:
+        measured_bead_mm = bead_width_profile(
+            deposit, (setup.center_x_mm, setup.center_y_mm),
+            bins=config.bead_width_bins)["mean_mm"]
+    except RuntimeError:
+        measured_bead_mm = None
+    if measured_bead_mm is not None and measured_bead_mm > 0:
+        spur_bead_mm = min(spur_bead_mm, measured_bead_mm)
+    counts["spur_guard_bead_mm"] = round(float(spur_bead_mm), 3)
+
     attempts: list[dict] = []
     ordered_pixels = None
     final_mask = final_skeleton = None
@@ -768,7 +795,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
         # adds roughly another half-width.  Prune only twigs no longer than that
         # combined footprint; longer arms remain safety-significant branches.
         spur_limit = max(2, int(math.ceil(
-            1.5 * recipe.bead_diameter_mm / config.raster_mm_per_pixel)))
+            1.5 * spur_bead_mm / config.raster_mm_per_pixel)))
         skeleton, pruned = _prune_short_spurs(skeleton, spur_limit)
         graph = _graph(skeleton)
         branches = sum(1 for links in graph.values() if len(links) > 2)
