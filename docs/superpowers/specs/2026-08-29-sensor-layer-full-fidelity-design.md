@@ -101,7 +101,8 @@ compatibility path.
 ### 4.1 The wire
 
 One depth format. A depth client sends `MODE FULL V2\n` (burst: `MODE BURST V2\n`). The
-server replies with **one newline-terminated JSON line — the greeting — then frames**:
+server replies with **one newline-terminated JSON line — the greeting — then frames**
+(schema below; numeric values illustrative, the server fills them from the live profile):
 
 ```json
 {"protocol": 2, "aligned": false, "depth_unit_mm": 0.1,
@@ -203,7 +204,7 @@ transform and stays valid** — R7 needs a validation run, not a recalibration.
 | extrusion archive | `manifest.provenance.camera_geometry` = `geom.raw` (temps, preset, fw, unit come free). **`figures.py` keeps one read-side fallback:** a manifest without `camera_geometry` is rendered as it was captured — aligned, 1 mm, colour K — so ring 1 and the paper fixtures still render. Archived data, not a live path. |
 | `scan/reconstruct.fuse_views` | depth-only TSDF: `TSDFVolumeColorType.NoColor` with a constant image at depth size; intrinsic = `depth_K` @ `depth_size`; extrinsic = inv(`depth_pose`); Open3D `depth_scale = 1000 / depth_unit_mm`. The `depth ≠ color shape` guard is deleted. `measured_mesh_neutral_color` becomes the only behaviour. |
 | `scan/depth_gate`, `scan/survey`, `scan/service._backproject_depth`, `_save_views` | via `backproject` + `to_color_pixels`; `_save_views` writes `geom.raw` instead of `depth_scale`. `ScanView` carries `geometry`. |
-| `tools/characterize_distance.py` | corners detected in colour → depth points whose colour projection lies within *r* px of the corner → median. It migrates in this push because it is what **proves** the win. |
+| `tools/characterize_distance.py` | corners detected in colour → depth points whose colour projection lies within `corner_disc_px` (default 6 px at 1080p, a tool argument) of the corner → median. It migrates in this push because it is what **proves** the win. |
 | calibration module | no code change (colour-only grabs, now 1080p). |
 | `webui/AimHud.tsx` | telemetry already carries `overlay_size`; plan-time check that the HUD divides by it rather than assuming 1280×720 — fix if it does. |
 
