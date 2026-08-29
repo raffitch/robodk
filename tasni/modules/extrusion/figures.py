@@ -28,8 +28,8 @@ import numpy as np
 
 from .processing import depth_to_work_points
 
-LAYER_FIGURES = ("plan", "heightmap", "iso", "profile")
-TRIAL_FIGURES = ("stack",)
+LAYER_FIGURES = ("plan", "heightmap", "iso", "profile", "pipeline")
+TRIAL_FIGURES = ("stack", "tube")
 FORMATS = ("png", "pdf")
 DPI = 300
 
@@ -307,6 +307,21 @@ def _figure_plan(plt, take: TakeData):
     return fig
 
 
+def _deposit_band(z) -> tuple[float, float]:
+    """Colour limits for a raw cloud, clipped to a plausible deposit band.
+
+    A D435i frame carries dropouts hundreds of millimetres below the work plane.
+    Left in, they own the colour scale and the ring -- the whole subject --
+    flattens to a single colour.
+    """
+    z = np.asarray(z, dtype=float)
+    band = z[(z > -15.0) & (z < 60.0)]
+    if not band.size:
+        band = z
+    lo, hi = (float(v) for v in np.percentile(band, [2, 99.5]))
+    return lo, max(hi, lo + .1)
+
+
 def heightmap_data(take: TakeData, *, cell_mm: float = .5) -> dict | None:
     """Gridded height map plus the colour range the relief should be read against.
 
@@ -410,6 +425,275 @@ def unrolled_profile(measured: np.ndarray, center, radius: float) -> dict:
             "maximum_mm": float(np.abs(deviation).max())}
 
 
+def take_stages(take: TakeData) -> "dict | None":
+    """Re-run the archived frame through the real chain, keeping every stage.
+
+    Nothing is re-implemented here: this calls ``process_observation`` with a
+    collector, so the panels show the arrays the pipeline actually held. Needs
+    the scan extra (Open3D); without it the method figure is skipped like any
+    other figure that cannot be drawn.
+    """
+    if take.depth is None or take.K is None or take.T_work_camera is None:
+        return None
+    from .processing import plan_for_archived_take, process_observation
+
+    trial_file = take.layer_dir.parent / "trial.json"
+    if not trial_file.is_file():
+        return None
+    trial = json.loads(trial_file.read_text(encoding="utf-8"))
+    config_payload = ((take.manifest.get("provenance") or {}).get("processing_config")
+                      or (trial.get("provenance") or {}).get("processing_config"))
+    if not config_payload:
+        return None
+    from ...core.config import ExtrusionConfig
+    plan = plan_for_archived_take(take.manifest, trial, nominal_xyz=take.nominal)
+    index = int(take.manifest.get("layer_index") or 1)
+    if index > len(plan.layers):
+        return None
+    stages: dict = {}
+    colour = take.layer_dir / (take.manifest.get("color_file") or "color.png")
+    image = None
+    if colour.is_file():
+        import cv2
+        image = cv2.imread(str(colour), cv2.IMREAD_COLOR)
+    if image is None:
+        image = np.zeros((*np.asarray(take.depth).shape[:2], 3), np.uint8)
+    try:
+        result = process_observation(
+            color=image, depth=take.depth,
+            T_work_camera=take.T_work_camera, K=take.K, plan=plan,
+            layer=plan.layers[index - 1],
+            config=ExtrusionConfig.model_validate(config_payload), stages=stages)
+    except Exception:
+        # A take that cannot be reconstructed still gets its other figures.
+        return stages or None
+    stages["result"] = result
+    return stages
+
+
+def _panel_cloud(ax, cloud, *, colour, size=1.2, label=None):
+    if cloud is None or not len(cloud):
+        return
+    ax.scatter(cloud[:, 0], cloud[:, 1], s=size, c=colour, linewidths=0, label=label)
+
+
+def _work_window(cloud, radius: float):
+    """The neighbourhood worth looking at, in mm.
+
+    A depth frame reaches well past the table -- the first real capture carried
+    returns a metre away on either side. Framed on those, the board and the ring
+    shrink to a smudge in the middle and the panel shows cell furniture instead
+    of the subject. The window is the deposit's own extent, generously padded.
+    """
+    if cloud is None or not len(cloud):
+        return None
+    cx, cy = float(np.median(cloud[:, 0])), float(np.median(cloud[:, 1]))
+    reach = max(float(radius or 0) * 2.6, 60.0,
+                float(np.ptp(cloud[:, 0])), float(np.ptp(cloud[:, 1]))) * .8
+    return (cx - reach, cx + reach, cy - reach, cy + reach)
+
+
+def _within(cloud, window):
+    if cloud is None or not len(cloud) or window is None:
+        return cloud
+    x0, x1, y0, y1 = window
+    keep = ((cloud[:, 0] >= x0) & (cloud[:, 0] <= x1)
+            & (cloud[:, 1] >= y0) & (cloud[:, 1] <= y1))
+    return cloud[keep]
+
+
+def _figure_pipeline(plt, take: TakeData):
+    """How one depth frame becomes a measured centreline, stage by stage.
+
+    This is the method figure: the same six arrays the pipeline held, in the
+    order it held them -- captured depth, the same cloud obliquely, the work
+    ROI, the deposit cluster, the top surface, and the extracted centreline
+    against nominal. Panels 1-3 share one window so the reader can watch points
+    being removed rather than re-reading three different scales.
+    """
+    stages = take_stages(take)
+    if not stages:
+        return None
+    raw = stages.get("backprojected")
+    if raw is None or not len(raw):
+        return None
+    result = stages.get("result")
+    radius = (take._nominal_circle or ((0.0, 0.0), 40.0))[1]
+    roi = stages.get("above_floor")
+    if roi is None or not len(roi):
+        roi = stages.get("work_roi")
+    window = _work_window(roi if roi is not None and len(roi) else raw, radius)
+    near = _within(raw, window)
+    band = _deposit_band(near[:, 2] if len(near) else raw[:, 2])
+
+    fig = plt.figure(figsize=(11.4, 7.4))
+    grid = fig.add_gridspec(2, 3, hspace=.33, wspace=.30,
+                            left=.055, right=.975, top=.90, bottom=.075)
+
+    # 1 -- everything the camera saw over the work, from above.
+    ax = fig.add_subplot(grid[0, 0])
+    dots = ax.scatter(near[:, 0], near[:, 1], s=.5, c=near[:, 2], cmap="viridis",
+                      vmin=band[0], vmax=band[1], linewidths=0)
+    fig.colorbar(dots, ax=ax, fraction=.046, pad=.03).set_label("Z (mm)", fontsize=8)
+    ax.set_title("1 · depth as captured", fontsize=10)
+    _square(ax, None, window)
+
+    # 2 -- the same points obliquely: the bead stands proud of the board.
+    ax = fig.add_subplot(grid[0, 1], projection="3d")
+    tall = near[(near[:, 2] > band[0]) & (near[:, 2] < band[1] + 4.0)]
+    thin = tall[:: max(1, len(tall) // 9000)] if len(tall) else tall
+    factor = _z_exaggeration(radius or 40.0,
+                             float(np.ptp(thin[:, 2])) if len(thin) else 0.0)
+    if len(thin):
+        ax.scatter(thin[:, 0], thin[:, 1], thin[:, 2] * factor, s=.7, c=thin[:, 2],
+                   cmap="viridis", vmin=band[0], vmax=band[1], linewidths=0)
+    ax.set_title(f"2 · the same points obliquely (Z × {factor:g})", fontsize=10)
+    ax.view_init(elev=24, azim=-62)
+    if window:
+        ax.set_xlim(window[0], window[1])
+        ax.set_ylim(window[2], window[3])
+    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+        axis.set_tick_params(labelsize=6)
+    ax.set_xlabel("X (mm)", fontsize=7)
+    ax.set_ylabel("Y (mm)", fontsize=7)
+
+    # 3 -- the work ROI: height band, radial band, previous layer's top.
+    ax = fig.add_subplot(grid[0, 2])
+    _panel_cloud(ax, near, colour="#dbe1e8", size=.5)
+    _panel_cloud(ax, roi, colour=CLOUD, size=1.2)
+    ax.set_title("3 · kept by the work ROI", fontsize=10)
+    _square(ax, None, window)
+
+    # 4 -- the deposit itself: largest cluster, then trimmed to the fitted ring.
+    ax = fig.add_subplot(grid[1, 0])
+    cluster, trimmed = stages.get("deposit_cluster"), stages.get("radial_trimmed")
+    _panel_cloud(ax, cluster, colour="#e0857b", size=1.4, label="trimmed away")
+    _panel_cloud(ax, trimmed, colour=CLOUD, size=1.4, label="kept")
+    if cluster is not None and trimmed is not None and len(cluster) > len(trimmed):
+        ax.legend(loc="upper right", fontsize=7, markerscale=4)
+    ax.set_title("4 · deposit cluster, radially trimmed", fontsize=10)
+    _square(ax, cluster)
+
+    # 5 -- the crest only, and the centreline thinned from it.
+    ax = fig.add_subplot(grid[1, 1])
+    top = stages.get("top_surface")
+    _panel_cloud(ax, trimmed, colour="#dbe1e8", size=1.0)
+    _panel_cloud(ax, top, colour=MEASURED, size=1.4)
+    if result is not None and result.measured_xyz is not None:
+        ax.plot(result.measured_xyz[:, 0], result.measured_xyz[:, 1],
+                color="#0b1017", linewidth=1.1, alpha=.7)
+    ax.set_title("5 · top surface, thinned to a centreline", fontsize=10)
+    _square(ax, top if top is not None and len(top) else trimmed)
+
+    # 6 -- what the paper measures.
+    ax = fig.add_subplot(grid[1, 2])
+    measured = result.measured_xyz if result is not None else take.measured
+    if take.nominal is not None:
+        ax.plot(take.nominal[:, 0], take.nominal[:, 1], color=NOMINAL, linewidth=1.3,
+                linestyle="--", label="nominal")
+    if measured is not None and len(measured):
+        ax.plot(measured[:, 0], measured[:, 1], color=MEASURED, linewidth=2.0,
+                label="extracted")
+    ax.legend(loc="upper right", fontsize=7.5)
+    ax.set_title("6 · extracted vs nominal", fontsize=10)
+    _square(ax, measured if measured is not None else take.nominal)
+
+    fig.suptitle(f"From one RGB-D frame to a measured centreline — {take.label}",
+                 fontsize=12)
+    fig.text(.5, .012, take.caption, ha="center", fontsize=7.5, color="#4b5563")
+    return fig
+
+
+def _square(ax, cloud, window=None):
+    """Equal aspect, mm axes, and a frame that fits what is being shown."""
+    ax.set_aspect("equal", adjustable="box")
+    ax.tick_params(labelsize=7)
+    ax.set_xlabel("X (mm)", fontsize=8)
+    ax.set_ylabel("Y (mm)", fontsize=8)
+    if window is not None:
+        ax.set_xlim(window[0], window[1])
+        ax.set_ylim(window[2], window[3])
+        return
+    if cloud is None or not len(cloud):
+        return
+    pad = max(4.0, .06 * float(max(np.ptp(cloud[:, 0]), np.ptp(cloud[:, 1]))))
+    ax.set_xlim(cloud[:, 0].min() - pad, cloud[:, 0].max() + pad)
+    ax.set_ylim(cloud[:, 1].min() - pad, cloud[:, 1].max() + pad)
+
+
+def _tube(centreline: np.ndarray, bead_mm: float, *, sides: int = 20):
+    """A pipe of diameter ``bead_mm`` swept along a closed centreline.
+
+    The toolpath is a curve, but what is deposited is a bead with a width and a
+    height; drawing the curve alone hides exactly the quantity the experiment
+    measures. Returns X, Y, Z surface arrays for plot_surface.
+    """
+    path = np.asarray(centreline, dtype=float).reshape(-1, 3)
+    if len(path) < 3:
+        return None
+    if not np.allclose(path[0], path[-1]):
+        path = np.vstack([path, path[:1]])
+    tangent = np.gradient(path, axis=0)
+    norms = np.linalg.norm(tangent, axis=1, keepdims=True)
+    tangent = tangent / np.where(norms == 0, 1.0, norms)
+    up = np.array([0.0, 0.0, 1.0])
+    side = np.cross(tangent, up)
+    side_norm = np.linalg.norm(side, axis=1, keepdims=True)
+    side = side / np.where(side_norm == 0, 1.0, side_norm)
+    normal = np.cross(side, tangent)
+    angles = np.linspace(0, 2 * np.pi, sides)
+    radius = float(bead_mm) / 2.0
+    offsets = (np.cos(angles)[None, :, None] * side[:, None, :]
+               + np.sin(angles)[None, :, None] * normal[:, None, :])
+    surface = path[:, None, :] + radius * offsets
+    return surface[:, :, 0], surface[:, :, 1], surface[:, :, 2]
+
+
+def _figure_tube(plt, takes: list[TakeData], trial_id: str):
+    """The stack as it is actually deposited: a bead with thickness, per layer.
+
+    Nominal is drawn as the pipe the recipe asks for -- at each layer's own
+    height, so the stack climbs by the layer height -- and the measured
+    centreline runs through it. Where the measured line leaves the pipe, the
+    deposit is off by more than half a bead.
+    """
+    drawable = [t for t in takes if t.measured is not None and len(t.measured)]
+    if not drawable:
+        return None
+    bead = 0.0
+    for take in drawable:
+        bead = max(bead, float((take.manifest.get("recipe") or {}).get("bead_diameter_mm") or 0))
+    if bead <= 0:
+        bead = 8.0
+    fig = plt.figure(figsize=(7.4, 6.0))
+    ax = fig.add_subplot(111, projection="3d")
+    for take in drawable:
+        if take.nominal is not None and len(take.nominal) >= 3:
+            pipe = _tube(take.nominal, bead)
+            if pipe is not None:
+                ax.plot_surface(*pipe, color=NOMINAL, alpha=.22, linewidth=0,
+                                shade=True, rstride=2, cstride=1)
+        ax.plot(take.measured[:, 0], take.measured[:, 1], take.measured[:, 2],
+                color=MEASURED, linewidth=2.0)
+    ax.plot([], [], color=NOMINAL, linewidth=6, alpha=.35,
+            label=f"commanded bead (Ø {bead:g} mm)")
+    ax.plot([], [], color=MEASURED, linewidth=2, label="measured centreline")
+    ax.set_xlabel("X (mm)", fontsize=9)
+    ax.set_ylabel("Y (mm)", fontsize=9)
+    ax.set_zlabel("Z (mm)", fontsize=9)
+    ax.set_title(f"Commanded bead against what was measured — {trial_id}", fontsize=10)
+    ax.legend(loc="upper left", fontsize=8)
+    ax.view_init(elev=18, azim=-62)
+    try:                                   # keep the ring round, not an ellipse
+        ax.set_box_aspect((1, 1, .55))
+    except Exception:
+        pass
+    fig.text(.5, .015, "True scale: the pipe is the commanded bead diameter and each layer "
+                       "sits at its own height.", ha="center", fontsize=7.5, color="#4b5563")
+    fig.tight_layout(rect=(0, .035, 1, 1))
+    return fig
+
+
 def _figure_profile(plt, take: TakeData):
     if take.measured is None or len(take.measured) < 3:
         return None
@@ -448,7 +732,8 @@ def _figure_profile(plt, take: TakeData):
 
 
 _LAYER_BUILDERS = {"plan": _figure_plan, "heightmap": _figure_heightmap,
-                   "iso": _figure_iso, "profile": _figure_profile}
+                   "iso": _figure_iso, "profile": _figure_profile,
+                   "pipeline": _figure_pipeline}
 
 
 # -- the trial figure --------------------------------------------------------
@@ -554,13 +839,17 @@ def render_layer_figures(layer_dir, *, formats=FORMATS, dpi: int = DPI,
 def render_trial_figures(trial_dir, *, formats=FORMATS, dpi: int = DPI) -> list[Path]:
     plt = _pyplot()
     trial_dir = Path(trial_dir)
-    fig = _figure_stack(plt, latest_takes(trial_dir), trial_dir.name)
-    if fig is None:
-        return []
-    try:
-        return _save(fig, trial_dir / "figures", "stack", formats, dpi)
-    finally:
-        plt.close(fig)
+    takes = latest_takes(trial_dir)
+    written: list[Path] = []
+    for stem, builder in (("stack", _figure_stack), ("tube", _figure_tube)):
+        fig = builder(plt, takes, trial_dir.name)
+        if fig is None:
+            continue
+        try:
+            written.extend(_save(fig, trial_dir / "figures", stem, formats, dpi))
+        finally:
+            plt.close(fig)
+    return written
 
 
 def ensure_figure(directory, filename: str) -> Path:

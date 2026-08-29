@@ -146,6 +146,8 @@ function layerDirName(take: MeasureTake): string {
 }
 
 const FIGURES: Array<{ stem: string; label: string; hint: string }> = [
+  { stem: "pipeline", label: "How it was measured",
+    hint: "every stage: captured depth → ROI → deposit → crest → centreline" },
   { stem: "plan", label: "Plan view", hint: "deposit cloud, extracted centreline, nominal ring" },
   { stem: "heightmap", label: "Height map", hint: "bird's-eye relief of the depth frame" },
   { stem: "iso", label: "Oblique", hint: "3-D cloud + centreline, vertical exaggeration" },
@@ -1359,22 +1361,26 @@ export default function Extrusion() {
           {showStack ? "Hide" : "Show"} stack figure
         </button>
       </div>
-      {showStack && measureSession ? <figure className="figure-card" style={{ marginTop: 10 }}>
-        <a href={`/api/modules/extrusion/trials/${encodeURIComponent(measureSession.trial_id)}/figures/stack.png`}
-           target="_blank" rel="noreferrer">
-          <img src={`/api/modules/extrusion/trials/${encodeURIComponent(measureSession.trial_id)}/figures/stack.png`}
-               alt="Every layer's latest measured centreline, plan and oblique" />
-        </a>
-        <figcaption><strong>Ring stack</strong>
-          <span className="hint">every layer's latest take, measured against nominal</span>
-          <span className="figure-links">
-            <a href={`/api/modules/extrusion/trials/${encodeURIComponent(measureSession.trial_id)}/figures/stack.png`}
-               target="_blank" rel="noreferrer">PNG</a>
-            <a href={`/api/modules/extrusion/trials/${encodeURIComponent(measureSession.trial_id)}/figures/stack.pdf`}
-               target="_blank" rel="noreferrer">PDF</a>
-          </span>
-        </figcaption>
-      </figure> : null}
+      {showStack && measureSession ? <div className="figure-gallery" style={{ marginTop: 10 }}>
+        {[{ stem: "stack", label: "Ring stack",
+            hint: "every layer's latest take, measured against nominal" },
+          { stem: "tube", label: "Commanded bead vs measured",
+            hint: "the bead drawn at its real diameter, each layer at its own height" }
+         ].map(({ stem, label, hint }) => {
+          const base = `/api/modules/extrusion/trials/${encodeURIComponent(measureSession.trial_id)}/figures/${stem}`;
+          return <figure className="figure-card" key={stem}>
+            <a href={`${base}.png`} target="_blank" rel="noreferrer">
+              <img src={`${base}.png`} alt={label} loading="lazy" />
+            </a>
+            <figcaption><strong>{label}</strong> <span className="hint">{hint}</span>
+              <span className="figure-links">
+                <a href={`${base}.png`} target="_blank" rel="noreferrer">PNG</a>
+                <a href={`${base}.pdf`} target="_blank" rel="noreferrer">PDF</a>
+              </span>
+            </figcaption>
+          </figure>;
+        })}
+      </div> : null}
       {paper && <pre className="log" style={{ whiteSpace: "pre-wrap" }}>{paper}</pre>}
     </div>}
 

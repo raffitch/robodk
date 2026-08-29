@@ -74,7 +74,8 @@ def scene_plan(*, radius=60.0, bead=8.0, layers=1, layer_height=6.0, center=CENT
     return generate_cylinder_plan(recipe, setup)
 
 
-def observe(plan, layer_index, rings, *, config=None, floor_profile=None, seed=0):
+def observe(plan, layer_index, rings, *, config=None, floor_profile=None, seed=0,
+            stages=None):
     """Render the rings from the derived inspection pose and process that frame."""
     layer = plan.layers[layer_index - 1]
     T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, layer_index), 300.0)
@@ -82,6 +83,8 @@ def observe(plan, layer_index, rings, *, config=None, floor_profile=None, seed=0
                                                            plan.setup.center_y_mm), seed=seed)
     color = np.zeros((syn.SIZE_720P[1], syn.SIZE_720P[0], 3), np.uint8)
     kwargs = {} if floor_profile is None else {"floor_profile": floor_profile}
+    if stages is not None:
+        kwargs["stages"] = stages
     return process_observation(color=color, depth=depth, T_work_camera=T, K=syn.K_720P,
                                plan=plan, layer=layer, config=config or ExtrusionConfig(),
                                **kwargs)
@@ -1493,9 +1496,12 @@ def test_the_draft_embeds_a_figure_for_every_condition(tmp_path):
     out = build_paper_docx(root, "t1", tmp_path / "draft.docx")
 
     document = Document(str(out))
-    # The trial stack, plus a plan view for each of the two conditions.
-    assert len(document.inline_shapes) == 3
     captions = [p.text for p in document.paragraphs if p.text.startswith("Figure ")]
+    # The method figure leads, then the stack and the bead as a pipe, then a
+    # plan view for each of the two conditions.
+    assert len(document.inline_shapes) == len(captions) == 5
+    assert "becoming a measured centreline" in captions[0]
+    assert any("commanded bead" in c for c in captions)
     assert any("layer 1 - noise floor" in c for c in captions)
     assert any("layer 2 - stacked true" in c for c in captions)
 
@@ -1564,3 +1570,47 @@ def test_an_unknown_api_path_fails_as_an_api_not_as_the_web_app(tmp_path, monkey
 
     assert missing.status_code == 404
     assert "text/html" not in missing.headers.get("content-type", "")
+
+
+# ------------------ the processing chain, made visible for the method figure
+
+def test_processing_hands_back_every_stage_it_went_through():
+    """The method figure has to show what the code did, not a redrawing of it.
+
+    Each stage is handed back as the array the run actually held, and the last
+    one IS what was measured -- so a figure built from these cannot drift away
+    from the pipeline it claims to illustrate.
+    """
+    pytest.importorskip("open3d")
+    plan = scene_plan(radius=60.0, bead=8.0, layer_height=6.0)
+    stages: dict = {}
+    result = observe(plan, 1, [syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.flat(6.0))],
+                     stages=stages)
+
+    for key in ("backprojected", "work_roi", "deposit_cluster",
+                "radial_trimmed", "top_surface"):
+        assert key in stages and len(stages[key]), f"{key} was not handed back"
+        assert stages[key].shape[1] == 3
+    # Each stage keeps a subset of the one before it.
+    assert len(stages["backprojected"]) > len(stages["work_roi"])
+    assert len(stages["work_roi"]) >= len(stages["deposit_cluster"])
+    assert len(stages["deposit_cluster"]) >= len(stages["top_surface"])
+    # The board is in the raw cloud and gone by the ROI.
+    assert stages["backprojected"][:, 2].min() < 1.0
+    assert stages["work_roi"][:, 2].min() >= 0.5
+    assert np.array_equal(stages["top_surface"], result.filtered_xyz)
+
+
+def test_an_archived_take_rebuilds_the_plan_it_was_measured_against():
+    """Shared by offline reprocessing and by the method figure, so they agree."""
+    from tasni.modules.extrusion.processing import plan_for_archived_take
+    manifest = {"recipe": scene_plan(radius=42.6, bead=12.8).recipe.model_dump(mode="json"),
+                "layer_index": 1}
+    trial = {"setup": scene_plan().setup.model_dump(mode="json")}
+    nominal = points_array(scene_plan(radius=42.6, center=(214.6, 146.7)).layers[0])
+
+    plan = plan_for_archived_take(manifest, trial, nominal_xyz=nominal)
+
+    assert plan.recipe.radius_mm == 42.6
+    assert plan.setup.center_x_mm == pytest.approx(214.6, abs=0.01)
+    assert plan.setup.center_y_mm == pytest.approx(146.7, abs=0.01)

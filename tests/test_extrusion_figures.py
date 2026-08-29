@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 import extrusion_synthetic as syn
+from tasni.core.config import ExtrusionConfig
 from tasni.modules.extrusion.archive import ExtrusionArchive
 from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup, LayerManifest
 from tasni.modules.extrusion.toolpath import generate_cylinder_plan
@@ -89,6 +90,9 @@ def write_take(root, *, trial_id="t1", layer_index=1, take=1, measured=None,
                                                   "acquisition_to_path_ms": 3100.0}},
         provenance={"T_work_camera": np.asarray(T, dtype=float).tolist(),
                     "camera_intrinsics": {"K": syn.K_720P.tolist()},
+                    # The method figure re-runs the chain from the frame, and
+                    # the chain is reproducible only with the config it used.
+                    "processing_config": ExtrusionConfig().model_dump(mode="json"),
                     "work_frame": "Tasni Work Frame"})
     return archive.write_layer(manifest, nominal_xyz=nominal, commanded_xyz=nominal,
                                measured_xyz=measured, pointcloud_xyz=cloud, depth=frame)
@@ -132,7 +136,11 @@ def test_heightmap_falls_back_to_the_archived_cloud_when_the_take_has_no_depth(t
     layer_dir = write_take(tmp_path, depth=False)
     written = figures.render_layer_figures(layer_dir, formats=("png",))
 
-    assert {p.name for p in written} == {f"{s}.png" for s in figures.LAYER_FIGURES}
+    # Everything except the method figure, which re-runs the chain from the raw
+    # frame: without depth there is no pipeline to show, and an invented one
+    # would be worse than none.
+    assert {p.name for p in written} == {
+        f"{s}.png" for s in figures.LAYER_FIGURES if s != "pipeline"}
 
 
 def test_a_take_whose_processing_failed_still_renders_what_it_has(tmp_path):
@@ -185,7 +193,7 @@ def test_stack_figure_draws_the_latest_take_of_every_layer(tmp_path):
     assert [(t.manifest["layer_index"], t.manifest["take"]) for t in takes] == [(1, 2), (2, 1)]
 
     written = figures.render_trial_figures(tmp_path / "t1", formats=("png",))
-    assert [p.name for p in written] == ["stack.png"]
+    assert [p.name for p in written] == ["stack.png", "tube.png"]
     assert written[0].parent == tmp_path / "t1" / "figures"
 
 
@@ -375,3 +383,43 @@ def test_profile_uses_the_true_nominal_centre_of_a_CLOSED_nominal_path(tmp_path)
     profile = figures.unrolled_profile(take.measured, take.center, take.radius)
     expected = compare_circle(take.measured, take.radius, nominal_center_mm=CENTER)
     assert profile["rms_mm"] == pytest.approx(expected.rms_mm, abs=1e-6)
+
+
+def test_the_method_figure_draws_every_stage_of_the_pipeline(tmp_path):
+    """The paper's method figure: one depth frame becoming a centreline.
+
+    It re-runs the archived frame through the real chain with a stage
+    collector, so what it draws is what the pipeline held -- not a second
+    implementation that could drift from it.
+    """
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion.figures import render_layer_figures, take_stages, load_take
+
+    root = tmp_path / "runs" / "extrusion"
+    layer_dir = write_take(root, layer_index=1)
+
+    stages = take_stages(load_take(layer_dir))
+    written = render_layer_figures(layer_dir, only="pipeline")
+
+    assert {p.name for p in written} == {"pipeline.png", "pipeline.pdf"}
+    assert (layer_dir / "figures" / "pipeline.png").stat().st_size > 20_000
+    assert stages and len(stages["backprojected"]) > len(stages["work_roi"])
+
+
+def test_the_tube_figure_draws_the_bead_as_a_pipe_at_each_layer_height(tmp_path):
+    """A curve hides the bead thickness, which is the quantity being measured."""
+    from tasni.modules.extrusion.figures import render_trial_figures, _tube
+
+    root = tmp_path / "runs" / "extrusion"
+    write_take(root, layer_index=1)
+    write_take(root, layer_index=2, measured=_ring_xyz(z=12.0))
+
+    written = render_trial_figures(root / "t1")
+
+    assert {p.name for p in written} == {"stack.png", "stack.pdf", "tube.png", "tube.pdf"}
+    # The pipe is a surface swept at the bead radius about the centreline.
+    surface = _tube(_ring_xyz(z=6.0), 8.0)
+    assert surface is not None and surface[0].shape[1] == 20
+    radii = np.linalg.norm(np.stack(surface, axis=-1)[:, :, :2]
+                           - np.array([CENTER[0], CENTER[1]]), axis=-1)
+    assert radii.max() - radii.min() == pytest.approx(8.0, abs=0.5)

@@ -436,10 +436,34 @@ def _top_surface(points: np.ndarray, config, counts: dict) -> np.ndarray:
     return points
 
 
+def plan_for_archived_take(manifest: dict, trial: dict, *,
+                           nominal_xyz: np.ndarray | None = None) -> CylinderPlan:
+    """The plan an archived take was MEASURED against, not the trial's first plan.
+
+    A measure-only session is created before Characterize -> Apply, so
+    ``trial.json`` carries the pre-Apply recipe and centre. The take's own
+    manifest holds the recipe it was measured with, and its archived nominal
+    ring holds the centre -- fitted, never averaged, because the archived path
+    is closed and its first point repeats. Shared by offline reprocessing and by
+    the method figure so the two cannot disagree about what a take meant.
+    """
+    recipe = (CylinderRecipe.model_validate(manifest["recipe"]) if manifest.get("recipe")
+              else CylinderRecipe.model_validate(trial["recipe"]))
+    setup = CylinderSetup.model_validate(trial["setup"])
+    if nominal_xyz is not None:
+        nominal = np.asarray(nominal_xyz, dtype=float).reshape(-1, 3)
+        if len(nominal) >= 3:
+            center, _ = fit_circle_xy(nominal)
+            setup = setup.model_copy(update={"center_x_mm": float(center[0]),
+                                             "center_y_mm": float(center[1])})
+    return generate_cylinder_plan(recipe, setup)
+
+
 def process_observation(*, color: np.ndarray, depth: np.ndarray,
                         T_work_camera: np.ndarray, K: np.ndarray,
                         plan: CylinderPlan, layer: LayerPath, config,
-                        floor_profile: np.ndarray | None = None) -> ProcessingResult:
+                        floor_profile: np.ndarray | None = None,
+                        stages: dict | None = None) -> ProcessingResult:
     """Reconstruct one layer from exactly one saved synchronized RGB-D frame.
 
     ``floor_profile`` is the previous layer's measured centreline (Nx3, work
@@ -448,7 +472,17 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     lets a DISPLACED ring be measured without the exposed crescent of the ring
     beneath it being dragged into the same skeleton. Omitted, behaviour is
     exactly as before.
+
+    ``stages``, when a dict is passed, is filled with a copy of the cloud at
+    each step of the chain (backprojected, work_roi, above_floor,
+    deposit_cluster, radial_trimmed, top_surface). It exists so the method
+    figure can draw what this function actually did instead of a second
+    implementation of it that could drift. Collecting costs a few copies and
+    changes nothing else.
     """
+    def keep(name: str, cloud: np.ndarray) -> None:
+        if stages is not None:
+            stages[name] = np.asarray(cloud, dtype=float).copy()
     started = time.perf_counter()
     timings: dict[str, float] = {}
     counts: dict[str, int] = {}
@@ -457,6 +491,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     points, counts["raw_depth_pixels"] = depth_to_work_points(
         depth, K, T_work_camera, depth_scale=1000.0)
     timings["backproject_ms"] = (time.perf_counter() - mark) * 1000
+    keep("backprojected", points)
     setup, recipe = plan.setup, plan.recipe
     radius = np.linalg.norm(points[:, :2] - np.array([setup.center_x_mm, setup.center_y_mm]), axis=1)
     max_z = layer.nominal_z_mm + recipe.bead_diameter_mm / 2 + config.deposit_height_margin_mm
@@ -493,6 +528,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
             roi_diag["z_within_radial_band_mm"] = [pct(zr, 1), pct(zr, 50), pct(zr, 99)]
     counts.update({k: v for k, v in roi_diag.items() if isinstance(v, int)})
     points = points[roi]
+    keep("work_roi", points)
     floor = {"source": "build_plane", "margin_mm": 0.0, "mean_mm": float(min_z)}
     if floor_profile is not None and len(points):
         profile = np.asarray(floor_profile, dtype=float).reshape(-1, 3)
@@ -502,6 +538,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
         floor = {"source": "previous_layer_measured",
                  "margin_mm": float(config.layer_floor_margin_mm),
                  "mean_mm": float(local.mean())}
+        keep("above_floor", points)
     counts["after_work_roi"] = len(points)
     if len(points) < config.cluster_min_points:
         raise RuntimeError(
@@ -510,10 +547,13 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
 
     mark = time.perf_counter()
     deposit = _filter_deposit(points, config, counts)
+    keep("deposit_cluster", deposit)
     # Before the crest is picked and before the bead width is read from the
     # flanks: both must see the bead alone, not the board fused to it.
     deposit = _radial_trim(deposit, getattr(config, "radial_trim_schedule_mm", ()), counts)
+    keep("radial_trimmed", deposit)
     points = _top_surface(deposit, config, counts)
+    keep("top_surface", points)
     timings["filter_ms"] = (time.perf_counter() - mark) * 1000
 
     attempts: list[dict] = []

@@ -119,11 +119,27 @@ def _figure_paths(trial_dir: Path, summary: dict) -> list[tuple[Path, str]]:
     from .figures import ensure_figure
 
     wanted: list[tuple[Path, str]] = []
-    try:
-        stack = ensure_figure(trial_dir, "stack.png")
-        wanted.append((stack, "Every layer's latest measured centreline against nominal."))
-    except Exception:
-        pass
+    # The method figure leads: it is the paper's account of how a depth frame
+    # becomes the number in Table 1.
+    first = next((m for m in summary["manifests"]
+                  if (m.get("metrics") or {}).get("valid")), None)
+    method_dir = None if first is None else _layer_dir_for(trial_dir, first)
+    if method_dir is not None:
+        try:
+            wanted.append((ensure_figure(method_dir, "pipeline.png"),
+                           "One RGB-D frame becoming a measured centreline: captured depth, "
+                           "the work region of interest, the deposit cluster, its top surface, "
+                           "and the extracted centreline against nominal."))
+        except Exception:
+            pass
+    for stem, caption in (
+            ("stack.png", "Every layer's latest measured centreline against nominal."),
+            ("tube.png", "The commanded bead drawn at its real diameter, each layer at its "
+                         "own height, with the measured centreline running through it.")):
+        try:
+            wanted.append((ensure_figure(trial_dir, stem), caption))
+        except Exception:
+            continue
     from .measure import _condition_name
     for condition in summary["conditions"]:
         # The latest VALID take of this condition: the one a reader would check
