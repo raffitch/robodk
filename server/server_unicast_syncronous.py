@@ -601,8 +601,211 @@ def get_ip_address():
     return IP
 
 
-def getFrames(pipeline, align, depth_filters):
-    frames = pipeline.wait_for_frames()
+# --- Camera supervision -----------------------------------------------------
+#
+# ``pipeline``/``align`` are built once at startup and shared by every client
+# thread, and until now nothing ever rebuilt them. On 2026-08-29 the D435i
+# streamed for two healthy hours and then stopped delivering at 14:44:04; from
+# that moment EVERY acquisition raised "Frame didn't arrive within 5000" -- 57 in
+# a row -- while the service stayed ``active``, kept LISTENING on 1024 and kept
+# accepting clients. The operator saw an app that connected normally and then
+# showed nothing, with no error anywhere near the UI.
+#
+# All acquisition now funnels through ``read_frames()``, so one stall detector
+# sees the timeouts from all client threads. It rides out a brief stall, rebuilds
+# the pipeline once for a persistent one, and if it cannot, stops serving instead
+# of feeding clients nothing forever.
+
+class CameraUnavailable(RuntimeError):
+    """The camera is not delivering frames and could not be recovered."""
+
+
+# Below this, a stall is just a dropped frameset -- librealsense recovers from
+# those on its own, and a rebuild costs seconds and re-opens the USB device.
+FRAME_WEDGE_THRESHOLD = 3
+
+# Reopen attempts, and the pause before each one. Bounded and increasing on
+# purpose: re-opening a USB device in a tight loop is how a Tegra host controller
+# ends up dead ("tegra-xusb: HC died; cleaning up", same cell, same day).
+RECOVERY_BACKOFF_S = (1.0, 5.0, 15.0)
+
+# A device can enumerate cleanly and still deliver nothing. Treating the reopen
+# itself as success would loop -- stall, rebuild, stall, rebuild -- re-opening the
+# USB device every ~20 s for as long as the service runs, which is the hammering
+# the backoff above exists to prevent. So a rebuild is only credited once frames
+# actually flow again, and only so many uncredited rebuilds are allowed.
+MAX_REBUILDS_WITHOUT_PROGRESS = 3
+HEALTHY_FRAMES_AFTER_REBUILD = 30      # ~1 s of streaming at 30 fps
+
+pipeline = None          # replaced at startup, and on every successful rebuild
+align = None
+depth_unit_mm = None
+
+_camera_lock = threading.RLock()   # one camera behind many threads
+_camera_generation = 0             # bumped on every successful rebuild
+_consecutive_timeouts = 0
+_rebuilds_without_progress = 0
+_frames_since_rebuild = 0
+_camera_unavailable_reason = None
+
+
+def _recovery_sleep(seconds):
+    """The backoff pause, as a seam so tests do not actually wait."""
+    time.sleep(seconds)
+
+
+def _reset_camera_state():
+    """Return the supervisor to its healthy startup state (test seam)."""
+    global _camera_generation, _consecutive_timeouts, _camera_unavailable_reason
+    global _rebuilds_without_progress, _frames_since_rebuild
+    with _camera_lock:
+        _camera_generation = 0
+        _consecutive_timeouts = 0
+        _rebuilds_without_progress = 0
+        _frames_since_rebuild = 0
+        _camera_unavailable_reason = None
+
+
+def _is_frame_timeout(exc):
+    """True only for librealsense's "Frame didn't arrive within N".
+
+    Anything else -- "No device connected", a genuine bug -- must propagate.
+    Rebuilding on those would spin until the process is killed.
+    """
+    return "didn't arrive" in str(exc)
+
+
+def _give_up(reason):
+    """Stop pretending to be a camera.
+
+    Exiting is deliberate. The process is holding a listening port and client
+    sockets it can no longer serve, and ``Restart=always``/``RestartSec=3`` gives
+    a clean re-open attempt from scratch. If the camera really is gone the unit
+    then loops on "No device connected" -- a visible, diagnosable state, unlike
+    silently accepting clients forever.
+    """
+    print(f"CAMERA UNAVAILABLE: {reason}", flush=True)
+    print("Exiting so systemd restarts the service and re-opens the device.",
+          flush=True)
+    os._exit(1)
+
+
+def _release_pipeline():
+    """Stop the wedged pipeline so the device can be re-opened.
+
+    Guarded because the teardown is itself the dangerous part: on 2026-08-29
+    stopping a wedged D435i took the whole USB host controller down with it and
+    the process died on SIGSEGV. There is no way to re-open without releasing
+    first, so the best available behaviour is to try and to carry on if it throws.
+    """
+    old = pipeline
+    if old is None:
+        return
+    try:
+        old.stop()
+    except Exception as exc:
+        print(f"  (releasing the wedged pipeline raised {exc!r}; continuing)",
+              flush=True)
+
+
+def _rebuild_pipeline(observed_generation):
+    """Re-open the camera once, on behalf of every waiting client thread."""
+    global pipeline, align, depth_unit_mm
+    global _camera_generation, _consecutive_timeouts, _camera_unavailable_reason
+    global _rebuilds_without_progress, _frames_since_rebuild
+
+    with _camera_lock:
+        if _camera_unavailable_reason is not None:
+            raise CameraUnavailable(_camera_unavailable_reason)
+        if _camera_generation != observed_generation:
+            return          # another thread already rebuilt it; just retry
+
+        print("Camera stalled; rebuilding the RealSense pipeline...", flush=True)
+        last_error = None
+        for attempt, pause in enumerate(RECOVERY_BACKOFF_S, start=1):
+            _recovery_sleep(pause)
+            try:
+                _release_pipeline()
+                new_pipeline, new_align = openPipeline()
+            except Exception as exc:
+                last_error = exc
+                print(f"  reopen attempt {attempt}/{len(RECOVERY_BACKOFF_S)} "
+                      f"failed: {exc}", flush=True)
+                continue
+
+            pipeline, align = new_pipeline, new_align
+            try:
+                depth_unit_mm = (pipeline.get_active_profile().get_device()
+                                 .first_depth_sensor().get_depth_scale() * 1000.0)
+            except Exception:
+                pass        # same device; the startup value still holds
+            _camera_generation += 1
+            _consecutive_timeouts = 0
+            _rebuilds_without_progress += 1
+            _frames_since_rebuild = 0
+            print(f"Camera re-opened (generation {_camera_generation}); "
+                  f"waiting for frames to confirm recovery.", flush=True)
+
+            if _rebuilds_without_progress > MAX_REBUILDS_WITHOUT_PROGRESS:
+                _camera_unavailable_reason = (
+                    f"camera re-opens but never streams "
+                    f"({_rebuilds_without_progress} rebuilds, no frames between)")
+                _give_up(_camera_unavailable_reason)
+                raise CameraUnavailable(_camera_unavailable_reason)
+            return
+
+        _camera_unavailable_reason = str(last_error)
+        _give_up(f"pipeline could not be re-opened after "
+                 f"{len(RECOVERY_BACKOFF_S)} attempts: {last_error}")
+        raise CameraUnavailable(_camera_unavailable_reason)
+
+
+def read_frames():
+    """Wait for a frameset, recovering the pipeline if the camera has wedged.
+
+    Every acquisition path in the server goes through here, so the stall counter
+    reflects the camera rather than any one client. Raises ``CameraUnavailable``
+    once the camera is known to be gone, so callers fail immediately instead of
+    each paying a fresh round of 5-second timeouts.
+    """
+    global _consecutive_timeouts, _rebuilds_without_progress, _frames_since_rebuild
+
+    while True:
+        with _camera_lock:
+            if _camera_unavailable_reason is not None:
+                raise CameraUnavailable(_camera_unavailable_reason)
+            generation = _camera_generation
+            current = pipeline
+
+        try:
+            frames = current.wait_for_frames()
+        except RuntimeError as exc:
+            if not _is_frame_timeout(exc):
+                raise
+            with _camera_lock:
+                _consecutive_timeouts += 1
+                wedged = _consecutive_timeouts >= FRAME_WEDGE_THRESHOLD
+            if wedged:
+                _rebuild_pipeline(generation)
+            continue
+
+        with _camera_lock:
+            _consecutive_timeouts = 0
+            # Credit a rebuild only once the camera has actually streamed for a
+            # while, so a flapping device cannot earn a fresh set of attempts by
+            # delivering a single frame between stalls.
+            if _rebuilds_without_progress:
+                _frames_since_rebuild += 1
+                if _frames_since_rebuild >= HEALTHY_FRAMES_AFTER_REBUILD:
+                    print(f"Camera streaming again after "
+                          f"{_rebuilds_without_progress} rebuild(s).", flush=True)
+                    _rebuilds_without_progress = 0
+                    _frames_since_rebuild = 0
+        return frames
+
+
+def getFrames(align, depth_filters):
+    frames = read_frames()
     aligned_frames = align.process(frames)
 
     depth = aligned_frames.get_depth_frame()
@@ -840,7 +1043,7 @@ def handle_client(conn, addr):
             # entirely — they cost the Nano ~a second per frame and we're throwing
             # depth away anyway. Just grab the raw color frame. (align leaves color
             # unchanged, so intrinsics/detection are identical to the full path.)
-            frames = pipeline.wait_for_frames()
+            frames = read_frames()
             color_frame = frames.get_color_frame()
             if not color_frame:
                 continue
@@ -848,7 +1051,7 @@ def handle_client(conn, addr):
             timestamp = frames.get_timestamp()
             depth_compressed = b''
         else:
-            depth, color, timestamp = getFrames(pipeline, align, depth_filters)
+            depth, color, timestamp = getFrames(align, depth_filters)
             if depth is None or color is None:
                 continue
             depth_buffer = io.BytesIO()
@@ -928,7 +1131,7 @@ def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
         last_telemetry = 0.0
         try:
             while not stop.is_set():
-                frames = pipeline.wait_for_frames()
+                frames = read_frames()
                 color = frames.get_color_frame()
                 if not color:
                     continue
@@ -1013,6 +1216,9 @@ def stream_h264(conn, addr, width, height, bitrate_kbps, scan_telemetry=False):
                 if buf.nbytes != frame_bytes:        # unexpected size -> skip
                     continue
                 _write_all(proc.stdin, buf.tobytes())
+        except CameraUnavailable as e:
+            # Say why in one line; the supervisor has already logged the detail.
+            print(f"H264 feeder stopping: {e}", flush=True)
         except (BrokenPipeError, OSError, ValueError):
             pass  # encoder gone / pipe closed -> sender loop will end too
         finally:
@@ -1107,7 +1313,7 @@ def stream_burst(conn, addr, max_frames=64):
                 depth = color = None
                 tries = 0
                 while (depth is None or color is None) and tries < 10:
-                    depth, color, _ts = getFrames(pipeline, align, depth_filters)
+                    depth, color, _ts = getFrames(align, depth_filters)
                     tries += 1
                 if depth is None or color is None or len(buffer) >= max_frames:
                     # signal a skip (no frame / buffer full) — index still advances
@@ -1164,13 +1370,17 @@ def _serve_client(conn, addr):
     """Run handle_client for one client and ALWAYS close its socket.
 
     handle_client's own conn.close() calls sit on its normal-return paths. When
-    the RealSense pipeline wedges, getFrames() raises straight out of the handler
-    ("Frame didn't arrive within 5000"), the thread dies with a traceback and the
-    accepted socket is never closed -- it sits in CLOSE_WAIT forever. Against
+    acquisition fails it raises straight out of the handler, the thread dies and
+    the accepted socket is never closed -- it sits in CLOSE_WAIT forever. Against
     listen(5) a handful of those stop new clients connecting, so a *recoverable*
     camera stall turns into a server that must be restarted by hand (seen on the
-    cell 2026-08-28: 10 leaked sockets). The traceback is still printed, because
-    it is what identifies a wedged camera in the journal.
+    cell 2026-08-28: 10 leaked sockets, and again 2026-08-29: 8). The traceback is
+    still printed, because it is what identifies the failure in the journal.
+
+    Since the camera supervisor landed, a wedge surfaces here as CameraUnavailable
+    rather than a raw "Frame didn't arrive within 5000" -- read_frames() rides out
+    a brief stall and rebuilds the pipeline for a persistent one, so reaching this
+    point means recovery was tried and failed.
     """
     try:
         handle_client(conn, addr)
