@@ -1406,16 +1406,21 @@ def test_the_word_draft_puts_the_measured_numbers_in_a_real_table(tmp_path):
 
     assert out.is_file() and out.suffix == ".docx"
     paragraphs, tables = _docx_content(out)
-    # By header, not by position: the draft grows sections over time.
+    # By header, not by position, for the columns too: the draft grows both
+    # sections and columns over time, and a positional assertion here just
+    # breaks on the next honest addition instead of catching anything.
     conditions = next(t for t in tables if t[0][0] == "Condition")
-    assert conditions[0][0] == "Condition"
+    column = {name: index for index, name in enumerate(conditions[0])}
     rows = {row[0]: row for row in conditions[1:]}
     assert "layer 1 - noise floor" in rows
-    assert rows["layer 1 - noise floor"][1] == "3"
+    assert rows["layer 1 - noise floor"][column["n"]] == "3"
     shifted = rows["layer 3 - top ring shifted - introduced offset (10, 0) mm"]
-    assert shifted[1] == "3"
-    assert "10.20" in shifted[2]                       # measured centre offset
-    assert "0.20" in shifted[3]                        # detection error vs the typed 10 mm
+    assert shifted[column["n"]] == "3"
+    assert "10.20" in shifted[column["Centre offset (mm)"]]
+    assert "0.20" in shifted[column["Detection error (mm)"]]
+    # How the takes were bought is part of the claim: three frames from one trip
+    # and three re-approaches support different sentences about repeatability.
+    assert shifted[column["How"]] in {"arm parked", "re-approached", "one take"}
     assert any("10.0 mm introduced offset was recovered" in p for p in paragraphs)
 
 
@@ -1922,3 +1927,254 @@ def test_a_depth_frame_that_never_matches_the_pose_fails_loudly(tmp_path, monkey
     assert "frozen" in message.lower(), message
     assert "jetson_deploy.py restart" in message, message
     assert rdk.events[-1] == ("move-joints", START_JOINTS)          # still comes home
+
+
+# -- one press, several takes ------------------------------------------------
+# Two questions the run asks separately, because they cost differently: how
+# repeatably the CHAIN sees a ring that has not moved (frames with the arm
+# parked, seconds each), and how repeatably the ARM comes back to look at it
+# (whole trips out and back, a trip each). Before this, both were three presses
+# of the same button and the difference was not recorded anywhere.
+
+def test_parked_repeats_take_several_frames_on_one_trip(tmp_path, monkeypatch):
+    """repeats=3 leaves the path ONCE and banks three takes from that pose."""
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    out = RingMeasureJob(svc, plan, session, 1, check_collisions=False, repeats=3)(Ctx())
+
+    starts = [e for e in rdk.events if e[0] == "start"]
+    homes = [e for e in rdk.events if e == ("move-joints", START_JOINTS)]
+    assert len(starts) == 1, "a parked repeat must not re-run the inspection move"
+    assert len(homes) == 1, "the arm comes home once, after the last frame"
+    assert camera.grabs == 4                       # readiness + three measurements
+    assert session.takes == {1: 3}
+    assert out["takes_recorded"] == [1, 2, 3]
+    names = sorted(p.parent.name for p in (tmp_path / "runs" / "extrusion").glob(
+        "*/layer-*/manifest.json"))
+    assert names == ["layer-001", "layer-001-take02", "layer-001-take03"]
+
+
+def test_a_shared_trip_is_never_priced_as_one_take_s_excursion(tmp_path, monkeypatch):
+    """The cycle figure is the cost of leaving the path for ONE measurement.
+
+    Three frames from one trip cost one trip between them. Letting each claim an
+    inspection_cycle_ms would divide the excursion's real price by three in the
+    one statistic the paper quotes as scan-to-feedback turnaround.
+    """
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    RingMeasureJob(svc, plan, session, 1, check_collisions=False, repeats=3)(Ctx())
+
+    root = tmp_path / "runs" / "extrusion" / session.trial_id
+    timings = [json.loads((root / name / "manifest.json").read_text())["processing"]["timings_ms"]
+               for name in ("layer-001", "layer-001-take02", "layer-001-take03")]
+    assert not any("inspection_cycle_ms" in t for t in timings)
+    # The move belongs to the frame that followed it, the return to the last.
+    assert "move_to_pose_ms" in timings[0] and "settle_ms" in timings[0]
+    assert not any("move_to_pose_ms" in t for t in timings[1:])
+    assert "return_ms" in timings[2] and "return_ms" not in timings[0]
+    # ...and every frame still carries what it really measured.
+    assert all(t["capture_ms"] >= 0 and t["acquisition_to_path_ms"] > 0 for t in timings)
+
+
+def test_excursions_repeat_the_whole_trip_unattended(tmp_path, monkeypatch):
+    """excursions=5 is five presses of the noise-floor button, without pressing.
+
+    The arm must genuinely leave and come back each time -- that re-approach is
+    the thing being measured -- and each take is priced as a whole excursion.
+    """
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    out = RingMeasureJob(svc, plan, session, 1, annotation={"phase": "noise floor"},
+                         check_collisions=False, excursions=5)(Ctx())
+
+    assert len([e for e in rdk.events if e[0] == "start"]) == 5
+    assert len([e for e in rdk.events if e == ("move-joints", START_JOINTS)]) == 5
+    assert out["takes_recorded"] == [1, 2, 3, 4, 5]
+    root = tmp_path / "runs" / "extrusion" / session.trial_id
+    cycles = [json.loads(p.read_text())["processing"]["timings_ms"].get("inspection_cycle_ms")
+              for p in sorted(root.glob("layer-001*/manifest.json"))]
+    assert len(cycles) == 5 and all(c is not None for c in cycles)
+
+
+def test_each_take_records_which_trip_it_came_from(tmp_path, monkeypatch):
+    """Three frames of one trip and three re-approaches must be tellable apart.
+
+    The difference between those two spreads IS the finding the noise floor
+    supports, so a reader of the archive alone has to be able to separate them.
+    """
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    RingMeasureJob(svc, plan, session, 1, check_collisions=False,
+                   excursions=2, repeats=2)(Ctx())
+
+    root = tmp_path / "runs" / "extrusion" / session.trial_id
+    stamps = [json.loads(p.read_text())["provenance"]
+              for p in sorted(root.glob("layer-001*/manifest.json"))]
+    assert [(s["excursion_index"], s["repeat_index"]) for s in stamps] == [
+        (1, 1), (1, 2), (2, 1), (2, 2)]
+    assert all(s["repeats_in_excursion"] == 2 for s in stamps)
+
+
+def test_a_batch_keeps_the_takes_it_already_measured(tmp_path, monkeypatch):
+    """A failure on trip three does not throw away trips one and two.
+
+    Unattended batches are the point of excursions; losing a whole run to the
+    last frame would make them worse than pressing the button five times.
+    """
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    calls = {"n": 0}
+
+    def fail_on_the_third(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise RuntimeError("branch guard exhausted")
+        return fake_measure_processing(**kwargs)
+
+    monkeypatch.setattr(measure_mod, "process_observation", fail_on_the_third)
+    with pytest.raises(RuntimeError, match="measurement invalid"):
+        RingMeasureJob(svc, plan, session, 1, check_collisions=False, excursions=5)(Ctx())
+
+    assert session.takes == {1: 3}, "the failed take is still numbered and archived"
+    valid = [r for r in session.records if r["valid"]]
+    assert len(valid) == 2, "the two good takes survive for the next press to continue from"
+    # And the arm is home, not parked over the ring.
+    assert rdk.events[-1] == ("move-joints", START_JOINTS)
+
+
+def test_the_api_carries_the_batch_counts_and_caps_them(tmp_path, monkeypatch):
+    """A mistyped count must not commit the cell to unattended motion for a quarter hour."""
+    from pydantic import ValidationError
+
+    from tasni.modules.extrusion.module import MeasureLayerBody
+
+    body = MeasureLayerBody(fingerprint="f", layer_index=1)
+    assert (body.repeats, body.excursions) == (1, 1)
+    assert MeasureLayerBody(fingerprint="f", layer_index=1, repeats=3).repeats == 3
+    for bad in ({"repeats": 0}, {"excursions": 11}, {"repeats": -1}):
+        with pytest.raises(ValidationError):
+            MeasureLayerBody(fingerprint="f", layer_index=1, **bad)
+
+
+def test_the_summary_separates_the_camera_s_repeatability_from_the_robot_s(tmp_path, monkeypatch):
+    """One "repeatability" over both would credit the robot's scatter to the camera.
+
+    Parked frames scatter by the sensing chain alone; takes that each cost a
+    trip out and back scatter by the chain AND the re-approach. The paper wants
+    to say what re-approaching costs, so the two must be pooled separately.
+    """
+    from tasni.modules.extrusion.measure import capture_style, centre_spread, paper_summary
+
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    plan = auto_plan()
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, plan)
+    # A wandering fitted centre, so the two pools cannot come out identical by
+    # accident: the noise-floor trips scatter ten times as far as the parked ones.
+    centres = iter([(200.0, 150.0), (210.0, 150.0), (190.0, 150.0),     # 3 trips
+                    (200.0, 150.0), (201.0, 150.0), (199.0, 150.0)])    # 3 parked frames
+
+    def wander(**kwargs):
+        out = fake_measure_processing(**kwargs)
+        out.metrics.measured_center_mm = next(centres)
+        return out
+
+    monkeypatch.setattr(measure_mod, "process_observation", wander)
+    RingMeasureJob(svc, plan, session, 1, annotation={"phase": "noise floor"},
+                   check_collisions=False, excursions=3)(Ctx())
+    RingMeasureJob(svc, plan, session, 1, annotation={"phase": "re-placed"},
+                   check_collisions=False, repeats=3)(Ctx())
+
+    summary = paper_summary(root, session.trial_id)
+    by_name = {c["condition"]: c for c in summary["conditions"]}
+    trips = by_name["layer 1 - noise floor"]
+    parked = by_name["layer 1 - re-placed"]
+    assert trips["capture"] == "re-approach" and parked["capture"] == "parked"
+    assert centre_spread([]) == {"n": 0, "rms_mm": None, "max_mm": None}
+    assert capture_style([{}]) == "single"
+
+    repeat = summary["repeatability_mm"]
+    assert repeat["sensing"]["takes"] == 3 and repeat["re_approach"]["takes"] == 3
+    assert repeat["sensing"]["rms_mm"] == pytest.approx(1.0, abs=0.01)
+    assert repeat["re_approach"]["rms_mm"] == pytest.approx(10.0, abs=0.01)
+    # And it is stated, not merely computed: the paper is written from the prose.
+    said = " ".join(summary["prose"])
+    assert "Sensing repeatability" in said and "Re-approach repeatability" in said
+
+
+def test_old_takes_without_a_trip_stamp_read_as_their_own_excursion(tmp_path, monkeypatch):
+    """Every take archived before the batch split WAS one press, so one trip.
+
+    Reading them as parked would retro-credit the chain with a repeatability it
+    was never measured to have.
+    """
+    from tasni.modules.extrusion.measure import capture_style
+
+    legacy = [{"metrics": {"valid": True, "measured_center_mm": [200.0, 150.0]}},
+              {"metrics": {"valid": True, "measured_center_mm": [201.0, 150.0]}}]
+    assert capture_style(legacy) == "re-approach"
+
+
+def test_the_teardown_pairs_each_ring_against_its_own_post_lift_baseline(tmp_path, monkeypatch):
+    """The whole run, in order, with the stack torn back down.
+
+    Layer 3 is displaced while it is the top ring, then lifted off so layer 2 is
+    the top, and so on. Each ring's shift must pair against the baseline taken
+    AFTER the ring above it came off -- pairing against a baseline measured
+    while it was still buried would fold "did the lift disturb it?" into the
+    chain's detection error, which is the one number the paper claims.
+    """
+    from tasni.modules.extrusion.measure import paper_summary
+
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    plan = auto_plan()
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, plan)
+    # Ring 2 sits at 200,150; the lift nudges it to 203,150; the 10 mm shift
+    # then takes it to 213,150. Paired against the post-lift baseline the chain
+    # sees exactly 10; against the pre-lift one it would see 13.
+    where = {"n": 0}
+    positions = [(200.0, 150.0)] * 3 + [(203.0, 150.0)] * 3 + [(213.0, 150.0)] * 3
+
+    def at_position(**kwargs):
+        out = fake_measure_processing(**kwargs)
+        centre = positions[where["n"]]
+        out.metrics.measured_center_mm = centre
+        # Keep the fake self-consistent: the offset IS where the ring sits
+        # relative to the plan centre, which is what the unpaired score reads.
+        out.metrics.center_offset_mm = (centre[0] - 200.0, centre[1] - 150.0)
+        where["n"] += 1
+        return out
+
+    monkeypatch.setattr(measure_mod, "process_observation", at_position)
+    # Build: layer 2 measured true, with ring 3 on top of it.
+    RingMeasureJob(svc, plan, session, 2, annotation={"phase": "stacked true"},
+                   check_collisions=False, repeats=3)(Ctx())
+    # Teardown: ring 3 lifted off, layer 2 re-baselined as the new top...
+    RingMeasureJob(svc, plan, session, 2, annotation={"phase": "newly exposed"},
+                   check_collisions=False, repeats=3)(Ctx())
+    # ...then displaced 10 mm and measured.
+    RingMeasureJob(svc, plan, session, 2,
+                   annotation={"phase": "top ring shifted",
+                               "introduced_offset_mm": [10, 0]},
+                   check_collisions=False, repeats=3)(Ctx())
+
+    summary = paper_summary(root, session.trial_id)
+    shifted = next(c for c in summary["conditions"] if c["introduced_norm_mm"] > 0)
+    # Paired against take 6 (the last `newly exposed`), not take 3.
+    assert shifted["paired_reference_takes"] == [6]
+    assert shifted["paired_shift_norm_mm"]["mean"] == pytest.approx(10.0, abs=0.01)
+    assert shifted["paired_detection_error_mm"]["mean"] == pytest.approx(0.0, abs=0.01)
+    # Scored against the plan centre instead, the lift's 3 mm would show up as
+    # detection error the chain never made.
+    assert shifted["detection_error_mm"]["mean"] == pytest.approx(3.0, abs=0.01)

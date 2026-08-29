@@ -93,20 +93,32 @@ Restart the backend first (it caches imported modules; check `/api/health` →
 1. Scan surface applied → **Center on scanned surface** → **Generate**.
 2. Place ring 1 within ~50 mm of the table centre → **Characterize ring**.
 3. **Apply to recipe & placement** → **Generate**. ← *the step that was missed*
-4. **Noise floor** (phase `noise floor`): Measure layer 1 **five times** without
-   touching the ring.
+4. **Noise floor** (phase `noise floor`): **one press**, five trips. The arm goes
+   out and back five times on its own — stay out of the cell until it stops. This is
+   the only step that re-approaches the ring for every take, which is what makes it
+   the floor: its spread contains the robot as well as the camera.
 5. **Placement repeatability** (phase `re-placed`): lift and re-place ring 1
-   **three times**, measure each.
-6. **Stack** (phase `stacked true`): ring 2 placed true → Measure L2 (×3); ring 3
-   true → Measure L3 (×3).
-7. **Introduced offsets — on the TOP ring only** (phase `top ring shifted`). Type
-   the value into *introduced offset X/Y* **before** pressing Measure, so ground
-   truth is archived beside the result. Mark where the ring sits, shift the top ring
-   **10 mm** along frame +X → Measure ×3; then **15 mm from the same marks** (not 5 mm
-   further) → Measure ×3. Optional: prop one side for a tilt case. The shift is scored
-   **paired** against this layer's last undisplaced take (step 6's `stacked true`
-   takes), so those must exist before the ring is moved — see *Paired detection
-   error* below.
+   **three times**, measuring each. Still one press per take — your hand has to move
+   between them, so they cannot be batched.
+6. **Build the stack** (phase `stacked true`): ring 2 placed true → **one press**
+   (three frames, arm parked); ring 3 true → **one press**. Each layer must be
+   measured as it goes on, because layer N's measurement floor *is* layer N−1's
+   measured top.
+7. **Then come back DOWN, displacing each ring while it is the top one.** Only the
+   top ring can be moved: one with another resting on it cannot be slid or lifted
+   without disturbing what sits above it, and a ring underneath is the measurement
+   floor for everything above it. So, for layer 3, then 2, then 1:
+   - *(layers 2 and 1 only)* lift the ring above off and set it aside → **one press**
+     (phase `newly exposed`). A fresh undisplaced baseline for the newly exposed
+     ring, taken **after** the lift — it is what that ring's own shift is scored
+     against, and it also measures whether lifting a ring off disturbs the one
+     beneath it.
+   - displace this ring ~**10 mm** along a board edge → **one press**; then
+     ~**15 mm from the same marks** (not 5 mm further) → **one press** (phase
+     `top ring shifted`). Type what you actually moved, measured with a steel rule,
+     into *introduced offset X/Y* **before** pressing — 12 mm scores as well as 10.
+   The paper gets the detection error at **three stack heights** instead of only at
+   the top, and no lift is ever attempted on a buried ring.
 8. **Paper summary** → copy the Markdown block, or **Word draft** → a `.docx` with
    the method paragraph, the condition table and the per-take table as real Word
    tables plus the figures, ready to paste into the manuscript. Both are rebuilt from
@@ -114,10 +126,36 @@ Restart the backend first (it caches imported modules; check `/api/health` →
    run still owes ("2 more takes", "11 more measurements") and says it is not ready
    to cite until those are gone.
 
-**Set the Phase selector on every take.** The summary groups by *layer + phase +
-introduced offset*, so the phase is what separates sensing repeatability (step 4)
-from placement repeatability (step 5) — pooled into one row they hide each other,
-and the paper wants both.
+The rail runs this order for you and sets layer, phase and offset per step, so no
+control can be left on a stale value. Finishing a step advances the run by itself;
+clicking a chip goes back to any step without losing your place.
+
+### Two repeatabilities, and why the run buys them differently
+
+A take can be bought two ways, and they cost and mean different things:
+
+- **arm parked** — several frames with the arm held at the inspection pose, seconds
+  apart. The spread is the *sensing chain's own* scatter, with the robot's
+  re-approach excluded by construction. Cheap: one trip, N frames.
+- **re-approached** — the arm leaves and returns for every take. The spread contains
+  the chain *and* the robot's re-approach. Expensive: a whole excursion per frame.
+
+The run buys the expensive kind **once**, at the noise floor, and the cheap kind
+everywhere else — which is why the noise floor is worth keeping even though nothing
+is touched during it. The summary pools the two separately (`repeatability_mm`) and
+states both in prose; the condition table's **How** and **Centre spread** columns say
+which kind each row is. Quoting one number over both would either credit the robot's
+scatter to the camera or hide it entirely, depending on which conditions happened to
+dominate the pool.
+
+Timing follows the same split: only a take that had a whole excursion to itself
+carries an `inspection_cycle_ms`, so the paper's "what one inspection costs" figure
+is never divided by the number of frames taken while parked.
+
+**The phase is set for you by each step**, and the summary groups by *layer + phase +
+introduced offset* — that grouping is what keeps sensing repeatability (step 4),
+placement repeatability (step 5) and each layer's baseline apart. Pooled into one row
+they hide each other, and the paper wants all of them.
 
 ### Gates: what the app now refuses
 
@@ -163,10 +201,21 @@ introduced offset at ~18 mm). If a take still fails, its raw RGB-D is archived a
 - **Top ring only.** Layer N's ROI floor is the *latest take* of layer N−1
   (`MeasureSession.floor_profile`). Displacing a ring that something else is
   measured on top of corrupts that floor for every take above it. Displace the
-  highest ring in the stack and nothing downstream is affected.
+  highest ring in the stack and nothing downstream is affected. Physically it is
+  also the only one that *can* be displaced: a buried ring cannot be slid or lifted
+  without disturbing everything resting on it.
+- **So the stack is torn back down** (2026-08-29). Building 1-2-3 and only ever
+  displacing ring 3 gets the detection error at one stack height. Building up, then
+  lifting ring 3 off to displace ring 2, then ring 2 off to displace ring 1, gets it
+  at three — with every displacement still on a ring that is on top at the time.
+  Each newly exposed ring takes a fresh `newly exposed` baseline **after** the lift,
+  which is both what its shift is paired against and the only measurement of whether
+  lifting a ring off disturbs the one beneath it.
 - **Three takes per condition, not one.** `paper-summary` reports mean ± sd per
   condition; a single take has no sd, and requirement #3 needs ≥ 12 measurements in
-  total anyway.
+  total anyway. Those three are frames taken with the arm **parked** — one trip out,
+  three frames — so they measure the sensing chain and not the robot's re-approach,
+  which the noise floor has already measured separately.
 
 ### Paired detection error — the number the claim rests on (2026-08-29)
 
@@ -183,8 +232,10 @@ ways and the paper quotes the second:
   `axis check` throwaway (a ring moved an untyped amount). A zero-offset take taken
   *after* the shift (ring put back) is never the reference.
 
-Consequences for the protocol: the `stacked true` takes of the top ring must exist
-before it is displaced (step 6 before step 7 — the guide already orders it that way);
+Consequences for the protocol: an undisplaced take of the ring must exist before it
+is displaced — `stacked true` for the top ring, `newly exposed` for each ring the
+teardown uncovers (step 6 before step 7, and the lift's baseline before that ring's
+shift — the guide already orders it that way);
 the +X throwaway is recorded with phase `axis check` and must be put back on its
 marks; and the 15 mm condition is measured from the original marks. A displaced
 condition with no undisplaced take of its layer before it is listed under *Still

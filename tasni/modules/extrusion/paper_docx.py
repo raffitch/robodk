@@ -17,7 +17,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from .measure import paper_summary
+from .measure import CAPTURE_LABEL, paper_summary
 
 # The protocol's own targets, and requirement 3 of the paper's outstanding list.
 TAKES_PER_CONDITION = 3
@@ -81,7 +81,8 @@ TIMING_ROWS = [("capture_ms", "RGB-D capture"),
                ("return_ms", "Return to the start pose"),
                ("inspection_cycle_ms", "Whole inspection excursion")]
 
-CONDITION_HEADERS = ["Condition", "n", "Centre offset (mm)", "Detection error (mm)",
+CONDITION_HEADERS = ["Condition", "n", "How", "Centre spread (mm)",
+                     "Centre offset (mm)", "Detection error (mm)",
                      "Paired detection error (mm)",
                      "Mean |dev| (mm)", "RMS (mm)", "Max (mm)", "Shape RMS (mm)"]
 TAKE_HEADERS = ["Layer", "Take", "Phase", "Introduced (mm)", "Measured offset (mm)",
@@ -334,7 +335,9 @@ def build_paper_docx(root, trial_id: str, out_path=None, *,
                            "hand-placement error of the undisplaced position; it is the "
                            "figure the claim rests on.")
     _add_table(document, CONDITION_HEADERS,
-               [[c["condition"], str(c["takes"]),
+               [[c["condition"], str(c["takes"]), CAPTURE_LABEL[c["capture"]],
+                 ("-" if c["centre_spread"]["rms_mm"] is None
+                  else f"{c['centre_spread']['rms_mm']:.2f}"),
                  _stat_cell(c["center_offset_norm_mm"]), _stat_cell(c["detection_error_mm"]),
                  _stat_cell(c["paired_detection_error_mm"]),
                  _stat_cell(c["mean_absolute_mm"]), _stat_cell(c["rms_mm"]),

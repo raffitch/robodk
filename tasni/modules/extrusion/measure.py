@@ -246,10 +246,16 @@ def take_summary(layer_dir: Path, manifest: dict, *, reprocessed: bool = False) 
             "timestamp": _utcnow()}
 
 
-def _inspect_and_capture(services, ctx: JobContext, plan: CylinderPlan, layer, *,
-                         inspection_name: str, start_joints, seed_pose, collisions: bool,
-                         artifacts: list[str], near_mm: float | None = None) -> dict:
-    """Move the camera to the derived pose, settle, read the pose, grab ONE frame."""
+def _move_to_inspection(services, ctx: JobContext, plan: CylinderPlan, layer, *,
+                        inspection_name: str, start_joints, seed_pose, collisions: bool,
+                        artifacts: list[str], near_mm: float | None = None) -> dict:
+    """Take the camera out to the derived pose, settle, and read where it landed.
+
+    Split out of the capture so ONE excursion can serve several frames: with the
+    arm parked at the pose, repeated grabs measure the sensing chain alone,
+    without the robot's re-approach folded into every number (and without the
+    minute of travel each extra trip costs at the cell).
+    """
     rdk: RdkIO = services.rdk
     ecfg = services.config.extrusion
     inspect = _build_inspection_move(
@@ -269,7 +275,15 @@ def _inspect_and_capture(services, ctx: JobContext, plan: CylinderPlan, layer, *
     # camera pose: the generated program's tool instruction does not update
     # RdkIO's cached tool transform.
     rdk.use_named_tool_frame(plan.setup.inspection_tool, plan.setup.work_frame)
-    T_work_camera = rdk.camera_pose_T()
+    return {"inspect": inspect, "T_work_camera": rdk.camera_pose_T(), "move_ms": move_ms,
+            # The dwell is commanded, not measured: reporting the configured
+            # value keeps the cycle total honest when a test stubs out sleep.
+            "settle_ms": float(ecfg.settle_s) * 1000.0}
+
+
+def _capture_at_pose(services, ctx: JobContext, T_work_camera) -> dict:
+    """Grab ONE validated RGB-D frame with the camera already at the pose."""
+    ecfg = services.config.extrusion
     started = time.perf_counter()
     frame = services.camera.grab(with_depth=True, timeout=ecfg.grab_timeout_s)
     capture_ms = (time.perf_counter() - started) * 1000.0
@@ -319,11 +333,18 @@ def _inspect_and_capture(services, ctx: JobContext, plan: CylinderPlan, layer, *
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:
         ctx.frame(jpeg.tobytes())
-    return {"inspect": inspect, "T_work_camera": T_work_camera, "frame": frame,
-            "capture_ms": capture_ms, "move_ms": move_ms, "depth_plane_check": check,
-            # The dwell is commanded, not measured: reporting the configured
-            # value keeps the cycle total honest when a test stubs out sleep.
-            "settle_ms": float(ecfg.settle_s) * 1000.0}
+    return {"frame": frame, "capture_ms": capture_ms, "depth_plane_check": check}
+
+
+def _inspect_and_capture(services, ctx: JobContext, plan: CylinderPlan, layer, *,
+                         inspection_name: str, start_joints, seed_pose, collisions: bool,
+                         artifacts: list[str], near_mm: float | None = None) -> dict:
+    """Move the camera to the derived pose, settle, read the pose, grab ONE frame."""
+    moved = _move_to_inspection(
+        services, ctx, plan, layer, inspection_name=inspection_name,
+        start_joints=start_joints, seed_pose=seed_pose, collisions=collisions,
+        artifacts=artifacts, near_mm=near_mm)
+    return {**moved, **_capture_at_pose(services, ctx, moved["T_work_camera"])}
 
 
 def _prepare_robot(services, ctx: JobContext, plan: CylinderPlan, *, label: str):
@@ -358,12 +379,19 @@ def _prepare_robot(services, ctx: JobContext, plan: CylinderPlan, *, label: str)
     return rdk.current_joints()
 
 
-def add_return_timing(layer_dir, return_ms: float) -> dict | None:
+def add_return_timing(layer_dir, return_ms: float, *, whole_excursion: bool = True) -> dict | None:
     """Fold the trip back into the take's timings, once the arm is home.
 
     The archive is written before the return move -- a measurement must survive
     a failure on the way back -- so the closing half of the excursion is patched
     into the manifest afterwards. Nothing derived is touched.
+
+    ``whole_excursion`` is False when several takes SHARED one trip out: the
+    return is still a real return and stands as a sample of one, but no single
+    take of that group cost a whole excursion, so none of them may claim an
+    ``inspection_cycle_ms``. The paper's cycle figure is the price of leaving
+    the path for one measurement, and averaging a shared trip into it would
+    quietly divide that price by the number of frames taken while parked.
     """
     manifest_file = Path(layer_dir) / "manifest.json"
     if not manifest_file.is_file():
@@ -371,20 +399,41 @@ def add_return_timing(layer_dir, return_ms: float) -> dict | None:
     payload = json.loads(manifest_file.read_text(encoding="utf-8"))
     timings = (payload.setdefault("processing", {}).setdefault("timings_ms", {}))
     timings["return_ms"] = float(return_ms)
-    timings["inspection_cycle_ms"] = float(sum(
-        float(timings.get(key) or 0.0) for key in
-        ("move_to_pose_ms", "settle_ms", "capture_ms", "total_ms", "return_ms")))
+    if whole_excursion:
+        timings["inspection_cycle_ms"] = float(sum(
+            float(timings.get(key) or 0.0) for key in
+            ("move_to_pose_ms", "settle_ms", "capture_ms", "total_ms", "return_ms")))
     manifest_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return timings
 
 
 class RingMeasureJob:
-    """Measure ONE hand-placed ring: inspect, capture, process, archive, return."""
+    """Measure a hand-placed ring: inspect, capture, process, archive, return.
+
+    Two counts shape what one press does, and they answer different questions.
+
+    ``repeats``     frames taken with the arm PARKED at the inspection pose.
+                    Their spread is the sensing chain's own repeatability, with
+                    the robot's re-approach excluded by construction -- one trip
+                    out, N frames, seconds apart.
+    ``excursions``  complete trips out and back, each re-deriving and re-running
+                    the inspection move. Their spread additionally contains the
+                    arm's re-approach. This is what the noise floor measures,
+                    and it is the expensive axis: a whole excursion per frame.
+
+    Splitting them is what lets the run ask for repeatability without paying for
+    it everywhere: the noise floor buys the expensive kind once (unattended),
+    and every later condition takes the cheap kind, with the arm still.
+
+    A batch banks each take as it lands, so a failure part-way through keeps
+    what it already measured -- pressing again continues from there.
+    """
 
     def __init__(self, services, plan: CylinderPlan, session: MeasureSession,
                  layer_index: int, *, annotation: dict | None = None,
                  check_collisions: bool = True,
-                 close_range_tool_clear: bool = False):
+                 close_range_tool_clear: bool = False,
+                 repeats: int = 1, excursions: int = 1):
         if not 1 <= layer_index <= len(plan.layers):
             raise ValueError(f"layer_index {layer_index} outside 1..{len(plan.layers)}")
         self.services = services
@@ -394,127 +443,80 @@ class RingMeasureJob:
         self.annotation = dict(annotation or {})
         self.check_collisions = bool(check_collisions)
         self.close_range_tool_clear = bool(close_range_tool_clear)
+        self.repeats = max(1, int(repeats))
+        self.excursions = max(1, int(excursions))
+        self.results: list[dict] = []
         self.result: dict | None = None
 
     def __call__(self, ctx: JobContext) -> dict:
         services = self.services
+        layer = self.plan.layers[self.layer_index - 1]
+        inspection_name = _program_name(self.plan, self.layer_index, "MEASURE") + "_Inspect"
+        archive = ExtrusionArchive(REPO_ROOT / "runs" / "extrusion")
+        start_joints = _prepare_robot(services, ctx, self.plan, label="extrusion-measure")
+        total = self.excursions * self.repeats
+        if total > 1:
+            ctx.log(f"layer {self.layer_index}: {self.excursions} excursion(s) x "
+                    f"{self.repeats} frame(s) at the pose = {total} takes, unattended")
+        for excursion in range(1, self.excursions + 1):
+            ctx.check_cancel()
+            self._one_excursion(ctx, layer=layer, inspection_name=inspection_name,
+                                archive=archive, start_joints=start_joints,
+                                excursion=excursion, total=total)
+        self.result = {"kind": "ring_measure", "mode": MODE,
+                       "trial_id": self.session.trial_id,
+                       "fingerprint": self.plan.fingerprint,
+                       **self.results[-1],
+                       # The batch as a whole, so a caller that asked for five
+                       # takes can tell five happened from the result alone.
+                       "takes_recorded": [r["take"] for r in self.results],
+                       "excursions": self.excursions, "repeats": self.repeats}
+        return self.result
+
+    # -- one trip out and back ---------------------------------------------
+    def _one_excursion(self, ctx: JobContext, *, layer, inspection_name: str,
+                       archive: ExtrusionArchive, start_joints, excursion: int,
+                       total: int) -> None:
+        """Go out, take ``repeats`` frames without moving, come home.
+
+        The return home and the artifact cleanup are per-trip: a batch that dies
+        on trip three must not leave the arm parked over the ring, and must not
+        leave three generations of inspection target in the station.
+        """
+        services = self.services
         rdk: RdkIO = services.rdk
         ecfg = services.config.extrusion
-        layer = self.plan.layers[self.layer_index - 1]
-        take = self.session.next_take(self.layer_index)
-        name = _program_name(self.plan, self.layer_index, "MEASURE")
-        inspection_name = name + "_Inspect"
-        archive = ExtrusionArchive(REPO_ROOT / "runs" / "extrusion")
         artifacts: list[str] = []
         current_program: str | None = None
-        layer_dir = None
-        start_joints = _prepare_robot(services, ctx, self.plan, label="extrusion-measure")
+        last_dir: Path | None = None
+        # Several takes sharing one trip means no single take of them cost a
+        # whole excursion -- see add_return_timing.
+        shared = self.repeats > 1
         try:
             with _camera_hold(services, "extrusion-measure"):
-                ctx.progress(1, 4, f"layer {self.layer_index} take {take}: moving the camera")
+                trip = (f" (trip {excursion} of {self.excursions})"
+                        if self.excursions > 1 else "")
+                ctx.progress(len(self.results), total,
+                             f"layer {self.layer_index}: moving the camera{trip}")
                 current_program = inspection_name
-                captured = _inspect_and_capture(
+                moved = _move_to_inspection(
                     services, ctx, self.plan, layer, inspection_name=inspection_name,
                     start_joints=start_joints, seed_pose=self.session.last_pose,
                     collisions=self.check_collisions, artifacts=artifacts,
                     near_mm=(ecfg.measure_close_range_min_mm
                              if self.close_range_tool_clear else None))
                 current_program = None
-                inspect, frame = captured["inspect"], captured["frame"]
-                T_work_camera, capture_ms = captured["T_work_camera"], captured["capture_ms"]
-                ctx.progress(2, 4, "processing the frame")
-                nominal = points_array(layer)
-                base = dict(
-                    trial_id=self.session.trial_id, layer_index=self.layer_index, take=take,
-                    mode=MODE, recipe=self.plan.recipe,
-                    toolpath_fingerprint=self.plan.fingerprint,
-                    color_file="color.png", depth_file="depth.npy",
-                    annotation=self.annotation,
-                    provenance={**_provenance(services),
-                                "work_frame": self.plan.setup.work_frame,
-                                "inspection_tool": self.plan.setup.inspection_tool,
-                                "inspection_target": inspect["target"],
-                                "inspection_pose": inspect["pose"],
-                                "T_work_camera": np.asarray(T_work_camera, dtype=float).tolist()})
-                floor = self.session.floor_profile(self.layer_index)
-                try:
-                    processed = process_observation(
-                        color=frame.color, depth=frame.depth, T_work_camera=T_work_camera,
-                        K=services.config.camera.K, plan=self.plan, layer=layer, config=ecfg,
-                        floor_profile=floor)
-                except Exception as exc:
-                    # A failed measurement still archives its raw RGB-D: the
-                    # operator cannot re-place the ring exactly, so the frame is
-                    # the only thing that can be reprocessed later.
-                    manifest = LayerManifest(
-                        **base, processing={"valid": False, "error": str(exc),
-                                            "timings_ms": {"capture_ms": capture_ms}},
-                        warnings=[str(exc)])
-                    failed_dir = archive.write_layer(
-                        manifest, nominal_xyz=nominal, commanded_xyz=nominal,
-                        color=frame.color, depth=frame.depth,
-                        report={"valid": False, "error": str(exc)})
-                    # A failure the operator cannot see is a failure they cannot
-                    # reprocess -- and the raw frame that would rescue it is
-                    # already on disk.
-                    self.session.record_take(
-                        layer_index=self.layer_index, take=take, measured_xyz=None,
-                        pose=inspect["pose"],
-                        summary=take_summary(failed_dir,
-                                             manifest.model_dump(mode="json")))
-                    self.session.save()
-                    raise RuntimeError(
-                        f"layer {self.layer_index} take {take} measurement invalid; "
-                        f"raw RGB-D archived: {exc}") from exc
-                timings = processed.report["timings_ms"]
-                timings["capture_ms"] = capture_ms
-                timings["acquisition_to_path_ms"] = capture_ms + timings["total_ms"]
-                timings["move_to_pose_ms"] = captured["move_ms"]
-                timings["settle_ms"] = captured["settle_ms"]
-                processed.report["depth_plane_check"] = captured["depth_plane_check"]
-                manifest = LayerManifest(
-                    **base, measured_path_file="measured_path.json",
-                    pointcloud_file="height-or-pointcloud.npy",
-                    metrics=processed.metrics, geometry=processed.geometry,
-                    processing=processed.report, warnings=processed.metrics.warnings)
-                layer_dir = archive.write_layer(
-                    manifest, nominal_xyz=nominal, commanded_xyz=nominal,
-                    measured_xyz=processed.measured_xyz,
-                    pointcloud_xyz=processed.filtered_xyz,
-                    color=frame.color, depth=frame.depth,
-                    derived_images={"segmentation.png": processed.segmentation,
-                                    "skeleton.png": processed.skeleton,
-                                    "comparison.png": processed.comparison},
-                    report={**processed.report,
-                            "metrics": processed.metrics.model_dump(mode="json")})
-                summary = {"layer_index": self.layer_index, "take": take,
-                           "layer_dir": str(layer_dir),
-                           # The directory NAME as well as the path: the browser
-                           # addresses figures by it and cannot use an absolute
-                           # server path.
-                           "layer_name": layer_dir.name, "annotation": self.annotation,
-                           "metrics": processed.metrics.model_dump(mode="json"),
-                           "geometry": (processed.geometry.model_dump(mode="json")
-                                        if processed.geometry else None),
-                           "timings_ms": timings, "valid": processed.metrics.valid,
-                           "timestamp": _utcnow()}
-                self.session.record_take(layer_index=self.layer_index, take=take,
-                                         measured_xyz=processed.measured_xyz,
-                                         pose=inspect["pose"], summary=summary)
-                self.session.save()
-                ctx.log(f"layer {self.layer_index} take {take}: offset "
-                        f"{processed.metrics.center_offset_norm_mm:.2f} mm, RMS "
-                        f"{processed.metrics.rms_mm:.2f} mm, "
-                        f"{timings['acquisition_to_path_ms']:.0f} ms acquisition->path")
+                for repeat in range(1, self.repeats + 1):
+                    ctx.check_cancel()
+                    last_dir = self._one_take(ctx, layer=layer, archive=archive,
+                                              moved=moved, excursion=excursion,
+                                              repeat=repeat, total=total)
             # Outside the camera hold: drawing needs no camera, and the Jetson
             # lease should not be held while matplotlib works.
-            ctx.progress(3, 4, "drawing the figures")
-            _draw_figures(ctx, layer_dir)
-            ctx.progress(4, 4, "returning to the start pose")
-            self.result = {"kind": "ring_measure", "mode": MODE,
-                           "trial_id": self.session.trial_id,
-                           "fingerprint": self.plan.fingerprint, **summary}
-            return self.result
+            for record in self.results[-self.repeats:]:
+                ctx.progress(len(self.results), total, "drawing the figures")
+                _draw_figures(ctx, Path(record["layer_dir"]))
+            ctx.progress(len(self.results), total, "returning to the start pose")
         finally:
             if current_program:
                 try:
@@ -527,25 +529,144 @@ class RingMeasureJob:
             except Exception:
                 pass
             return_ms = (time.perf_counter() - came_home) * 1000.0
-            if layer_dir is not None:
+            if last_dir is not None:
                 try:
-                    complete = add_return_timing(layer_dir, return_ms)
+                    complete = add_return_timing(last_dir, return_ms,
+                                                 whole_excursion=not shared)
                     if complete is not None:
                         # The operator's table and the paper both read the cycle,
                         # so the session row cannot lag the manifest.
                         for record in self.session.records:
-                            if record.get("layer_name") == Path(layer_dir).name:
+                            if record.get("layer_name") == Path(last_dir).name:
                                 record["timings_ms"] = complete
                         self.session.save()
-                        ctx.log(f"inspection excursion {complete['inspection_cycle_ms']:.0f} ms "
+                        for record in self.results:
+                            if record.get("layer_name") == Path(last_dir).name:
+                                record["timings_ms"] = complete
+                        cycle = complete.get("inspection_cycle_ms")
+                        ctx.log(f"inspection excursion {cycle:.0f} ms "
                                 f"(out {complete.get('move_to_pose_ms', 0):.0f}, back "
-                                f"{return_ms:.0f})")
+                                f"{return_ms:.0f})" if cycle is not None else
+                                f"trip home {return_ms:.0f} ms; {self.repeats} frames "
+                                "shared this excursion, so none of them is priced as one")
                 except Exception as exc:
                     ctx.log(f"return timing not recorded (the measurement stands): {exc}")
             try:
                 rdk.delete_items(list(dict.fromkeys(reversed(artifacts))))
             except Exception:
                 pass
+
+    # -- one frame, processed and archived ----------------------------------
+    def _one_take(self, ctx: JobContext, *, layer, archive: ExtrusionArchive,
+                  moved: dict, excursion: int, repeat: int, total: int) -> Path:
+        services = self.services
+        ecfg = services.config.extrusion
+        take = self.session.next_take(self.layer_index)
+        inspect = moved["inspect"]
+        T_work_camera = moved["T_work_camera"]
+        parked = (f" (frame {repeat} of {self.repeats}, arm parked)"
+                  if self.repeats > 1 else "")
+        ctx.progress(len(self.results), total,
+                     f"layer {self.layer_index} take {take}: capturing{parked}")
+        captured = _capture_at_pose(services, ctx, T_work_camera)
+        frame, capture_ms = captured["frame"], captured["capture_ms"]
+        ctx.progress(len(self.results), total, f"take {take}: processing the frame")
+        nominal = points_array(layer)
+        base = dict(
+            trial_id=self.session.trial_id, layer_index=self.layer_index, take=take,
+            mode=MODE, recipe=self.plan.recipe,
+            toolpath_fingerprint=self.plan.fingerprint,
+            color_file="color.png", depth_file="depth.npy",
+            annotation=self.annotation,
+            provenance={**_provenance(services),
+                        "work_frame": self.plan.setup.work_frame,
+                        "inspection_tool": self.plan.setup.inspection_tool,
+                        "inspection_target": inspect["target"],
+                        "inspection_pose": inspect["pose"],
+                        # Which trip out this frame belongs to, and where in it.
+                        # Without this a reader cannot tell three frames of one
+                        # excursion from three separate re-approaches -- and the
+                        # difference between those two spreads is the finding.
+                        "excursion_index": excursion,
+                        "repeat_index": repeat,
+                        "repeats_in_excursion": self.repeats,
+                        "T_work_camera": np.asarray(T_work_camera, dtype=float).tolist()})
+        floor = self.session.floor_profile(self.layer_index)
+        try:
+            processed = process_observation(
+                color=frame.color, depth=frame.depth, T_work_camera=T_work_camera,
+                K=services.config.camera.K, plan=self.plan, layer=layer, config=ecfg,
+                floor_profile=floor)
+        except Exception as exc:
+            # A failed measurement still archives its raw RGB-D: the operator
+            # cannot re-place the ring exactly, so the frame is the only thing
+            # that can be reprocessed later.
+            manifest = LayerManifest(
+                **base, processing={"valid": False, "error": str(exc),
+                                    "timings_ms": {"capture_ms": capture_ms}},
+                warnings=[str(exc)])
+            failed_dir = archive.write_layer(
+                manifest, nominal_xyz=nominal, commanded_xyz=nominal,
+                color=frame.color, depth=frame.depth,
+                report={"valid": False, "error": str(exc)})
+            # A failure the operator cannot see is a failure they cannot
+            # reprocess -- and the raw frame that would rescue it is already
+            # on disk.
+            self.session.record_take(
+                layer_index=self.layer_index, take=take, measured_xyz=None,
+                pose=inspect["pose"],
+                summary=take_summary(failed_dir, manifest.model_dump(mode="json")))
+            self.session.save()
+            raise RuntimeError(
+                f"layer {self.layer_index} take {take} measurement invalid; "
+                f"raw RGB-D archived: {exc}") from exc
+        timings = processed.report["timings_ms"]
+        timings["capture_ms"] = capture_ms
+        timings["acquisition_to_path_ms"] = capture_ms + timings["total_ms"]
+        # Only the frame that actually followed the move may claim the move. The
+        # frames after it were taken with the arm already still, and charging
+        # them a travel time nothing travelled is how a shared trip would make
+        # the excursion look cheaper than it is.
+        if repeat == 1:
+            timings["move_to_pose_ms"] = moved["move_ms"]
+            timings["settle_ms"] = moved["settle_ms"]
+        processed.report["depth_plane_check"] = captured["depth_plane_check"]
+        manifest = LayerManifest(
+            **base, measured_path_file="measured_path.json",
+            pointcloud_file="height-or-pointcloud.npy",
+            metrics=processed.metrics, geometry=processed.geometry,
+            processing=processed.report, warnings=processed.metrics.warnings)
+        layer_dir = archive.write_layer(
+            manifest, nominal_xyz=nominal, commanded_xyz=nominal,
+            measured_xyz=processed.measured_xyz,
+            pointcloud_xyz=processed.filtered_xyz,
+            color=frame.color, depth=frame.depth,
+            derived_images={"segmentation.png": processed.segmentation,
+                            "skeleton.png": processed.skeleton,
+                            "comparison.png": processed.comparison},
+            report={**processed.report,
+                    "metrics": processed.metrics.model_dump(mode="json")})
+        summary = {"layer_index": self.layer_index, "take": take,
+                   "layer_dir": str(layer_dir),
+                   # The directory NAME as well as the path: the browser
+                   # addresses figures by it and cannot use an absolute
+                   # server path.
+                   "layer_name": layer_dir.name, "annotation": self.annotation,
+                   "metrics": processed.metrics.model_dump(mode="json"),
+                   "geometry": (processed.geometry.model_dump(mode="json")
+                                if processed.geometry else None),
+                   "timings_ms": timings, "valid": processed.metrics.valid,
+                   "timestamp": _utcnow()}
+        self.session.record_take(layer_index=self.layer_index, take=take,
+                                 measured_xyz=processed.measured_xyz,
+                                 pose=inspect["pose"], summary=summary)
+        self.session.save()
+        self.results.append(summary)
+        ctx.log(f"layer {self.layer_index} take {take}: offset "
+                f"{processed.metrics.center_offset_norm_mm:.2f} mm, RMS "
+                f"{processed.metrics.rms_mm:.2f} mm, "
+                f"{timings['acquisition_to_path_ms']:.0f} ms acquisition->path")
+        return layer_dir
 
 
 class RingCharacterizeJob:
@@ -693,6 +814,75 @@ def pure_shift_expectation(introduced_norm_mm: float) -> dict:
     return {"mean_absolute_mm": 2.0 * d / math.pi,
             "rms_mm": d / math.sqrt(2.0),
             "maximum_mm": d}
+
+
+CAPTURE_LABEL = {"parked": "arm parked", "re-approach": "re-approached",
+                 "single": "one take"}
+
+
+def capture_style(manifests: list[dict]) -> str:
+    """Did these takes share one trip out, or did the arm re-approach for each?
+
+    The distinction is the whole point of splitting the run's two repeat counts:
+    frames taken with the arm PARKED measure the sensing chain alone, while
+    takes that each had their own excursion also contain the robot's
+    re-approach. Takes archived before that split carry no stamp, and each of
+    them WAS its own press and so its own excursion -- which is what the default
+    reads as.
+    """
+    if len(manifests) < 2:
+        return "single"
+    provenance = [m.get("provenance") or {} for m in manifests]
+    parked = max((int(p.get("repeats_in_excursion") or 1) for p in provenance), default=1)
+    trips = {int(p.get("excursion_index") or 0) for p in provenance}
+    return "parked" if parked > 1 and len(trips) == 1 else "re-approach"
+
+
+def centre_spread(manifests: list[dict]) -> dict:
+    """How far the FITTED centres of one condition's takes scatter about their own mean.
+
+    This is repeatability proper -- the chain asked the same question several
+    times over an unchanged ring -- as opposed to centre_offset, which measures
+    where the ring sits relative to the plan. Reported as an unbiased 2-D
+    spread: sqrt(sum d^2 / (n-1)), the radial standard deviation.
+    """
+    centres = [m["metrics"]["measured_center_mm"] for m in manifests
+               if (m.get("metrics") or {}).get("valid")
+               and (m.get("metrics") or {}).get("measured_center_mm")]
+    if len(centres) < 2:
+        return {"n": len(centres), "rms_mm": None, "max_mm": None}
+    arr = np.asarray(centres, dtype=float)
+    deviations = np.linalg.norm(arr - arr.mean(axis=0), axis=1)
+    n = len(centres)
+    return {"n": n,
+            "rms_mm": float(np.sqrt(float((deviations ** 2).sum()) / (n - 1))),
+            "max_mm": float(deviations.max())}
+
+
+def _pooled_spread(groups: list[list[dict]]) -> dict:
+    """Pool several conditions' centre spreads into one estimate.
+
+    Each condition scatters about its OWN mean -- the ring is somewhere
+    different in each -- so the deviations pool, not the positions: the standard
+    (n-1)-weighted pooled variance.
+    """
+    weight = 0.0
+    total = 0.0
+    n_takes = 0
+    worst = None
+    for items in groups:
+        spread = centre_spread(items)
+        if spread["rms_mm"] is None:
+            continue
+        degrees = spread["n"] - 1
+        total += (spread["rms_mm"] ** 2) * degrees
+        weight += degrees
+        n_takes += spread["n"]
+        worst = spread["max_mm"] if worst is None else max(worst, spread["max_mm"])
+    return {"conditions": sum(1 for g in groups if centre_spread(g)["rms_mm"] is not None),
+            "takes": n_takes,
+            "rms_mm": float(np.sqrt(total / weight)) if weight else None,
+            "max_mm": worst}
 
 
 def shift_consistency(observed: dict, introduced_norm_mm: float, *,
@@ -898,6 +1088,11 @@ def paper_summary(root: Path, trial_id: str) -> dict:
             "paired_shift_norm_mm": _stat(p["measured_shift_norm_mm"] for p in paired),
             "paired_detection_error_mm": _stat(p["detection_error_mm"] for p in paired),
             "paired_reference_takes": sorted({p["reference_take"] for p in paired}),
+            # How this condition's takes were bought, and how tightly they
+            # agreed with each other. Together across conditions these separate
+            # the camera's repeatability from the robot's -- see `repeatability`.
+            "capture": capture_style(items),
+            "centre_spread": centre_spread(items),
             **deviation,
             "shape_rms_mm": _stat(x.get("shape_rms_mm") for x in metrics),
             "shift_consistency": shift_consistency(
@@ -915,6 +1110,17 @@ def paper_summary(root: Path, trial_id: str) -> dict:
     bead = {key: _stat(g.get(key) for g in geometry)
             for key in ("bead_width_mean_mm", "bead_width_min_mm", "bead_width_max_mm")}
     valid = sum(1 for m in takes if (m.get("metrics") or {}).get("valid"))
+    # The two repeatabilities, kept apart. A condition measured with the arm
+    # parked scatters by the camera alone; one where the arm went away and came
+    # back for every take scatters by the camera AND the re-approach. Quoting a
+    # single "repeatability" over both would attribute the robot's contribution
+    # to the sensing chain, or hide it entirely, depending on which conditions
+    # happened to dominate the pool.
+    by_style: dict[str, list[list[dict]]] = {}
+    for name, items in groups.items():
+        by_style.setdefault(capture_style(items), []).append(items)
+    repeatability = {"sensing": _pooled_spread(by_style.get("parked", [])),
+                     "re_approach": _pooled_spread(by_style.get("re-approach", []))}
     session_file = trial_dir / "session.json"
     characterization = None
     if session_file.is_file():
@@ -929,6 +1135,21 @@ def paper_summary(root: Path, trial_id: str) -> dict:
     # displacement the chain was TOLD about was recovered. Built once, as data,
     # so the Markdown block and the Word draft can never word it differently.
     prose: list[str] = []
+    sensing, reapproach = repeatability["sensing"], repeatability["re_approach"]
+    if sensing["rms_mm"] is not None:
+        prose.append(
+            f"Sensing repeatability, with the arm held at the inspection pose between frames: "
+            f"{sensing['rms_mm']:.2f} mm RMS about each condition's own mean centre "
+            f"(worst {sensing['max_mm']:.2f} mm) over {sensing['takes']} takes in "
+            f"{sensing['conditions']} condition(s). This is the chain's own scatter, with the "
+            "robot's re-approach excluded by construction.")
+    if reapproach["rms_mm"] is not None:
+        prose.append(
+            f"Re-approach repeatability, the arm leaving and returning to the pose for every "
+            f"take: {reapproach['rms_mm']:.2f} mm RMS (worst {reapproach['max_mm']:.2f} mm) "
+            f"over {reapproach['takes']} takes in {reapproach['conditions']} condition(s). "
+            "Measured the same way as the line above, so the difference between the two is "
+            "what re-approaching the ring costs.")
     for c in conditions:
         if c["introduced_norm_mm"] > 0 and c["paired_detection_error_mm"]["n"]:
             refs = c["paired_reference_takes"]
@@ -991,12 +1212,15 @@ def paper_summary(root: Path, trial_id: str) -> dict:
                      f"{characterization['top_z_min_mm']:.1f}-{characterization['top_z_max_mm']:.1f} mm.")
 
     lines = [f"**{headline}**", "",
-             "| Condition | n | centre offset (mm) | detection error (mm) | "
-             "paired detection error (mm) | "
+             "| Condition | n | how | centre spread (mm) | centre offset (mm) | "
+             "detection error (mm) | paired detection error (mm) | "
              "mean abs dev (mm) | RMS (mm) | max (mm) | shape RMS (mm) |",
-             "|---|---|---|---|---|---|---|---|---|"]
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
     for c in conditions:
-        lines.append(f"| {c['condition']} | {c['takes']} | {_fmt(c['center_offset_norm_mm'])} | "
+        spread = c["centre_spread"]["rms_mm"]
+        lines.append(f"| {c['condition']} | {c['takes']} | {CAPTURE_LABEL[c['capture']]} | "
+                     f"{'-' if spread is None else f'{spread:.2f}'} | "
+                     f"{_fmt(c['center_offset_norm_mm'])} | "
                      f"{_fmt(c['detection_error_mm'])} | "
                      f"{_fmt(c['paired_detection_error_mm'])} | "
                      f"{_fmt(c['mean_absolute_mm'])} | {_fmt(c['rms_mm'])} | "
@@ -1005,6 +1229,7 @@ def paper_summary(root: Path, trial_id: str) -> dict:
         lines += ["", paragraph]
     return {"trial_id": trial_id, "mode": trial.get("mode", "LIVE_PRINT"),
             "takes": len(takes), "valid": valid, "conditions": conditions,
+            "repeatability_mm": repeatability,
             "timing_ms": timing, "height_mm": height, "bead_width_mm": bead,
             "characterization": characterization, "headline": headline,
             "prose": prose, "manifests": takes, "markdown": "\n".join(lines)}

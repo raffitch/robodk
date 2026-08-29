@@ -116,6 +116,8 @@ const PHASES: Array<{ value: string; label: string; hint: string }> = [
     hint: "ring lifted and put back by hand — placement repeatability" },
   { value: "stacked true", label: "Stacked true",
     hint: "the next ring placed as accurately as you can, no deliberate offset" },
+  { value: "newly exposed", label: "Newly exposed",
+    hint: "the ring above was just lifted off — this ring's baseline as the new top" },
   { value: "top ring shifted", label: "Top ring shifted",
     hint: "the TOP ring displaced by the offset you typed — the controlled validation" },
 ];
@@ -715,11 +717,17 @@ export default function Extrusion() {
       refreshStatus();
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
-  const measure = async (take?: { layer: number; phase: string; offset: [number, number] }) => {
+  const measure = async (take?: { layer: number; phase: string; offset: [number, number];
+                                  /** Frames grabbed with the arm PARKED at the pose. */
+                                  repeats?: number;
+                                  /** Whole trips out and back, one frame each. */
+                                  excursions?: number }) => {
     if (!plan) return;
     const layerIndex = take ? take.layer : measureLayer;
     const takePhase = take ? take.phase : phase;
     const [dx, dy] = take ? take.offset : [offsetX, offsetY];
+    const repeats = Math.max(1, Math.min(10, take?.repeats ?? 1));
+    const excursions = Math.max(1, Math.min(10, take?.excursions ?? 1));
     // One take's timeline per take: stale lines from the previous ring read as
     // this one's.
     setBusy(true); setLogs([]);
@@ -730,12 +738,15 @@ export default function Extrusion() {
         annotation: { introduced_offset_mm: shifted ? [dx, dy] : null,
                       phase: takePhase || undefined, note: measureNote },
         confirm_robot_motion: confirmMotion,
-        collision_check_enabled: false,
+        collision_check_enabled: false, repeats, excursions,
       });
       // Echo the ground truth back: it is the number every detection-error
       // figure is measured against, and nothing else on screen repeats it.
-      setMessage(`MEASURE started — recording as ${annotationLabel(layerIndex, takePhase, [dx, dy])}. `
-        + "Collision validation OFF; camera move only, no extrusion, no valve.");
+      const batch = excursions > 1
+        ? ` — ${excursions} trips out and back, unattended; do not touch the cell`
+        : repeats > 1 ? ` — ${repeats} frames on one trip, arm parked` : "";
+      setMessage(`MEASURE started — recording as ${annotationLabel(layerIndex, takePhase, [dx, dy])}`
+        + `${batch}. Collision validation OFF; camera move only, no extrusion, no valve.`);
       refreshStatus();
     } catch (e: any) { setBusy(false); setMessage(e.message); }
   };
@@ -898,8 +909,6 @@ export default function Extrusion() {
   const countPhase = (layerIndex: number, want: string) => validTakes.filter(
     (t) => t.layer_index === layerIndex && (t.annotation?.phase || "") === want
            && offsetNorm(t) === 0).length;
-  const countOffset = (millimetres: number) => validTakes.filter(
-    (t) => Math.abs(offsetNorm(t) - millimetres) < 0.51).length;
   // The bead each layer's newest VALID take measured. An invalid take measured
   // no footprint, so it must not contribute one.
   const measuredBeadByLayer = useMemo(() => {
@@ -925,20 +934,131 @@ export default function Extrusion() {
   // One thing to do at a time, in the order the protocol needs it. Each step
   // owns the take it records, so the operator never sets layer/phase/offset by
   // hand and a mislabelled group cannot happen by forgetting a control.
+  //
+  // Two shapes of press, because repeatability has two sources that cost
+  // differently to measure:
+  //   * the NOISE FLOOR buys whole trips out and back (the arm's re-approach is
+  //     the thing under test), five of them, unattended on one press;
+  //   * every later condition buys frames with the arm PARKED -- the sensing
+  //     spread alone, three frames on one trip, in seconds.
+  // Read together they say how much of the deviation is the robot and how much
+  // is the camera, which is the claim the noise floor exists to support.
+  const REPEATS = 3;                     // frames per condition, arm parked
+  const NOISE_TRIPS = 5;                 // whole excursions, unattended
   const noiseTakes = countPhase(1, "noise floor");
   const replacedTakes = countPhase(1, "re-placed");
-  const layer2Takes = countPhase(2, "stacked true");
-  const layer3Takes = countPhase(3, "stacked true");
-  const shift10 = countOffset(10), shift15 = countOffset(15);
   const topLayer = plan?.layers.length ?? 1;
   const offsetVector: [number, number] = offsetAxis === "X" ? [offsetMag, 0] : [0, offsetMag];
+  // The two displacement conditions are "about 10" and "about 15" mm, not
+  // exactly 10 and 15: the operator measures what they actually moved with a
+  // steel rule and types that. So a take belongs to whichever condition it is
+  // nearer -- 12 mm is the small one. Matching an exact millimetre (as this
+  // did) left a step that instructed "12 mm scores as well as 10" unable to
+  // ever count that take, and so unable to finish.
+  const SHIFT_SPLIT_MM = 12.5;
+  const countShift = (layerIndex: number, band: "small" | "large") => validTakes.filter(
+    (t) => {
+      const norm = offsetNorm(t);
+      if (t.layer_index !== layerIndex || norm < 0.51) return false;
+      return band === "small" ? norm < SHIFT_SPLIT_MM : norm >= SHIFT_SPLIT_MM;
+    }).length;
   const motionBlocked = !plan ? "Generate the plan first."
     : !connected ? "Connect to RoboDK — the camera move is a real robot motion."
     : !planIsApplied ? "Press “Use this ring” so the session measures against the plan it applied."
     : !confirmMotion ? "Tick “Hands clear” — the robot moves the camera."
     : null;
+  const stalled = Boolean(motionBlocked) || busy || Boolean(status?.running);
   const runStep = (over: Partial<RunStep> & { id: string; label: string; title: string;
                                               done: boolean }): RunStep => ({ ...over } as RunStep);
+  /** A condition measured with the arm parked: one trip, the frames still owed. */
+  const parkedStep = (over: {
+    id: string; label: string; title: string; layer: number; phase: string;
+    hands: string; note: string; offset?: [number, number];
+  }): RunStep => {
+    const offset = over.offset ?? ([0, 0] as [number, number]);
+    const have = offset[0] || offset[1]
+      ? countShift(over.layer, Math.hypot(...offset) < SHIFT_SPLIT_MM ? "small" : "large")
+      : countPhase(over.layer, over.phase);
+    const owed = Math.max(1, REPEATS - have);
+    return runStep({
+      id: over.id, label: over.label, title: over.title, layer: over.layer,
+      hands: over.hands, note: over.note,
+      done: have >= REPEATS, progress: { have, need: REPEATS },
+      button: `Measure ${owed} frame${owed === 1 ? "" : "s"} — one trip, arm parked`,
+      records: annotationLabel(over.layer, over.phase, offset),
+      onRun: () => measure({ layer: over.layer, phase: over.phase, offset, repeats: owed }),
+      moves: true, disabled: stalled, blocked: motionBlocked,
+    });
+  };
+  /** Displace THIS layer's ring — it is the top one by now — and measure it. */
+  const shiftStep = (layer: number, opts: { firstOfTheRun: boolean }): RunStep => {
+    const small = countShift(layer, "small"), large = countShift(layer, "large");
+    const onSmall = small < REPEATS;
+    const have = onSmall ? small : large;
+    const nominal = onSmall ? 10 : 15;
+    const owed = Math.max(1, REPEATS - have);
+    // The axis check is a one-off for the whole run: once the operator knows
+    // which way is +X, every later layer reuses the answer.
+    const needsAxis = opts.firstOfTheRun && !axisKnown;
+    return runStep({
+      id: `shift${layer}`, label: `Shift L${layer}`, layer,
+      title: needsAxis ? "Find out which way is +X"
+        : `Displace ring ${layer} — about ${nominal} mm`,
+      hands: needsAxis
+        ? "Slide the TOP ring roughly 10 mm along one board edge, measure once, then read the "
+          + "Offset column below to see which axis moved and in which direction. Put it back "
+          + "on its marks after."
+        : `Ring ${layer} is the top ring now. Mark where it sits, slide it along a board edge, `
+          + `and measure what you actually moved with a steel rule, from those marks. Type that `
+          + `number — 12 mm scores as well as 10. The ${nominal === 15 ? "15" : "10"} mm `
+          + `condition is measured from the SAME marks, not from where the last one left it.`,
+      done: !needsAxis && small >= REPEATS && large >= REPEATS,
+      progress: needsAxis ? undefined : { have, need: REPEATS },
+      button: needsAxis ? "Take one throwaway measurement"
+        : `Measure ${owed} frame${owed === 1 ? "" : "s"} — one trip, arm parked`,
+      records: needsAxis ? undefined
+        : annotationLabel(layer, "top ring shifted", offsetVector),
+      onRun: () => measure(needsAxis
+        ? { layer, phase: "axis check", offset: [0, 0] }
+        : { layer, phase: "top ring shifted", offset: offsetVector, repeats: owed }),
+      moves: true, disabled: stalled, blocked: motionBlocked,
+      offsetInput: !needsAxis, axisAck: opts.firstOfTheRun,
+      note: `Displace ring ${layer} only. Keep it under 25 mm. The shift is scored against `
+        + `this layer's last undisplaced take, so that one must come first — the step above `
+        + `takes it.`,
+    });
+  };
+
+  // The stack goes UP to build the floors, then comes DOWN to be displaced.
+  //
+  // Every displacement must happen on a ring that is on TOP: a ring with
+  // another resting on it cannot be lifted or slid without disturbing what sits
+  // above it, and a ring underneath is the measurement floor for everything
+  // above it. So the run builds 1-2-3 (each layer measured, because layer N's
+  // floor IS layer N-1's measured top), then displaces ring 3, lifts it off,
+  // displaces ring 2, lifts it off, displaces ring 1. Every ring gets its
+  // controlled offset while it is reachable, and the paper gets the detection
+  // error at three stack heights instead of only at the top.
+  const teardown: RunStep[] = [];
+  for (let layer = topLayer; layer >= 1; layer--) {
+    // Layer 3's undisplaced baseline is the "stacked true" pair of takes from
+    // the build-up. Every lower layer needs a FRESH one: the ring above it was
+    // just lifted off, and whether that disturbed it is exactly what a baseline
+    // taken before the lift could not tell us.
+    if (layer < topLayer) {
+      teardown.push(parkedStep({
+        id: `exposed${layer}`, label: `Expose L${layer}`, layer, phase: "newly exposed",
+        title: `Lift ring ${layer + 1} off — measure ring ${layer} as the new top`,
+        hands: `Lift ring ${layer + 1} off the stack and set it aside. Do not touch ring `
+          + `${layer}. It is the top of the stack now.`,
+        note: "A fresh undisplaced baseline for this ring, taken AFTER the one above it came "
+          + "off — the take its own displacement is scored against. It also measures whether "
+          + "lifting a ring off disturbs the one beneath it, which nothing else here can see.",
+      }));
+    }
+    teardown.push(shiftStep(layer, { firstOfTheRun: layer === topLayer }));
+  }
+
   const RUN: RunStep[] = [
     runStep({
       id: "fresh", label: "Fresh ring", title: "Start a fresh ring",
@@ -977,77 +1097,48 @@ export default function Extrusion() {
         : "The robot moves the camera over the ring, takes one frame and returns.",
     }),
     runStep({
-      id: "noise", layer: 1, label: "Noise floor", title: "Noise floor — five takes, touching nothing",
-      hands: "Hands off. Do not touch the ring, the board or the table between takes.",
-      done: noiseTakes >= 5, progress: { have: noiseTakes, need: 5 },
-      button: `Measure take ${Math.min(noiseTakes + 1, 5)} of 5`,
+      id: "noise", layer: 1, label: "Noise floor",
+      title: `Noise floor — ${NOISE_TRIPS} trips, unattended`,
+      hands: "Hands off, and stay out of the cell until it stops. One press sends the arm out "
+        + "and back five times on its own; nothing is touched between trips.",
+      done: noiseTakes >= NOISE_TRIPS, progress: { have: noiseTakes, need: NOISE_TRIPS },
+      button: `Run ${Math.max(1, NOISE_TRIPS - noiseTakes)} trip`
+        + `${NOISE_TRIPS - noiseTakes === 1 ? "" : "s"} — unattended`,
       records: annotationLabel(1, "noise floor", [0, 0]),
-      onRun: () => measure({ layer: 1, phase: "noise floor", offset: [0, 0] }),
-      moves: true, disabled: Boolean(motionBlocked) || busy || Boolean(status?.running),
-      blocked: motionBlocked,
-      note: "How repeatably the chain sees a ring that has not moved — every other number is read against this.",
+      onRun: () => measure({ layer: 1, phase: "noise floor", offset: [0, 0],
+                             excursions: Math.max(1, NOISE_TRIPS - noiseTakes) }),
+      moves: true, disabled: stalled, blocked: motionBlocked,
+      note: "The only step that re-approaches the ring for every take, so it is the only one "
+        + "whose spread contains the robot as well as the camera. Every later condition is "
+        + "measured with the arm parked and read against this. A trip that fails keeps the "
+        + "takes before it — press again to finish the set.",
     }),
     runStep({
       id: "replace", layer: 1, label: "Re-place", title: "Placement repeatability — three takes",
-      hands: "Lift ring 1 off the board and set it back down as accurately as you can. Once per take.",
-      done: replacedTakes >= 3, progress: { have: replacedTakes, need: 3 },
-      button: `Measure take ${Math.min(replacedTakes + 1, 3)} of 3`,
+      hands: "Lift ring 1 off the board and set it back down as accurately as you can. Once "
+        + "per press — the hand has to move between these, so they cannot be batched.",
+      done: replacedTakes >= REPEATS, progress: { have: replacedTakes, need: REPEATS },
+      button: `Measure take ${Math.min(replacedTakes + 1, REPEATS)} of ${REPEATS}`,
       records: annotationLabel(1, "re-placed", [0, 0]),
       onRun: () => measure({ layer: 1, phase: "re-placed", offset: [0, 0] }),
-      moves: true, disabled: Boolean(motionBlocked) || busy || Boolean(status?.running),
-      blocked: motionBlocked,
+      moves: true, disabled: stalled, blocked: motionBlocked,
       note: "How repeatably a hand places a ring — separate from how well the chain sees it.",
     }),
-    runStep({
-      id: "ring2", layer: 2, label: "Ring 2", title: "Ring 2 on the stack — three takes",
-      hands: "Place ring 2 on top of ring 1, as true as you can. Leave it there for all three takes.",
-      done: layer2Takes >= 3, progress: { have: layer2Takes, need: 3 },
-      button: `Measure layer 2 · take ${Math.min(layer2Takes + 1, 3)} of 3`,
-      records: annotationLabel(2, "stacked true", [0, 0]),
-      onRun: () => measure({ layer: 2, phase: "stacked true", offset: [0, 0] }),
-      moves: true, disabled: Boolean(motionBlocked) || busy || Boolean(status?.running),
-      blocked: motionBlocked,
-      note: "Check the first take says VALID before continuing: where ring 2 sits low there is under a "
-        + "millimetre of floor margin and its low stretches can be clipped.",
+    parkedStep({
+      id: "ring2", label: "Ring 2", layer: 2, phase: "stacked true",
+      title: "Ring 2 on the stack — three frames",
+      hands: "Place ring 2 on top of ring 1, as true as you can, then keep clear.",
+      note: "Check the first take says VALID before continuing: where ring 2 sits low there is "
+        + "under a millimetre of floor margin and its low stretches can be clipped.",
     }),
-    runStep({
-      id: "ring3", layer: 3, label: "Ring 3", title: "Ring 3 on the stack — three takes",
-      hands: "Place ring 3 on top, as true as you can.",
-      done: layer3Takes >= 3, progress: { have: layer3Takes, need: 3 },
-      button: `Measure layer 3 · take ${Math.min(layer3Takes + 1, 3)} of 3`,
-      records: annotationLabel(3, "stacked true", [0, 0]),
-      onRun: () => measure({ layer: 3, phase: "stacked true", offset: [0, 0] }),
-      moves: true, disabled: Boolean(motionBlocked) || busy || Boolean(status?.running),
-      blocked: motionBlocked,
-      note: "The camera climbs with the stack: every layer is measured from 300 mm above its own top.",
+    parkedStep({
+      id: "ring3", label: "Ring 3", layer: 3, phase: "stacked true",
+      title: "Ring 3 on the stack — three frames",
+      hands: "Place ring 3 on top, as true as you can, then keep clear.",
+      note: "The camera climbs with the stack: every layer is measured from 300 mm above its "
+        + "own top. This is also ring 3's undisplaced baseline — it is displaced next.",
     }),
-    runStep({
-      id: "offsets", layer: topLayer, label: "Offsets",
-      title: !axisKnown ? "Find out which way is +X"
-        : `Displace the top ring — about ${shift10 < 3 ? 10 : 15} mm`,
-      hands: !axisKnown
-        ? "Slide the TOP ring roughly 10 mm along one board edge, measure once, then read the "
-          + "Offset column below to see which axis moved and in which direction. Put it back "
-          + "on its marks after."
-        : `Mark where the top ring sits, slide it along a board edge, and measure what you `
-          + `actually moved with a steel rule, from those marks. Type that number — 12 mm scores `
-          + `as well as 10. The 15 mm condition is 15 mm from the SAME marks, not 5 mm further.`,
-      done: shift10 >= 3 && shift15 >= 3,
-      progress: axisKnown ? { have: shift10 < 3 ? shift10 : shift15, need: 3 } : undefined,
-      button: !axisKnown ? "Take one throwaway measurement"
-        : `Measure take ${Math.min((shift10 < 3 ? shift10 : shift15) + 1, 3)} of 3`,
-      records: axisKnown ? annotationLabel(topLayer, "top ring shifted", offsetVector) : undefined,
-      onRun: () => measure(axisKnown
-        ? { layer: topLayer, phase: "top ring shifted", offset: offsetVector }
-        : { layer: topLayer, phase: "axis check", offset: [0, 0] }),
-      moves: true, disabled: Boolean(motionBlocked) || busy || Boolean(status?.running),
-      blocked: motionBlocked,
-      offsetInput: axisKnown,
-      axisAck: true,
-      note: "Displace the TOP ring only — a ring underneath is the measurement floor for everything "
-        + "above it. Keep it under 25 mm. The shift is scored against this layer's last undisplaced "
-        + "take (the 'stacked true' takes above), so those must come first.",
-    }),
+    ...teardown,
     runStep({
       id: "summary", label: "Summary", title: "Take the numbers",
       hands: "Nothing to touch in the cell.",
@@ -1067,6 +1158,24 @@ export default function Extrusion() {
   const activeIndex = (stepPin !== null && RUN[stepPin]) ? stepPin : resumeIndex;
   const pinnedAway = stepPin !== null && stepPin !== resumeIndex;
   const active = RUN[activeIndex];
+  // Finish a step and the run moves on by itself, pin or no pin.
+  //
+  // The pin exists so the operator can go back and look at a step; it should
+  // not also mean "and stay here forever". Without this, working from a pinned
+  // step (which is how you resume after a restart, or redo a condition) left
+  // the panel sitting on a finished step showing "3 of 3 done" with a button
+  // that would only over-measure it. Only a pin that was placed on UNFINISHED
+  // work releases -- clicking back to an already-green step keeps you there,
+  // which is the whole point of clicking it.
+  const pinWasUnfinished = useRef(false);
+  useEffect(() => {
+    pinWasUnfinished.current = stepPin !== null && !RUN[stepPin]?.done;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [stepPin]);
+  const pinnedDone = stepPin !== null && Boolean(RUN[stepPin]?.done);
+  useEffect(() => {
+    if (pinnedDone && pinWasUnfinished.current) { pinWasUnfinished.current = false; setStepPin(null); }
+  }, [pinnedDone]);
   // The floor is the layer BELOW the one this step measures -- not the one the
   // manual selector happens to be showing.
   const stepFloorReady = !active.layer || active.layer <= 1
@@ -1534,15 +1643,34 @@ export default function Extrusion() {
           </li>)}
         </ol>
         <div className="io-note">
-          <b>Placing the rings.</b> Displace only the <b>TOP</b> ring: layer N is measured
-          above layer N−1's latest take, so moving a ring underneath corrupts everything
-          stacked on it. Keep every offset ≤ 25 mm (the search band is ±30 mm). The work
-          frame's axes run along the board edges, so a steel rule laid along an edge IS the
-          frame axis: mark where the ring sits, slide it along the rule, and type the distance
-          you actually achieved. Do <b>not</b> count ChArUco squares — this board's are 40 mm,
-          past the 25 mm cap, and the ring would fall outside the search band. Take one
-          throwaway measurement first to learn which edge is +X: the reported offset tells you
-          the sign.
+          <b>The stack goes up, then comes down.</b> Only the <b>TOP</b> ring may ever be
+          displaced — layer N is measured above layer N−1's latest take, so sliding a ring
+          that has another resting on it corrupts everything above it, and you cannot lift it
+          without disturbing them either. So the run builds 1‑2‑3 first (each layer measured,
+          because layer N's floor <i>is</i> layer N−1's measured top), then works back down:
+          displace ring 3, lift it off, displace ring 2, lift it off, displace ring 1. Every
+          ring is displaced while it is the reachable one, and the paper gets the detection
+          error at three stack heights instead of one. After each lift the run takes a fresh
+          undisplaced baseline of the newly exposed ring — that is what its own shift is
+          scored against.
+        </div>
+        <div className="io-note">
+          <b>Two kinds of repeat, and why only some batch.</b> The <b>noise floor</b> sends the
+          arm out and back {NOISE_TRIPS} times on one press: its spread contains the robot's
+          re-approach as well as the camera, which is what makes it the floor everything else
+          is read against. Every later condition takes {REPEATS} frames with the arm
+          <b> parked</b> — one trip, seconds apart — so it measures the sensing chain alone,
+          and the robot's contribution is already known from the noise floor. Only
+          <b> Re-place</b> stays one press per take: your hand has to move between those.
+        </div>
+        <div className="io-note">
+          <b>Measuring the offset.</b> Keep every offset ≤ 25 mm (the search band is ±30 mm).
+          The work frame's axes run along the board edges, so a steel rule laid along an edge
+          IS the frame axis: mark where the ring sits, slide it along the rule, and type the
+          distance you actually achieved — 12 mm scores as well as 10. Do <b>not</b> count
+          ChArUco squares — this board's are 40 mm, past the 25 mm cap, and the ring would fall
+          outside the search band. Take one throwaway measurement first to learn which edge is
+          +X: the reported offset tells you the sign.
         </div>
         <div className="io-note">
           <b>What the numbers mean.</b> A pure shift of d reads centre offset ≈ d, max ≈ d,

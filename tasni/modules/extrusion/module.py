@@ -74,6 +74,13 @@ class MeasureLayerBody(FingerprintBody):
     layer_index: int = Field(ge=1)
     annotation: dict = Field(default_factory=dict)
     confirm_robot_motion: bool = False
+    # How many takes one press buys, and how they are bought. `repeats` are
+    # frames grabbed with the arm PARKED (sensing repeatability, seconds each);
+    # `excursions` are whole trips out and back (which additionally measures the
+    # arm's re-approach, and costs a trip each). Capped so a mistyped number
+    # cannot commit the cell to a quarter of an hour of unattended motion.
+    repeats: int = Field(default=1, ge=1, le=10)
+    excursions: int = Field(default=1, ge=1, le=10)
     # Escape hatch for a layer whose floor can never be measured (every take of
     # the layer below failed). Deliberately not in the UI: the floor is
     # load-bearing, and skipping it silently would produce a number the paper
@@ -709,13 +716,16 @@ class ExtrusionModule(WorkflowModule):
             self._active_measure_job = RingMeasureJob(
                 services, self._plan, session, body.layer_index,
                 annotation=body.annotation, check_collisions=body.collision_check_enabled,
-                close_range_tool_clear=body.confirm_close_range_tool_clear)
+                close_range_tool_clear=body.confirm_close_range_tool_clear,
+                repeats=body.repeats, excursions=body.excursions)
             try:
                 services.jobs.start(self._active_measure_job, name="extrusion-measure")
             except JobBusy as exc:
                 raise HTTPException(409, str(exc))
             return {"status": "started", "mode": MEASURE_MODE, "trial_id": session.trial_id,
-                    "layer_index": body.layer_index, "take": session.next_take(body.layer_index)}
+                    "layer_index": body.layer_index, "take": session.next_take(body.layer_index),
+                    "repeats": body.repeats, "excursions": body.excursions,
+                    "takes_requested": body.repeats * body.excursions}
 
         @router.get("/status")
         def status() -> dict:
