@@ -565,15 +565,21 @@ def lock_scan_surface(services, *, force_crop: bool = False,
         #
         # 2026-08-30 false-refusal investigation: the old message said "the platform
         # overruns the camera view", which the operator could see with their own
-        # eyes was false -- the platform was fully visible, comfortably framed with
-        # margin, in the colour image. The refusal itself was correct (the RANSAC
-        # plane fit genuinely extends past the colour frame -- verified live on this
-        # camera with a real capture: a board resting on a desk fits the colour view,
-        # but the desk surface beyond it, coplanar and visible only to the wider
-        # native depth FOV, pulls the fitted rectangle past the colour frame); what
-        # was wrong was the MESSAGE, which named the wrong camera. It now says which
-        # field of view is binding and gives the actual numbers, so the operator can
-        # verify the claim instead of just disbelieving it.
+        # eyes was false. A first pass here concluded the refusal itself was
+        # geometrically correct and only the message was wrong -- WRONG: a second
+        # live re-measurement (histogram of the actual reported scene) found two
+        # DISJOINT, non-coplanar populations ~620 mm apart (a platform and the floor
+        # beside it), and plain maximal-consensus RANSAC was selecting the more
+        # numerous one (the floor) regardless of which one the operator was aiming
+        # at. That is now fixed at the SOURCE (survey_surface's plane fit is seeded
+        # from the aiming-reticle region -- see fit_plane's seed_mask and
+        # SurveyThresholds.center_patch_frac), so this refusal should no longer fire
+        # on a platform the operator can see is fully framed. It still exists for a
+        # plane that is genuinely too large for the colour view even once correctly
+        # selected (test_entire_platform_overrun_refuses_instead_of_auto_cropping),
+        # and for that case the message below remains an improvement: it names which
+        # field of view is binding and gives the actual numbers, rather than an
+        # unverifiable "camera view".
         extent = [float(v) for v in (survey.extent_mm or ())] or None
         fov = _large_surface_fov_context(survey, getattr(frame, "geometry", None))
         standoff = (round(float(survey.standoff_mm), 0)
@@ -911,6 +917,12 @@ def _survey_thresholds(scfg) -> SurveyThresholds:
         grid_target_px=scfg.grid_target_px,
         frame_margin_uv=float(getattr(scfg, "live_frame_margin_uv", 0.02)),
         work_crop_mm=tuple(scfg.work_crop_mm),
+        # Same aiming-reticle region the depth gate already uses (scan_gate_
+        # thresholds, above) -- one canonical definition of "where the operator
+        # is looking" that both the coarse gate AND the full-frame plane fit
+        # agree on (2026-08-30 false-refusal fix: seeds RANSAC's plane
+        # selection so it locks onto the surface being aimed at).
+        center_patch_frac=float(scfg.center_patch_frac),
     )
 
 

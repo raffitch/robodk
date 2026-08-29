@@ -45,6 +45,11 @@ class SurveyThresholds:
     #                                       => object bounded in view (keep the rectangle)
     work_crop_mm: tuple[float, float] = (1000.0, 1000.0)  # generic work square when the
     #                                       surface overruns the view (edges untrustworthy)
+    center_patch_frac: float = 0.25       # aiming-reticle region (same convention as
+    #     ScanGateThresholds.center_patch_frac) that SEEDS the plane fit below, so
+    #     RANSAC locks onto the surface the operator is aiming at rather than
+    #     whichever coplanar-ish cluster happens to have the most points anywhere
+    #     in the wider native depth frame (e.g. an adjoining floor).
 
 
 @dataclass
@@ -187,9 +192,25 @@ def survey_surface(
     if len(pts_mm) > th.max_samples:
         pts_mm = pts_mm[::int(np.ceil(len(pts_mm) / th.max_samples))]
 
+    # 2b. Seed region (2026-08-30 false-refusal fix): the colour-image centre
+    # patch, same box convention as ColorRegistered._center_patch_bounds / the
+    # depth gate's own centre-patch aiming region -- what the operator is
+    # actually pointed at. Passed to fit_plane as seed_mask so the RANSAC locks
+    # onto the plane THROUGH this region rather than whichever cluster anywhere
+    # in the (wider-than-colour) native depth frame happens to have the most
+    # points -- see fit_plane's own docstring for the live-cell evidence.
+    seed_uv = project_to_color(pts_mm, K_color, dist_color)
+    pf = float(np.clip(th.center_patch_frac, 0.05, 1.0))
+    cw, ch = max(2, int(W * pf)), max(2, int(H * pf))
+    sx0, sy0 = (W - cw) // 2, (H - ch) // 2
+    sx1, sy1 = sx0 + cw, sy0 + ch
+    seed_mask = ((seed_uv[:, 0] >= sx0) & (seed_uv[:, 0] < sx1)
+                & (seed_uv[:, 1] >= sy0) & (seed_uv[:, 1] < sy1))
+
     # 3. RANSAC plane fit (COLOUR camera frame), then re-orient the normal to face it.
     try:
-        normal, centroid, _ = fit_plane(pts_mm, distance=th.ransac_distance_mm)
+        normal, centroid, _ = fit_plane(pts_mm, distance=th.ransac_distance_mm,
+                                        seed_mask=seed_mask)
     except ValueError:
         return _not_detected(th, fov_deg)
 

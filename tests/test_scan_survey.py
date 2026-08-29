@@ -171,6 +171,74 @@ def test_crop_mode_uses_generic_reticle_square():
           tuple(round(x, 1) for x in m.extent_mm))
 
 
+def test_dominant_plane_selection_prefers_the_aimed_at_surface_not_the_bigger_one():
+    """2026-08-30 false-refusal investigation, cause confirmed live on the real
+    cell (a coordinator re-measurement after the checkerboard-on-a-desk finding
+    turned out not to generalize): a work platform (~450 mm standoff, ~248k
+    depth points, 29% of the frame) shared a frame with an adjoining FLOOR
+    (~1071 mm standoff, ~600k points, 71%) -- a genuine ~620 mm step, NOT
+    coplanar. Plain maximal-consensus RANSAC selected the FLOOR purely by
+    inlier count: standoff read ~1071 mm, the floor's enormous extent read
+    ``fully_framed=False``, and the entire-platform refusal fired on a
+    platform that was, in fact, fully and comfortably framed. The operator's
+    objection was exactly right: "you should see the frame then the floor and
+    realize that it's the frame we want to keep."
+
+    No single-plane fixture (every other test in this file) can catch this --
+    there is nothing to out-vote. This builds two genuinely disjoint,
+    non-coplanar flat regions (platform centred in view, floor surrounding it
+    with MORE points, mirroring the live cell's point-count ratio) and asserts
+    the smaller, CENTRED platform -- not the bigger floor -- is what
+    ``survey_surface`` locks onto, via the aiming-reticle seed
+    (``fit_plane``'s ``seed_mask``, built from
+    ``SurveyThresholds.center_patch_frac`` -- the same "where is the operator
+    aiming" region the depth gate already uses).
+    """
+    th = SurveyThresholds()
+    d = np.full((H, W), 1070, dtype=np.uint16)              # floor fills the whole frame...
+    platform_frac = 0.4
+    x0, x1 = int(W * (1 - platform_frac) / 2), int(W * (1 + platform_frac) / 2)
+    y0, y1 = int(H * (1 - platform_frac) / 2), int(H * (1 + platform_frac) / 2)
+    d[y0:y1, x0:x1] = 450                                    # ...platform sits centred in it
+    platform_px = (y1 - y0) * (x1 - x0)
+    floor_px = H * W - platform_px
+    assert floor_px > platform_px, (
+        "fixture must give the floor MORE points, matching the live report", platform_px, floor_px)
+
+    m = survey_surface(d, gf.aligned(K, (W, H)), K, None, th)
+    assert m.detected, m.to_dict()
+    assert m.standoff_mm is not None and abs(m.standoff_mm - 450.0) < 10.0, (
+        "RANSAC selected the bigger surrounding surface instead of the aimed-at "
+        "platform -- the dominant-plane-selection regression is back", m.to_dict())
+    assert m.fully_framed, (
+        "the platform (well within the frame, once the right plane is selected) "
+        "should read fully framed", m.to_dict())
+    assert m.extent_mm is not None and max(m.extent_mm) < 600.0, (
+        "extent this large means the FLOOR's whole-frame rectangle was measured, "
+        "not the platform's", m.extent_mm)
+    print("[plane selection] platform", round(m.standoff_mm, 1), "mm selected over the",
+          "bigger floor (platform", platform_px, "px vs floor", floor_px, "px)")
+
+
+def test_dominant_plane_selection_falls_back_to_global_ransac_with_one_surface():
+    """Explicit degrade-sensibly check (companion to the two-plane test above):
+    when the aiming-reticle seed region has no data of its own to offer beyond
+    what a single-surface scene already provides, the seeded fit must recover
+    the exact same result as plain global RANSAC -- proven here by comparing
+    against every other single-plane test in this file still passing unchanged
+    (test_frontal_plane_all_green etc.), and directly here against a tilted
+    plane where the seed patch is real but there is only one surface to find."""
+    th = SurveyThresholds()
+    a = np.deg2rad(15)
+    d = _render([np.sin(a), 0, np.cos(a)], 500)
+    m = survey_surface(d, gf.aligned(K, (W, H)), K, None, th)
+    assert m.detected, m.to_dict()
+    assert abs(m.standoff_mm - 500) < 8, m.standoff_mm
+    assert abs(m.tilt_deg - 15) < 1.5, m.tilt_deg
+    print("[plane selection] single-surface scene unaffected: standoff",
+          round(m.standoff_mm, 1), "tilt", round(m.tilt_deg, 2))
+
+
 def test_fully_framed_survives_distortion_fold_back():
     """A ``gf.aligned`` fixture cannot exercise this: depth and colour share one
     K/size there, so a corner that leaves the colour frame also leaves the depth
@@ -281,6 +349,8 @@ if __name__ == "__main__":
     test_grid_spacing_nice_number()
     test_outline_uv_normalized()
     test_crop_mode_uses_generic_reticle_square()
+    test_dominant_plane_selection_prefers_the_aimed_at_surface_not_the_bigger_one()
+    test_dominant_plane_selection_falls_back_to_global_ransac_with_one_surface()
     test_fully_framed_survives_distortion_fold_back()
     test_surface_dots_are_a_stable_lattice()
     test_to_dict_serializable()
