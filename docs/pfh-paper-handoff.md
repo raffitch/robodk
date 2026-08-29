@@ -103,7 +103,12 @@ Restart the backend first (it caches imported modules; check `/api/health` →
    the value into *introduced offset X/Y* **before** pressing Measure, so ground
    truth is archived beside the result. Shift the top ring **10 mm** along frame +X
    → Measure ×3; then **15 mm** → Measure ×3. Optional: prop one side for a tilt case.
-8. **Paper summary** → copy the Markdown block.
+8. **Paper summary** → copy the Markdown block, or **Word draft** → a `.docx` with
+   the method paragraph, the condition table and the per-take table as real Word
+   tables plus the figures, ready to paste into the manuscript. Both are rebuilt from
+   the archive on every press, so they can be pulled mid-run: the draft names what the
+   run still owes ("2 more takes", "11 more measurements") and says it is not ready
+   to cite until those are gone.
 
 **Set the Phase selector on every take.** The summary groups by *layer + phase +
 introduced offset*, so the phase is what separates sensing repeatability (step 4)

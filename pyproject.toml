@@ -36,6 +36,10 @@ sam = ["onnxruntime"]          # ONNXRuntime (CPU) — EdgeSAM / MobileSAM encod
 # package imports and every measurement still runs without it — only the figures
 # are skipped. `pip install -e .[figures]`.
 figures = ["matplotlib"]       # plan / height map / oblique / unrolled profile
+# The paper's results as a Word file with real tables (extrusion module). Imported
+# lazily in modules/extrusion/paper_docx.py, so measurements run without it and only
+# the draft endpoint needs it. `pip install -e .[docx]`.
+docx = ["python-docx"]         # results draft: condition table, per-take table, figures
 
 [project.scripts]
 tasni = "tasni.__main__:main"

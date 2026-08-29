@@ -1310,6 +1310,9 @@ export default function Extrusion() {
       })() : null}
       <div className="btn-row">
         <button className="secondary" disabled={!measureSession} onClick={showPaper}>Paper summary</button>
+        {measureSession && <a className="secondary btn-link"
+          href={`/api/modules/extrusion/trials/${encodeURIComponent(measureSession.trial_id)}/paper-draft.docx`}
+          download>Word draft</a>}
         <button className="secondary" disabled={!measureSession}
                 onClick={() => setShowStack(!showStack)}>
           {showStack ? "Hide" : "Show"} stack figure

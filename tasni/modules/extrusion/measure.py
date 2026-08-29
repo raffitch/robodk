@@ -736,10 +736,55 @@ def paper_summary(root: Path, trial_id: str) -> dict:
         found = json.loads(session_file.read_text(encoding="utf-8")).get("characterizations") or []
         characterization = found[-1] if found else None
 
-    lines = [f"**Controlled validation of the sensing-and-comparison chain** - trial `{trial_id}`, "
-             f"hand-placed dried beads with a known introduced offset (not a printed-cylinder "
-             f"deposition deviation). {valid}/{len(takes)} measurements produced a valid, "
-             f"branch-free path.", "",
+    headline = (f"Controlled validation of the sensing-and-comparison chain - trial "
+                f"{trial_id}, hand-placed dried beads with a known introduced offset (not a "
+                f"printed-cylinder deposition deviation). {valid}/{len(takes)} measurements "
+                f"produced a valid, branch-free path.")
+    # The claim itself, in words: not where the ring sat, but how well a
+    # displacement the chain was TOLD about was recovered. Built once, as data,
+    # so the Markdown block and the Word draft can never word it differently.
+    prose: list[str] = []
+    for c in conditions:
+        if c["introduced_norm_mm"] > 0:
+            prose.append(f"A {c['introduced_norm_mm']:.1f} mm introduced offset was recovered "
+                         f"as {_fmt(c['center_offset_norm_mm'])} mm over {c['takes']} take(s); "
+                         f"detection error {_fmt(c['detection_error_mm'])} mm.")
+        else:
+            prose.append(f"With no offset introduced the chain read a centre offset of "
+                         f"{_fmt(c['center_offset_norm_mm'])} mm over {c['takes']} take(s) - "
+                         f"the baseline this comparison is read against.")
+        check = c["shift_consistency"]
+        if check and not check["consistent"]:
+            named = ", ".join(f"{key} {check['observed_mm'][key]:.2f} vs "
+                              f"{check['expected_mm'][key]:.2f} expected"
+                              for key in check["disagreements"])
+            prose.append(f"WARNING - {c['condition']}: the deviation profile does not match a "
+                         f"pure translation of {c['introduced_norm_mm']:.1f} mm "
+                         f"(tolerance {check['tolerance_mm']:.2f} mm): {named}. "
+                         "Investigate before citing this condition.")
+    acq = timing["acquisition_to_path_ms"]
+    if acq["n"]:
+        prose.append(f"Across {acq['n']} processing cycles, RGB-D acquisition to reconstructed "
+                     f"three-dimensional path took {_fmt(acq, 0)} ms "
+                     f"(capture {_fmt(timing['capture_ms'], 0)} ms, processing "
+                     f"{_fmt(timing['total_ms'], 0)} ms).")
+    if timing["offline_reprocessed_takes"]:
+        prose.append(f"{timing['offline_reprocessed_takes']} take(s) were reprocessed offline "
+                     "from their archived RGB-D frame; their geometry counts, and their "
+                     "processing time is excluded from the cycle statistic above unless it "
+                     "was measured live.")
+    if geometry:
+        prose.append(f"Layer height along the ring: mean {_fmt(height['height_mean_mm'], 1)} mm, "
+                     f"min {_fmt(height['height_min_mm'], 1)} mm, max "
+                     f"{_fmt(height['height_max_mm'], 1)} mm; bead footprint width "
+                     f"{_fmt(bead['bead_width_mean_mm'], 1)} mm.")
+    if characterization:
+        prose.append(f"Ring characterized from its own scan: radius "
+                     f"{characterization['radius_mm']:.1f} mm, bead "
+                     f"{characterization['bead_width_mm']:.1f} mm, height "
+                     f"{characterization['top_z_min_mm']:.1f}-{characterization['top_z_max_mm']:.1f} mm.")
+
+    lines = [f"**{headline}**", "",
              "| Condition | n | centre offset (mm) | detection error (mm) | "
              "mean abs dev (mm) | RMS (mm) | max (mm) | shape RMS (mm) |",
              "|---|---|---|---|---|---|---|---|"]
@@ -748,48 +793,10 @@ def paper_summary(root: Path, trial_id: str) -> dict:
                      f"{_fmt(c['detection_error_mm'])} | "
                      f"{_fmt(c['mean_absolute_mm'])} | {_fmt(c['rms_mm'])} | "
                      f"{_fmt(c['maximum_mm'])} | {_fmt(c['shape_rms_mm'])} |")
-    # The claim itself, in words: not where the ring sat, but how well a
-    # displacement the chain was TOLD about was recovered.
-    for c in conditions:
-        if c["introduced_norm_mm"] > 0:
-            lines += ["", f"A {c['introduced_norm_mm']:.1f} mm introduced offset was recovered "
-                          f"as {_fmt(c['center_offset_norm_mm'])} mm over {c['takes']} take(s); "
-                          f"detection error {_fmt(c['detection_error_mm'])} mm."]
-        else:
-            lines += ["", f"With no offset introduced the chain read a centre offset of "
-                          f"{_fmt(c['center_offset_norm_mm'])} mm over {c['takes']} take(s) - "
-                          f"the baseline this comparison is read against."]
-        check = c["shift_consistency"]
-        if check and not check["consistent"]:
-            named = ", ".join(f"{key} {check['observed_mm'][key]:.2f} vs "
-                              f"{check['expected_mm'][key]:.2f} expected"
-                              for key in check["disagreements"])
-            lines += ["", f"WARNING - {c['condition']}: the deviation profile does not match a "
-                          f"pure translation of {c['introduced_norm_mm']:.1f} mm "
-                          f"(tolerance {check['tolerance_mm']:.2f} mm): {named}. "
-                          "Investigate before citing this condition."]
-    acq = timing["acquisition_to_path_ms"]
-    if acq["n"]:
-        lines += ["", f"Across {acq['n']} processing cycles, RGB-D acquisition to reconstructed "
-                      f"three-dimensional path took {_fmt(acq, 0)} ms "
-                      f"(capture {_fmt(timing['capture_ms'], 0)} ms, processing "
-                      f"{_fmt(timing['total_ms'], 0)} ms)."]
-    if timing["offline_reprocessed_takes"]:
-        lines += ["", f"{timing['offline_reprocessed_takes']} take(s) were reprocessed offline "
-                      "from their archived RGB-D frame; their geometry counts, and their "
-                      "processing time is excluded from the cycle statistic above unless it "
-                      "was measured live."]
-    if geometry:
-        lines += ["", f"Layer height along the ring: mean {_fmt(height['height_mean_mm'], 1)} mm, "
-                      f"min {_fmt(height['height_min_mm'], 1)} mm, max "
-                      f"{_fmt(height['height_max_mm'], 1)} mm; bead footprint width "
-                      f"{_fmt(bead['bead_width_mean_mm'], 1)} mm."]
-    if characterization:
-        lines += ["", f"Ring characterized from its own scan: radius "
-                      f"{characterization['radius_mm']:.1f} mm, bead "
-                      f"{characterization['bead_width_mm']:.1f} mm, height "
-                      f"{characterization['top_z_min_mm']:.1f}-{characterization['top_z_max_mm']:.1f} mm."]
+    for paragraph in prose:
+        lines += ["", paragraph]
     return {"trial_id": trial_id, "mode": trial.get("mode", "LIVE_PRINT"),
             "takes": len(takes), "valid": valid, "conditions": conditions,
             "timing_ms": timing, "height_mm": height, "bead_width_mm": bead,
-            "characterization": characterization, "markdown": "\n".join(lines)}
+            "characterization": characterization, "headline": headline,
+            "prose": prose, "manifests": takes, "markdown": "\n".join(lines)}

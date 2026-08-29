@@ -1352,3 +1352,147 @@ def test_apply_after_a_restart_rebuilds_from_the_sessions_own_trial(tmp_path, mo
     assert recovered["fingerprint"] == applied["fingerprint"]
     assert recovered["recipe"]["points_per_circle"] == 24
     assert recovered["setup"]["work_frame"] == "Tasni Work Frame"
+
+
+# ================================= the Word draft the paper is written from ===
+
+def _docx_content(path):
+    """Paragraph texts and tables, as Word will show them."""
+    from docx import Document
+    document = Document(str(path))
+    paragraphs = [p.text for p in document.paragraphs]
+    tables = [[[cell.text for cell in row.cells] for row in table.rows]
+              for table in document.tables]
+    return paragraphs, tables
+
+
+def _two_condition_trial(root):
+    """A noise-floor condition and a 10 mm displaced condition, three takes each."""
+    session = MeasureSession.create(root, auto_plan(), note="rings")
+    trial_id = session.trial_id
+    for take in (1, 2, 3):
+        _write_take(root, trial_id, 1, take, offset=None, offset_norm=0.4 + take * 0.1,
+                    rms=0.5, mean_abs=0.4, maximum=1.1, acq_ms=1000 + take * 10,
+                    phase="noise floor")
+    for take in (1, 2, 3):
+        _write_take(root, trial_id, 3, take, offset=[10, 0], measured_offset=[10.2, 0.0],
+                    rms=7.1, mean_abs=6.4, maximum=10.2, acq_ms=1000,
+                    phase="top ring shifted")
+    return trial_id
+
+
+def test_the_word_draft_puts_the_measured_numbers_in_a_real_table(tmp_path):
+    """A Markdown block pasted into Word is plain text; the paper needs a table.
+
+    The numbers must also be the SAME object the app reports, never a second
+    formatting of the archive that can drift from it.
+    """
+    pytest.importorskip("docx")
+    from tasni.modules.extrusion.paper_docx import build_paper_docx
+
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = _two_condition_trial(root)
+
+    out = build_paper_docx(root, trial_id, tmp_path / "draft.docx", embed_figures=False)
+
+    assert out.is_file() and out.suffix == ".docx"
+    paragraphs, tables = _docx_content(out)
+    conditions = tables[0]
+    assert conditions[0][0] == "Condition"
+    rows = {row[0]: row for row in conditions[1:]}
+    assert "layer 1 - noise floor" in rows
+    assert rows["layer 1 - noise floor"][1] == "3"
+    shifted = rows["layer 3 - top ring shifted - introduced offset (10, 0) mm"]
+    assert shifted[1] == "3"
+    assert "10.20" in shifted[2]                       # measured centre offset
+    assert "0.20" in shifted[3]                        # detection error vs the typed 10 mm
+    assert any("10.0 mm introduced offset was recovered" in p for p in paragraphs)
+
+
+def test_the_draft_says_what_is_still_missing_while_the_run_is_under_way(tmp_path):
+    """It is written DURING collection, so it has to show what is not there yet."""
+    pytest.importorskip("docx")
+    from tasni.modules.extrusion.paper_docx import build_paper_docx
+
+    root = tmp_path / "runs" / "extrusion"
+    session = MeasureSession.create(root, auto_plan(), note="rings")
+    _write_take(root, session.trial_id, 1, 1, offset=None, offset_norm=0.4, rms=0.5,
+                mean_abs=0.4, maximum=1.1, acq_ms=1000, phase="noise floor")
+
+    out = build_paper_docx(root, session.trial_id, tmp_path / "draft.docx",
+                           embed_figures=False)
+
+    paragraphs, _ = _docx_content(out)
+    text = "\n".join(paragraphs)
+    assert "2 more" in text                    # 1 of the 3 takes a condition needs
+    assert "11 more" in text                   # 1 of the 12 measurements requirement 3 needs
+    assert "not ready to cite" in text.lower()
+
+
+def test_the_draft_carries_the_wording_the_paper_is_required_to_use(tmp_path):
+    """Hand-placed dried beads are not a printed cylinder, and the text says so."""
+    pytest.importorskip("docx")
+    from tasni.modules.extrusion.paper_docx import build_paper_docx
+
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = _two_condition_trial(root)
+
+    out = build_paper_docx(root, trial_id, tmp_path / "draft.docx", embed_figures=False)
+
+    text = "\n".join(_docx_content(out)[0])
+    assert "controlled validation" in text
+    assert "not the deposition deviation of a printed cylinder" in text
+    assert "1.26" in text                      # the error floor, stated where it is claimed
+
+
+def test_every_take_is_listed_so_the_appendix_needs_no_transcription(tmp_path):
+    pytest.importorskip("docx")
+    from tasni.modules.extrusion.paper_docx import build_paper_docx
+
+    root = tmp_path / "runs" / "extrusion"
+    trial_id = _two_condition_trial(root)
+
+    out = build_paper_docx(root, trial_id, tmp_path / "draft.docx", embed_figures=False)
+
+    takes_table = _docx_content(out)[1][1]
+    assert takes_table[0][:4] == ["Layer", "Take", "Phase", "Introduced (mm)"]
+    assert len(takes_table) == 7                        # header + six takes
+    assert [row[0] for row in takes_table[1:]] == ["1", "1", "1", "3", "3", "3"]
+
+
+def test_the_word_draft_is_served_by_the_api(tmp_path, monkeypatch):
+    pytest.importorskip("docx")
+    monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
+    client = TestClient(create_app(AppConfig()))
+    api_plan(client)
+    trial_id = _two_condition_trial(tmp_path / "runs" / "extrusion")
+
+    got = client.get(f"/api/modules/extrusion/trials/{trial_id}/paper-draft.docx")
+
+    assert got.status_code == 200
+    assert got.headers["content-type"] == (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    assert trial_id in got.headers.get("content-disposition", "")
+    assert client.get("/api/modules/extrusion/trials/nope/paper-draft.docx").status_code == 404
+
+
+def test_the_draft_embeds_a_figure_for_every_condition(tmp_path):
+    """The figures belong in the draft, not in a folder the writer has to hunt through."""
+    pytest.importorskip("docx")
+    pytest.importorskip("matplotlib")
+    import test_extrusion_figures as figs
+    from docx import Document
+    from tasni.modules.extrusion.paper_docx import build_paper_docx
+
+    root = tmp_path / "runs" / "extrusion"
+    figs.write_take(root, layer_index=1, annotation={"phase": "noise floor"})
+    figs.write_take(root, layer_index=2, annotation={"phase": "stacked true"})
+
+    out = build_paper_docx(root, "t1", tmp_path / "draft.docx")
+
+    document = Document(str(out))
+    # The trial stack, plus a plan view for each of the two conditions.
+    assert len(document.inline_shapes) == 3
+    captions = [p.text for p in document.paragraphs if p.text.startswith("Figure ")]
+    assert any("layer 1 - noise floor" in c for c in captions)
+    assert any("layer 2 - stacked true" in c for c in captions)

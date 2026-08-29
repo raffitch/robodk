@@ -868,6 +868,34 @@ class ExtrusionModule(WorkflowModule):
             except (ValueError, FileNotFoundError) as exc:
                 raise HTTPException(404, str(exc)) from exc
 
+        @router.get("/trials/{trial_id}/paper-draft.docx")
+        def trial_paper_docx(trial_id: str):
+            """The results as a Word file: real tables, paste straight into the paper.
+
+            Rebuilt from the archive on every request, so it is always the run as
+            it stands -- including a section naming what the run still owes.
+            """
+            from fastapi.responses import FileResponse
+            from .paper_docx import build_paper_docx        # the `docx` extra
+            try:
+                trial = _segment(trial_id, "trial id")
+            except ValueError as exc:
+                raise HTTPException(404, str(exc)) from exc
+            root = self._measure_root()
+            if not (root / trial / "trial.json").is_file():
+                raise HTTPException(404, f"trial does not exist: {trial}")
+            try:
+                path = build_paper_docx(root, trial)
+            except ImportError as exc:
+                raise HTTPException(
+                    503, "the Word draft needs python-docx "
+                         f"(pip install -e .[docx]): {exc}") from exc
+            return FileResponse(
+                path,
+                media_type="application/vnd.openxmlformats-officedocument."
+                           "wordprocessingml.document",
+                filename=f"{trial}-paper-draft.docx")
+
         @router.get("/trials/{trial_id}/paper-summary")
         def trial_paper_summary(trial_id: str) -> dict:
             try:

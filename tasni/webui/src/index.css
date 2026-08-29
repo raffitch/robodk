@@ -504,6 +504,7 @@ tr.clickable.selected > td { background: var(--panel-2); box-shadow: inset 2px 0
 
 .ring-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .ring-foot .spacer { flex: 1 1 auto; }
+.btn-link { display: inline-flex; align-items: center; text-decoration: none; }
 .linkish { background: none; border: 0; padding: 0; color: var(--accent); font-size: 12px;
   cursor: pointer; text-decoration: underline; }
 .linkish:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
