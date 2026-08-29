@@ -24,6 +24,8 @@ from tasni.modules.extrusion.toolpath import generate_cylinder_plan
 # The fake robot's joint vector. Real joints (not a string sentinel) because the
 # job now takes a SETTLED pose reading, which parses them numerically.
 START_JOINTS = (11.0, 22.0, 33.0, 44.0, 55.0, 66.0)
+SIDE_APPROACH_JOINTS = (10.0, -70.0, 120.0, 0.0, -40.0, 0.0)
+SIDE_JOINTS = (10.0, -55.0, 100.0, 0.0, -25.0, 0.0)
 
 # Camera 500 mm above the layer-1 aim point (which sits at z=6 mm), so the
 # fake pose and the fake 500 mm depth frame describe the same geometry.
@@ -48,7 +50,12 @@ class FakeRdk:
         self.station_calls = 0; self.fail_station_call = None
         self.targets = []; self.unreachable_targets = 0; self.bad_inspections = 0
         self.flipped_inspections = 0
+        # Taught side-photo targets carry stored joints, as GUI-taught targets do.
+        # Set an entry to None to model a cartesian-only target.
+        self.taught_joints = {"TowardsSideCapture": SIDE_APPROACH_JOINTS,
+                              "SideCapture": SIDE_JOINTS}
     def item_exists_as(self, name, kind): return name not in self.absent and bool(name)
+    def target_joints(self, name): return self.taught_joints.get(name)
     def move_j(self, name): self.events.append(("move-target", name))
     def program_instructions(self, name):
         return (["Set IO_508=1", "Set IO_601=1"] if name == "AirOn"

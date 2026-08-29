@@ -592,6 +592,7 @@ def test_archive_writes_a_characterization_directory(tmp_path):
 # ------------------------------------------------- MEASURE_ONLY job (Task 8)
 
 from test_extrusion_job import (Ctx, FakeCamera, FakeRdk, START_JOINTS,  # noqa: F401
+                                SIDE_APPROACH_JOINTS, SIDE_JOINTS,
                                 services)
 from tasni.modules.extrusion import measure as measure_mod
 from tasni.modules.extrusion.measure import MeasureSession, RingMeasureJob
@@ -2407,12 +2408,31 @@ def test_the_side_photo_goes_out_and_back_through_the_approach_target(tmp_path, 
     out = RingMeasureJob(svc, plan, session, 1, check_collisions=False, repeats=2)(Ctx())
 
     route = [e for e in rdk.events if e[0] in {"move-target", "move-joints"}]
-    assert route[-4:] == [("move-target", "TowardsSideCapture"),
-                          ("move-target", "SideCapture"),
-                          ("move-target", "TowardsSideCapture"),
+    # By STORED JOINTS, not by target item: a cartesian MoveJ resolves against
+    # whatever tool/frame the last take left active, which on the cell sent the
+    # arm somewhere else entirely (137.8 s excursion, 2.7 s is an inspection move).
+    assert route[-4:] == [("move-joints", SIDE_APPROACH_JOINTS),
+                          ("move-joints", SIDE_JOINTS),
+                          ("move-joints", SIDE_APPROACH_JOINTS),
                           ("move-joints", START_JOINTS)]
     assert out["side_view"]["captured"] is True
     assert camera.witness_grabs == 1, "the side photo is RGB only -- it measures nothing"
+
+
+def test_a_cartesian_only_side_target_still_moves_but_says_it_is_ambiguous(tmp_path,
+                                                                          monkeypatch):
+    """No stored joints = no unambiguous move. Do it, but do not do it silently."""
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch, side_photo=True)
+    rdk.taught_joints["SideCapture"] = None
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    ctx = Ctx()
+
+    out = RingMeasureJob(svc, plan, session, 1, check_collisions=False)(ctx)
+
+    assert out["side_view"]["captured"] is True
+    assert ("move-target", "SideCapture") in rdk.events
+    assert any("stores no joints" in m and "SideCapture" in m for m in ctx.logs), ctx.logs
 
 
 def test_the_side_photo_is_taken_once_per_press_and_lands_on_the_last_take(tmp_path, monkeypatch):
@@ -2428,7 +2448,7 @@ def test_the_side_photo_is_taken_once_per_press_and_lands_on_the_last_take(tmp_p
 
     RingMeasureJob(svc, plan, session, 1, check_collisions=False, repeats=3)(Ctx())
 
-    assert len([e for e in rdk.events if e == ("move-target", "SideCapture")]) == 1
+    assert len([e for e in rdk.events if e == ("move-joints", SIDE_JOINTS)]) == 1
     trial = root / session.trial_id
     assert (trial / "layer-001-take03" / "side.png").is_file()
     assert not (trial / "layer-001" / "side.png").exists()
@@ -2487,7 +2507,7 @@ def test_a_failure_at_the_side_pose_still_retraces_and_keeps_the_measurement(tmp
     assert out["side_view"]["captured"] is False
     assert "camera stopped answering" in out["side_view"]["error"]
     route = [e for e in rdk.events if e[0] in {"move-target", "move-joints"}]
-    assert route[-2:] == [("move-target", "TowardsSideCapture"),
+    assert route[-2:] == [("move-joints", SIDE_APPROACH_JOINTS),
                           ("move-joints", START_JOINTS)]
 
 

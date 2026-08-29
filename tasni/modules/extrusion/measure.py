@@ -449,12 +449,36 @@ def capture_side_photo(services, ctx: JobContext, *, start_joints) -> dict:
         record["error"] = f"side photo skipped: {missing} is not in the station"
         ctx.log(record["error"])
         return record
+    def go(name: str) -> None:
+        """Move to a taught target by its STORED JOINTS whenever it has them.
+
+        ``move_j(name)`` is ``MoveJ(target_item)``, and for a CARTESIAN target
+        RoboDK resolves that pose against the tool and frame active right now --
+        not the ones it was taught with. By the time the side photo runs, the
+        last take left ``Realsense`` + the work frame selected
+        (``_move_to_inspection``), so a target taught under any other selection
+        resolves somewhere else entirely and RoboDK reaches it on whatever IK
+        branch that implies. Cell 2026-08-29: the excursion took 137.8 s against
+        2.7 s for an inspection move, and the arm visibly went somewhere wrong.
+
+        A stored joint vector has no such dependency -- it is the pose, on the
+        branch it was taught on. Fall back to the item move only when the target
+        carries no joints, and say so, because that move is the ambiguous one.
+        """
+        joints = rdk.target_joints(name)
+        if joints is not None:
+            rdk.move_j_joints(joints)
+            return
+        ctx.log(f"WARNING side photo: target {name!r} stores no joints; moving to it as a "
+                "cartesian target, which depends on the active tool and frame")
+        rdk.move_j(name)
+
     departed = time.perf_counter()
     reached = False
     try:
         ctx.log(f"side photo: {approach} -> {side}")
-        rdk.move_j(approach)
-        rdk.move_j(side)
+        go(approach)
+        go(side)
         reached = True
         time.sleep(ecfg.side_capture_settle_s)
         with _camera_hold(services, "extrusion-side-photo"):
@@ -471,7 +495,7 @@ def capture_side_photo(services, ctx: JobContext, *, start_joints) -> dict:
         # Back the way we came, whatever happened on the way out.
         try:
             if reached:
-                rdk.move_j(approach)
+                go(approach)
             rdk.move_j_joints(start_joints)
         except Exception as exc:
             ctx.log(f"WARNING side photo: could not retrace to the neutral pose: {exc}")
