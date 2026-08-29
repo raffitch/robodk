@@ -24,7 +24,7 @@
 - The RoboDK-embedded macros (`macros/3DScan.py`, `AutoCalibrate.py`, `3DScanParam.py`, `ArucoToPlane.py`) and `server/robodk_*.py` speak the old wire and WILL be refused. They are superseded by the app (CLAUDE.md north star). Do not port them; say so in the docs (Task 13).
 - **Branch: `sensor-layer-v2`, cut from `main` before Task 1.** The Jetson auto-pulls `main` every ~2 min and restarts the camera whenever `server/` changed, so a server commit on `main` deploys ITSELF. Every task commits and pushes to `sensor-layer-v2`; Task 13 merges to `main` and is the ONE deploy. Never push `server/` changes to `main` before Task 13.
 - Windows traps: use `py -3.10`; never round-trip source files through PowerShell `Get-Content`/`Set-Content` (mojibake); after host code changes the Tasni backend must be restarted before any cell test (it caches imports).
-- Order is fixed: Task 1 -> 2 -> 3 -> (4..12 in order) -> 13. Task 2 MUST precede any change to `depth_units` (the depth table is part of the as-found JSON). Task 3 MUST be verified on the OLD protocol before Task 13 deploys the new one.
+- Order is fixed: Task 1 (done) -> 2 -> 3 -> (4..12 in order) -> 13. Task 2 MUST precede any change to `depth_units` (the depth table is part of the as-found JSON). Task 3 MUST be verified on the OLD protocol before Task 13 deploys the new one.
 
 ---
 
@@ -58,7 +58,7 @@
 
 ---
 
-### Task 1: Commit the in-flight extrusion work
+### Task 1: Commit the in-flight extrusion work — DONE (`aba0d9e` on `main`, 2026-08-29; 3 tests green). Skip to Task 2.
 
 **Files:**
 - Modify (commit as-is): `tasni/modules/extrusion/processing.py`, `tests/test_extrusion_measure.py`, `tests/fixtures/extrusion/ring1/README.md`
