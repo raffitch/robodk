@@ -71,7 +71,10 @@ the repo.
 - **Hand-eye** is the RoboDK `Realsense` **tool** offset: `RoboDKIO.camera_pose_T() =
   flange_pose_T() @ _tool_pose` (`core/rdk_io.py:181`). It was solved from ChArUco in the
   **colour** image, so it is the *colour* camera's pose.
-- **Extrusion** `processing.py` never reads `frame.color`; the archive manifest already
+- **Extrusion** `processing.py` did not read `frame.color` when this was written; since
+  `041ad1b` (2026-08-29, after the spec) a saturation gate decides bead vs board from the
+  colour frame by same-pixel indexing -- an aligned-depth assumption this design must port
+  (see 4.4). The archive manifest already
   has a `provenance.camera_intrinsics` block that `figures.py` reads back. The extrusion
   chain voxel-downsamples at **2 mm** (`ExtrusionConfig.voxel_size_m`).
 - **Scan TSDF** `reconstruct.fuse_views` integrates RGB-D with `TSDFVolumeColorType.RGB8`
@@ -200,7 +203,7 @@ transform and stays valid** — R7 needs a validation run, not a recalibration.
 
 | Consumer | Change |
 |---|---|
-| `extrusion/processing.py::depth_to_work_points` | signature `(depth, geom, T_work_color)`; composes `depth_pose`; back-projects with `depth_K`. `ExtrusionConfig.voxel_size_m` **0.002 → 0.001** — R2 reaches the ring numbers only through this (the voxel is point spacing, not accuracy; the 1.26 mm hand-eye floor still governs claims). |
+| `extrusion/processing.py::depth_to_work_points` | signature `(depth, geom, T_work_color)`; back-projects with `depth_K` into the colour frame. **Chroma gate (`041ad1b`) moves from depth pixels to registered points**: project each depth point into the calibrated colour model, read the saturation mask there; abstention rules unchanged; points outside the colour image dropped while the gate applies. `ExtrusionConfig.voxel_size_m` **0.002 → 0.001** — R2 reaches the ring numbers only through this (the voxel is point spacing, not accuracy; the 1.26 mm hand-eye floor still governs claims). |
 | extrusion archive | `manifest.provenance.camera_geometry` = `geom.raw` (temps, preset, fw, unit come free). **`figures.py` keeps one read-side fallback:** a manifest without `camera_geometry` is rendered as it was captured — aligned, 1 mm, colour K — so ring 1 and the paper fixtures still render. Archived data, not a live path. |
 | `scan/reconstruct.fuse_views` | depth-only TSDF: `TSDFVolumeColorType.NoColor` with a constant image at depth size; intrinsic = `depth_K` @ `depth_size`; extrinsic = inv(`depth_pose`); Open3D `depth_scale = 1000 / depth_unit_mm`. The `depth ≠ color shape` guard is deleted. `measured_mesh_neutral_color` becomes the only behaviour. |
 | `scan/depth_gate`, `scan/survey`, `scan/service._backproject_depth`, `_save_views` | via `backproject` + `to_color_pixels`; `_save_views` writes `geom.raw` instead of `depth_scale`. `ScanView` carries `geometry`. |

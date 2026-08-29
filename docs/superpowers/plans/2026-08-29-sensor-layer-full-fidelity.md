@@ -1943,9 +1943,11 @@ git push origin sensor-layer-v2
 
 **Interfaces:**
 - Consumes: `CameraGeometry`, `backproject` (Task 7); `Frame.geometry` (Task 8).
-- Produces: `depth_to_work_points(depth, geometry: CameraGeometry, T_work_camera) -> tuple[np.ndarray, int]`; `process_observation(*, color, depth, geometry, T_work_camera, plan, layer, config, floor_profile=None, stages=None, assemble_arcs=False)`; `characterize_ring(*, color, depth, geometry, T_work_camera, search_center_mm, work_frame, config, inspection_tool=..., print_tool=...)`; manifest `provenance.camera_geometry` (the greeting dict); `figures.TakeData.geometry: CameraGeometry | None`; `figures.geometry_for_take(manifest: dict, K: np.ndarray | None, depth: np.ndarray | None) -> CameraGeometry | None`.
+- Produces: `depth_to_work_points(depth, geometry: CameraGeometry, T_work_camera) -> tuple[np.ndarray, int]`; `process_observation(*, color, depth, geometry, T_work_camera, K, dist, plan, layer, config, floor_profile=None, stages=None, assemble_arcs=False)`; `characterize_ring(*, color, depth, geometry, T_work_camera, K, dist, search_center_mm, work_frame, config, inspection_tool=..., print_tool=...)`; `chroma_gate_mask(color, registered: ColorRegistered, config, counts=None) -> tuple[np.ndarray, bool]` (per-POINT keep mask + whether the gate applied; replaces the image-space `chroma_gated_depth`); manifest `provenance.camera_geometry` (the greeting dict); `figures.TakeData.geometry: CameraGeometry | None`; `figures.geometry_for_take(manifest: dict, K: np.ndarray | None, depth: np.ndarray | None) -> CameraGeometry | None`.
 
-`K` disappears from the processing signatures: the colour K is not used by the depth path at all (it was only ever the aligned depth's model). `T_work_camera` stays the COLOUR camera's pose (`camera_pose_T()`), which `backproject`'s colour-frame points need.
+`K`/`dist` STAY in the processing signatures, but as the CALIBRATED COLOUR model, used for one thing only: projecting registered depth points into the colour image for the chroma gate (`041ad1b`, 2026-08-29: bead vs board is decided by saturation, not height). `T_work_camera` stays the COLOUR camera's pose (`camera_pose_T()`), which `backproject`'s colour-frame points need.
+
+**Why the gate must move (read this before Step 3b).** `chroma_gated_depth(color, depth, config)` blanks depth pixels where the colour pixel at the SAME (v, u) is achromatic -- an aligned-depth assumption. With protocol 2 the colour frame is 1920x1080 and depth 1280x720, so its `image.shape[:2] != depth.shape[:2]` check trips and the gate ABSTAINS silently, the deposit floor falls back to 2.5 mm, and every take goes back to the 0/4-valid + branch-guard-crash state that commit fixed. The fix is not to mask depth pixels but to mask registered POINTS: project each depth point into the calibrated colour model (`ColorRegistered.uv`) and read the saturation mask there. With the legacy aligned geometry the projection is the identity, so the archived-frame tests (`ring1_take04_branchguard_20260829.npz`, with and without the gate) keep their exact meaning.
 
 - [ ] **Step 1: Failing processing tests (replace `test_depth_backprojection_uses_explicit_work_transform` in `tests/test_extrusion_processing.py`)**
 
@@ -1996,11 +1998,114 @@ def depth_to_work_points(depth: np.ndarray, geometry: CameraGeometry,
     return transform_points(T_work_camera, camera), int(len(camera))
 ```
 
-`process_observation(*, color, depth, geometry: CameraGeometry, T_work_camera, plan, layer, config, ...)` — the call becomes `depth_to_work_points(depth, geometry, T_work_camera)`. `characterize_ring(*, color, depth, geometry: CameraGeometry, T_work_camera, search_center_mm, ...)` — same, and its inner `process_observation(color=color, depth=depth, geometry=geometry, T_work_camera=T_work_camera, ...)`. Remove every `K` parameter and `depth_scale` mention from this file.
+`process_observation(*, color, depth, geometry: CameraGeometry, T_work_camera, plan, layer, config, ...)` — the call becomes `depth_to_work_points(depth, geometry, T_work_camera)`. `characterize_ring(*, color, depth, geometry: CameraGeometry, T_work_camera, search_center_mm, ...)` — same, and its inner `process_observation(color=color, depth=depth, geometry=geometry, T_work_camera=T_work_camera, ...)`. Remove every `depth_scale` mention from this file; `K` is kept as the colour model (see Step 3b).
+
+- [ ] **Step 3b: Port the chroma gate to registered points**
+
+Failing tests first (append to `tests/test_extrusion_processing.py`):
+
+```python
+def test_chroma_gate_masks_points_by_their_colour_projection_not_depth_pixel():
+    """Depth is not aligned to colour any more: a bead point must be kept because the
+    colour pixel it PROJECTS TO is saturated, even though the depth pixel with the
+    same (v, u) index looks at something else."""
+    from tasni.core.config import ExtrusionConfig
+    from tasni.core.depth_geometry import ColorRegistered
+    from tasni.modules.extrusion.processing import chroma_gate_mask
+    K_c = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
+    geom = gf.offset(color_K=K_c, color_size=(320, 240), depth_size=(160, 120))
+    # two colour-frame points at z=400: one lands on the saturated blob, one on grey
+    pts = np.array([[0.0, 0.0, 400.0], [-80.0, 0.0, 400.0]])
+    depth = gf.render_depth_in_depth_camera(pts, geom)
+    color = np.full((240, 320, 3), 128, np.uint8)               # achromatic everywhere ...
+    color[100:140, 140:180] = (20, 40, 220)                    # ... except a chromatic blob at the reticle
+    reg = ColorRegistered.build(depth, geom, K_c, None)
+    cfg = ExtrusionConfig(deposit_min_chroma_fraction=0.001)
+    keep, applied = chroma_gate_mask(color, reg, cfg)
+    assert applied and keep.shape == (len(reg),)
+    on_blob = np.linalg.norm(reg.pts_mm - pts[0], axis=1) < 3.5
+    assert keep[on_blob].all() and not keep[~on_blob].any()
+
+
+def test_chroma_gate_abstains_on_an_achromatic_frame_or_size_mismatch():
+    from tasni.core.config import ExtrusionConfig
+    from tasni.core.depth_geometry import ColorRegistered
+    from tasni.modules.extrusion.processing import chroma_gate_mask, deposit_floor_mm
+    K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
+    depth = np.full((240, 320), 4000, np.uint16)
+    reg = ColorRegistered.build(depth, gf.aligned(K, (320, 240), depth_unit_mm=0.1), K, None)
+    cfg = ExtrusionConfig()
+    keep, applied = chroma_gate_mask(np.full((240, 320, 3), 128, np.uint8), reg, cfg)
+    assert not applied and keep.all()
+    assert deposit_floor_mm(cfg, applied) == 2.5
+    keep, applied = chroma_gate_mask(np.zeros((100, 100, 3), np.uint8), reg, cfg)   # wrong size
+    assert not applied and keep.all()
+```
+
+Run `py -3.10 -m pytest tests/test_extrusion_processing.py -k chroma_gate -v` -> FAIL (`ImportError: chroma_gate_mask`). Then implement, REPLACING `chroma_gated_depth` (delete it -- its image-space contract is the aligned assumption):
+
+```python
+def chroma_gate_mask(color, registered: "ColorRegistered", config,
+                     counts: dict | None = None) -> tuple[np.ndarray, bool]:
+    """Per REGISTERED POINT: True where the colour frame says "bead", not "board".
+
+    Depth is native and not aligned to colour (camera protocol 2), so the gate
+    cannot blank depth pixels in place; each depth point is projected into the
+    calibrated colour model (``registered.uv``) and the saturation mask is read
+    there. Everything else is the 2026-08-29 gate unchanged: saturation > threshold
+    (bead ~20:1 over the printed board), a chroma-fraction abstention for RGB
+    dropouts and depth-only fixtures, and a closing so speckle inside the bead
+    does not punch holes. Points that project OUTSIDE the colour image (the depth
+    field is wider than colour) have no colour evidence and are dropped while the
+    gate applies -- they are far outside any ring ROI anyway. Abstains as
+    ``(all True, False)``, which ``deposit_floor_mm`` turns into the 2.5 mm floor.
+    """
+    def note(key: str, value: int) -> None:
+        if counts is not None:
+            counts[key] = value
+
+    n = len(registered)
+    threshold = int(getattr(config, "deposit_min_saturation", 0) or 0)
+    if threshold <= 0 or color is None:
+        note("chroma_gate_applied", 0)
+        return np.ones(n, bool), False
+    image = np.asarray(color)
+    w, h = registered.color_size
+    if image.ndim != 3 or image.shape[2] != 3 or image.shape[:2] != (h, w):
+        note("chroma_gate_applied", 0)
+        return np.ones(n, bool), False
+    saturation = cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_BGR2HSV)[:, :, 1]
+    keep = (saturation > threshold).astype(np.uint8)
+    note("chroma_gate_kept_pixels", int(keep.sum()))
+    if float(keep.mean()) < float(getattr(config, "deposit_min_chroma_fraction", 0.0)):
+        note("chroma_gate_applied", 0)
+        return np.ones(n, bool), False
+    k = max(3, int(round(5 * w / 1280.0)))          # the 5x5 close was tuned at 720p
+    keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    u = np.rint(registered.uv[:, 0]).astype(int)
+    v = np.rint(registered.uv[:, 1]).astype(int)
+    inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    mask = np.zeros(n, bool)
+    mask[inside] = keep[v[inside], u[inside]] > 0
+    note("chroma_gate_applied", 1)
+    note("chroma_gate_outside_colour", int((~inside).sum()))
+    return mask, True
+```
+
+In `process_observation` (and identically in `characterize_ring`) the first stage becomes:
+
+```python
+    reg = ColorRegistered.build(depth, geometry, K, dist)
+    keep, chroma_gated = chroma_gate_mask(color, reg, config, counts)
+    points = transform_points(T_work_camera, reg.pts_mm[keep])
+    counts["raw_depth_pixels"] = int(keep.sum())
+```
+
+(`depth_to_work_points` stays as the ungated helper for `figures._scene_points`.) Rewrite the two direct `chroma_gated_depth(...)` tests in `tests/test_extrusion_measure.py` (`test_chroma_gate_keeps_the_chromatic_bead_and_blanks_the_achromatic_board`, `test_chroma_gate_abstains_on_an_achromatic_frame_and_restores_the_floor`) against `chroma_gate_mask(color, ColorRegistered.build(depth, gf.aligned(K, (w, h)), K, None), config)` with the same expectations stated on points instead of pixels. The paired take-04 tests (`..._clears_the_board_lobe_...` / `..._still_fails_with_the_chroma_gate_disabled`) need only the new kwargs: `geometry=gf.aligned(f["K"], (1280, 720)), K=f["K"], dist=None` -- with the identity registration they must keep passing unchanged, which is the proof the port preserved the gate.
 
 - [ ] **Step 4: Callers in `measure.py` and `service.py`**
 
-`measure.py:712` -> `process_observation(color=frame.color, depth=frame.depth, geometry=frame.geometry, T_work_camera=T_work_camera, plan=..., layer=..., config=ecfg, floor_profile=floor)`. `measure.py:835` -> `characterize_ring(color=frame.color, depth=frame.depth, geometry=frame.geometry, T_work_camera=captured["T_work_camera"], ...)`. `service.py:1034` same shape. Guard at both capture sites right after the grab: `if frame.geometry is None: raise RuntimeError("depth frame arrived without a protocol-2 greeting")`.
+`measure.py:712` -> `process_observation(color=frame.color, depth=frame.depth, geometry=frame.geometry, T_work_camera=T_work_camera, K=services.config.camera.K, dist=services.config.camera.dist, plan=..., layer=..., config=ecfg, floor_profile=floor)`. `measure.py:835` -> `characterize_ring(color=frame.color, depth=frame.depth, geometry=frame.geometry, T_work_camera=captured["T_work_camera"], K=services.config.camera.K, dist=services.config.camera.dist, ...)`. `service.py:1034` same shape. Guard at both capture sites right after the grab: `if frame.geometry is None: raise RuntimeError("depth frame arrived without a protocol-2 greeting")`.
 
 Provenance: in the per-take manifest base dict (`measure.py:700-708` and `service.py:1020-1026`) add `"camera_geometry": frame.geometry.to_dict()`. `_provenance(services)` (`measure.py:76`) is unchanged (the calibrated colour K is still a fact worth recording).
 
@@ -2016,7 +2121,9 @@ Reprocess (`service.py:1131-1176`):
         geometry = CameraGeometry.legacy_aligned(np.asarray(intrinsics["K"], float),
                                                  (depth.shape[1], depth.shape[0]))
     processed = process_observation(color=color, depth=depth, geometry=geometry,
-                                    T_work_camera=np.asarray(transform, dtype=float), ...)
+                                    T_work_camera=np.asarray(transform, dtype=float),
+                                    K=np.asarray(intrinsics["K"], dtype=float),
+                                    dist=intrinsics.get("dist_coeffs"), ...)
 ```
 
 - [ ] **Step 5: Figures — the one read-side fallback**
@@ -2037,7 +2144,7 @@ def geometry_for_take(manifest: dict, K, depth) -> "CameraGeometry | None":
     d = np.asarray(depth)
     return CameraGeometry.legacy_aligned(np.asarray(K, float), (d.shape[1], d.shape[0]))
 ```
-`TakeData` gains `geometry: CameraGeometry | None`; `load_take` sets `geometry=geometry_for_take(manifest, K, depth)` (compute `depth` and `K` first). `_scene_points`: `if take.depth is not None and take.geometry is not None and take.T_work_camera is not None: points, _ = depth_to_work_points(take.depth, take.geometry, take.T_work_camera)`. `_compute_stages` (`:488-493`): `process_observation(color=image, depth=take.depth, geometry=take.geometry, T_work_camera=..., ...)` with the same `geometry is not None` guard as `take.K` had. `TakeData.label`: append `" · depth: legacy aligned 1 mm"` when `self.geometry is not None and self.geometry.legacy`.
+`TakeData` gains `geometry: CameraGeometry | None`; `load_take` sets `geometry=geometry_for_take(manifest, K, depth)` (compute `depth` and `K` first). `_scene_points`: `if take.depth is not None and take.geometry is not None and take.T_work_camera is not None: points, _ = depth_to_work_points(take.depth, take.geometry, take.T_work_camera)`. `_compute_stages` (`:488-493`): `process_observation(color=image, depth=take.depth, geometry=take.geometry, T_work_camera=..., K=take.K, dist=None, ...)` with the same `geometry is not None` guard as `take.K` had (a zero image makes the gate abstain, as today). `TakeData.label`: append `" · depth: legacy aligned 1 mm"` when `self.geometry is not None and self.geometry.legacy`.
 
 - [ ] **Step 6: Tests for the archive paths (append to `tests/test_extrusion_figures.py`)**
 
@@ -2068,7 +2175,7 @@ def test_a_protocol_2_take_uses_its_recorded_geometry(tmp_path):
 ```
 (`write_take` takes `trial_id` — check its signature at `:52`; add the kwarg if it lacks one.) Add `sys.path.insert(0, str(Path(__file__).resolve().parent))` + imports at the top of the file as the other test files do.
 
-Ring fixtures (`tests/test_extrusion_measure.py` `:334-345`, `:409-420`, and `:290`, `:318`, `:386`): replace `K=<...>` with `geometry=gf.aligned(<the same K>, (1280, 720))` for the real-capture `.npz` fixtures (`fixture["K"]`), and `geometry=gf.aligned(syn.K_720P, syn.SIZE_720P)` for synthetic renders. Fake cameras in `tests/test_extrusion_job.py:150-163` and `tests/test_extrusion_measure.py:1990-1998` must return `Frame(..., geometry=gf.aligned(syn.K_720P, (16, 16)))` — the 16x16 frames there are only ever median-checked, so any aligned geometry of that size works.
+Ring fixtures (`tests/test_extrusion_measure.py` `:334-345`, `:409-420`, and `:290`, `:318`, `:386`): ADD `geometry=gf.aligned(<the same K>, (1280, 720)), dist=None` (keeping `K=`) for the real-capture `.npz` fixtures (`fixture["K"]`; `ring1_take04_branchguard_20260829.npz` also carries `color_jpeg` -- decode with `cv2.imdecode`), and `geometry=gf.aligned(syn.K_720P, syn.SIZE_720P), dist=None` for synthetic renders. Fake cameras in `tests/test_extrusion_job.py:150-163` and `tests/test_extrusion_measure.py:1990-1998` must return `Frame(..., geometry=gf.aligned(syn.K_720P, (16, 16)))` — the 16x16 frames there are only ever median-checked, so any aligned geometry of that size works.
 
 - [ ] **Step 7: Voxel default test (append to `tests/test_extrusion_processing.py`)**
 
@@ -2437,6 +2544,7 @@ Report: the pushed hashes, `jetson_deploy status` output, and the results table.
 ## Self-review notes (done while writing; kept so the executor sees the reasoning)
 
 - **Spec coverage.** 4.1 wire/gate/greeting -> Tasks 4, 6, 8. 4.2 server (rs_config, rs_geometry, align removal, filters, 1080p, sizes, startup log) -> Tasks 4, 5, 6. 4.3 host core (`depth_geometry`, client, `depth_scale` deletion, K migration) -> Tasks 7, 8. 4.4 consumers (extrusion + archive + figures fallback + voxel; scan TSDF/gate/survey/service/`_save_views`; characterize; calibration no-op; HUD) -> Tasks 9, 10, 11, 12. 4.5 sequencing -> Tasks 1-3 first, 13 last. 5 error handling: refusal (6, 8), greeting validation (7, 8), extrinsic assert (5, 6), archive fallback (9), `depth_units` achieved-not-requested (4, 6). 6 tests: every task has its file. 7 acceptance -> Task 13. 9 task list -> mapped 1:1 (spec task 12 "HUD check" is Task 12; spec task 13 is Task 13).
+- **Late change absorbed (`041ad1b`, pushed after the plan was written):** extrusion now reads the COLOUR frame -- a saturation gate separates bead from board -- written against aligned depth (same-pixel indexing). Task 9 Step 3b ports it to registered points; without that port the gate abstains silently on protocol-2 frames and the 2026-08-29 ring failure returns.
 - **Consumers the spec did not list, found while planning and covered:** `corner_evidence.extract_corner_evidence` and `service._plane_rms_mm` (colour-pixel depth reads; Task 10), `look_point_from_views` (Task 10), the live-preview `depth_probe` interleave (`core/livepreview.py:163`) — verified UNUSED in production (no module passes `depth_probe=`; scan uses the telemetry side-channel), so it is left alone; the extrusion readiness grabs (`measure.py:367`, `service.py:769`) only check `depth is not None` and need nothing.
 - **Type consistency.** `CameraGeometry`, `backproject(depth, geom, *, stride, mask) -> (pts, uv_depth)`, `depth_pose(T_x_color, geom)`, `ColorRegistered.build(depth, geom, K_color, dist_color, *, stride)` are used with those exact shapes in Tasks 9, 10, 11. `ScanView(color, depth, pose_T, geometry)` in Task 10 matches its `fuse_views`/`_view_support_counts` readers. `Frame.geometry` (Task 8) is what Tasks 9-11 read.
 - **Known approximation, stated in code:** `ColorRegistered.valid_frac_in_center_patch` estimates the expected point density from the registered footprint; it feeds a 0.5 threshold, not a measurement.
