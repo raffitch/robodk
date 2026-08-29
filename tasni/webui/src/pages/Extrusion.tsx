@@ -705,7 +705,13 @@ export default function Extrusion() {
       const next = await api.post<Plan>("/measure/apply-characterization");
       setPlan(next); setRecipe(next.recipe); setSetup(next.setup);
       setPreflight(null); setResult(null); setSelectedLayer(1);
-      setMessage(`Recipe and placement set from the measured ring: r ${next.recipe.radius_mm} mm, bead ${next.recipe.bead_diameter_mm} mm, layer ${next.recipe.layer_height_mm} mm.`);
+      // Applying binds the SESSION to this plan, and that binding is what marks
+      // the step done and moves the run on. Without re-reading it the rail sat
+      // on "Ring 1" for ever and the button just re-applied.
+      await refreshMeasure();
+      setMessage(`Recipe and placement set from the measured ring: r ${next.recipe.radius_mm} mm, `
+        + `bead ${next.recipe.bead_diameter_mm} mm, layer ${next.recipe.layer_height_mm} mm. `
+        + "Next: five noise-floor takes without touching the ring.");
       refreshStatus();
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
   };
