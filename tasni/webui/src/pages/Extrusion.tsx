@@ -1053,8 +1053,13 @@ export default function Extrusion() {
     }),
   ];
   const autoIndex = RUN.findIndex((step) => !step.done);
-  const activeIndex = (stepPin !== null && RUN[stepPin] && !RUN[stepPin].done)
-    ? stepPin : (autoIndex < 0 ? RUN.length - 1 : autoIndex);
+  // A pin is honoured whatever the step's state. Refusing it for a COMPLETED
+  // step made every green chip in the rail unclickable -- and on a resumed
+  // session the first steps are green, so there was no way back to "start a
+  // fresh ring" at all.
+  const resumeIndex = autoIndex < 0 ? RUN.length - 1 : autoIndex;
+  const activeIndex = (stepPin !== null && RUN[stepPin]) ? stepPin : resumeIndex;
+  const pinnedAway = stepPin !== null && stepPin !== resumeIndex;
   const active = RUN[activeIndex];
   // The floor is the layer BELOW the one this step measures -- not the one the
   // manual selector happens to be showing.
@@ -1300,14 +1305,20 @@ export default function Extrusion() {
         <button type="button" className="secondary guide-btn"
                 onClick={() => setGuideOpen(true)}>Run guide</button>
       </div>
+      {pinnedAway && <p className="hint">Viewing a step you chose. The run itself is at
+        <b> {RUN[resumeIndex].label}</b>.{" "}
+        <button type="button" className="linkish"
+                onClick={() => setStepPin(null)}>Back to the run</button></p>}
 
       {applied && !planIsApplied && <div className="io-note warn-text">
         <b>This is not the plan the session applied</b> (ring characterized at r {applied.recipe.radius_mm} mm,
         centre {applied.setup.center_x_mm.toFixed(1)}, {applied.setup.center_y_mm.toFixed(1)}).
         Press <b>Use this ring</b> again before measuring.
       </div>}
-      {plan?.restored_from && <p className="hint">Plan restored from session
-        <code> {plan.restored_from} </code>after a restart — no need to apply again.</p>}
+      {plan?.restored_from && <p className="hint">Resumed session
+        <code> {plan.restored_from} </code>with its plan — the first steps show as done
+        because this ring was already characterized and applied. To measure a different ring,
+        open <b>Fresh ring</b> in the rail (or <b>Start over with a new ring</b> below).</p>}
 
       {/* Exactly one thing to do, and the press that does it. Everything the step
           records is set by the step itself, so no control can be left on a stale
