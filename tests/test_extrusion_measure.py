@@ -287,12 +287,19 @@ def test_the_same_frame_still_fails_with_the_chroma_gate_disabled():
     """
     pytest.importorskip("open3d")
     f = _ring1_take04()
+    # This fixture is a pre-protocol-2 capture with 1 mm depth WORDS, so it is
+    # processed at the 2 mm voxel it was captured under. The new 1 mm default
+    # (spec 4.4) sits at this archive's quantisation floor, where it merges
+    # nothing and lets noise through -- it flips this frame's branch-guard
+    # outcome in BOTH directions across the two archived takes. On protocol-2
+    # depth (0.1 mm words) 1 mm spans ten quantisation steps, which is the point.
     with pytest.raises(RuntimeError, match="branch guard exhausted"):
         process_observation(color=f["color"], depth=f["depth"],
                             geometry=gf.aligned(f["K"], (1280, 720)), K=f["K"], dist=None,
                             T_work_camera=f["T_work_camera"], plan=f["plan"],
                             layer=f["plan"].layers[0],
-                            config=ExtrusionConfig(deposit_min_saturation=0))
+                            config=ExtrusionConfig(deposit_min_saturation=0,
+                                                   voxel_size_m=0.002))
 
 
 def test_chroma_gate_keeps_the_chromatic_bead_and_blanks_the_achromatic_board():
@@ -458,12 +465,18 @@ def test_characterize_real_checkerboard_capture_selects_the_visible_ring():
     depth = fixture["depth"]
     color = np.zeros((*depth.shape, 3), np.uint8)
 
+    # This fixture is a pre-protocol-2 capture with 1 mm depth WORDS, so it is
+    # processed at the 2 mm voxel it was captured under. The new 1 mm default
+    # (spec 4.4) sits at this archive's quantisation floor, where it merges
+    # nothing and lets noise through -- it flips this frame's branch-guard
+    # outcome in BOTH directions across the two archived takes. On protocol-2
+    # depth (0.1 mm words) 1 mm spans ten quantisation steps, which is the point.
     found = characterize_ring(
         color=color, depth=depth,
         geometry=gf.aligned(fixture["K"], (depth.shape[1], depth.shape[0])),
         T_work_camera=fixture["T_work_camera"], K=fixture["K"], dist=None,
         search_center_mm=fixture["search_center_mm"],
-        work_frame="Tasni Work Frame", config=ExtrusionConfig())
+        work_frame="Tasni Work Frame", config=ExtrusionConfig(voxel_size_m=0.002))
 
     assert found.radius_mm == pytest.approx(39.17, abs=0.5)
     assert found.center_mm == pytest.approx((217.94, 150.44), abs=0.5)
