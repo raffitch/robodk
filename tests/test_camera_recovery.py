@@ -62,8 +62,8 @@ class FakePipeline:
 
     ``depth_scale`` is the device's metres-per-count, as ``_rebuild_pipeline`` reads
     it back off the reopened device. Left None, ``get_active_profile()`` raises the
-    way a binding that cannot report it would, which the rebuild swallows on purpose
-    ("same device; the startup value still holds").
+    way a binding that cannot report it would -- the rebuild then has to fall back to
+    what ``openPipeline`` read off that same reopened device, and say so.
     """
 
     def __init__(self, name="pipe", timeouts=0, always_wedged=False, depth_scale=None):
@@ -122,12 +122,19 @@ def _install(pipeline, tag="stale"):
                        "color_auto_exposure_priority": 0}
 
 
-def _opener(pipeline, tag, opened=None, lock=None):
+def _opener(pipeline, tag, opened=None, lock=None, depth_unit_mm=0.1):
     """A stand-in for openPipeline with the same side effects as the real one.
 
     The real ``openPipeline`` declares ``global STATIC_GEOMETRY, ACHIEVED_OPTIONS,
     DEVICE_INFO`` and rebinds all three while starting the streams, then returns the
     pipeline alone. Anything that models it has to do both halves.
+
+    ``ACHIEVED_OPTIONS`` always carries a ``depth_unit_mm`` key because the real one
+    does: ``rs_config.configure_depth_sensor`` sets ``depth_units`` on the reopened
+    sensor and reads the achieved scale straight back (storing None when the device
+    will not report it, which ``depth_unit_mm=None`` models). That key is the
+    rebuild's fallback when the direct re-read fails, so it is part of what an opener
+    has to reproduce -- 0.1 is the pinned 0.1 mm/count of protocol 2.
     """
     def fake_open():
         if opened is not None:
@@ -137,7 +144,7 @@ def _opener(pipeline, tag, opened=None, lock=None):
             else:
                 opened.append(1)
         srv.STATIC_GEOMETRY = SimpleNamespace(tag=tag)
-        srv.ACHIEVED_OPTIONS = {"tag": tag}
+        srv.ACHIEVED_OPTIONS = {"tag": tag, "depth_unit_mm": depth_unit_mm}
         srv.DEVICE_INFO = {"tag": tag, "serial": f"serial-{tag}",
                            "color_auto_exposure_priority": 1}
         return pipeline
@@ -214,6 +221,70 @@ def test_a_persistent_stall_rebuilds_the_pipeline(monkeypatch):
     assert srv.depth_unit_mm == pytest.approx(0.1), (
         "depth_unit_mm was not re-read off the reopened device; protocol 2 sends "
         "raw counts, so a stale scale silently mis-sizes every depth the host reads")
+
+
+def test_an_unreadable_depth_scale_falls_back_to_the_reopened_device(monkeypatch):
+    """The direct re-read failing must not leave the PREVIOUS open's scale in place.
+
+    ``depth_unit_mm`` is the one number every host measurement is multiplied by --
+    protocol 2 ships raw counts, so the host multiplies by whatever the greeting
+    says. The re-read used to sit in a bare ``try/except: pass`` justified by "same
+    device; the startup value still holds", but the value is a per-OPEN fact:
+    ``configure_depth_sensor`` sets ``depth_units`` and reads it back on every open,
+    and a device that comes back at its 1 mm/count default while the module still
+    says 0.1 mm mis-sizes every depth by 10x, silently.
+
+    ``openPipeline`` has already read the scale off the REOPENED device into
+    ``ACHIEVED_OPTIONS``, so that -- not the stale global -- is what a failed direct
+    read must fall back to.
+    """
+    fresh = FakePipeline(name="fresh", depth_scale=None)      # direct re-read raises
+    monkeypatch.setattr(srv, "openPipeline",
+                        _opener(fresh, "fresh", depth_unit_mm=0.1))
+    _install(FakePipeline(name="wedged", always_wedged=True))  # leaves depth_unit_mm 1.0
+
+    assert srv.read_frames() == "frames-from-fresh"
+    assert srv.depth_unit_mm == pytest.approx(0.1), (
+        "the rebuild kept the previous open's mm/count instead of the value "
+        "openPipeline read off the reopened device")
+    assert srv._camera_snapshot().depth_unit_mm == pytest.approx(0.1), (
+        "the greeting would still quote the pre-stall depth scale")
+
+
+def test_a_depth_scale_that_cannot_be_read_at_all_is_reported(monkeypatch, capsys):
+    """When NEITHER source works the value really is possibly stale -- so say so.
+
+    Silence was the actual defect: a bare ``except: pass`` on the scale factor that
+    every downstream millimetre depends on. Carrying the old value forward is the
+    right behaviour (there is nothing better to use), but it has to be visible in
+    the journal, because from that point on no measurement is trustworthy without
+    someone checking.
+    """
+    fresh = FakePipeline(name="fresh", depth_scale=None)      # direct re-read raises
+    monkeypatch.setattr(srv, "openPipeline",
+                        _opener(fresh, "fresh", depth_unit_mm=None))  # and so did openPipeline
+    _install(FakePipeline(name="wedged", always_wedged=True))
+
+    assert srv.read_frames() == "frames-from-fresh"
+    assert srv.depth_unit_mm == 1.0, "with no reading available, keep the last known one"
+
+    # ...and the operator has to be able to SEE that, in the rebuild's own output.
+    logged = capsys.readouterr().out
+    assert "could not re-read the depth scale" in logged, (
+        f"the failed depth-scale read was swallowed silently; log was {logged!r}")
+    assert "KEEPING 1.0 mm/count" in logged, (
+        f"the journal does not say which scale the camera is now serving: {logged!r}")
+
+
+def test_the_depth_scale_re_read_never_raises(monkeypatch):
+    """It runs inside the recovery path, and the unit is Restart=always with NO
+    start limit -- an exception here is an infinite crash-loop with the camera dark
+    for every module, which is strictly worse than a stale number plus a log line."""
+    broken = FakePipeline(name="broken", depth_scale=None)
+    for junk in (None, {}, {"depth_unit_mm": None}, {"depth_unit_mm": "0.1 mm"},
+                 SimpleNamespace()):
+        monkeypatch.setattr(srv, "ACHIEVED_OPTIONS", junk)
+        assert srv._reread_depth_unit_mm(broken, 0.1) == 0.1
 
 
 def test_a_rebuild_that_forgets_to_rebind_is_caught(monkeypatch):

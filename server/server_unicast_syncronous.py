@@ -717,6 +717,53 @@ def _release_pipeline():
               flush=True)
 
 
+def _reread_depth_unit_mm(new_pipeline, previous):
+    """The REOPENED device's millimetres-per-count. Never raises, never silent.
+
+    Protocol 2 ships raw depth counts, so this one number is the scale factor every
+    host measurement is multiplied by: get it wrong and every scan, gate reading and
+    extrusion measurement is off by a constant factor, with nothing anywhere in the
+    chain able to notice. ``configure_depth_sensor`` SETS ``depth_units`` on every
+    open and reads the achieved value back, so it is a per-open fact -- it cannot
+    simply be assumed to carry over from the open that just died.
+
+    Three sources, in falling order of directness:
+
+    1. the reopened device, asked here;
+    2. ``ACHIEVED_OPTIONS["depth_unit_mm"]`` -- which ``openPipeline`` read off that
+       SAME reopened device moments ago (and which the rebuild has already rebound,
+       being a side effect of ``openPipeline``). This is the fallback that used to
+       be missing: the old code swallowed the failure with "same device; the startup
+       value still holds" and kept the module global, which is the PREVIOUS open's
+       number, not this one's;
+    3. the previous value, only when neither read worked -- and said out loud, so a
+       possibly-stale scale factor appears in the journal instead of nowhere.
+
+    Never raising is deliberate: the unit is ``Restart=always`` with no start limit,
+    so an exception on the recovery path is an infinite crash-loop with the camera
+    dark for every module.
+    """
+    try:
+        return float(new_pipeline.get_active_profile().get_device()
+                     .first_depth_sensor().get_depth_scale() * 1000.0)
+    except Exception as exc:            # noqa: BLE001 - see the docstring
+        print(f"WARNING: could not re-read the depth scale off the reopened camera "
+              f"({exc!r}); depth_unit_mm scales EVERY measurement the host makes.",
+              flush=True)
+    try:
+        fallback = float(ACHIEVED_OPTIONS.get("depth_unit_mm"))
+    except (AttributeError, TypeError, ValueError):
+        # openPipeline could not read it either (it stores None then), or left
+        # something unexpected behind.
+        print(f"  the reopened device reported no depth scale either; KEEPING "
+              f"{previous} mm/count from the previous open -- verify it before "
+              f"trusting a measurement from this camera.", flush=True)
+        return previous
+    print(f"  using the value openPipeline read back off the reopened device: "
+          f"depth_unit_mm = {fallback}", flush=True)
+    return fallback
+
+
 def _rebuild_pipeline(observed_generation):
     """Re-open the camera once, on behalf of every waiting client thread."""
     global pipeline, depth_unit_mm
@@ -743,11 +790,15 @@ def _rebuild_pipeline(observed_generation):
                 continue
 
             pipeline = new_pipeline
-            try:
-                depth_unit_mm = (pipeline.get_active_profile().get_device()
-                                 .first_depth_sensor().get_depth_scale() * 1000.0)
-            except Exception:
-                pass        # same device; the startup value still holds
+            was = depth_unit_mm
+            depth_unit_mm = _reread_depth_unit_mm(new_pipeline, depth_unit_mm)
+            if depth_unit_mm != was:
+                # A silent change of the scale factor across a rebuild is exactly
+                # the failure this whole function exists to make visible. (Clients
+                # greeted before the rebuild are dropped by _greeting_is_stale, so
+                # none of them keeps quoting the old number.)
+                print(f"  depth_unit_mm changed across the rebuild: {was} -> "
+                      f"{depth_unit_mm} mm/count", flush=True)
             _camera_generation += 1
             _consecutive_timeouts = 0
             _rebuilds_without_progress += 1
@@ -1143,12 +1194,16 @@ def handle_client(conn, addr):
     # buffers frames in RAM and ships them all in one transfer at the end — keeps
     # the robot tour from stalling on a per-pose depth transfer over Wi-Fi.
     #
-    # Send timeout: this server is single-threaded with listen(1), so a client
-    # that dies without a clean RST would otherwise leave sendall blocked
-    # forever and the server would stop accepting anyone (the "NO SIGNAL"
-    # wedge). With a timeout, a stuck/dead client just gets dropped and we go
-    # back to accept(). Generous enough that a slow-but-alive link (a full
-    # depth+color frame over slow Wi-Fi can take a few seconds) is not killed.
+    # Send timeout: a client that dies without a clean RST leaves sendall blocked
+    # forever. When this server was single-threaded with listen(1) that alone
+    # stopped it accepting anyone (the "NO SIGNAL" wedge); `main()` now runs a
+    # thread per client against listen(5), so the wedge is no longer immediate --
+    # but each stuck client still pins a thread and a socket for good, and enough
+    # of those reproduce the same symptom (seen on the cell as sockets piling up
+    # in CLOSE_WAIT: 10 on 2026-08-28, 8 on 2026-08-29 -- see _serve_client).
+    # With a timeout, a stuck/dead client is dropped and its thread exits.
+    # Generous enough that a slow-but-alive link (a full depth+color frame over
+    # slow Wi-Fi can take a few seconds) is not killed.
     req = b""
     try:
         conn.settimeout(0.5)
