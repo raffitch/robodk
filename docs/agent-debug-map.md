@@ -329,6 +329,13 @@ pytest tests\test_collision_guard.py tests\test_calibration_job.py tests\test_sc
 
 Read only when needed:
 
+- `docs/deposit-segmentation-handoff-2026-08-30.md`: **read before touching the
+  extrusion chroma gate, `deposit_floor_mm`, or `floor_profile`.** The gate's
+  bead-vs-board saturation separation has inverted on the cell (bead 25, board 28)
+  and its 1 mm-quantisation justification is obsolete at protocol 2's 0.1 mm --
+  but the 1.5 mm floor it unlocks is still load-bearing, so it cannot just be
+  deleted. Also carries the `floor_profile`-is-None-in-production defect and the
+  `assemble_arcs` three-way divergence.
 - `docs/live-robot-testing.md`: **how to drive the real KUKA from a script safely**
   and read the live HUD — SIMULATE-vs-RUN_ROBOT trap, telemetry stalls, stale-hold
   reads, camera-tool IK, the continuous-monitor pattern. Read before any move script.

@@ -45,6 +45,9 @@ strand the robot on old code. Say which commit hashes you pushed in your summary
 3. **[tasni/README.md](tasni/README.md)** — the app's architecture.
 4. `docs/extrusion-current-handoff.md`, `docs/jetson-scanner.md`,
    `docs/scan-workframe-two-path-plan.md` — per-area depth.
+5. **[docs/deposit-segmentation-handoff-2026-08-30.md](docs/deposit-segmentation-handoff-2026-08-30.md)**
+   — bead-vs-background segmentation: the failing chroma gate and the proposed
+   background- and pigment-independent replacement (see §4).
 
 ## 4. What is open right now (2026-08-28)
 
@@ -236,6 +239,22 @@ the Jetson, and runs an **unrecorded Custom preset** that nobody can reproduce. 
 findings R1-R12 with a dependency-ordered sequence; R4.1 (record the as-found advanced-mode
 JSON) is read-only and should go first because it makes the 2026-08-13 characterisation
 reproducible. Nothing else there lands on the cell before the 1 Sep paper deadline.
+
+**Deposit segmentation: the chroma gate's premise has inverted (opened 2026-08-30, nothing
+started):** [docs/deposit-segmentation-handoff-2026-08-30.md](docs/deposit-segmentation-handoff-2026-08-30.md)
+is the single page. Measured on tonight's cell frames: bead saturation collapsed 106-114 -> 25
+while the board's black squares read 28, so the gate now admits **more board than bead** (its
+stage render is a recognisable checkerboard). Its original justification is obsolete too --
+it was written for **1 mm** depth quantisation, and protocol 2 delivers 0.1 mm, so the black
+squares that used to read 2.9-5.9 mm above the plane now read 0.14 mm. Height alone separates
+them today. Do **not** simply delete the gate: the 1.5 mm deposit floor it unlocks is still
+load-bearing (`layer-001-take05` drops 0.993 -> 0.842 without it). Two further findings on the
+same page: `floor_profile` is `None` in production while its unit test asserts otherwise, and
+`assemble_arcs` diverges between the live path, `reprocess_saved_layer` and the take figure.
+Proposed replacement is one reference-surface concept (capture the empty plate, then layer N-1)
+with a k-sigma threshold and shape priors, replacing both the gate and `floor_profile`.
+Tonight's 8 layer-1 takes are good data (radius spread 0.15 mm); the 3 layer-2 takes failed and
+are fully reprocessable -- do not re-run the robot for them.
 
 ## 5. How to work here
 
