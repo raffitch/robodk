@@ -24,7 +24,7 @@ from .comparison import fit_circle_xy
 from .inspection import (aim_point_mm, cylinder_diameter_mm, framing_standoff,
                          inspection_plan, order_candidates_seed_first,
                          pose_candidates, standoff_fault,
-                         standoff_report)
+                         standoff_report, star_view_candidates)
 from .models import CylinderPlan, CylinderRecipe, CylinderSetup, LayerManifest
 from .processing import process_observation
 from .surface import surface_check
@@ -392,7 +392,8 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
                            inspection_name: str, config, camera,
                            start_joints, seed_pose: dict | None = None,
                            collisions: bool = True,
-                           near_mm: float | None = None) -> dict:
+                           near_mm: float | None = None,
+                           tilt_deg: float = 0.0, azimuth_deg: float = 0.0) -> dict:
     """Create the inspection program for one layer and return its validation.
 
     Manual mode moves to the taught target, exactly as before. Automatic mode
@@ -408,6 +409,13 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
     all deliberately absent. ``near_mm`` is used only by explicitly-confirmed
     measure-only jobs whose extrusion tool is detached/clear; normal inspection
     retains the configured 300 mm live-print clearance.
+
+    ``tilt_deg``/``azimuth_deg`` are what a multi-view STAR pose is, not a
+    fallback: when ``tilt_deg`` is non-zero the candidate list comes from
+    :func:`star_view_candidates` (roll varies, tilt/azimuth never do) instead of
+    :func:`pose_candidates` (fronto-parallel first, tilt/azimuth as a last
+    resort). At the defaults (0, 0) this is exactly today's fronto-parallel walk
+    — the two cell-validated callers of this function never pass either.
     """
     speed_mm_s = plan.recipe.travel_speed_mm_s
     if not plan.setup.inspection_auto:
@@ -436,8 +444,17 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
     # frame-referenced one is only reachable through a wrist flip.
     reference_x = [float(v) for v in rdk.camera_axes_in_frame(
         plan.setup.inspection_tool, plan.setup.work_frame, start_joints)[:3, 0]]
-    candidates = order_candidates_seed_first(
-        pose_candidates(aim, framing["standoff_mm"], config, reference_x), seed_pose)
+    if tilt_deg:
+        raw_candidates = [
+            {**{k: v for k, v in candidate.items() if k != "T_work_camera"},
+             "T": candidate["T_work_camera"],
+             "xyz_mm": [float(v) for v in candidate["T_work_camera"][:3, 3]]}
+            for candidate in star_view_candidates(
+                aim, framing["standoff_mm"], config, tilt_deg=tilt_deg,
+                azimuth_deg=azimuth_deg, reference_x=reference_x)]
+    else:
+        raw_candidates = pose_candidates(aim, framing["standoff_mm"], config, reference_x)
+    candidates = order_candidates_seed_first(raw_candidates, seed_pose)
     for candidate in candidates:
         descriptor = {k: v for k, v in candidate.items() if k != "T"}
         made = rdk.create_inspection_target(

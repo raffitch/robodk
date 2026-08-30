@@ -60,7 +60,9 @@ class ExtrusionArchive:
                     measured_xyz=None, corrected_xyz=None, color=None, depth=None,
                     pointcloud_xyz=None,
                     derived_images: dict[str, np.ndarray] | None = None,
-                    report: dict | None = None) -> Path:
+                    report: dict | None = None,
+                    views: list[dict] | None = None,
+                    merged_points_xyz=None) -> Path:
         trial = self.root / _segment(manifest.trial_id, "trial id")
         if not (trial / "trial.json").is_file():
             raise FileNotFoundError(f"trial does not exist: {manifest.trial_id}")
@@ -94,6 +96,23 @@ class ExtrusionArchive:
         if report is not None:
             (layer / "report.json").write_text(json.dumps(report, indent=2),
                                                 encoding="utf-8")
+        # Extra views of the SAME take. The top view deliberately stays at the
+        # layer root as color.png/depth.npy so reprocess_saved_layer, figures.py
+        # and the archived ring fixtures keep working with no change at all.
+        if views:
+            import cv2
+            for view in views:
+                out = layer / "views" / _segment(str(view["name"]), "view name")
+                out.mkdir(parents=True, exist_ok=False)
+                if view.get("color") is not None:
+                    if not cv2.imwrite(str(out / "color.png"), np.asarray(view["color"])):
+                        raise OSError(f"failed to write {out / 'color.png'}")
+                if view.get("depth") is not None:
+                    np.save(out / "depth.npy", np.asarray(view["depth"]))
+                (out / "pose.json").write_text(
+                    json.dumps(view.get("pose") or {}, indent=2), encoding="utf-8")
+        if merged_points_xyz is not None:
+            np.save(layer / "merged_points.npy", np.asarray(merged_points_xyz, float))
         (layer / "manifest.json").write_text(
             manifest.model_dump_json(indent=2), encoding="utf-8")
         return layer

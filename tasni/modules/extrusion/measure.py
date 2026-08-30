@@ -28,8 +28,10 @@ from ...core.logging import REPO_ROOT
 from ...core.rdk_io import RdkIO
 from ..calibration.service import _camera_hold, ensure_real_robot_link
 from .archive import ExtrusionArchive
-from .models import CylinderPlan, LayerManifest
-from .processing import characterize_ring, process_observation
+from .models import CaptureRecord, CylinderPlan, LayerManifest, ViewRecord
+from .multiview import MergeResult, ViewCloud, merge_views
+from .processing import (characterize_ring, observation_points, process_observation,
+                         process_points)
 
 try:                                       # matplotlib is the `figures` extra
     from .figures import render_layer_figures
@@ -301,20 +303,26 @@ def take_summary(layer_dir: Path, manifest: dict, *, reprocessed: bool = False) 
 
 def _move_to_inspection(services, ctx: JobContext, plan: CylinderPlan, layer, *,
                         inspection_name: str, start_joints, seed_pose, collisions: bool,
-                        artifacts: list[str], near_mm: float | None = None) -> dict:
+                        artifacts: list[str], near_mm: float | None = None,
+                        tilt_deg: float = 0.0, azimuth_deg: float = 0.0) -> dict:
     """Take the camera out to the derived pose, settle, and read where it landed.
 
     Split out of the capture so ONE excursion can serve several frames: with the
     arm parked at the pose, repeated grabs measure the sensing chain alone,
     without the robot's re-approach folded into every number (and without the
     minute of travel each extra trip costs at the cell).
+
+    ``tilt_deg``/``azimuth_deg`` pass straight through to
+    ``_build_inspection_move``; at the defaults this is byte-identical to
+    omitting them, which is what the single-view path (multiview off) does.
     """
     rdk: RdkIO = services.rdk
     ecfg = services.config.extrusion
     inspect = _build_inspection_move(
         rdk, plan, layer, inspection_name=inspection_name, config=ecfg,
         camera=services.config.camera, start_joints=start_joints,
-        seed_pose=seed_pose, collisions=collisions, near_mm=near_mm)
+        seed_pose=seed_pose, collisions=collisions, near_mm=near_mm,
+        tilt_deg=tilt_deg, azimuth_deg=azimuth_deg)
     ctx.check_cancel()
     artifacts.extend(inspect["artifacts"])
     # What the excursion costs the print starts here: the arm leaving the path.
@@ -332,6 +340,58 @@ def _move_to_inspection(services, ctx: JobContext, plan: CylinderPlan, layer, *,
             # The dwell is commanded, not measured: reporting the configured
             # value keeps the cycle total honest when a test stubs out sleep.
             "settle_ms": float(ecfg.settle_s) * 1000.0}
+
+
+def capture_views(services, ctx: JobContext, plan: CylinderPlan, layer, *,
+                  inspection_name: str, start_joints, seed_pose, collisions: bool,
+                  artifacts: list[str], near_mm=None, repeats: int = 1) -> dict:
+    """Visit every star pose once, grabbing ``repeats`` frames at each.
+
+    The arm visits each pose EXACTLY once: take k is later assembled from the
+    k-th frame of every view, so repeats = 3 costs 4 moves, not 12. That keeps
+    what ``repeats`` has always meant -- frames with the arm parked, robot
+    re-approach excluded by construction -- instead of quietly turning it into
+    an averaging window.
+
+    A view that cannot be reached or cannot be trusted is recorded and skipped;
+    only the TOP view failing fails the take, exactly as today.
+    """
+    from .inspection import star_view_angles
+    ecfg = services.config.extrusion
+    out = {"views": [], "records": []}
+    for name, tilt, azimuth in star_view_angles(ecfg):
+        # RoboDK item names drop the hyphen (star-120 -> _star120); the
+        # directory names archived later keep it -- see archive.write_layer.
+        program = (inspection_name if name == "top"
+                   else f"{inspection_name}_{name.replace('-', '')}")
+        record = {"name": name, "tilt_deg": tilt, "azimuth_deg": azimuth,
+                  "dropped": False, "drop_reason": None}
+        try:
+            ctx.check_cancel()
+            if name != "top":
+                ctx.log(f"view {name}: moving to tilt {tilt:.0f} deg / "
+                        f"azimuth {azimuth:.0f} deg")
+            moved = _move_to_inspection(
+                services, ctx, plan, layer, inspection_name=program,
+                start_joints=start_joints, seed_pose=seed_pose,
+                collisions=collisions, artifacts=artifacts, near_mm=near_mm,
+                tilt_deg=tilt, azimuth_deg=azimuth)
+            frames = [_capture_at_pose(services, ctx, moved["T_work_camera"])
+                      for _ in range(max(1, int(repeats)))]
+        except Exception as exc:
+            if name == "top":
+                raise
+            record.update({"dropped": True, "drop_reason": str(exc)[:200]})
+            ctx.log(f"view {name} dropped: {exc}")
+            out["records"].append(record)
+            continue
+        record.update({
+            "T_work_camera": np.asarray(moved["T_work_camera"], float).tolist(),
+            "roll_deg": moved["inspect"]["pose"].get("roll_deg") if moved["inspect"]["pose"] else None})
+        out["views"].append({"name": name, "moved": moved, "frames": frames,
+                             "tilt_deg": tilt, "azimuth_deg": azimuth})
+        out["records"].append(record)
+    return out
 
 
 def _capture_at_pose(services, ctx: JobContext, T_work_camera) -> dict:
@@ -567,6 +627,107 @@ def capture_side_photo(services, ctx: JobContext, *, start_joints) -> dict:
     return record
 
 
+def _process_star_take(*, views: list[dict], repeat: int, plan: CylinderPlan, layer,
+                       config, camera_cfg, floor_profile) -> tuple:
+    """Back-project + gate every surviving view's take-``repeat`` frame, merge,
+    then run the UNCHANGED chain (process_points) on the merged cloud.
+
+    This is the seam multi-view sits on (processing.observation_points /
+    process_points, task 4) plus the ring-first merge (multiview.merge_views,
+    task 5) -- nothing here reimplements either. Returns
+    ``(ProcessingResult, MergeResult, per_view_diag)``: the caller archives the
+    merged cloud and builds the manifest's ``CaptureRecord`` from the last two.
+    """
+    started = time.perf_counter()
+    timings: dict = {}
+    clouds: list[ViewCloud] = []
+    diag: dict[str, dict] = {}
+    for view in views:
+        cap = view["frames"][repeat - 1]
+        vframe = cap["frame"]
+        vT = view["moved"]["T_work_camera"]
+        pts, gated = observation_points(
+            color=vframe.color, depth=vframe.depth, geometry=vframe.geometry,
+            T_work_camera=vT, K=camera_cfg.K, dist=camera_cfg.dist, config=config)
+        clouds.append(ViewCloud(name=view["name"], points=pts, chroma_gated=gated,
+                                tilt_deg=view["tilt_deg"], azimuth_deg=view["azimuth_deg"],
+                                T_work_camera=vT))
+        diag[view["name"]] = {"chroma_gated": gated, "points_before_merge": int(len(pts))}
+    timings["backproject_ms"] = (time.perf_counter() - started) * 1000.0
+    mark = time.perf_counter()
+    merged = merge_views(clouds, plan=plan, layer=layer, config=config)
+    timings["merge_ms"] = (time.perf_counter() - mark) * 1000.0
+    processed = process_points(
+        merged.points, plan=plan, layer=layer, config=config,
+        chroma_gated=merged.chroma_gated, floor_profile=floor_profile,
+        timings=timings, started=started)
+    return processed, merged, diag
+
+
+def _capture_record_from_merge(capture_records: list[dict], merged: MergeResult,
+                               diag: dict[str, dict]) -> CaptureRecord:
+    """Build the manifest's ``CaptureRecord`` from what capture_views and the
+    merge each learned about every configured star view.
+
+    Every configured view gets exactly one ``ViewRecord`` regardless of WHERE it
+    was dropped -- unreachable pose (capture_views), or failed levelling/arc/
+    registration (merge_views) -- so the operator reads one drop reason per view,
+    not two competing lists.
+    """
+    views: list[ViewRecord] = []
+    for record in capture_records:
+        name = record["name"]
+        if record.get("dropped"):
+            views.append(ViewRecord(name=name, tilt_deg=record["tilt_deg"],
+                                    azimuth_deg=record["azimuth_deg"], dropped=True,
+                                    drop_reason=record.get("drop_reason")))
+            continue
+        d = diag.get(name, {})
+        merge_reason = merged.dropped.get(name)
+        offset = merged.offsets_mm.get(name)
+        views.append(ViewRecord(
+            name=name, tilt_deg=record["tilt_deg"], azimuth_deg=record["azimuth_deg"],
+            roll_deg=record.get("roll_deg"), T_work_camera=record.get("T_work_camera"),
+            chroma_gated=d.get("chroma_gated"), points_before_merge=d.get("points_before_merge"),
+            solved_offset_mm=(list(offset) if offset is not None else None),
+            residual_rms_mm=merged.residual_rms_mm.get(name),
+            dropped=merge_reason is not None, drop_reason=merge_reason))
+    return CaptureRecord(
+        style="star", views=views,
+        consensus_center_mm=(list(merged.consensus_center_mm)
+                             if merged.consensus_center_mm is not None else None),
+        consensus_radius_mm=merged.consensus_radius_mm,
+        spread_before_mm=merged.spread_before_mm,
+        residual_after_mm=merged.residual_after_mm,
+        merged_points_file="merged_points.npy")
+
+
+def _archive_view_payload(views: list[dict], repeat: int) -> list[dict]:
+    """Everything ``ExtrusionArchive.write_layer(views=...)`` needs, per view.
+
+    The TOP view carries no color/depth here -- its frame already sits at the
+    take root as color.png/depth.npy (archive layout, never moves) -- only its
+    pose.json, so the record of what it was commanded to and where it landed
+    is not lost inside ``views/top/``.
+    """
+    payload = []
+    for view in views:
+        cap = view["frames"][repeat - 1]
+        vframe = cap["frame"]
+        pose = {"tilt_deg": view["tilt_deg"], "azimuth_deg": view["azimuth_deg"],
+                "roll_deg": view["moved"]["inspect"]["pose"].get("roll_deg")
+                if view["moved"]["inspect"]["pose"] else None,
+                "T_work_camera": np.asarray(view["moved"]["T_work_camera"], float).tolist(),
+                "camera_geometry": vframe.geometry.to_dict(),
+                "depth_plane_check": cap["depth_plane_check"]}
+        entry = {"name": view["name"], "pose": pose}
+        if view["name"] != "top":
+            entry["color"] = vframe.color
+            entry["depth"] = vframe.depth
+        payload.append(entry)
+    return payload
+
+
 class RingMeasureJob:
     """Measure a hand-placed ring: inspect, capture, process, archive, return.
 
@@ -594,7 +755,8 @@ class RingMeasureJob:
                  check_collisions: bool = True,
                  close_range_tool_clear: bool = False,
                  repeats: int = 1, excursions: int = 1,
-                 side_photo: bool | None = None):
+                 side_photo: bool | None = None,
+                 multiview: bool | None = None):
         if not 1 <= layer_index <= len(plan.layers):
             raise ValueError(f"layer_index {layer_index} outside 1..{len(plan.layers)}")
         self.services = services
@@ -608,6 +770,10 @@ class RingMeasureJob:
         self.excursions = max(1, int(excursions))
         self.side_photo = (services.config.extrusion.side_capture_enabled
                            if side_photo is None else bool(side_photo))
+        # Off means off: the single-view chain is the cell-validated one and
+        # every number in the PFH archive came from it (spec section 5.8).
+        self.multiview = (services.config.extrusion.multiview_enabled
+                          if multiview is None else bool(multiview))
         self.results: list[dict] = []
         self.result: dict | None = None
 
@@ -701,19 +867,38 @@ class RingMeasureJob:
                         if self.excursions > 1 else "")
                 ctx.progress(len(self.results), total,
                              f"layer {self.layer_index}: moving the camera{trip}")
+                near_mm = (ecfg.measure_close_range_min_mm
+                          if self.close_range_tool_clear else None)
                 current_program = inspection_name
-                moved = _move_to_inspection(
-                    services, ctx, self.plan, layer, inspection_name=inspection_name,
-                    start_joints=start_joints, seed_pose=self.session.last_pose,
-                    collisions=self.check_collisions, artifacts=artifacts,
-                    near_mm=(ecfg.measure_close_range_min_mm
-                             if self.close_range_tool_clear else None))
+                # Single view calls _move_to_inspection exactly as today; that
+                # path is unchanged byte-for-byte. Multi-view calls
+                # capture_views, which visits all four star poses once each --
+                # see capture_views for why repeats does not multiply the moves.
+                if self.multiview:
+                    captured = capture_views(
+                        services, ctx, self.plan, layer, inspection_name=inspection_name,
+                        start_joints=start_joints, seed_pose=self.session.last_pose,
+                        collisions=self.check_collisions, artifacts=artifacts,
+                        near_mm=near_mm, repeats=self.repeats)
+                    moved = captured["views"][0]["moved"]          # the top view
+                    views_for_take = captured["views"]
+                    capture_records = captured["records"]
+                else:
+                    moved = _move_to_inspection(
+                        services, ctx, self.plan, layer, inspection_name=inspection_name,
+                        start_joints=start_joints, seed_pose=self.session.last_pose,
+                        collisions=self.check_collisions, artifacts=artifacts,
+                        near_mm=near_mm)
+                    views_for_take = None
+                    capture_records = None
                 current_program = None
                 for repeat in range(1, self.repeats + 1):
                     ctx.check_cancel()
                     last_dir = self._one_take(ctx, layer=layer, archive=archive,
                                               moved=moved, excursion=excursion,
-                                              repeat=repeat, total=total)
+                                              repeat=repeat, total=total,
+                                              views=views_for_take,
+                                              capture_records=capture_records)
             # Outside the camera hold: drawing needs no camera, and the Jetson
             # lease should not be held while matplotlib works.
             for record in self.results[-self.repeats:]:
@@ -761,7 +946,9 @@ class RingMeasureJob:
 
     # -- one frame, processed and archived ----------------------------------
     def _one_take(self, ctx: JobContext, *, layer, archive: ExtrusionArchive,
-                  moved: dict, excursion: int, repeat: int, total: int) -> Path:
+                  moved: dict, excursion: int, repeat: int, total: int,
+                  views: list[dict] | None = None,
+                  capture_records: list[dict] | None = None) -> Path:
         services = self.services
         ecfg = services.config.extrusion
         take = self.session.next_take(self.layer_index)
@@ -771,7 +958,11 @@ class RingMeasureJob:
                   if self.repeats > 1 else "")
         ctx.progress(len(self.results), total,
                      f"layer {self.layer_index} take {take}: capturing{parked}")
-        captured = _capture_at_pose(services, ctx, T_work_camera)
+        # In star mode every view's frame at this repeat was already grabbed
+        # (parked, once per pose) by capture_views; the TOP view's own frame
+        # is what stays archived at the take root, exactly as single-view does.
+        captured = (_capture_at_pose(services, ctx, T_work_camera) if views is None
+                   else views[0]["frames"][repeat - 1])
         frame, capture_ms = captured["frame"], captured["capture_ms"]
         ctx.progress(len(self.results), total, f"take {take}: processing the frame")
         nominal = points_array(layer)
@@ -802,11 +993,19 @@ class RingMeasureJob:
                         "camera_geometry": frame.geometry.to_dict()})
         floor = self.session.floor_profile(self.layer_index)
         camera_cfg = services.config.camera
+        capture_record = None
+        merged: MergeResult | None = None
         try:
-            processed = process_observation(
-                color=frame.color, depth=frame.depth, geometry=frame.geometry,
-                T_work_camera=T_work_camera, K=camera_cfg.K, dist=camera_cfg.dist,
-                plan=self.plan, layer=layer, config=ecfg, floor_profile=floor)
+            if views is None:
+                processed = process_observation(
+                    color=frame.color, depth=frame.depth, geometry=frame.geometry,
+                    T_work_camera=T_work_camera, K=camera_cfg.K, dist=camera_cfg.dist,
+                    plan=self.plan, layer=layer, config=ecfg, floor_profile=floor)
+            else:
+                processed, merged, diag = _process_star_take(
+                    views=views, repeat=repeat, plan=self.plan, layer=layer,
+                    config=ecfg, camera_cfg=camera_cfg, floor_profile=floor)
+                capture_record = _capture_record_from_merge(capture_records, merged, diag)
         except Exception as exc:
             # A failed measurement still archives its raw RGB-D: the operator
             # cannot re-place the ring exactly, so the frame is the only thing
@@ -845,7 +1044,13 @@ class RingMeasureJob:
             **base, measured_path_file="measured_path.json",
             pointcloud_file="height-or-pointcloud.npy",
             metrics=processed.metrics, geometry=processed.geometry,
-            processing=processed.report, warnings=processed.metrics.warnings)
+            processing=processed.report, warnings=processed.metrics.warnings,
+            capture=capture_record)
+        archive_kwargs: dict = {}
+        if views is not None:
+            archive_kwargs["views"] = _archive_view_payload(views, repeat)
+            archive_kwargs["merged_points_xyz"] = (
+                merged.points if merged is not None else None)
         layer_dir = archive.write_layer(
             manifest, nominal_xyz=nominal, commanded_xyz=nominal,
             measured_xyz=processed.measured_xyz,
@@ -855,7 +1060,8 @@ class RingMeasureJob:
                             "skeleton.png": processed.skeleton,
                             "comparison.png": processed.comparison},
             report={**processed.report,
-                    "metrics": processed.metrics.model_dump(mode="json")})
+                    "metrics": processed.metrics.model_dump(mode="json")},
+            **archive_kwargs)
         summary = {"layer_index": self.layer_index, "take": take,
                    "layer_dir": str(layer_dir),
                    # The directory NAME as well as the path: the browser
@@ -889,12 +1095,19 @@ class RingCharacterizeJob:
 
     def __init__(self, services, plan: CylinderPlan, session: MeasureSession, *,
                  check_collisions: bool = True,
-                 close_range_tool_clear: bool = False):
+                 close_range_tool_clear: bool = False,
+                 multiview: bool | None = None):
         self.services = services
         self.plan = plan.model_copy(deep=True)
         self.session = session
         self.check_collisions = bool(check_collisions)
         self.close_range_tool_clear = bool(close_range_tool_clear)
+        # Accepted for API symmetry with RingMeasureJob (spec section 5.8); not
+        # yet wired to a capture path here -- characterize_ring measures the
+        # ring before any recipe exists and does not go through the
+        # observation_points/process_points seam the star capture merges at.
+        self.multiview = (services.config.extrusion.multiview_enabled
+                          if multiview is None else bool(multiview))
         self.result: dict | None = None
 
     def __call__(self, ctx: JobContext) -> dict:

@@ -1,6 +1,7 @@
 """Multi-view ring capture: poses, gates, levelling, the joint circle solve, merge."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -62,6 +63,7 @@ from tasni.modules.extrusion.inspection import (pose_from_aim,  # noqa: E402
                                                 multiview_plan)
 import extrusion_synthetic as syn  # noqa: E402
 import test_extrusion_measure as tem  # noqa: E402
+import test_extrusion_job as tej  # noqa: E402
 
 
 def test_star_angles_are_top_first_then_the_configured_azimuths():
@@ -423,3 +425,366 @@ def test_a_wildly_misregistered_view_is_rejected_and_the_rest_survive():
     out = merge_views(views, plan=plan, layer=plan.layers[0], config=ExtrusionConfig())
     assert "star-240" in out.dropped
     assert set(out.used) == {"top", "star-000", "star-120"}
+
+
+# ------------------------------------------------------- Task 6: capture the views
+
+def test_archive_writes_the_views_directory_and_the_merged_cloud(tmp_path):
+    from tasni.modules.extrusion.archive import ExtrusionArchive
+    from tasni.modules.extrusion.models import CaptureRecord, LayerManifest, ViewRecord
+    plan = tem.scene_plan()
+    archive = ExtrusionArchive(tmp_path)
+    archive.create_trial("t1", plan)
+    color = np.zeros((8, 8, 3), np.uint8)
+    depth = np.ones((8, 8), np.uint16)
+    manifest = LayerManifest(
+        trial_id="t1", layer_index=1, recipe=plan.recipe,
+        toolpath_fingerprint=plan.fingerprint,
+        capture=CaptureRecord(style="star", merged_points_file="merged_points.npy",
+                              views=[ViewRecord(name="star-120", tilt_deg=15.0,
+                                                azimuth_deg=120.0)]))
+    layer_dir = archive.write_layer(
+        manifest, nominal_xyz=np.zeros((3, 3)), commanded_xyz=np.zeros((3, 3)),
+        color=color, depth=depth,
+        views=[{"name": "star-120", "color": color, "depth": depth,
+                "pose": {"tilt_deg": 15.0}}],
+        merged_points_xyz=np.zeros((5, 3)))
+    assert (layer_dir / "color.png").is_file()          # top view stays at the root
+    assert (layer_dir / "views" / "star-120" / "color.png").is_file()
+    assert (layer_dir / "views" / "star-120" / "depth.npy").is_file()
+    assert (layer_dir / "views" / "star-120" / "pose.json").is_file()
+    assert (layer_dir / "merged_points.npy").is_file()
+
+
+def test_single_view_take_writes_no_views_directory(tmp_path):
+    from tasni.modules.extrusion.archive import ExtrusionArchive
+    from tasni.modules.extrusion.models import LayerManifest
+    plan = tem.scene_plan()
+    archive = ExtrusionArchive(tmp_path)
+    archive.create_trial("t1", plan)
+    manifest = LayerManifest(trial_id="t1", layer_index=1, recipe=plan.recipe,
+                             toolpath_fingerprint=plan.fingerprint)
+    layer_dir = archive.write_layer(manifest, nominal_xyz=np.zeros((3, 3)),
+                                    commanded_xyz=np.zeros((3, 3)),
+                                    color=np.zeros((8, 8, 3), np.uint8),
+                                    depth=np.ones((8, 8), np.uint16))
+    assert not (layer_dir / "views").exists()
+
+
+# ---------------------------------------------------- _build_inspection_move (tilt/azimuth)
+
+from tasni.modules.extrusion.service import _build_inspection_move  # noqa: E402
+
+
+def test_default_tilt_is_byte_identical_to_omitting_it():
+    """Off means off: the two cell-validated live callers never pass tilt_deg,
+    so the default MUST reach exactly today's fronto-parallel candidate walk."""
+    plan = tej.plan(layers=1, auto_inspection=True)
+    layer = plan.layers[0]
+    svc_a, rdk_a, _ = tej.services(".")
+    out_a = _build_inspection_move(
+        rdk_a, plan, layer, inspection_name="X_Inspect", config=svc_a.config.extrusion,
+        camera=svc_a.config.camera, start_joints=tej.START_JOINTS)
+    svc_b, rdk_b, _ = tej.services(".")
+    out_b = _build_inspection_move(
+        rdk_b, plan, layer, inspection_name="X_Inspect", config=svc_b.config.extrusion,
+        camera=svc_b.config.camera, start_joints=tej.START_JOINTS,
+        tilt_deg=0.0, azimuth_deg=0.0)
+    assert out_a == out_b
+    assert rdk_a.events == rdk_b.events
+    np.testing.assert_array_equal(rdk_a.targets[0]["T"], rdk_b.targets[0]["T"])
+    assert out_a["pose"]["tilt_deg"] == 0.0 and out_a["pose"]["azimuth_deg"] == 0.0
+
+
+def test_nonzero_tilt_selects_star_view_candidates_not_the_fallback_walk():
+    """tilt_deg != 0 must land on the REQUESTED tilt/azimuth (what the view IS),
+    never on a different one from the fronto-parallel fallback table."""
+    plan = tej.plan(layers=1, auto_inspection=True)
+    layer = plan.layers[0]
+    svc, rdk, _ = tej.services(".")
+    out = _build_inspection_move(
+        rdk, plan, layer, inspection_name="X_Inspect", config=svc.config.extrusion,
+        camera=svc.config.camera, start_joints=tej.START_JOINTS,
+        tilt_deg=15.0, azimuth_deg=120.0)
+    assert out["pose"]["tilt_deg"] == 15.0
+    assert out["pose"]["azimuth_deg"] == 120.0
+    # Only roll varied across the candidates actually tried.
+    assert len(rdk.targets) == 1, "the first (roll 0) candidate should have been reachable"
+
+
+def test_a_star_view_that_cannot_be_reached_raises_and_never_falls_back_to_a_different_tilt():
+    plan = tej.plan(layers=1, auto_inspection=True)
+    layer = plan.layers[0]
+    svc, rdk, _ = tej.services(".")
+    rdk.unreachable_targets = 999
+    with pytest.raises(RuntimeError, match="no reachable, collision-free inspection pose") as excinfo:
+        _build_inspection_move(
+            rdk, plan, layer, inspection_name="X_Inspect", config=svc.config.extrusion,
+            camera=svc.config.camera, start_joints=tej.START_JOINTS,
+            tilt_deg=15.0, azimuth_deg=120.0)
+    # Every candidate actually tried (one per configured roll) kept the
+    # REQUESTED tilt/azimuth -- a star view never substitutes a different one.
+    message = str(excinfo.value)
+    assert len(rdk.targets) == len(svc.config.extrusion.inspection_roll_candidates_deg)
+    assert "tilt 15/azimuth 120" in message
+
+
+# ---------------------------------------------------- RingMeasureJob(multiview=True) wiring
+
+from tasni.modules.extrusion import measure as measure_mod  # noqa: E402
+from tasni.modules.extrusion.measure import (RingMeasureJob, capture_views,  # noqa: E402
+                                             MeasureSession)
+from tasni.modules.extrusion.multiview import MergeResult  # noqa: E402
+
+
+def _fake_observation_points(**kwargs):
+    _fake_observation_points.calls.append(kwargs)
+    return np.zeros((10, 3)), True
+
+
+_fake_observation_points.calls = []
+
+
+def _fake_merge_views(views, *, plan, layer, config):
+    names = [v.name for v in views]
+    return MergeResult(
+        points=np.zeros((10, 3)), chroma_gated=True, used=list(names), dropped={},
+        consensus_center_mm=(1.0, 2.0), consensus_radius_mm=40.5,
+        offsets_mm={n: (0.1, -0.2) for n in names},
+        residual_rms_mm={n: 0.3 for n in names},
+        spread_before_mm=0.6, residual_after_mm=0.2)
+
+
+def _fake_process_points(points, **kwargs):
+    return tem.fake_measure_processing(**kwargs)
+
+
+def _multiview_env(tmp_path, monkeypatch):
+    svc, rdk, camera = tem.measure_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(measure_mod, "observation_points", _fake_observation_points)
+    monkeypatch.setattr(measure_mod, "merge_views", _fake_merge_views)
+    monkeypatch.setattr(measure_mod, "process_points", _fake_process_points)
+    _fake_observation_points.calls.clear()
+    tem.fake_measure_processing.calls.clear()
+    return svc, rdk, camera
+
+
+def test_multiview_off_takes_the_identical_single_view_path(tmp_path, monkeypatch):
+    """off means off: with multiview=False, capture_views/merge_views/observation_points
+    must never run and the archive/manifest must be exactly what today writes."""
+    svc, rdk, camera = _multiview_env(tmp_path, monkeypatch)
+    plan = tem.auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    out = RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True,
+                         multiview=False)(tem.Ctx())
+    assert camera.grabs == 2                       # readiness + exactly one measurement
+    assert not any(e[0] == "start" and "_star" in e[1] for e in rdk.events)
+    assert _fake_observation_points.calls == []     # the star seam never ran
+    manifest = json.loads((Path(out["layer_dir"]) / "manifest.json").read_text())
+    assert manifest["capture"] is None
+    assert not (Path(out["layer_dir"]) / "views").exists()
+    assert not (Path(out["layer_dir"]) / "merged_points.npy").exists()
+
+
+def test_multiview_on_visits_four_poses_and_archives_the_star(tmp_path, monkeypatch):
+    svc, rdk, camera = _multiview_env(tmp_path, monkeypatch)
+    plan = tem.auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    out = RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True,
+                         multiview=True)(tem.Ctx())
+    stem = f"TasniCylinder_MEASURE_{plan.fingerprint[:10]}_L001_Inspect"
+    starts = [e[1] for e in rdk.events if e[0] == "start"]
+    assert starts == [stem, f"{stem}_star000", f"{stem}_star120", f"{stem}_star240"]
+    assert camera.grabs == 1 + 4                    # readiness + one frame per view
+    layer_dir = Path(out["layer_dir"])
+    assert (layer_dir / "color.png").is_file() and (layer_dir / "depth.npy").is_file()
+    assert (layer_dir / "views" / "top" / "pose.json").is_file()
+    assert not (layer_dir / "views" / "top" / "color.png").exists()   # top stays at the root
+    for name in ("star-000", "star-120", "star-240"):
+        assert (layer_dir / "views" / name / "color.png").is_file()
+        assert (layer_dir / "views" / name / "depth.npy").is_file()
+        assert (layer_dir / "views" / name / "pose.json").is_file()
+    assert (layer_dir / "merged_points.npy").is_file()
+    manifest = json.loads((layer_dir / "manifest.json").read_text())
+    assert manifest["capture"]["style"] == "star"
+    assert len(manifest["capture"]["views"]) == 4
+    assert {v["name"] for v in manifest["capture"]["views"]} == {
+        "top", "star-000", "star-120", "star-240"}
+    assert all(not v["dropped"] for v in manifest["capture"]["views"])
+    assert manifest["capture"]["consensus_center_mm"] == [1.0, 2.0]
+    assert manifest["capture"]["merged_points_file"] == "merged_points.npy"
+    assert rdk.events[-1] == ("move-joints", tej.START_JOINTS)         # still returns home
+
+
+def test_a_dropped_star_view_still_completes_the_take_on_the_rest(tmp_path, monkeypatch):
+    """Only the TOP view failing may fail the take (spec section 8)."""
+    svc, rdk, camera = _multiview_env(tmp_path, monkeypatch)
+    original_move = measure_mod._move_to_inspection
+
+    def flaky_move(services, ctx, plan, layer, *, inspection_name, **kwargs):
+        if inspection_name.endswith("_star120"):
+            raise RuntimeError("simulated: no reachable pose")
+        return original_move(services, ctx, plan, layer,
+                             inspection_name=inspection_name, **kwargs)
+
+    monkeypatch.setattr(measure_mod, "_move_to_inspection", flaky_move)
+    plan = tem.auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    ctx = tem.Ctx()
+    out = RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True,
+                         multiview=True)(ctx)
+    assert camera.grabs == 1 + 3                    # readiness + top/star-000/star-240 only
+    layer_dir = Path(out["layer_dir"])
+    assert not (layer_dir / "views" / "star-120").exists()
+    assert (layer_dir / "views" / "star-000").exists()
+    manifest = json.loads((layer_dir / "manifest.json").read_text())
+    views_by_name = {v["name"]: v for v in manifest["capture"]["views"]}
+    assert views_by_name["star-120"]["dropped"] is True
+    assert "simulated" in views_by_name["star-120"]["drop_reason"]
+    assert views_by_name["star-000"]["dropped"] is False
+    assert any("star-120" in message and "dropped" in message for message in ctx.logs)
+
+
+def test_a_failing_top_view_fails_the_whole_take(tmp_path, monkeypatch):
+    svc, rdk, camera = _multiview_env(tmp_path, monkeypatch)
+    original_move = measure_mod._move_to_inspection
+
+    def flaky_move(services, ctx, plan, layer, *, inspection_name, **kwargs):
+        if inspection_name.endswith("_Inspect"):
+            raise RuntimeError("simulated: top view unreachable")
+        return original_move(services, ctx, plan, layer,
+                             inspection_name=inspection_name, **kwargs)
+
+    monkeypatch.setattr(measure_mod, "_move_to_inspection", flaky_move)
+    plan = tem.auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    with pytest.raises(RuntimeError, match="simulated: top view unreachable"):
+        RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True,
+                       multiview=True)(tem.Ctx())
+    assert rdk.events[-1] == ("move-joints", tej.START_JOINTS)         # still comes home
+
+
+def test_a_star_take_that_fails_processing_still_archives_the_top_frame_and_returns_home(
+        tmp_path, monkeypatch):
+    """Distinct from the top-VIEW-capture failing: here every view is captured
+    fine but the merged cloud fails process_points (e.g. not enough deposit
+    points) -- the take must still fail loudly, archive the irreplaceable top
+    RGB-D exactly as the single-view path does, and the arm must still return."""
+    svc, rdk, camera = _multiview_env(tmp_path, monkeypatch)
+
+    def failing_process_points(points, **kwargs):
+        raise RuntimeError("simulated: not enough deposited-geometry points")
+
+    monkeypatch.setattr(measure_mod, "process_points", failing_process_points)
+    plan = tem.auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    with pytest.raises(RuntimeError, match="raw RGB-D archived"):
+        RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True,
+                       multiview=True)(tem.Ctx())
+    layer_dir = session.trial_dir / "layer-001"
+    assert (layer_dir / "depth.npy").is_file() and (layer_dir / "color.png").is_file()
+    assert "simulated" in (layer_dir / "report.json").read_text()
+    manifest = json.loads((layer_dir / "manifest.json").read_text())
+    assert manifest["capture"] is None       # never built once processing failed
+    assert not (layer_dir / "merged_points.npy").exists()
+    assert rdk.events[-1] == ("move-joints", tej.START_JOINTS)         # still comes home
+
+
+def test_repeats_visits_each_star_pose_once_not_once_per_repeat(tmp_path, monkeypatch):
+    svc, rdk, camera = _multiview_env(tmp_path, monkeypatch)
+    plan = tem.auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    out = RingMeasureJob(svc, plan, session, 1, check_collisions=False,
+                         multiview=True, repeats=3)(tem.Ctx())
+    starts = [e[1] for e in rdk.events if e[0] == "start"]
+    assert len(starts) == 4                          # 4 moves total, not 12
+    assert out["takes_recorded"] == [1, 2, 3]
+    assert camera.grabs == 1 + 4 * 3                  # readiness + 4 views x 3 frames each
+    for suffix in ("layer-001", "layer-001-take02", "layer-001-take03"):
+        assert (session.trial_dir / suffix / "merged_points.npy").is_file()
+        assert (session.trial_dir / suffix / "views" / "star-000" / "color.png").is_file()
+
+
+def test_multiview_off_default_follows_config(tmp_path, monkeypatch):
+    """multiview=None resolves from config.extrusion.multiview_enabled, exactly
+    like side_photo already does."""
+    svc, rdk, camera = _multiview_env(tmp_path, monkeypatch)
+    svc.config.extrusion.multiview_enabled = True
+    plan = tem.auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    out = RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True)(tem.Ctx())
+    assert Path(out["layer_dir"]).joinpath("merged_points.npy").is_file()
+
+
+# ---------------------------------------------------- end-to-end: the real colour gate
+
+def test_end_to_end_star_merge_survives_the_real_chroma_gate():
+    """Task 5 review finding: merge tests hand-set ``chroma_gated`` on a ViewCloud,
+    which never actually exercises chroma_gate_mask. This renders each view with
+    BOTH syn.render_scene (depth) and syn.render_color (colour), pushes them
+    through the real observation_points (which calls chroma_gate_mask for real),
+    and merges the result -- so a synthetic view that fails the real gate would
+    be silently dropped and this test would exercise only the top-only fallback.
+    """
+    pytest.importorskip("open3d")
+    import geometry_fixtures as gf
+    from tasni.modules.extrusion.processing import observation_points, process_points
+
+    plan = tem.scene_plan(radius=60.0, bead=8.0)
+    layer = plan.layers[0]
+    config = ExtrusionConfig()
+    aim = np.array([plan.setup.center_x_mm, plan.setup.center_y_mm, 6.0])
+    rings = [syn.RingSpec(60.0, 8.0, (plan.setup.center_x_mm, plan.setup.center_y_mm),
+                          height_fn=syn.flat(6.0))]
+    geom = gf.aligned(syn.K_720P, syn.SIZE_720P)
+
+    clouds = []
+    for name, tilt, azimuth in star_view_angles(config):
+        T = pose_from_aim(aim, 300.0, tilt_deg=tilt, azimuth_deg=azimuth,
+                          reference_x=syn.CAMERA_X_AT_PARK)
+        depth = syn.render_scene(rings, T, plane_center_xy_mm=(
+            plan.setup.center_x_mm, plan.setup.center_y_mm), seed=hash(name) % 1000)
+        # The levelling annulus (r 90-150 mm here) sits OUTSIDE the ring, on bare
+        # board -- render_color's default board is a flat, zero-saturation grey
+        # with no noise, so the real chroma gate would remove every point out
+        # there and level_points would starve (0 of the needed 500). Give the
+        # board real chroma too (still a different hue from the ring) so the
+        # gate has genuine per-pixel saturation to threshold, same as a real
+        # frame's board is not perfectly achromatic either.
+        color = syn.render_color(rings, T, board_bgr=(120, 160, 210))
+        points, gated = observation_points(color=color, depth=depth, geometry=geom,
+                                           T_work_camera=T, K=syn.K_720P, dist=None,
+                                           config=config)
+        assert gated is True, f"{name}: the real chroma gate abstained on synthetic colour"
+        clouds.append(ViewCloud(name=name, points=points, chroma_gated=gated,
+                                tilt_deg=tilt, azimuth_deg=azimuth, T_work_camera=T))
+
+    merged = merge_views(clouds, plan=plan, layer=layer, config=config)
+    # The views must have genuinely survived registration, not fallen back to
+    # top-only -- that would silently exercise the degenerate path instead.
+    assert len(merged.used) > 1, merged.dropped
+    assert "top" in merged.used
+    assert merged.chroma_gated is True
+
+    processed = process_points(merged.points, plan=plan, layer=layer, config=config,
+                               chroma_gated=merged.chroma_gated)
+    assert processed.metrics.valid, processed.metrics.warnings
+    assert abs(processed.metrics.measured_radius_mm - 60.0) < 1.5
+    assert processed.metrics.center_offset_norm_mm < 1.5
+
+
+# --------------------------------------- RingCharacterizeJob(multiview=...) attribute
+
+from tasni.modules.extrusion.measure import RingCharacterizeJob  # noqa: E402
+
+
+def test_characterize_job_resolves_multiview_like_side_photo(tmp_path, monkeypatch):
+    """API symmetry with RingMeasureJob (spec 5.8): explicit True/False win,
+    None follows config.extrusion.multiview_enabled -- exactly like side_photo."""
+    svc, rdk, camera = tem.measure_env(tmp_path, monkeypatch)
+    plan = tem.auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    assert RingCharacterizeJob(svc, plan, session).multiview is False
+    svc.config.extrusion.multiview_enabled = True
+    assert RingCharacterizeJob(svc, plan, session).multiview is True
+    assert RingCharacterizeJob(svc, plan, session, multiview=False).multiview is False
