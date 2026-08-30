@@ -741,3 +741,210 @@ def test_a_characterizations_pipeline_figure_reruns_its_own_coarse_plan(tmp_path
     assert stages and "result" in stages
     assert len(stages["backprojected"]) > len(stages["work_roi"]) > 0
     assert stages["result"].measured_xyz is not None
+
+
+# ---------------------------------------------------- Task 8: the "views" figure
+
+def write_star_take(root, *, trial_id="s1", layer_index=1, take=1, drop_star_120=False,
+                    merge_dropped: str | None = None):
+    """A star take with real per-view colour frames and hand-built numeric
+    capture data. _figure_views only displays the frames and overlays the
+    already-computed consensus/offset -- it never reprocesses anything -- so
+    the depth/points behind them need not be real (unlike the multiview A/B
+    fixture in test_extrusion_multiview.py, which DOES reprocess and so does
+    need a real reconstruction).
+
+    ``drop_star_120`` simulates capture_views itself failing to reach that
+    pose -- no colour frame is ever archived for it. ``merge_dropped`` (a view
+    name) simulates the OTHER kind of drop: capture succeeded (its frame IS
+    archived) but merge_views rejected it afterwards -- so the panel must
+    still show the raw frame, labelled with why.
+    """
+    from tasni.modules.extrusion.inspection import pose_from_aim
+    from tasni.modules.extrusion.models import CaptureRecord, ViewRecord
+
+    plan = _plan(layers=max(layer_index, 1))
+    archive = ExtrusionArchive(root)
+    if not (root / trial_id / "trial.json").is_file():
+        archive.create_trial(trial_id, plan, mode="MEASURE_ONLY",
+                             provenance={"camera_intrinsics": {"K": syn.K_720P.tolist()}})
+    layer = plan.layers[layer_index - 1]
+    aim = np.array([CENTER[0], CENTER[1], layer.nominal_z_mm])
+    ring = [syn.RingSpec(RADIUS, 8.0, CENTER, height_fn=syn.flat(6.0))]
+    names_angles = [("top", 0.0, 0.0), ("star-000", 15.0, 0.0),
+                    ("star-120", 15.0, 120.0), ("star-240", 15.0, 240.0)]
+    view_records, views_payload = [], []
+    top_color = top_T = None
+    for name, tilt, azimuth in names_angles:
+        T = pose_from_aim(aim, 300.0, tilt_deg=tilt, azimuth_deg=azimuth,
+                          reference_x=syn.CAMERA_X_AT_PARK)
+        if drop_star_120 and name == "star-120":
+            view_records.append(ViewRecord(name=name, tilt_deg=tilt, azimuth_deg=azimuth,
+                                           dropped=True, drop_reason="sees 40 deg of arc, "
+                                           "need 90"))
+            continue
+        color = syn.render_color(ring, T, board_bgr=(120, 160, 210))
+        dropped_here = name == merge_dropped
+        offset = (None if dropped_here else [0.0, 0.0] if name == "top" else [0.6, -0.3])
+        view_records.append(ViewRecord(
+            name=name, tilt_deg=tilt, azimuth_deg=azimuth, dropped=dropped_here,
+            drop_reason=("solved offset 8.1 mm exceeds 5.0 mm" if dropped_here else None),
+            T_work_camera=T.tolist(), solved_offset_mm=offset,
+            residual_rms_mm=None if dropped_here else 0.3,
+            chroma_gated=True, points_before_merge=1200))
+        pose = {"tilt_deg": tilt, "azimuth_deg": azimuth, "roll_deg": 0.0,
+                "T_work_camera": T.tolist()}
+        if name == "top":
+            top_color, top_T = color, T
+            views_payload.append({"name": "top", "pose": pose})
+        else:
+            views_payload.append({"name": name, "color": color, "depth": None, "pose": pose})
+    capture = CaptureRecord(
+        style="star", views=view_records,
+        consensus_center_mm=[CENTER[0] + 0.5, CENTER[1] - 0.2], consensus_radius_mm=RADIUS,
+        spread_before_mm=1.1, residual_after_mm=0.3, merged_points_file="merged_points.npy")
+    nominal = _ring_xyz(z=layer.nominal_z_mm)
+    manifest = LayerManifest(
+        trial_id=trial_id, layer_index=layer_index, take=take, mode="MEASURE_ONLY",
+        recipe=plan.recipe, toolpath_fingerprint=plan.fingerprint,
+        color_file="color.png", depth_file=None,
+        measured_path_file="measured_path.json", pointcloud_file="height-or-pointcloud.npy",
+        metrics={"mean_absolute_mm": 1.0, "rms_mm": 1.2, "maximum_mm": 2.0,
+                "measured_center_mm": [CENTER[0] + 0.5, CENTER[1] - 0.2],
+                "measured_radius_mm": RADIUS, "path_completeness": 1.0,
+                "maximum_angular_gap_deg": 2.0, "valid": True,
+                "center_offset_mm": [0.5, -0.2], "center_offset_norm_mm": 0.54,
+                "shape_rms_mm": 0.2, "shape_max_mm": 0.5},
+        provenance={"T_work_camera": np.asarray(top_T, float).tolist(),
+                    "camera_intrinsics": {"K": syn.K_720P.tolist()},
+                    "work_frame": "Tasni Work Frame"},
+        capture=capture)
+    return archive.write_layer(
+        manifest, nominal_xyz=nominal, commanded_xyz=nominal,
+        pointcloud_xyz=_cloud_xyz(seed=3), color=top_color,
+        views=views_payload, merged_points_xyz=_cloud_xyz(seed=9))
+
+
+def test_views_figure_is_none_for_an_ordinary_single_view_take(tmp_path):
+    """No views/ directory, nothing to show -- and no crash asking for one."""
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_take(tmp_path)
+    take = figures.load_take(layer_dir)
+
+    assert figures._figure_views(figures._pyplot(), take) is None
+    with pytest.raises(FileNotFoundError):
+        figures.ensure_figure(layer_dir, "views.png")
+
+
+def test_views_figure_draws_every_surviving_view_plus_the_merged_cloud(tmp_path):
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_star_take(tmp_path)
+    take = figures.load_take(layer_dir)
+    assert take.merged is not None and len(take.merged)
+
+    fig = figures._figure_views(figures._pyplot(), take)
+    try:
+        assert fig is not None
+        titles = [ax.get_title() for ax in fig.axes]
+        assert len(fig.axes) == 5                    # top + 3 star views + the cloud panel
+        for name in ("top", "star-000", "star-120", "star-240"):
+            assert any(name in t for t in titles), titles
+        assert "merged cloud" in titles[-1]
+        # The fitted ring got drawn on at least one non-cloud panel (a line
+        # labelled "fitted ring" means the projection actually produced points).
+        assert any(line.get_label() == "fitted ring"
+                  for ax in fig.axes[:-1] for line in ax.get_lines())
+    finally:
+        figures._pyplot().close(fig)
+
+
+def test_views_figure_omits_a_view_capture_views_never_reached(tmp_path):
+    """A view capture_views could not move to has no raw frame archived at
+    all, so it simply does not appear as a panel -- but the take is still a
+    star and the other three views still draw."""
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_star_take(tmp_path, drop_star_120=True)
+    take = figures.load_take(layer_dir)
+
+    fig = figures._figure_views(figures._pyplot(), take)
+    try:
+        assert fig is not None
+        titles = " ".join(ax.get_title() for ax in fig.axes)
+        assert "star-120" not in titles          # never captured -- no frame to show
+        assert "star-000" in titles and "star-240" in titles and "top" in titles
+        assert len(fig.axes) == 4                 # top + 2 star views + the cloud panel
+    finally:
+        figures._pyplot().close(fig)
+
+
+def test_views_figure_still_shows_the_frame_of_a_view_the_merge_dropped(tmp_path):
+    """Unlike a view capture_views never reached, a view the MERGE rejected
+    (its own colour frame captured fine, only the joint solve threw it out)
+    still has a raw frame on disk -- and the operator diagnosing why a star
+    fell back to top-only needs to see it, labelled with the reason."""
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_star_take(tmp_path, merge_dropped="star-120")
+    take = figures.load_take(layer_dir)
+
+    fig = figures._figure_views(figures._pyplot(), take)
+    try:
+        assert fig is not None
+        assert len(fig.axes) == 5                 # top + all 3 star views + the cloud panel
+        dropped_ax = next(ax for ax in fig.axes if "star-120" in ax.get_title())
+        assert "dropped" in dropped_ax.get_title()
+        assert "exceeds" in dropped_ax.get_title()
+        # No ring overlay on a dropped panel -- there is nothing solved to draw.
+        assert not any(line.get_label() == "fitted ring" for line in dropped_ax.get_lines())
+        # A surviving view beside it still gets its ring.
+        kept_ax = next(ax for ax in fig.axes if ax.get_title() == "star-000")
+        assert any(line.get_label() == "fitted ring" for line in kept_ax.get_lines())
+    finally:
+        figures._pyplot().close(fig)
+
+
+def test_views_figure_renders_on_demand_via_ensure_figure(tmp_path):
+    """The API path: a star take's views.png does not exist until asked for,
+    exactly like every other lazily-rendered figure."""
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_star_take(tmp_path)
+    assert not (layer_dir / "figures" / "views.png").is_file()
+
+    path = figures.ensure_figure(layer_dir, "views.png")
+
+    assert path.is_file() and path.stat().st_size > 1000
+    assert "views" not in figures.LAYER_FIGURES            # optional, not eager
+    assert "views" in figures.OPTIONAL_LAYER_FIGURES
+
+
+def test_views_is_never_part_of_the_eagerly_rendered_set(tmp_path):
+    """Adding an optional figure must not change what render_layer_figures()
+    writes with no explicit ``only`` -- for a STAR take too, not just the
+    ordinary one test_rendering_a_take_writes_every_figure_in_both_formats
+    already covers."""
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_star_take(tmp_path)
+    written = {p.name for p in figures.render_layer_figures(layer_dir, formats=("png",))}
+
+    assert "views.png" not in written
+    assert "views" not in figures.LAYER_FIGURES
+    assert written <= {f"{stem}.png" for stem in figures.LAYER_FIGURES}
+
+
+def test_the_merged_cloud_is_preferred_over_the_top_views_own_reprojection(tmp_path):
+    """_scene_points (heightmap/mesh/iso/birdseye) must read the star's merged
+    cloud when there is one -- it already combines every surviving view's
+    points, wider than the top frame's own re-projection alone."""
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_star_take(tmp_path)
+    take = figures.load_take(layer_dir)
+
+    scene = figures._scene_points(take)
+
+    np.testing.assert_array_equal(scene, take.merged)

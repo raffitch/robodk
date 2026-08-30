@@ -5,7 +5,7 @@ next to it), so a figure can be produced long after the cell run, on a machine
 with no robot and no camera, and re-produced identically. Nothing in this module
 touches the robot, RoboDK or the job runner.
 
-Seven figures per take:
+Seven figures per take, drawn eagerly by ``render_layer_figures`` for every take:
 
 ``plan``       top view: deposit cloud, extracted centreline, nominal circle
 ``heightmap``  bird's-eye height map of the re-projected depth frame, z colourbar
@@ -15,6 +15,13 @@ Seven figures per take:
                the whole ring with margin -- ``render_view(..., birdseye=True)``
 ``profile``    unrolled: height z(theta) and radial deviation dr(theta) over 360 deg
 ``pipeline``   the method figure: the six arrays the chain held, in order
+
+plus one OPTIONAL per-take figure, drawn only on demand (``ensure_figure``),
+because it applies to a star take alone:
+
+``views``      each view's own colour frame with its fitted ring and solved
+               offset, plus the merged cloud -- None for an ordinary
+               single-view take (no ``views/`` directory to draw)
 
 and two per trial: ``stack`` (every layer's latest take, plan + oblique) and
 ``tube`` (the commanded bead against the measured footprint).
@@ -41,6 +48,12 @@ from ...core.depth_geometry import CameraGeometry
 from .processing import depth_to_work_points
 
 LAYER_FIGURES = ("plan", "heightmap", "mesh", "iso", "birdseye", "profile", "pipeline")
+# "views" is not in LAYER_FIGURES: that tuple is what render_layer_figures(..., only=None)
+# eagerly draws for EVERY take, and an ordinary single-view take has no views/ directory
+# to draw at all -- forcing it in there would turn a genuinely conditional figure (like
+# "pipeline" without depth) into one every "renders everything" test has to special-case.
+# ensure_figure still serves it on demand, exactly like every other figure a take may lack.
+OPTIONAL_LAYER_FIGURES = ("views",)
 TRIAL_FIGURES = ("stack", "tube")
 FORMATS = ("png", "pdf")
 DPI = 300
@@ -113,6 +126,10 @@ class TakeData:
     K: np.ndarray | None
     T_work_camera: np.ndarray | None
     geometry: CameraGeometry | None = None
+    # The star's merged work-frame cloud (multiview.merge_views's output,
+    # archived as merged_points.npy), when this take is one. None for every
+    # take before multi-view existed and for an ordinary single-view take.
+    merged: np.ndarray | None = None
 
     @property
     def _nominal_circle(self) -> tuple[tuple[float, float], float] | None:
@@ -223,6 +240,22 @@ def _intrinsics(manifest: dict, layer_dir: Path) -> np.ndarray | None:
     return None if found is None else np.asarray(found, dtype=float)
 
 
+def _dist_coeffs(manifest: dict, layer_dir: Path) -> np.ndarray | None:
+    """Calibrated distortion, the same fallback-to-trial rule as ``_intrinsics``.
+
+    Only used to reproject a fitted ring INTO a view's own colour frame (the
+    views figure) -- never to back-project depth, which stays untouched.
+    """
+    found = ((manifest.get("provenance") or {}).get("camera_intrinsics") or {}).get("dist_coeffs")
+    if found is None:
+        trial_file = layer_dir.parent / "trial.json"
+        if trial_file.is_file():
+            trial = json.loads(trial_file.read_text(encoding="utf-8"))
+            found = (((trial.get("provenance") or {}).get("camera_intrinsics") or {})
+                     .get("dist_coeffs"))
+    return None if found is None else np.asarray(found, dtype=float)
+
+
 def geometry_for_take(manifest: dict, K: np.ndarray | None,
                       depth: np.ndarray | None) -> "CameraGeometry | None":
     """The take's depth geometry: protocol-2 greeting from provenance, else the
@@ -291,6 +324,10 @@ def load_take(layer_dir: Path) -> TakeData:
     cloud = np.load(cloud_file) if cloud_file.is_file() else None
     if cloud is not None and (cloud.ndim != 2 or cloud.shape[1] != 3):
         cloud = None                                   # a height map, not a cloud
+    merged_file = layer_dir / "merged_points.npy"
+    merged = np.load(merged_file) if merged_file.is_file() else None
+    if merged is not None and (merged.ndim != 2 or merged.shape[1] != 3):
+        merged = None
     transform = (manifest.get("provenance") or {}).get("T_work_camera")
     depth = np.load(depth_file) if depth_file.is_file() else None
     K = _intrinsics(manifest, layer_dir)
@@ -300,7 +337,7 @@ def load_take(layer_dir: Path) -> TakeData:
         measured=_points(layer_dir / "measured_path.json"),
         cloud=cloud, depth=depth, K=K,
         T_work_camera=None if transform is None else np.asarray(transform, dtype=float),
-        geometry=geometry_for_take(manifest, K, depth))
+        geometry=geometry_for_take(manifest, K, depth), merged=merged)
 
 
 # -- shared drawing helpers --------------------------------------------------
@@ -345,7 +382,12 @@ def _grid_heights(points: np.ndarray, center, half_mm: float, cell_mm: float):
 
 
 def _scene_points(take: TakeData) -> np.ndarray | None:
-    """The densest cloud available: the whole re-projected frame, else the archived cloud."""
+    """The densest cloud available: the star's merged cloud when there is one
+    (it already combines every surviving view's chroma-gated points, wider
+    than any single frame's re-projection), else the whole re-projected TOP
+    frame, else the archived (deposit-only) cloud."""
+    if take.merged is not None and len(take.merged):
+        return take.merged
     if (take.depth is not None and take.geometry is not None
             and take.T_work_camera is not None):
         points, _ = depth_to_work_points(take.depth, take.geometry, take.T_work_camera)
@@ -1364,10 +1406,123 @@ def _figure_profile(plt, take: TakeData):
     return fig
 
 
+def _view_frame_path(layer_dir: Path, name: str) -> Path:
+    """The top view's colour frame stays at the take root; every other view's
+    lives under views/<name>/ -- see ExtrusionArchive.write_layer."""
+    return (layer_dir / "color.png" if name == "top"
+            else layer_dir / "views" / name / "color.png")
+
+
+def _ring_uv(center_xy, radius: float, z_mm: float, T_work_camera, K, dist) -> "np.ndarray | None":
+    """A circle in the work frame, reprojected into ONE view's own colour pixels.
+
+    None when the circle would land behind that camera (an unphysical solve)
+    or the intrinsics/pose needed to project it are missing.
+    """
+    if center_xy is None or radius is None or T_work_camera is None or K is None:
+        return None
+    from ...core.depth_geometry import project_to_color
+    from ...core.geometry import invert_T, transform_points
+    theta = np.linspace(0.0, 2 * np.pi, 73)
+    work = np.column_stack((center_xy[0] + radius * np.cos(theta),
+                            center_xy[1] + radius * np.sin(theta),
+                            np.full_like(theta, float(z_mm))))
+    camera = transform_points(invert_T(np.asarray(T_work_camera, dtype=float)), work)
+    if not np.all(camera[:, 2] > 1.0):          # behind the lens somewhere -- do not draw it
+        return None
+    return project_to_color(camera, K, dist)
+
+
+def _figure_views(plt, take: TakeData):
+    """The star's raw evidence: each surviving view's own colour frame, with
+    the ring the joint solve fitted TO IT and the offset that solve applied,
+    plus the merged cloud every view was reconciled into.
+
+    None for a take with no views/ directory at all -- an ordinary
+    single-view take has nothing here to show (spec section 5.7 / Task 8).
+    A view the merge dropped is still shown, labelled with why, so a reader
+    can see what the star actually captured even when the merge fell back to
+    top-only.
+    """
+    import cv2
+    if not (take.layer_dir / "views").is_dir():
+        return None
+    capture = take.manifest.get("capture") or {}
+    records = {v["name"]: v for v in (capture.get("views") or [])}
+    names = ["top"] + sorted(p.name for p in (take.layer_dir / "views").iterdir()
+                             if p.is_dir() and p.name != "top")
+    frames = []
+    for name in names:
+        path = _view_frame_path(take.layer_dir, name)
+        if not path.is_file():
+            continue
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is None:
+            continue
+        frames.append((name, image, records.get(name)))
+    if len(frames) < 2:                          # "top" alone is not a star
+        return None
+
+    K = take.K
+    dist = None if (take.geometry is not None and take.geometry.legacy) \
+        else _dist_coeffs(take.manifest, take.layer_dir)
+    consensus = capture.get("consensus_center_mm")
+    radius = capture.get("consensus_radius_mm")
+    z_ring = (take.manifest.get("geometry") or {}).get("top_z_mean_mm", 0.0)
+
+    n = len(frames) + 1                          # + the merged-cloud panel
+    fig, axes = plt.subplots(1, n, figsize=(3.4 * n, 3.8))
+    for ax, (name, image, record) in zip(axes, frames):
+        ax.imshow(image[:, :, ::-1])              # BGR (archived) -> RGB (matplotlib)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        if record and record.get("dropped"):
+            ax.set_title(f"{name}\n(dropped: {record.get('drop_reason') or '-'})",
+                        fontsize=7.5, color="#b91c1c")
+            continue
+        ax.set_title(name, fontsize=9)
+        T_work_camera = record.get("T_work_camera") if record else None
+        if T_work_camera is None and name == "top" and take.T_work_camera is not None:
+            T_work_camera = take.T_work_camera.tolist()
+        offset = (record or {}).get("solved_offset_mm")
+        # Fitted: where the shared circle sits BEFORE this view's own offset is
+        # applied -- i.e. where it actually appeared to this view (multiview.
+        # solve_view_offsets: p_i + offset_i == the shared circle).
+        fitted_center = (consensus if not offset else
+                        (consensus[0] - offset[0], consensus[1] - offset[1]))
+        uv = _ring_uv(fitted_center, radius, z_ring, T_work_camera, K, dist)
+        if uv is not None:
+            ax.plot(uv[:, 0], uv[:, 1], color=MEASURED, linewidth=1.5,
+                    label="fitted ring")
+        if offset and (abs(offset[0]) > 1e-6 or abs(offset[1]) > 1e-6):
+            ax.text(.03, .03, f"solved offset {offset[0]:+.2f}, {offset[1]:+.2f} mm",
+                    transform=ax.transAxes, fontsize=7, color=ACCENT,
+                    ha="left", va="bottom",
+                    bbox=dict(boxstyle="round", fc="white", ec="none", alpha=.8))
+    cloud_ax = axes[-1]
+    if take.merged is not None and len(take.merged):
+        cloud_ax.scatter(take.merged[:, 0], take.merged[:, 1], s=2, c=CLOUD, linewidths=0,
+                         label=f"merged cloud ({len(take.merged)} pts)")
+    if consensus is not None and radius is not None:
+        theta = np.linspace(0.0, 2 * np.pi, 73)
+        cloud_ax.plot(consensus[0] + radius * np.cos(theta), consensus[1] + radius * np.sin(theta),
+                     color=MEASURED, linewidth=1.4, label="consensus circle")
+    cloud_ax.set_aspect("equal", adjustable="datalim")
+    cloud_ax.set_title("merged cloud", fontsize=9)
+    cloud_ax.set_xlabel("X (mm)", fontsize=8)
+    cloud_ax.set_ylabel("Y (mm)", fontsize=8)
+    cloud_ax.grid(True, color="#e5e7eb", linewidth=.6)
+    cloud_ax.legend(loc="upper right", fontsize=6.5)
+    fig.suptitle(f"Star views — {take.label}", fontsize=11)
+    fig.tight_layout(rect=(0, .02, 1, .92))
+    return fig
+
+
 _LAYER_BUILDERS = {"plan": _figure_plan, "heightmap": _figure_heightmap,
                    "mesh": _figure_mesh, "iso": _figure_iso,
                    "birdseye": _figure_birdseye,
-                   "profile": _figure_profile, "pipeline": _figure_pipeline}
+                   "profile": _figure_profile, "pipeline": _figure_pipeline,
+                   "views": _figure_views}
 
 
 # -- the trial figure --------------------------------------------------------
@@ -1500,7 +1655,7 @@ def ensure_figure(directory, filename: str) -> Path:
     path = directory / "figures" / filename
     if path.is_file():
         return path
-    if stem in LAYER_FIGURES:
+    if stem in LAYER_FIGURES or stem in OPTIONAL_LAYER_FIGURES:
         render_layer_figures(directory, formats=(suffix,), only=stem)
     elif stem in TRIAL_FIGURES:
         render_trial_figures(directory, formats=(suffix,))

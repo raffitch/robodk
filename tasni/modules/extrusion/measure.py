@@ -1321,19 +1321,32 @@ def pure_shift_expectation(introduced_norm_mm: float) -> dict:
 
 
 CAPTURE_LABEL = {"parked": "arm parked", "re-approach": "re-approached",
-                 "single": "one take"}
+                 "single": "one take", "star": "star (merged views)",
+                 "mixed": "mixed styles -- DO NOT POOL"}
 
 
 def capture_style(manifests: list[dict]) -> str:
     """Did these takes share one trip out, or did the arm re-approach for each?
+    Extended (not duplicated) for the star: a merged take measures the ring
+    differently from a single-view one, so that distinction is checked FIRST
+    and short-circuits the parked/re-approach question entirely.
 
-    The distinction is the whole point of splitting the run's two repeat counts:
-    frames taken with the arm PARKED measure the sensing chain alone, while
-    takes that each had their own excursion also contain the robot's
-    re-approach. Takes archived before that split carry no stamp, and each of
-    them WAS its own press and so its own excursion -- which is what the default
-    reads as.
+    The parked-vs-re-approach distinction is the whole point of splitting the
+    run's two repeat counts: frames taken with the arm PARKED measure the
+    sensing chain alone, while takes that each had their own excursion also
+    contain the robot's re-approach. Takes archived before that split carry no
+    stamp, and each of them WAS its own press and so its own excursion --
+    which is what the default reads as.
+
+    ``"star"`` only when every manifest's own ``capture.style`` says so;
+    ``"mixed"`` when some do and some do not -- callers (paper_summary) must
+    refuse to pool a "mixed" group, exactly as they already refuse to pool
+    "parked" with "re-approach" spread. A group with no star takes at all
+    falls through to the parked/re-approach/single logic unchanged.
     """
+    styles = [(m.get("capture") or {}).get("style") for m in manifests]
+    if any(s == "star" for s in styles):
+        return "star" if all(s == "star" for s in styles) else "mixed"
     if len(manifests) < 2:
         return "single"
     provenance = [m.get("provenance") or {} for m in manifests]
@@ -1528,12 +1541,19 @@ def paired_detection(manifest: dict, manifests: list[dict]) -> "dict | None":
 
 
 def _condition_name(manifest: dict) -> str:
-    """Layer + the phase the operator recorded + the ground truth they typed.
+    """Layer + the phase the operator recorded + the ground truth they typed +
+    whether this take was a merged star capture.
 
     Five untouched takes (sensing noise floor) and three re-placed takes
     (placement repeatability) are different experiments that share an empty
     offset; pooling them hides one inside the other. The layer matters too --
     per-layer numbers are the evidence that measuring climbs with the stack.
+    A merged take is the same discipline again: it measures the ring through a
+    denser, differently-composed cloud than a single view does, so it must
+    never land in the same condition -- and so the same averaged deviation,
+    geometry and timing numbers -- as a single-view take of the identical
+    layer/phase/offset (Task 8). This is what keeps capture_style() from ever
+    seeing a "mixed" group inside one condition's own takes.
     """
     annotation = manifest.get("annotation") or {}
     parts = [f"layer {int(manifest.get('layer_index', 0))}"]
@@ -1545,6 +1565,8 @@ def _condition_name(manifest: dict) -> str:
         parts.append(f"introduced offset ({offset[0]:g}, {offset[1]:g}) mm")
     elif not phase:
         parts.append("no introduced offset")
+    if (manifest.get("capture") or {}).get("style") == "star":
+        parts.append("star capture")
     return " - ".join(parts)
 
 
@@ -1632,13 +1654,25 @@ def paper_summary(root: Path, trial_id: str) -> dict:
             "shape_rms_mm": _stat(x.get("shape_rms_mm") for x in metrics),
             "shift_consistency": shift_consistency(
                 {key: stat["mean"] for key, stat in deviation.items()}, introduced_norm)})
-    timings = [live_timings(m) for m in takes]
-    timing = {key: _stat(t.get(key) for t in timings)
-              for key in ("capture_ms", "total_ms", "acquisition_to_path_ms",
-                          "move_to_pose_ms", "settle_ms", "return_ms",
-                          "inspection_cycle_ms")}
-    timing["offline_reprocessed_takes"] = sum(
-        1 for m in takes if (m.get("processing") or {}).get("offline_reprocess"))
+    def _timing_block(subset: list[dict]) -> dict:
+        block_timings = [live_timings(m) for m in subset]
+        block = {key: _stat(t.get(key) for t in block_timings)
+                 for key in ("capture_ms", "total_ms", "acquisition_to_path_ms",
+                             "move_to_pose_ms", "settle_ms", "return_ms",
+                             "inspection_cycle_ms")}
+        block["offline_reprocessed_takes"] = sum(
+            1 for m in subset if (m.get("processing") or {}).get("offline_reprocess"))
+        return block
+    # acquisition_to_path_ms means something different for a star take (four
+    # moves/captures plus a merge) than for a single-view one -- pooling them
+    # would put a number in the paper that describes neither. timing_ms keeps
+    # its historical meaning (the validated single-view chain, spec 5.7);
+    # timing_ms_star is the same block over the star takes alone, present only
+    # when this trial actually has any.
+    is_star_take = [(m.get("capture") or {}).get("style") == "star" for m in takes]
+    timing = _timing_block([m for m, star in zip(takes, is_star_take) if not star])
+    star_takes = [m for m, star in zip(takes, is_star_take) if star]
+    timing_star = _timing_block(star_takes) if star_takes else None
     geometry = [m["geometry"] for m in takes if m.get("geometry")]
     height = {key: _stat(g.get(key) for g in geometry)
               for key in ("height_mean_mm", "height_min_mm", "height_max_mm", "top_z_std_mm")}
@@ -1741,6 +1775,14 @@ def paper_summary(root: Path, trial_id: str) -> dict:
                      "from their archived RGB-D frame; their geometry counts, and their "
                      "processing time is excluded from the cycle statistic above unless it "
                      "was measured live.")
+    if timing_star and timing_star["acquisition_to_path_ms"]["n"]:
+        # A separate paragraph, never folded into the line above: a star take
+        # visits four poses and merges them, so its acquisition-to-path number
+        # answers a different question than the single-view figure does.
+        prose.append(f"{timing_star['acquisition_to_path_ms']['n']} star (merged-view) take(s) "
+                     f"acquired in {_fmt(timing_star['acquisition_to_path_ms'], 0)} ms end to "
+                     "end, reported separately -- pooling it with the single-view figure above "
+                     "would describe neither chain.")
     if geometry:
         prose.append(f"Layer height along the ring: mean {_fmt(height['height_mean_mm'], 1)} mm, "
                      f"min {_fmt(height['height_min_mm'], 1)} mm, max "
@@ -1771,6 +1813,10 @@ def paper_summary(root: Path, trial_id: str) -> dict:
     return {"trial_id": trial_id, "mode": trial.get("mode", "LIVE_PRINT"),
             "takes": len(takes), "valid": valid, "conditions": conditions,
             "repeatability_mm": repeatability,
-            "timing_ms": timing, "height_mm": height, "bead_width_mm": bead,
+            "timing_ms": timing,
+            # None unless this trial has star takes at all -- present so a
+            # caller can tell "no star takes" from "star takes, zero timed".
+            "timing_ms_star": timing_star,
+            "height_mm": height, "bead_width_mm": bead,
             "characterization": characterization, "headline": headline,
             "prose": prose, "manifests": takes, "markdown": "\n".join(lines)}
