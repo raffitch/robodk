@@ -199,11 +199,25 @@ def star_view_angles(config) -> list[tuple[str, float, float]]:
     Azimuth is measured in the WORK frame from +X -- the axis the paired
     detection offset is expressed along -- so a star has the same orientation
     across takes and across sessions.
+
+    Raises ``ValueError`` when two configured azimuths round to the same view
+    name: left unchecked, the collision is invisible until archive.write_layer
+    hits ``mkdir(exist_ok=False)`` on the second view's directory -- AFTER all
+    four excursions have already run, losing an otherwise-completed take. This
+    way it is a config error, caught before any robot motion (review minor 2).
     """
     tilt = min(float(config.multiview_tilt_deg), float(config.multiview_max_tilt_deg))
     views = [("top", 0.0, 0.0)]
+    seen = {"top"}
     for azimuth in config.multiview_azimuths_deg:
-        views.append((f"star-{int(round(float(azimuth))):03d}", tilt, float(azimuth)))
+        name = f"star-{int(round(float(azimuth))):03d}"
+        if name in seen:
+            raise ValueError(
+                f"multiview_azimuths_deg {list(config.multiview_azimuths_deg)} has two "
+                f"azimuths that round to the same view name {name!r} -- space them far "
+                "enough apart that rounding to the nearest degree cannot collide")
+        seen.add(name)
+        views.append((name, tilt, float(azimuth)))
     return views
 
 

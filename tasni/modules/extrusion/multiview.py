@@ -129,7 +129,7 @@ def level_points(points, *, r_inner_mm: float, r_outer_mm: float, center_xy,
                       "annulus_points": int(len(annulus))}
 
 
-def solve_view_offsets(view_xy: dict[str, np.ndarray], config) -> dict:
+def solve_view_offsets(view_xy: dict[str, np.ndarray], _config) -> dict:
     """Per-view lateral offsets that make every view fit ONE shared circle.
 
     Unknowns: one (dx, dy) per view, plus a shared centre and a shared radius.
@@ -143,6 +143,14 @@ def solve_view_offsets(view_xy: dict[str, np.ndarray], config) -> dict:
     centre is the consensus of all views rather than the first one's answer.
 
     Soft-L1 loss so one bad arc cannot drag the solution.
+
+    ``_config`` is accepted, not read: every caller in this module already has
+    an ``ExtrusionConfig`` in scope and passes it on the chance a future solve
+    tuning (a loss scale, an iteration cap) needs it, matching the shape of
+    every other function in this file. Left in the signature (as a positional
+    parameter, keyword callers would break) rather than removed, since removing
+    it would also break the two-argument calls in test_extrusion_multiview.py
+    (review minor 4).
     """
     names = list(view_xy)
     subs, seeds = [], []
@@ -187,7 +195,8 @@ def solve_view_offsets(view_xy: dict[str, np.ndarray], config) -> dict:
 
 
 def merge_views(views: list[ViewCloud], *, plan, layer, config) -> MergeResult:
-    """Level, register and concatenate. Never raises; degrades to the top view.
+    """Level, register and concatenate; degrades to the top view rather than
+    dropping a take over a bad tilted view.
 
     Drops are normal, not errors (spec section 8): a tilted view can miss the
     ring, land badly, or lose its colour gate, and the take must still complete
@@ -195,6 +204,12 @@ def merge_views(views: list[ViewCloud], *, plan, layer, config) -> MergeResult:
     contributed, because the deposit floor is a property of the merged cloud --
     letting one abstainer through would drag the whole merge to the 2.5 mm floor,
     which on 2026-08-29 cost a 45 deg sector and made all four takes invalid.
+
+    Raises ``ValueError`` only when ``views`` is empty -- there is no top view
+    left to degrade to. A live capture always includes one (capture_views
+    fails the take outright if the top pose itself is unreachable), so this is
+    reachable only from an offline reprocess of an archive whose ``views/``
+    directory holds no readable pose at all; nothing downstream catches it.
     """
     recipe, setup = plan.recipe, plan.setup
     centre = np.array([float(setup.center_x_mm), float(setup.center_y_mm)])
@@ -247,9 +262,14 @@ def merge_views(views: list[ViewCloud], *, plan, layer, config) -> MergeResult:
     def top_only(reason: str | None = None) -> MergeResult:
         if reason:
             dropped.setdefault("__merge__", reason)
+        # top.name, not the literal "top": ``top`` falls back to views[0] when
+        # no view is actually named "top" (an archive whose views/top/pose.json
+        # is missing while other views survive), and archiving THAT view's
+        # unlevelled cloud under the wrong name would misreport which view a
+        # reader is looking at (review minor 1).
         return MergeResult(points=np.asarray(top.points, dtype=float),
                            chroma_gated=bool(top.chroma_gated),
-                           used=["top"], dropped=dropped)
+                           used=[top.name], dropped=dropped)
 
     if len(fit_xy) < int(config.multiview_min_views):
         return top_only(f"only {len(fit_xy)} view(s) usable, "

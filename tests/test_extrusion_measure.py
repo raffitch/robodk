@@ -2777,3 +2777,105 @@ def test_the_side_photo_is_served_to_the_browser_and_listed(tmp_path, monkeypatc
     # A path that is not on the whitelist is still refused.
     assert client.get(f"/api/modules/extrusion/trials/{session.trial_id}"
                       "/layers/layer-001/files/depth.npy").status_code == 404
+
+
+# ------------------------------------------------ multi-view review fix-wave (2026-08-30)
+#
+# Star-take reconstructions of tests/test_extrusion_multiview.py (the full
+# capture/merge machinery, ~35 min) are deliberately NOT exercised here -- these
+# two are the pure-dict regression tests for the whole-branch review's two
+# criticals: paper_summary must not pool star and single-view geometry, and a
+# star take's acquisition_to_path_ms must count all four views, not the top
+# one alone. Neither touches Open3D or a robot.
+
+def test_paper_summary_does_not_pool_star_and_single_view_geometry(tmp_path):
+    """Bead width is the one number multi-view exists to change (spec section
+    10's decision rule reads it): pooling a star take's very different
+    geometry into the single-view figure would score both against a value
+    that describes neither chain (review Critical 1)."""
+    from tasni.modules.extrusion.models import CaptureRecord
+
+    root = tmp_path / "runs" / "extrusion"
+    plan = auto_plan()
+    session = MeasureSession.create(root, plan, note="rings")
+    t = session.trial_id
+    setup = plan.setup
+
+    def geometry(height_max, bead_mean):
+        return RingGeometry(top_z_mean_mm=6, top_z_min_mm=5, top_z_max_mm=height_max,
+                            top_z_std_mm=1, height_mean_mm=6, height_min_mm=5,
+                            height_max_mm=height_max, height_reference="build_plane",
+                            bead_width_mean_mm=bead_mean, bead_width_min_mm=bead_mean - 1,
+                            bead_width_max_mm=bead_mean + 1, bead_width_bins=36)
+
+    def metrics():
+        return DeviationMetrics(mean_absolute_mm=0.4, rms_mm=0.5, maximum_mm=1.0,
+                                measured_center_mm=(setup.center_x_mm, setup.center_y_mm),
+                                measured_radius_mm=40, path_completeness=0.99,
+                                maximum_angular_gap_deg=4, valid=True,
+                                center_offset_mm=(0.0, 0.0), center_offset_norm_mm=0.0,
+                                shape_rms_mm=0.4)
+
+    # A single-view take with modest height/bead numbers ...
+    single = LayerManifest(
+        trial_id=t, layer_index=1, take=1, mode="MEASURE_ONLY",
+        recipe=plan.recipe, toolpath_fingerprint="f" * 64,
+        metrics=metrics(), geometry=geometry(9.0, 8.0))
+    ExtrusionArchive(root).write_layer(single, nominal_xyz=np.zeros((4, 3)),
+                                       commanded_xyz=np.zeros((4, 3)))
+    # ... and a star take of the SAME layer whose numbers are wildly different
+    # -- if pooled, the single-view figures below would move toward it.
+    star = LayerManifest(
+        trial_id=t, layer_index=1, take=2, mode="MEASURE_ONLY",
+        recipe=plan.recipe, toolpath_fingerprint="f" * 64,
+        metrics=metrics(), geometry=geometry(20.0, 15.0),
+        capture=CaptureRecord(style="star"))
+    ExtrusionArchive(root).write_layer(star, nominal_xyz=np.zeros((4, 3)),
+                                       commanded_xyz=np.zeros((4, 3)))
+
+    summary = paper_summary(root, t)
+    assert summary["height_mm"]["height_max_mm"]["n"] == 1
+    assert summary["height_mm"]["height_max_mm"]["mean"] == pytest.approx(9.0)
+    assert summary["bead_width_mm"]["bead_width_mean_mm"]["mean"] == pytest.approx(8.0)
+    # The star take is reported too, just never folded into the line above.
+    assert summary["height_mm_star"]["height_max_mm"]["n"] == 1
+    assert summary["height_mm_star"]["height_max_mm"]["mean"] == pytest.approx(20.0)
+    assert summary["bead_width_mm_star"]["bead_width_mean_mm"]["mean"] == pytest.approx(15.0)
+
+
+def test_a_star_takes_acquisition_to_path_ms_exceeds_a_single_views(tmp_path):
+    """On the SAME synthetic per-view move/settle/capture timings, a star
+    take's acquisition_to_path_ms must come out roughly four times a single
+    view's -- not equal to it, which is what charging only the top view's
+    frame produced before the fix (review Critical 2)."""
+    from tasni.modules.extrusion.measure import _acquisition_timings
+
+    single_timings = {"total_ms": 500.0}
+    _acquisition_timings(single_timings, views=None, repeat=1,
+                         moved={"move_ms": 2000.0, "settle_ms": 300.0},
+                         capture_ms=40.0)
+
+    # Four views, each costing exactly what the single view's own frame cost:
+    # a bug that only charges the top view would leave the two takes' numbers
+    # equal instead of ~4x apart.
+    views = [{"name": name, "moved": {"move_ms": 2000.0, "settle_ms": 300.0},
+             "frames": [{"capture_ms": 40.0}]}
+            for name in ("top", "star-000", "star-120", "star-240")]
+    star_timings = {"total_ms": 500.0}
+    _acquisition_timings(star_timings, views=views, repeat=1,
+                         moved={"move_ms": 0.0, "settle_ms": 0.0}, capture_ms=0.0)
+
+    assert star_timings["acquisition_to_path_ms"] > single_timings["acquisition_to_path_ms"]
+    assert star_timings["capture_ms"] == pytest.approx(4 * 40.0)
+    assert star_timings["move_to_pose_ms"] == pytest.approx(4 * 2000.0)
+    assert star_timings["settle_ms"] == pytest.approx(4 * 300.0)
+    # A later repeat at the same excursion still charges every view's fresh
+    # capture, but claims no move/settle -- the arm never moved again for it.
+    star_repeat2 = {"total_ms": 500.0}
+    views_repeat2 = [{"name": v["name"], "moved": v["moved"],
+                      "frames": [{"capture_ms": 40.0}, {"capture_ms": 40.0}]}
+                     for v in views]
+    _acquisition_timings(star_repeat2, views=views_repeat2, repeat=2,
+                         moved={"move_ms": 0.0, "settle_ms": 0.0}, capture_ms=0.0)
+    assert "move_to_pose_ms" not in star_repeat2 and "settle_ms" not in star_repeat2
+    assert star_repeat2["capture_ms"] == pytest.approx(4 * 40.0)

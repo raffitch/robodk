@@ -1284,6 +1284,12 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
         clouds: list[ViewCloud] = []
         diag: dict[str, dict] = {}
         capture_records: list[dict] = []
+        # Mirrors _merge_star_views's own started/timings so total_ms spans the
+        # whole reprocessed star (back-projecting every view plus the merge),
+        # not process_points alone -- the same class of bug fixed at the live
+        # seam by commit aa7ae29, here at the offline one (review Important 5).
+        star_started = time.perf_counter()
+        star_timings: dict = {}
         for name, tilt, azimuth in star_view_angles(cfg):
             vdir = view_dir / name
             pose_file = vdir / "pose.json"
@@ -1335,11 +1341,16 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
                 "name": name, "tilt_deg": tilt, "azimuth_deg": azimuth,
                 "dropped": False, "drop_reason": None,
                 "T_work_camera": v_transform.tolist(), "roll_deg": pose.get("roll_deg")})
+        star_timings["backproject_ms"] = (time.perf_counter() - star_started) * 1000.0
+        mark = time.perf_counter()
         merged = merge_views(clouds, plan=plan, layer=layer, config=cfg)
+        star_timings["merge_ms"] = (time.perf_counter() - mark) * 1000.0
         fallback_warning = _merge_fallback_warning(merged)
         processed = process_points(merged.points, plan=plan, layer=layer, config=cfg,
-                                   chroma_gated=merged.chroma_gated)
-        capture_record = _capture_record_from_merge(capture_records, merged, diag)
+                                   chroma_gated=merged.chroma_gated,
+                                   timings=star_timings, started=star_started)
+        capture_record = _capture_record_from_merge(
+            capture_records, merged, diag, star_timings=star_timings)
     else:
         # "as_archived" and no views/ directory: an ordinary single-view take,
         # completely unaffected -- today's path, byte for byte.

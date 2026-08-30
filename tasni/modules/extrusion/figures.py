@@ -922,9 +922,25 @@ def _figure_pipeline(plt, take: TakeData):
     ax.set_title("6 · extracted vs nominal", fontsize=10)
     _square(ax, measured if measured is not None else take.nominal)
 
-    fig.suptitle(f"From one RGB-D frame to a measured centreline — {take.label}",
-                 fontsize=12)
-    fig.text(.5, .012, take.caption, ha="center", fontsize=7.5, color="#4b5563")
+    # _compute_stages always reruns process_observation on the TOP frame alone
+    # (there is no equivalent walk-through-the-merge implementation here yet),
+    # so for a star take every panel above is the top view's own reconstruction
+    # -- NOT the merged-view chain that actually produced this take's archived
+    # metrics. Silently drawing it as if it were would be a second, drifted
+    # implementation of the merge presented as the real one; say so instead
+    # (review Important 4). The views figure is where the merge itself is drawn.
+    star_take = take.merged is not None
+    title = (f"From one RGB-D frame to a measured centreline "
+             f"(TOP VIEW ONLY -- see the views figure for the merge) — {take.label}"
+             if star_take else
+             f"From one RGB-D frame to a measured centreline — {take.label}")
+    fig.suptitle(title, fontsize=12)
+    caption = take.caption
+    if star_take:
+        note = ("this take's archived metrics came from the merged multi-view "
+                "cloud; the panels above rebuild the TOP VIEW alone")
+        caption = f"{caption} · {note}" if caption else note
+    fig.text(.5, .012, caption, ha="center", fontsize=7.5, color="#4b5563")
     return fig
 
 

@@ -104,8 +104,7 @@ class CharacterizeBody(BaseModel):
     confirm_close_range_tool_clear: bool = False
     collision_check_enabled: bool = False
     # Capture the ring from the top view plus three tilted views merged into one
-    # cloud. None = follow the configured default (off). Independent of
-    # side_photo: either, both or neither.
+    # cloud. None = follow the configured default (off).
     multiview: bool | None = None
 
 

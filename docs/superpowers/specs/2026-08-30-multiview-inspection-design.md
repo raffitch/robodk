@@ -462,8 +462,8 @@ and every field must be optional so old archives still validate):
   `fitted_center_mm`, `solved_offset_mm`, `residual_rms_mm`, `dropped` (bool),
   `drop_reason` (str | None).
 - `CaptureRecord`: `style` (`"single"` | `"star"`), `views: list[ViewRecord]`,
-  `consensus_center_mm`, `consensus_radius_mm`, `inter_view_spread_mm` (pre-correction),
-  `inter_view_residual_mm` (post-correction), `merged_points_file`, `timings_ms` per view
+  `consensus_center_mm`, `consensus_radius_mm`, `spread_before_mm` (pre-correction),
+  `residual_after_mm` (post-correction), `merged_points_file`, `timings_ms` per view
   and total.
 - `LayerManifest.capture: CaptureRecord | None`.
 
@@ -666,7 +666,7 @@ Run **after** the PFH paper's single-view cell run is complete.
 |---|---|---|
 | Did the profile improve? | bead width profile spread, crest height range | `geometry` (`RingGeometry`) |
 | Did coverage improve? | completeness, max angular gap | `metrics` |
-| Was the merge trustworthy? | pre-correction inter-view spread, post-correction residual | `capture.inter_view_*` |
+| Was the merge trustworthy? | pre-correction inter-view spread, post-correction residual | `capture.spread_before_mm`, `capture.residual_after_mm` |
 | Did repeatability improve? | centre spread across the 3 repeats | `centre_spread()` |
 | Which tilt wins? | all of the above across 10/15/20° | the sweep |
 

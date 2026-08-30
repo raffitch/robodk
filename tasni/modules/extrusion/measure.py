@@ -692,7 +692,10 @@ def _merge_fallback_warning(merged: MergeResult) -> "str | None":
 
 
 def _capture_record_from_merge(capture_records: list[dict], merged: MergeResult,
-                               diag: dict[str, dict]) -> CaptureRecord:
+                               diag: dict[str, dict], *,
+                               captured_views: list[dict] | None = None,
+                               repeat: int = 1,
+                               star_timings: dict | None = None) -> CaptureRecord:
     """Build the manifest's ``CaptureRecord`` from what capture_views and the
     merge each learned about every configured star view.
 
@@ -708,6 +711,19 @@ def _capture_record_from_merge(capture_records: list[dict], merged: MergeResult,
     was dropped -- unreachable pose (capture_views), or failed levelling/arc/
     registration (merge_views) -- so the operator reads one drop reason per view,
     not two competing lists.
+
+    ``captured_views``/``repeat`` are the LIVE capture's own view list (each
+    view's ``moved`` move/settle time and the ``repeat``-th frame's capture
+    time) -- only measure.py's live take has them; an offline reprocess has
+    nothing left to recover the original excursion from (spec 5.6), so it
+    passes neither. ``star_timings`` is ``_merge_star_views``'s own
+    ``backproject_ms``/``merge_ms`` (or the reprocess seam's own copy of the
+    same two numbers) and is available either way. Together they fill
+    ``timings_ms`` per spec 5.5's "per-view move_ms/settle_ms/capture_ms, a
+    views_total_ms, and the merge cost separately" -- declared on the model
+    and never written until now, which is why acquisition_to_path_ms and
+    inspection_cycle_ms both undercounted a star take by the three views the
+    top-only numbers left out (review Critical 2).
     """
     views: list[ViewRecord] = []
     for record in capture_records:
@@ -727,6 +743,24 @@ def _capture_record_from_merge(capture_records: list[dict], merged: MergeResult,
             solved_offset_mm=(list(offset) if offset is not None else None),
             residual_rms_mm=merged.residual_rms_mm.get(name),
             dropped=merge_reason is not None, drop_reason=merge_reason))
+    timings_ms: dict = {}
+    if captured_views:
+        per_view: dict = {}
+        total = 0.0
+        for v in captured_views:
+            move_ms = float(v["moved"]["move_ms"])
+            settle_ms = float(v["moved"]["settle_ms"])
+            capture_ms = float(v["frames"][repeat - 1]["capture_ms"])
+            per_view[v["name"]] = {"move_ms": move_ms, "settle_ms": settle_ms,
+                                   "capture_ms": capture_ms}
+            total += move_ms + settle_ms + capture_ms
+        timings_ms["views"] = per_view
+        timings_ms["views_total_ms"] = total
+    if star_timings:
+        if star_timings.get("backproject_ms") is not None:
+            timings_ms["backproject_ms"] = float(star_timings["backproject_ms"])
+        if star_timings.get("merge_ms") is not None:
+            timings_ms["merge_ms"] = float(star_timings["merge_ms"])
     return CaptureRecord(
         style=("star" if len(merged.used) > 1 else "single"), views=views,
         consensus_center_mm=(list(merged.consensus_center_mm)
@@ -734,7 +768,8 @@ def _capture_record_from_merge(capture_records: list[dict], merged: MergeResult,
         consensus_radius_mm=merged.consensus_radius_mm,
         spread_before_mm=merged.spread_before_mm,
         residual_after_mm=merged.residual_after_mm,
-        merged_points_file="merged_points.npy")
+        merged_points_file="merged_points.npy",
+        timings_ms=timings_ms)
 
 
 def _archive_view_payload(views: list[dict], repeat: int) -> list[dict]:
@@ -761,6 +796,45 @@ def _archive_view_payload(views: list[dict], repeat: int) -> list[dict]:
             entry["depth"] = vframe.depth
         payload.append(entry)
     return payload
+
+
+def _acquisition_timings(timings: dict, *, views: "list[dict] | None", repeat: int,
+                         moved: dict, capture_ms: float) -> None:
+    """Fill ``capture_ms``/``acquisition_to_path_ms``/(on repeat 1)
+    ``move_to_pose_ms``/``settle_ms`` into ``timings`` (``processed.report``'s
+    ``timings_ms``, which already carries ``total_ms``) -- in place, so a
+    caller keeps using the same dict it passed in.
+
+    Single-view (``views`` is ``None``): ``capture_ms`` is the one frame just
+    grabbed for THIS take. Star (``views`` is the live capture's own view
+    list, each with its ``moved`` move/settle time and per-repeat frames):
+    the take's real acquisition cost is the SUM of every view's capture for
+    this repeat, and its real arm cost (on the repeat that paid for it) is the
+    sum of every view's move+settle -- not the top view's alone. Charging only
+    the top view undercounted acquisition_to_path_ms, and -- because
+    add_return_timing's inspection_cycle_ms sums these same fields back out of
+    the manifest -- undercounted the cycle figure too, by roughly three
+    quarters of a star take's real arm time (review Critical 2).
+
+    Only the frame that actually followed the move may claim the move. The
+    frames after it were taken with the arm already still, and charging them
+    a travel time nothing travelled is how a shared trip would make the
+    excursion look cheaper than it is -- true for a single view and, summed
+    over the star's four, true for a star take as well.
+    """
+    if views is None:
+        timings["capture_ms"] = capture_ms
+        timings["acquisition_to_path_ms"] = capture_ms + timings["total_ms"]
+        if repeat == 1:
+            timings["move_to_pose_ms"] = moved["move_ms"]
+            timings["settle_ms"] = moved["settle_ms"]
+    else:
+        star_capture_ms = sum(float(v["frames"][repeat - 1]["capture_ms"]) for v in views)
+        timings["capture_ms"] = star_capture_ms
+        timings["acquisition_to_path_ms"] = star_capture_ms + timings["total_ms"]
+        if repeat == 1:
+            timings["move_to_pose_ms"] = sum(float(v["moved"]["move_ms"]) for v in views)
+            timings["settle_ms"] = sum(float(v["moved"]["settle_ms"]) for v in views)
 
 
 class RingMeasureJob:
@@ -1063,7 +1137,9 @@ class RingMeasureJob:
                     merged.points, plan=self.plan, layer=layer, config=ecfg,
                     chroma_gated=merged.chroma_gated, floor_profile=floor,
                     timings=star_timings, started=star_started)
-                capture_record = _capture_record_from_merge(capture_records, merged, diag)
+                capture_record = _capture_record_from_merge(
+                    capture_records, merged, diag, captured_views=views, repeat=repeat,
+                    star_timings=star_timings)
         except Exception as exc:
             # A failed measurement still archives its raw RGB-D: the operator
             # cannot re-place the ring exactly, so the frame is the only thing
@@ -1073,7 +1149,9 @@ class RingMeasureJob:
             # than throwing four good captures away because the MERGED cloud
             # failed process_points.
             warnings = [str(exc)] + ([fallback_warning] if fallback_warning else [])
-            failure_capture = (_capture_record_from_merge(capture_records, merged, diag)
+            failure_capture = (_capture_record_from_merge(
+                                   capture_records, merged, diag, captured_views=views,
+                                   repeat=repeat, star_timings=star_timings)
                                if (views is not None and merged is not None) else None)
             manifest = LayerManifest(
                 **base, processing={"valid": False, "error": str(exc),
@@ -1082,7 +1160,11 @@ class RingMeasureJob:
             failure_kwargs: dict = {}
             if views is not None:
                 failure_kwargs["views"] = _archive_view_payload(views, repeat)
-                if merged is not None:
+                # Same guard as the success path below (review Important 6):
+                # a top-only fallback's points are identical to the top view's
+                # own re-projection, so archiving them again as merged_points.npy
+                # only bloats a failed take's archive for no benefit.
+                if merged is not None and len(merged.used) > 1:
                     failure_kwargs["merged_points_xyz"] = merged.points
             failed_dir = archive.write_layer(
                 manifest, nominal_xyz=nominal, commanded_xyz=nominal,
@@ -1101,15 +1183,8 @@ class RingMeasureJob:
                 f"layer {self.layer_index} take {take} measurement invalid; "
                 f"raw RGB-D archived: {exc}") from exc
         timings = processed.report["timings_ms"]
-        timings["capture_ms"] = capture_ms
-        timings["acquisition_to_path_ms"] = capture_ms + timings["total_ms"]
-        # Only the frame that actually followed the move may claim the move. The
-        # frames after it were taken with the arm already still, and charging
-        # them a travel time nothing travelled is how a shared trip would make
-        # the excursion look cheaper than it is.
-        if repeat == 1:
-            timings["move_to_pose_ms"] = moved["move_ms"]
-            timings["settle_ms"] = moved["settle_ms"]
+        _acquisition_timings(timings, views=views, repeat=repeat, moved=moved,
+                             capture_ms=capture_ms)
         processed.report["depth_plane_check"] = captured["depth_plane_check"]
         warnings = list(processed.metrics.warnings)
         if fallback_warning:
@@ -1123,8 +1198,16 @@ class RingMeasureJob:
         archive_kwargs: dict = {}
         if views is not None:
             archive_kwargs["views"] = _archive_view_payload(views, repeat)
+            # A merge that fell back to the top view alone (merged.used == 1)
+            # writes points IDENTICAL to that view's own re-projection -- so
+            # archiving them a second time as merged_points.npy both bloats
+            # the archive and, worse, makes figures._scene_points prefer this
+            # chroma-gated/levelled fallback cloud over the same re-projection
+            # an ordinary single-view take draws from, giving two takes the
+            # statistics treat as identical (capture.style == "single" either
+            # way) two different figures (review Important 6).
             archive_kwargs["merged_points_xyz"] = (
-                merged.points if merged is not None else None)
+                merged.points if (merged is not None and len(merged.used) > 1) else None)
         layer_dir = archive.write_layer(
             manifest, nominal_xyz=nominal, commanded_xyz=nominal,
             measured_xyz=processed.measured_xyz,
@@ -1462,9 +1545,25 @@ def detection_error_mm(manifest: dict) -> "float | None":
 AXIS_CHECK_PHASE = "axis check"
 
 
+def _capture_style_of(manifest: dict) -> "str | None":
+    """``capture.style`` if the take has one -- ``None`` for a single-view take
+    (``capture`` is only ever set for a star reconstruction; see _one_take)."""
+    return (manifest.get("capture") or {}).get("style")
+
+
 def _undisplaced_takes(manifests: list[dict], layer: int, *,
-                       before_take: int | None = None) -> list[dict]:
-    """Valid, zero-offset, centre-bearing takes of one layer, axis check excluded."""
+                       before_take: int | None = None,
+                       style: "str | None" = None) -> list[dict]:
+    """Valid, zero-offset, centre-bearing takes of one layer, axis check excluded.
+
+    ``style`` restricts candidates to the SAME ``capture.style`` as the take
+    being scored (None matches a single-view take, "star" a merged one) --
+    a merged and a single-view reconstruction measure the ring's centre
+    through different clouds, so pairing a displaced star take against a
+    single-view "before" (or vice versa) would fold that style-dependent bias
+    into detection_error_mm, the number the paper leads with (review
+    Important 3).
+    """
     found = []
     for other in manifests:
         metrics = other.get("metrics") or {}
@@ -1473,6 +1572,7 @@ def _undisplaced_takes(manifests: list[dict], layer: int, *,
                 and (before_take is None or int(other.get("take") or 1) < before_take)
                 and introduced_offset_mm(other) == (0.0, 0.0)
                 and phase != AXIS_CHECK_PHASE
+                and _capture_style_of(other) == style
                 and metrics.get("valid") and metrics.get("measured_center_mm")):
             found.append(other)
     return found
@@ -1495,13 +1595,17 @@ def pre_shift_reference(manifest: dict, manifests: list[dict]) -> "dict | None":
     was stacked on, and centre(this) - centre(below) is exactly that. Scored
     against the plan centre instead, the whole stack's placement error would be
     charged to the chain.
+
+    Both choices are restricted to takes captured the SAME way as ``manifest``
+    itself (single-view or star) -- see _undisplaced_takes.
     """
     layer = int(manifest.get("layer_index") or 0)
     take = int(manifest.get("take") or 1)
-    same = _undisplaced_takes(manifests, layer, before_take=take)
+    style = _capture_style_of(manifest)
+    same = _undisplaced_takes(manifests, layer, before_take=take, style=style)
     if same:
         return max(same, key=lambda m: int(m.get("take") or 1))
-    below = _undisplaced_takes(manifests, layer - 1) if layer > 1 else []
+    below = _undisplaced_takes(manifests, layer - 1, style=style) if layer > 1 else []
     return max(below, key=lambda m: int(m.get("take") or 1), default=None)
 
 
@@ -1531,6 +1635,10 @@ def paired_detection(manifest: dict, manifests: list[dict]) -> "dict | None":
     reference_layer = int(reference.get("layer_index") or 0)
     return {"reference_take": int(reference.get("take") or 1),
             "reference_layer": reference_layer,
+            # What captured the reference -- always the same style as
+            # ``manifest`` itself (pre_shift_reference restricts candidates to
+            # it), surfaced here so a reader does not have to re-derive it.
+            "reference_style": _capture_style_of(reference),
             # True when the ring arrived displaced and is measured against the
             # one it was stacked on, rather than against its own earlier self.
             "relative_to_layer_below": reference_layer != int(manifest.get("layer_index") or 0),
@@ -1673,11 +1781,24 @@ def paper_summary(root: Path, trial_id: str) -> dict:
     timing = _timing_block([m for m, star in zip(takes, is_star_take) if not star])
     star_takes = [m for m, star in zip(takes, is_star_take) if star]
     timing_star = _timing_block(star_takes) if star_takes else None
-    geometry = [m["geometry"] for m in takes if m.get("geometry")]
-    height = {key: _stat(g.get(key) for g in geometry)
-              for key in ("height_mean_mm", "height_min_mm", "height_max_mm", "top_z_std_mm")}
-    bead = {key: _stat(g.get(key) for g in geometry)
-            for key in ("bead_width_mean_mm", "bead_width_min_mm", "bead_width_max_mm")}
+    # Ring geometry pools the same way timing does, and for the same reason:
+    # a merged-view take measures the ring through a denser, differently
+    # composed cloud than a single view does, so bead width and layer height
+    # -- the two numbers multi-view exists to change -- must not be averaged
+    # with the single-view figure they are meant to be compared against.
+    def _geometry_block(subset: list[dict]) -> tuple[dict, dict]:
+        geom = [m["geometry"] for m in subset if m.get("geometry")]
+        height_block = {key: _stat(g.get(key) for g in geom)
+                        for key in ("height_mean_mm", "height_min_mm", "height_max_mm",
+                                   "top_z_std_mm")}
+        bead_block = {key: _stat(g.get(key) for g in geom)
+                     for key in ("bead_width_mean_mm", "bead_width_min_mm",
+                                "bead_width_max_mm")}
+        return height_block, bead_block
+    height, bead = _geometry_block([m for m, star in zip(takes, is_star_take) if not star])
+    height_star = bead_star = None
+    if star_takes:
+        height_star, bead_star = _geometry_block(star_takes)
     valid = sum(1 for m in takes if (m.get("metrics") or {}).get("valid"))
     # The two repeatabilities, kept apart. A condition measured with the arm
     # parked scatters by the camera alone; one where the arm went away and came
@@ -1783,11 +1904,22 @@ def paper_summary(root: Path, trial_id: str) -> dict:
                      f"acquired in {_fmt(timing_star['acquisition_to_path_ms'], 0)} ms end to "
                      "end, reported separately -- pooling it with the single-view figure above "
                      "would describe neither chain.")
-    if geometry:
+    if height["height_mean_mm"]["n"]:
         prose.append(f"Layer height along the ring: mean {_fmt(height['height_mean_mm'], 1)} mm, "
                      f"min {_fmt(height['height_min_mm'], 1)} mm, max "
                      f"{_fmt(height['height_max_mm'], 1)} mm; bead footprint width "
                      f"{_fmt(bead['bead_width_mean_mm'], 1)} mm.")
+    if height_star and height_star["height_mean_mm"]["n"]:
+        # Never folded into the line above, for the same reason timing_star
+        # is not folded into timing: a merged-view take measures the ring
+        # through a different cloud, so its height/bead numbers answer a
+        # different question than the single-view figure does.
+        prose.append(f"Star (merged-view) layer height along the ring: mean "
+                     f"{_fmt(height_star['height_mean_mm'], 1)} mm, min "
+                     f"{_fmt(height_star['height_min_mm'], 1)} mm, max "
+                     f"{_fmt(height_star['height_max_mm'], 1)} mm; bead footprint width "
+                     f"{_fmt(bead_star['bead_width_mean_mm'], 1)} mm, reported separately -- "
+                     "pooling it with the single-view figure above would describe neither chain.")
     if characterization:
         prose.append(f"Ring characterized from its own scan: radius "
                      f"{characterization['radius_mm']:.1f} mm, bead "
@@ -1818,5 +1950,8 @@ def paper_summary(root: Path, trial_id: str) -> dict:
             # caller can tell "no star takes" from "star takes, zero timed".
             "timing_ms_star": timing_star,
             "height_mm": height, "bead_width_mm": bead,
+            # None unless this trial has star takes at all -- same discipline
+            # as timing_ms_star, and for the same reason (Critical 1 review).
+            "height_mm_star": height_star, "bead_width_mm_star": bead_star,
             "characterization": characterization, "headline": headline,
             "prose": prose, "manifests": takes, "markdown": "\n".join(lines)}
