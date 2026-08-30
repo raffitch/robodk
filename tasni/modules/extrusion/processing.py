@@ -82,7 +82,7 @@ def chroma_gate_mask(color: np.ndarray | None, registered: ColorRegistered, conf
     outside any ring ROI anyway. Abstains as ``(all True, False)``, which
     ``deposit_floor_mm`` turns into the 2.5 mm floor.
     """
-    def note(key: str, value: int) -> None:
+    def note(key: str, value: float) -> None:
         if counts is not None:
             counts[key] = value
 
@@ -107,6 +107,16 @@ def chroma_gate_mask(color: np.ndarray | None, registered: ColorRegistered, conf
     # 1920x1080 colour image (protocol 2) closes the same physical gap.
     k = max(3, int(round(5 * w / 1280.0)))
     keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    # The fraction of the colour frame this gate actually admits, AFTER the close
+    # -- the one number that says whether it is still discriminating. The absolute
+    # ``chroma_gate_kept_pixels`` above cannot: 534247 means nothing without the
+    # frame size, and the frame size changed with protocol 2. A ring at the
+    # inspection standoff covers ~1.5% of the frame, and the 2026-08-29 cell frames
+    # this gate was tuned on kept 9%; the 2026-08-30 16:35 frame kept 26% -- the
+    # board's near-black print reading S 72-85 because saturation is (max-min)/max
+    # and a ~7-count warm channel offset is most of ``max`` when ``max`` is 24.
+    # That single ratio is the whole diagnosis, and it was computed and discarded.
+    note("chroma_gate_kept_fraction", round(float(keep.mean()), 4))
     u = np.rint(registered.uv[:, 0]).astype(int)
     v = np.rint(registered.uv[:, 1]).astype(int)
     inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
@@ -586,9 +596,19 @@ def _select_ring_cluster(clusters: list[np.ndarray], search_center_xy: np.ndarra
         "candidates": diagnostics,
     }
     if not eligible:
+        # The candidate table says WHICH criterion each blob failed; it never says
+        # why there were eighteen blobs. On 2026-08-30 the answer was upstream and
+        # numeric -- the chroma gate admitted 26% of the colour frame instead of
+        # 9%, so the board arrived with the ring and DBSCAN fused the two into one
+        # disc (r 51.6 mm, radial span 79 mm about a real 42 mm ring). This
+        # function RAISES, so, exactly as with the branch guard (`da5f7a4`), every
+        # count the capture already measured was computed and thrown away on the
+        # one occasion it mattered. They ride along now: a leaking colour gate and
+        # a genuinely low-relief ring produce the same shape-gate message and
+        # opposite remedies, so the message has to carry enough to tell them apart.
         raise RuntimeError(
             "deposited geometry was found, but no complete ring-like cluster passed "
-            f"the characterization shape gate: {json.dumps(selector)}")
+            f"the characterization shape gate: {json.dumps({**selector, 'capture': dict(counts)})}")
     _, selected_index, selected = max(eligible, key=lambda item: item[0])
     selector["selected_candidate"] = selected_index + 1
     diagnostics[selected_index]["selected"] = True
@@ -930,7 +950,7 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, geometry: CameraG
     the chroma gate -- see :func:`process_observation`.
     """
     started = time.perf_counter()
-    counts: dict[str, int] = {}
+    counts: dict[str, float] = {}
     # The same gate as the layer measurements: characterization defines the
     # recipe they are then judged against, so the two must see the same cloud.
     reg = ColorRegistered.build(depth, geometry, K, dist)
@@ -942,6 +962,21 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, geometry: CameraG
     radial = np.linalg.norm(points[:, :2] - center, axis=1)
     roi = ((points[:, 2] >= min_z) & (points[:, 2] <= config.characterize_max_height_mm)
            & (radial <= config.characterize_search_radius_mm))
+    # What the search cylinder looks like BEFORE the height floor cuts it, mirroring
+    # ``process_observation``'s ``observed_z_mm``. ``deposit_floor_mm`` is a fixed
+    # 1.5 mm above the work plane while the plane's own measured noise at the 300 mm
+    # inspection standoff is ~1.1 mm (2026-08-30: 18.6% of board points cleared
+    # 1.5 mm, 3.8% cleared 2.5 mm). Whether that tail is a nuisance or the whole
+    # story is a property of the frame, not of the code, so the frame has to say it.
+    in_cylinder = points[radial <= config.characterize_search_radius_mm]
+    if len(in_cylinder):
+        counts["search_cylinder_points"] = int(len(in_cylinder))
+        counts["search_cylinder_above_floor_fraction"] = round(
+            float(np.mean(in_cylinder[:, 2] >= min_z)), 4)
+        counts["search_cylinder_z_mm_p50"] = round(float(np.median(in_cylinder[:, 2])), 2)
+        counts["search_cylinder_z_mm_p99"] = round(
+            float(np.percentile(in_cylinder[:, 2], 99)), 2)
+    counts["deposit_floor_mm"] = round(float(min_z), 3)
     points = points[roi]
     counts["after_search_roi"] = len(points)
     if len(points) < config.cluster_min_points:

@@ -497,6 +497,115 @@ def test_chroma_gate_abstains_on_an_achromatic_frame_and_restores_the_floor():
     assert deposit_floor_mm(config, True) == pytest.approx(1.5)
 
 
+def test_chroma_gate_reports_the_fraction_of_the_frame_it_kept():
+    """The one number that says whether the gate is still telling bead from board.
+
+    Every other chroma-gate test here paints the board a PERFECTLY NEUTRAL grey,
+    where saturation is 0 by construction and the gate cannot fail. Real black
+    print is not neutral: on the 2026-08-30 16:35 cell frame it measured BGR
+    (17.5, 20.3, 24.4) -- a ~7-count warm channel offset -- and saturation is
+    (max - min) / max, so at max = 24 that reads S = 72, over the threshold of 60.
+    The gate kept 26% of that frame against 9% on the 2026-08-29 frames it was
+    tuned on, the board arrived with the ring, and the ring characterization died
+    at the shape gate with an eighteen-candidate JSON dump that named none of it.
+
+    This pins the DIAGNOSTIC, not a decision: the gate's behaviour on a warm-cast
+    near-black background is unchanged and is asserted here so the hazard is
+    visible, because tightening it (a value floor, an absolute-chroma criterion)
+    also shaves the bead's own dim flanks -- measured on the 2026-08-29 fixture it
+    moves the reported bead width 9.48 mm -> 5.1-6.9 mm, which is a paper number.
+    """
+    K = np.array([[400.0, 0, 20.0], [0, 400.0, 20.0], [0, 0, 1.0]])
+    depth = np.full((40, 40), 300, np.uint16)
+    reg = ColorRegistered.build(depth, gf.aligned(K, (40, 40)), K, None)
+    clay = (40, 110, 190)
+
+    neutral = np.dstack([np.full((40, 40), 24, np.uint8)] * 3)   # S = 0 by construction
+    neutral[10:30, 10:30] = clay
+    counts: dict = {}
+    keep, applied = chroma_gate_mask(neutral, reg, ExtrusionConfig(), counts)
+    assert applied and keep.any()
+    assert counts["chroma_gate_kept_fraction"] < 0.45, counts
+
+    warm = np.zeros((40, 40, 3), np.uint8)                       # real black print
+    warm[:, :] = (17, 20, 24)
+    warm[10:30, 10:30] = clay
+    warm_counts: dict = {}
+    keep_warm, applied_warm = chroma_gate_mask(warm, reg, ExtrusionConfig(), warm_counts)
+
+    assert applied_warm
+    # Unchanged behaviour: the warm-cast board still passes a gate built on a ratio.
+    assert keep_warm.mean() > 0.9, "the leak this number exists to expose"
+    # ... and now the count says so, in a form that does not need the frame size.
+    assert warm_counts["chroma_gate_kept_fraction"] > 0.9
+    assert (warm_counts["chroma_gate_kept_fraction"]
+            > 2 * counts["chroma_gate_kept_fraction"])
+
+
+def test_the_shape_gate_rejection_names_the_capture_that_produced_the_blobs():
+    """A rejection has to distinguish a leaking gate from a genuinely low ring.
+
+    2026-08-30 16:35, cell: candidate 1 was 5489 points at r 51.6 mm with a 79 mm
+    radial span -- a disc, around a physical ring that a colour-only fit put at
+    r 42.3 mm. The message listed all eighteen blobs and their failed criteria and
+    said nothing about where they came from, so the two opposite remedies (fix the
+    capture / re-place the ring) were indistinguishable from it. Same defect the
+    branch guard's message had until `da5f7a4`, same fix: this function RAISES, so
+    the counts the capture already measured die with it unless they ride along.
+    """
+    from tasni.modules.extrusion.processing import _select_ring_cluster
+
+    rng = np.random.default_rng(0)
+    radius = 60.0 * np.sqrt(rng.random(4000))
+    theta = rng.random(4000) * 2 * math.pi
+    disc = np.column_stack((250.0 + radius * np.cos(theta),
+                            140.0 + radius * np.sin(theta),
+                            rng.random(4000) * 3.0))       # filled: span ratio ~1.5
+    counts = {"chroma_gate_kept_fraction": 0.2982, "chroma_gate_applied": 1,
+              "deposit_floor_mm": 1.5, "search_cylinder_above_floor_fraction": 0.1871}
+
+    with pytest.raises(RuntimeError, match="shape gate") as excinfo:
+        _select_ring_cluster([disc], np.array([212.1, 149.7]), counts)
+
+    message = str(excinfo.value)
+    payload = json.loads(message[message.index("{"):])
+    assert payload["candidates"][0]["radial_span_ratio"] > 0.8      # the gate was right
+    assert payload["capture"]["chroma_gate_kept_fraction"] == pytest.approx(0.2982)
+    assert payload["capture"]["search_cylinder_above_floor_fraction"] == pytest.approx(0.1871)
+    assert payload["capture"]["deposit_floor_mm"] == pytest.approx(1.5)
+
+
+def test_characterize_records_what_the_search_cylinder_held_before_the_floor():
+    """The deposit floor is fixed; the noise it has to beat is a fact of the frame.
+
+    1.5 mm above the work plane against a plane whose own measured noise at the
+    300 mm inspection standoff is ~1.1 mm is ~1.4 sigma, and on 2026-08-30 18.7%
+    of the search cylinder cleared it. Whether that tail is a nuisance or the whole
+    story cannot be read from ``after_search_roi`` alone, so the frame states it.
+    """
+    pytest.importorskip("open3d")
+    plan = scene_plan(radius=60.0, bead=8.0, layer_height=5.0)
+    T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, 1), 300.0)
+    depth = syn.render_scene([syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.flat(6.0))],
+                             T, plane_center_xy_mm=CENTER)
+    found = characterize_ring(color=np.zeros((720, 1280, 3), np.uint8), depth=depth,
+                              geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
+                              T_work_camera=T, K=syn.K_720P, dist=None,
+                              search_center_mm=CENTER, work_frame="Tasni Work Frame",
+                              config=ExtrusionConfig())
+
+    coarse = found.report["counts_coarse"]
+    # A depth-only frame: the gate abstains, so the conservative floor applies.
+    assert coarse["deposit_floor_mm"] == pytest.approx(2.5)
+    assert coarse["search_cylinder_points"] > coarse["after_search_roi"]
+    assert 0.0 < coarse["search_cylinder_above_floor_fraction"] < 1.0
+    # The statistic describes the WHOLE cylinder, not the deposit the ROI kept:
+    # its median is the build plane and only its tail is the ring's 6 mm crest.
+    # That is what makes 0.187-at-1.5 mm readable as "the board is in here too".
+    assert coarse["search_cylinder_z_mm_p50"] == pytest.approx(0.0, abs=1.0)
+    assert coarse["search_cylinder_z_mm_p99"] > 4.0
+
+
 def test_floor_from_previous_layer_keeps_the_ring_below_out_of_the_measurement():
     pytest.importorskip("open3d")
     plan = scene_plan(layers=2, layer_height=6.0)
