@@ -129,3 +129,97 @@ def test_multiview_plan_executes_and_returns_correct_shape():
     assert view_names == ["top", "star-000", "star-120", "star-240"]
     view_tilts = [v["tilt_deg"] for v in result["views"]]
     assert view_tilts == [0.0, 15.0, 15.0, 15.0]
+
+
+from tasni.modules.extrusion.measure import depth_plane_check  # noqa: E402
+
+AIM = np.array([0.0, 0.0, 5.0])          # a layer top 5 mm above the work plane
+
+
+def _frame(mm: float, shape=(48, 64)):
+    """A depth frame whose every pixel reads the same distance, in 1 mm words."""
+    return np.full(shape, float(mm), dtype=float)
+
+
+def test_top_view_gate_is_unchanged_byte_for_byte():
+    """Pinned from the implementation BEFORE this task. The single-view path is
+    cell-validated and this refactor must not move it by one millimetre."""
+    T = pose_from_aim(AIM, 300.0, tilt_deg=0.0)
+    out = depth_plane_check(_frame(300.0), T, ExtrusionConfig(), unit_mm=1.0)
+    assert out["camera_z_mm"] == pytest.approx(305.0, abs=1e-6)
+    assert out["observed_depth_mm"] == pytest.approx(300.0, abs=1e-6)
+    assert out["accepted_range_mm"] == [265.0, 320.0]
+    assert out["agrees"] is True
+    assert out["cos_incidence"] == pytest.approx(1.0, abs=1e-12)
+
+
+@pytest.mark.parametrize("standoff, tilt", [(300.0, 25.0), (400.0, 20.0), (500.0, 18.0)])
+def test_tilted_views_that_the_old_gate_rejected_now_pass(standoff, tilt):
+    """Each row is a case computed against the real constants where the
+    height-based gate fails: the median sits standoff*(1-cos t) above camera_z
+    and the high side has only depth_plane_slack_mm = 15 mm of budget."""
+    T = pose_from_aim(AIM, standoff, tilt_deg=tilt)
+    config = ExtrusionConfig()
+    camera_z = float(T[2, 3])
+    old_high = camera_z + config.depth_plane_slack_mm
+    assert standoff > old_high                      # the old gate WOULD have failed
+    out = depth_plane_check(_frame(standoff), T, config, unit_mm=1.0)
+    assert out["agrees"] is True
+    assert out["cos_incidence"] == pytest.approx(np.cos(np.radians(tilt)), abs=1e-9)
+
+
+def test_the_gate_keeps_its_sensitivity_across_the_whole_envelope():
+    """The correction must not merely let tilted views through: the gap between
+    expected and the true median has to stay at the aim_z term (+5.0 mm at tilt
+    0) instead of growing with tilt, or the gate goes blind exactly where the
+    data is worst."""
+    for standoff in (300.0, 400.0, 500.0, 800.0):
+        for tilt in (0.0, 10.0, 15.0, 20.0, 25.0):
+            T = pose_from_aim(AIM, standoff, tilt_deg=tilt)
+            out = depth_plane_check(_frame(standoff), T, ExtrusionConfig(), unit_mm=1.0)
+            bias = out["expected_depth_mm"] - standoff
+            assert 5.0 <= bias <= 5.8, (standoff, tilt, bias)
+            assert out["agrees"] is True
+
+
+def test_a_genuinely_wrong_depth_is_still_refused_at_tilt():
+    """The frozen-stream fault the gate exists for (cell 2026-08-29: colour at
+    312 mm, depth stuck at 447) must still be caught on a tilted view."""
+    T = pose_from_aim(AIM, 300.0, tilt_deg=15.0)
+    out = depth_plane_check(_frame(447.0), T, ExtrusionConfig(), unit_mm=1.0)
+    assert out["agrees"] is False
+
+
+def test_a_degenerate_near_horizontal_pose_is_refused_not_divided_by():
+    T = pose_from_aim(AIM, 300.0, tilt_deg=80.0)          # cos = 0.17 < 0.5
+    out = depth_plane_check(_frame(300.0), T, ExtrusionConfig(), unit_mm=1.0)
+    assert out["agrees"] is False
+    assert "incidence" in (out.get("refused") or "")
+
+
+def test_native_depth_units_still_scale():
+    T = pose_from_aim(AIM, 300.0, tilt_deg=15.0)
+    out = depth_plane_check(_frame(3000.0), T, ExtrusionConfig(), unit_mm=0.1)
+    assert out["observed_depth_mm"] == pytest.approx(300.0)
+    assert out["agrees"] is True
+
+
+def test_a_backward_facing_pose_names_the_real_cause_not_just_the_angle():
+    """cos_incidence <= 0 is a different mistake from a genuinely oblique view
+    (0 < cos_incidence < floor): a real hand-eye pose never points the lens
+    away from the plane, so this is almost always an identity or otherwise
+    non-camera rotation standing in for a camera pose -- exactly the fixture
+    bug this task found in tests/test_extrusion_job.py's FAKE_CAMERA_T. The
+    message must say so rather than just reporting a 180 deg incidence."""
+    T = np.eye(4)                                     # identity rotation: lens points +Z, i.e. UP
+    T[:3, 3] = [0.0, 0.0, 300.0]
+    out = depth_plane_check(_frame(300.0), T, ExtrusionConfig(), unit_mm=1.0)
+    assert out["agrees"] is False
+    assert out["cos_incidence"] == pytest.approx(-1.0, abs=1e-12)
+    message = (out.get("refused") or "").lower()
+    assert "away" in message
+    assert "identity" in message or "non-camera" in message
+    # And the too-oblique-but-real branch keeps its old, narrower wording.
+    oblique = depth_plane_check(_frame(300.0), pose_from_aim(AIM, 300.0, tilt_deg=80.0),
+                                ExtrusionConfig(), unit_mm=1.0)
+    assert "away" not in (oblique.get("refused") or "").lower()

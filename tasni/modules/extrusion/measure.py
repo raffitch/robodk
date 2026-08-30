@@ -223,17 +223,64 @@ def depth_plane_check(depth, T_work_camera, config, *, unit_mm: float = 1.0) -> 
     ``frame.geometry.depth_unit_mm``). Left at the 1.0 mm/word default this
     reads a 0.1 mm-unit frame's true ~300 mm standoff as ~3000 mm, which fails
     loudly but points at the work frame or a frozen camera -- the wrong cause.
+
+    **Off-axis.** The paragraph above holds looking straight DOWN, where the
+    frame's median depth IS the camera's height above the plane. Tilt separates
+    them: the camera drops to ``aim_z + standoff*cos(t)`` while the median stays
+    at roughly the standoff, so the median runs ABOVE camera_z by
+    ``standoff*(1 - cos t)`` -- and the high side has only
+    ``depth_plane_slack_mm`` (15 mm) of budget. Computed against the real
+    constants that fails above ~18 deg at a 300 mm standoff and above ~14 deg at
+    500 mm, and even where it passes it spends 5-12 mm of that 15 mm budget on
+    geometry, leaving almost nothing to catch the fault this gate exists for.
+
+    So the expectation is scaled by the incidence, read from the pose itself:
+    ``pose_from_aim`` sets ``z_axis = -away`` with ``away_z = cos(tilt)``, so
+    ``-T[2, 2]`` IS ``cos(tilt)`` -- no convention to get wrong, and nothing to
+    pass in that could disagree with where the arm actually went. At tilt 0
+    every expression below collapses to the height-based form exactly, which is
+    what keeps the cell-validated single-view path unmoved. Swept over
+    300-800 mm x 0-30 deg the residual holds at +5.0..+5.8 mm (the ``aim_z``
+    term the tilt-0 gate already carries), so sensitivity stays flat instead of
+    decaying with tilt.
     """
-    camera_z = float(np.asarray(T_work_camera, dtype=float)[2, 3])
+    T = np.asarray(T_work_camera, dtype=float)
+    camera_z = float(T[2, 3])
     values = np.asarray(depth)
     valid = values[values > 0]
     observed = float(np.median(valid)) * float(unit_mm) if valid.size else float("nan")
     ceiling = float(getattr(config, "characterize_max_height_mm", 40.0))
     slack = float(getattr(config, "depth_plane_slack_mm", 15.0))
-    low, high = camera_z - ceiling, camera_z + slack
-    return {"camera_z_mm": camera_z, "observed_depth_mm": observed,
+    # -T[2,2] is cos(tilt) for every pose_from_aim pose; clamp guards a
+    # hand-built or degenerate transform rather than trusting the caller.
+    cos_incidence = float(np.clip(-T[2, 2], -1.0, 1.0))
+    floor_cos = float(getattr(config, "multiview_min_cos_incidence", 0.5))
+    base = {"camera_z_mm": camera_z, "observed_depth_mm": observed,
+            "valid_pixels": int(valid.size), "cos_incidence": cos_incidence}
+    if cos_incidence < floor_cos:
+        # Dividing by this would manufacture an expectation from nothing. A pose
+        # this far off-axis is a bug upstream, not a view worth gating.
+        if cos_incidence <= 0.0:
+            # A genuinely oblique-but-real view still has cos_incidence > 0; at
+            # or below zero the lens is pointed AWAY from the work plane, which
+            # a real hand-eye pose never produces. Seen once already (this
+            # task): an identity-rotation test double stood in for a camera
+            # pose because the old gate never read rotation at all.
+            refused = (
+                f"camera pose has the lens facing AWAY from the work plane "
+                f"(cos_incidence={cos_incidence:.2f}) -- this usually means the pose was "
+                f"built from an identity or otherwise non-camera rotation rather than a "
+                f"real hand-eye pose, not that the view is genuinely oblique")
+        else:
+            refused = (f"camera incidence {np.degrees(np.arccos(cos_incidence)):.0f} deg "
+                       f"exceeds the {np.degrees(np.arccos(floor_cos)):.0f} deg limit")
+        return {**base, "expected_depth_mm": float("nan"),
+                "accepted_range_mm": [float("nan"), float("nan")], "agrees": False,
+                "refused": refused}
+    expected = camera_z / cos_incidence
+    low, high = expected - ceiling / cos_incidence, expected + slack / cos_incidence
+    return {**base, "expected_depth_mm": expected,
             "accepted_range_mm": [round(low, 1), round(high, 1)],
-            "valid_pixels": int(valid.size),
             "agrees": bool(valid.size and low <= observed <= high)}
 
 
