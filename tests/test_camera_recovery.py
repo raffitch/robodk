@@ -153,15 +153,20 @@ def _assert_serves_one_camera(tag):
     All of those are module globals, so a rebuild that rebinds ``pipeline`` and
     nothing else leaves the server streaming the new device through the old device's
     geometry -- a silent metric error, not a crash. This is the check that catches it.
+
+    Asserted through ``_camera_snapshot()`` -- the one coherent read every serving
+    path now goes through -- rather than off the globals directly, so this checks
+    what a client is actually SERVED and not merely what the module happens to hold.
     """
-    assert srv.pipeline.name == tag, "frames are not coming from the newest open"
-    assert srv.STATIC_GEOMETRY.tag == tag, (
+    snap = srv._camera_snapshot()
+    assert snap.pipeline.name == tag, "frames are not coming from the newest open"
+    assert snap.geometry.tag == tag, (
         "STATIC_GEOMETRY is stale: the greeting and the telemetry back-projection "
         "would describe new frames with the pre-stall extrinsics")
-    assert srv.ACHIEVED_OPTIONS.get("tag") == tag, (
+    assert snap.achieved.get("tag") == tag, (
         "ACHIEVED_OPTIONS is stale: the greeting would report options the reopened "
         "sensor was never actually configured with")
-    assert srv.DEVICE_INFO.get("tag") == tag, (
+    assert snap.device.get("tag") == tag, (
         "DEVICE_INFO is stale: the greeting would report the pre-stall serial/"
         "firmware and colour auto_exposure_priority")
 

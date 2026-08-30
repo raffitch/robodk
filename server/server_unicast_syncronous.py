@@ -6,7 +6,7 @@ import traceback
 import json
 import os
 import time
-from collections import deque
+from collections import deque, namedtuple
 import pyrealsense2 as rs
 import numpy as np
 import lz4.frame as lz4f
@@ -877,6 +877,64 @@ ACHIEVED_OPTIONS = {}       # read-back values, set by openPipeline
 DEVICE_INFO = {}
 
 
+# Everything one client is served from, captured together. A rebuild rebinds the
+# five globals below ONE AT A TIME (openPipeline sets the three geometry/option/
+# device ones as a side effect of restarting the streams; _rebuild_pipeline then
+# sets `pipeline` and re-reads `depth_unit_mm`), so a reader that samples them
+# separately can catch a MIX -- e.g. the reopened device's DEVICE_INFO with the
+# pre-stall STATIC_GEOMETRY. That mix does not raise and is not logged: the client
+# just back-projects every depth frame of that connection through the wrong
+# numbers. `generation` is stamped in the same breath so a connection can later
+# tell whether the camera it was greeted with is still the one streaming.
+CameraSnapshot = namedtuple(
+    "CameraSnapshot",
+    "pipeline depth_unit_mm geometry achieved device generation")
+
+
+def _camera_snapshot() -> CameraSnapshot:
+    """One COHERENT view of the camera state, for anything that serves a client.
+
+    Every write to these globals happens under ``_camera_lock`` (the whole rebuild
+    runs inside it; startup binds them before any client thread exists), so reading
+    them under the same lock is what makes the set atomic.
+
+    The lock is held only for the six reads -- no device I/O inside it, so a slow or
+    hung control transfer can never keep the supervisor from rebuilding. A reader
+    that arrives mid-rebuild does WAIT for it (``_rebuild_pipeline`` holds the lock
+    across the backoff and the multi-second ``openPipeline``), but it would have
+    waited anyway: ``read_frames`` takes the same lock on the very next statement,
+    so a greeted client pays the same total delay either way -- it simply gets the
+    greeting after the rebuild instead of a torn one before it.
+    """
+    with _camera_lock:
+        return CameraSnapshot(pipeline, depth_unit_mm, STATIC_GEOMETRY,
+                              ACHIEVED_OPTIONS, DEVICE_INFO, _camera_generation)
+
+
+def _greeting_is_stale(generation) -> bool:
+    """True once a rebuild has invalidated the greeting this connection was sent.
+
+    The greeting goes out ONCE per connection and the frame stream carries no
+    generation marker, so a client that was already connected when the camera was
+    rebuilt keeps describing the new device's frames with the old open's numbers --
+    ``depth_unit_mm`` above all, which ``configure_depth_sensor`` re-applies on
+    every open and is therefore not guaranteed to survive unchanged. Observed live
+    2026-08-30: client 40437 connected 01:03:42, the camera rebuilt at 01:03:57,
+    and that connection lived on until 01:08:35 -- 4.5 minutes on a stale greeting.
+
+    Re-sending the greeting is not available: the wire format is one greeting line
+    per connection and the host parses exactly one. So the connection is dropped
+    instead, and the client's existing reconnect path fetches a fresh one through
+    the unchanged handshake.
+
+    Deliberately an unlocked read: rebinding/reading a module-level int is atomic
+    under the GIL, ``_camera_generation`` is the LAST thing a rebuild rebinds, and
+    taking ``_camera_lock`` here would make every frame of every client wait out a
+    rebuild before being allowed to notice one.
+    """
+    return generation is not None and generation != _camera_generation
+
+
 def _first_color_sensor(device):
     """The RGB endpoint, however this librealsense build exposes it, or None.
 
@@ -982,15 +1040,34 @@ def _log(msg):
     print(msg, flush=True)
 
 
-def make_greeting() -> dict:
-    """The per-connection greeting: static geometry + LIVE temps + achieved options."""
-    sensor = pipeline.get_active_profile().get_device().first_depth_sensor()
+def make_greeting(snapshot: CameraSnapshot = None) -> dict:
+    """The per-connection greeting: static geometry + LIVE temps + achieved options.
+
+    Built from ONE ``_camera_snapshot()`` rather than from the globals directly, so
+    a rebuild running concurrently cannot hand a connecting client a mixture of two
+    opens. The temperature/global-time reads are live device I/O and happen after
+    the snapshot, outside the lock.
+    """
+    snap = _camera_snapshot() if snapshot is None else snapshot
+    sensor = snap.pipeline.get_active_profile().get_device().first_depth_sensor()
     return rs_geometry.build_greeting(
-        STATIC_GEOMETRY, depth_unit_mm=depth_unit_mm,
+        snap.geometry, depth_unit_mm=snap.depth_unit_mm,
         filters=["threshold", "disparity", "spatial", "temporal", "disparity_inv"],
         temps=rs_config.read_temperatures(sensor, rs, log=_log),
         global_time_enabled=rs_config.read_global_time_enabled(sensor, rs, log=_log),
-        achieved=ACHIEVED_OPTIONS, device=DEVICE_INFO)
+        achieved=snap.achieved, device=snap.device)
+
+
+def greet(conn) -> int:
+    """Send the protocol-2 greeting and return the camera generation it describes.
+
+    Returning the generation (rather than sending and forgetting) is what lets the
+    serving loop notice later that a rebuild has made this connection's one and only
+    greeting a lie -- see ``_greeting_is_stale``.
+    """
+    snap = _camera_snapshot()
+    conn.sendall(rs_geometry.greeting_line(make_greeting(snap)))
+    return snap.generation
 
 
 def handle_client(conn, addr):
@@ -1078,10 +1155,25 @@ def handle_client(conn, addr):
         conn.close()
         return
 
-    if not color_only:
-        conn.sendall(rs_geometry.greeting_line(make_greeting()))
+    # Colour-only carries no geometry (no greeting is sent and the host reads
+    # none), so a depth rebuild means nothing to it: greeted_generation stays None
+    # and the staleness check below never fires for it.
+    greeted_generation = None if color_only else greet(conn)
 
     while True:
+        if _greeting_is_stale(greeted_generation):
+            # This connection's geometry/depth scale describe a camera open that no
+            # longer exists. There is no way to correct it in-band -- one greeting
+            # per connection is the protocol -- so drop the connection and let the
+            # client reconnect into a fresh greeting. Losing the connection is a
+            # condition every host path already handles (the live preview
+            # reconnects after a 1 s backoff, a burst tour falls back to per-pose
+            # grabs, and a per-pose grab opens its own connection anyway); silently
+            # wrong millimetres is not.
+            print(f"Closing {addr}: camera rebuilt (greeting describes generation "
+                  f"{greeted_generation}, camera is now {_camera_generation}); "
+                  f"the client must reconnect for a fresh greeting", flush=True)
+            break
         if color_only:
             # Fast path: skip the depth filters entirely — they cost the Nano ~a
             # second per frame and we're throwing depth away anyway. Just grab the
@@ -1212,8 +1304,13 @@ def stream_h264(conn, addr, bitrate_kbps, scan_telemetry=False):
                             intr = depth_profile.intrinsics
                             color_intr = color_profile.intrinsics
                             depth_to_color = depth_profile.get_extrinsics_to(color_profile)
-                            R_vec = STATIC_GEOMETRY.R_dc          # row-major, asserted at start
-                            t_dc_mm = STATIC_GEOMETRY.t_dc_mm
+                            # One coherent read per tick: the extrinsic and the
+                            # depth scale come from the SAME open, so a rebuild
+                            # in flight cannot pair the new device's geometry
+                            # with the old open's millimetres-per-count.
+                            snap = _camera_snapshot()
+                            R_vec = snap.geometry.R_dc           # row-major, asserted at start
+                            t_dc_mm = snap.geometry.t_dc_mm
                             depth_points = pointcloud.calculate(depth)
                             depth_vertices_mm = (
                                 np.asanyarray(depth_points.get_vertices())
@@ -1246,7 +1343,7 @@ def stream_h264(conn, addr, bitrate_kbps, scan_telemetry=False):
                                 return depth_vertices_mm[uv[:, 1], uv[:, 0]]
 
                             payload = scan_plane_telemetry(
-                                np.asanyarray(depth.get_data()), intr, depth_unit_mm,
+                                np.asanyarray(depth.get_data()), intr, snap.depth_unit_mm,
                                 overlay_project=overlay_project,
                                 overlay_project_points=overlay_project_points,
                                 overlay_transform_points=overlay_transform_points,
@@ -1344,12 +1441,22 @@ def stream_burst(conn, addr, max_frames=64):
     buffer = []   # list of (depth_compressed: bytes, color_jpeg: bytes, ts: float)
     try:
         conn.sendall(b'BURST READY\n')
-        conn.sendall(rs_geometry.greeting_line(make_greeting()))
+        greeted_generation = greet(conn)
     except OSError:
         return
     print(f"Burst session opened with {addr}")
     try:
         while True:
+            if _greeting_is_stale(greeted_generation):
+                # Same contract as the streaming path: the buffered frames and the
+                # ones still to come no longer share the geometry this session was
+                # greeted with. End the session (the buffer is dropped in `finally`,
+                # as always) so the client re-opens and is greeted afresh -- the host
+                # falls back to the per-pose grab path on a burst error.
+                print(f"Ending the burst session with {addr}: camera rebuilt "
+                      f"(greeting describes generation {greeted_generation}, camera "
+                      f"is now {_camera_generation})", flush=True)
+                break
             # The next command may be many seconds away (the robot is moving between
             # poses); wait generously rather than dropping the connection.
             conn.settimeout(180.0)
