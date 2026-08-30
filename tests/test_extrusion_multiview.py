@@ -908,3 +908,372 @@ def test_characterize_job_resolves_multiview_like_side_photo(tmp_path, monkeypat
     svc.config.extrusion.multiview_enabled = True
     assert RingCharacterizeJob(svc, plan, session).multiview is True
     assert RingCharacterizeJob(svc, plan, session, multiview=False).multiview is False
+
+
+# ------------------------------------------------- Task 7: reprocess views= + A/B
+
+
+def _archived_star_take(tmp_path, trial_id: str, *, radius: float = 60.0, bead: float = 8.0,
+                        center: tuple[float, float] = (200.0, 150.0),
+                        drop: str | None = None) -> str:
+    """A real star take on disk, archived the way Task 6's capture path does.
+
+    Every view is genuinely rendered (real depth AND real colour, so the
+    chroma gate is exercised for real -- see
+    test_end_to_end_star_merge_survives_the_real_chroma_gate) and pushed
+    through the exact seam ``_one_take`` uses: observation_points per view,
+    merge_views, process_points, then
+    ``ExtrusionArchive.write_layer(views=..., merged_points_xyz=...)``. Only
+    the robot/job harness around those calls is skipped -- the archive layout
+    this produces is byte-for-byte what a live star capture writes.
+
+    ``drop``, if given, is a view name that is never captured (no pose.json on
+    disk at all), so a test can exercise the "carry the original drop reason
+    forward" path in reprocess_saved_layer.
+    """
+    import geometry_fixtures as gf
+    from tasni.modules.extrusion.archive import ExtrusionArchive
+    from tasni.modules.extrusion.inspection import pose_from_aim
+    from tasni.modules.extrusion.measure import _capture_record_from_merge
+    from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup
+    from tasni.modules.extrusion.processing import observation_points, process_points
+    from tasni.modules.extrusion.toolpath import generate_cylinder_plan, points_array
+
+    recipe = CylinderRecipe(radius_mm=radius, layer_count=1, layer_height_mm=6.0,
+                            bead_diameter_mm=bead, robot_speed_mm_s=75,
+                            extrusion_rate_pct=0, points_per_circle=180)
+    setup = CylinderSetup(print_tool="LongCalibTool", work_frame="Tasni Work Frame",
+                          inspection_tool="Realsense", inspection_auto=True,
+                          center_x_mm=center[0], center_y_mm=center[1])
+    plan = generate_cylinder_plan(recipe, setup)
+    layer = plan.layers[0]
+    config = ExtrusionConfig()
+    geom = gf.aligned(syn.K_720P, syn.SIZE_720P)
+    aim = np.array([center[0], center[1], 6.0])
+    rings = [syn.RingSpec(radius, bead, center, height_fn=syn.flat(6.0))]
+
+    archive = ExtrusionArchive(tmp_path)
+    archive.create_trial(trial_id, plan, mode="MEASURE_ONLY")
+
+    clouds: list[ViewCloud] = []
+    diag: dict[str, dict] = {}
+    capture_records: list[dict] = []
+    view_payload: list[dict] = []
+    top_color = top_depth = top_T = None
+    for name, tilt, azimuth in star_view_angles(config):
+        if name == drop:
+            capture_records.append({
+                "name": name, "tilt_deg": tilt, "azimuth_deg": azimuth, "dropped": True,
+                "drop_reason": "simulated: unreachable at capture time"})
+            continue
+        T = pose_from_aim(aim, 300.0, tilt_deg=tilt, azimuth_deg=azimuth,
+                          reference_x=syn.CAMERA_X_AT_PARK)
+        depth = syn.render_scene(rings, T, plane_center_xy_mm=center,
+                                 seed=hash(name) % 1000)
+        color = syn.render_color(rings, T, board_bgr=(120, 160, 210))
+        pts, gated = observation_points(color=color, depth=depth, geometry=geom,
+                                        T_work_camera=T, K=syn.K_720P, dist=None,
+                                        config=config)
+        clouds.append(ViewCloud(name=name, points=pts, chroma_gated=gated,
+                                tilt_deg=tilt, azimuth_deg=azimuth, T_work_camera=T))
+        diag[name] = {"chroma_gated": gated, "points_before_merge": int(len(pts))}
+        capture_records.append({
+            "name": name, "tilt_deg": tilt, "azimuth_deg": azimuth, "dropped": False,
+            "drop_reason": None, "T_work_camera": T.tolist(), "roll_deg": 0.0})
+        pose = {"tilt_deg": tilt, "azimuth_deg": azimuth, "roll_deg": 0.0,
+                "T_work_camera": T.tolist(), "camera_geometry": geom.to_dict(),
+                "depth_plane_check": {"agrees": True}}
+        entry = {"name": name, "pose": pose}
+        if name == "top":
+            top_color, top_depth, top_T = color, depth, T
+        else:
+            entry["color"], entry["depth"] = color, depth
+        view_payload.append(entry)
+
+    merged = merge_views(clouds, plan=plan, layer=layer, config=config)
+    assert len(merged.used) > 1, merged.dropped     # the fixture must genuinely be a star
+    processed = process_points(merged.points, plan=plan, layer=layer, config=config,
+                               chroma_gated=merged.chroma_gated)
+    assert processed.metrics.valid, processed.metrics.warnings
+    capture_record = _capture_record_from_merge(capture_records, merged, diag)
+    assert capture_record.style == "star"
+
+    nominal = points_array(layer)
+    manifest = LayerManifest(
+        trial_id=trial_id, layer_index=1, take=1, mode="MEASURE_ONLY",
+        recipe=recipe, toolpath_fingerprint=plan.fingerprint,
+        color_file="color.png", depth_file="depth.npy",
+        measured_path_file="measured_path.json",
+        pointcloud_file="height-or-pointcloud.npy",
+        metrics=processed.metrics, geometry=processed.geometry,
+        processing={**processed.report, "metrics": processed.metrics.model_dump(mode="json")},
+        provenance={"T_work_camera": np.asarray(top_T, float).tolist(),
+                    "camera_intrinsics": {"K": syn.K_720P.tolist()},
+                    "processing_config": config.model_dump(mode="json"),
+                    "camera_geometry": geom.to_dict()},
+        capture=capture_record, warnings=processed.metrics.warnings)
+    archive.write_layer(
+        manifest, nominal_xyz=nominal, commanded_xyz=nominal,
+        measured_xyz=processed.measured_xyz, pointcloud_xyz=processed.filtered_xyz,
+        color=top_color, depth=top_depth,
+        derived_images={"segmentation.png": processed.segmentation,
+                        "skeleton.png": processed.skeleton,
+                        "comparison.png": processed.comparison},
+        report={**processed.report, "metrics": processed.metrics.model_dump(mode="json")},
+        views=view_payload, merged_points_xyz=merged.points)
+    return trial_id
+
+
+def test_reprocess_top_only_equals_the_single_view_result(tmp_path):
+    """The A/B's control arm. Same capture, two reconstructions -- paired on the
+    identical ring placement, which the operator cannot reproduce by hand."""
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion.service import reprocess_saved_layer
+    _archived_star_take(tmp_path, "t1")
+
+    merged = reprocess_saved_layer(tmp_path, "t1", 1, views="as_archived")
+    top = reprocess_saved_layer(tmp_path, "t1", 1, views="top_only")
+
+    assert merged["capture"]["style"] == "star"
+    assert top["capture"]["style"] == "single"
+    assert top["metrics"]["measured_center_mm"] != merged["metrics"]["measured_center_mm"]
+
+
+def test_as_archived_leaves_a_single_view_take_completely_unaffected(tmp_path):
+    """A take with no views/ directory never enters the star branch: 'as_archived'
+    on it is byte-for-byte today's single-frame reprocess, and 'top_only' on the
+    SAME take reconstructs identically, only explicitly labelled 'single'."""
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion.archive import ExtrusionArchive
+    from tasni.modules.extrusion.service import reprocess_saved_layer
+    from tasni.modules.extrusion.toolpath import points_array
+
+    plan = tem.scene_plan(radius=60.0, bead=8.0)
+    layer = plan.layers[0]
+    center = (plan.setup.center_x_mm, plan.setup.center_y_mm)
+    T = syn.inspection_camera_T((*center, 6.0), 300.0)
+    depth = syn.render_scene([syn.RingSpec(60.0, 8.0, center, height_fn=syn.flat(6.0))], T,
+                             plane_center_xy_mm=center, seed=11)
+    color = np.zeros((*depth.shape, 3), np.uint8)
+    archive = ExtrusionArchive(tmp_path)
+    archive.create_trial("t2", plan, mode="MEASURE_ONLY")
+    manifest = LayerManifest(
+        trial_id="t2", layer_index=1, take=1, mode="MEASURE_ONLY",
+        recipe=plan.recipe, toolpath_fingerprint=plan.fingerprint,
+        color_file="color.png", depth_file="depth.npy",
+        processing={"valid": False, "error": "not yet processed"},
+        provenance={"T_work_camera": np.asarray(T, float).tolist(),
+                    "camera_intrinsics": {"K": syn.K_720P.tolist()},
+                    "processing_config": ExtrusionConfig().model_dump(mode="json")})
+    nominal = points_array(layer)
+    archive.write_layer(manifest, nominal_xyz=nominal, commanded_xyz=nominal,
+                        color=color, depth=depth, report={"valid": False})
+
+    as_archived = reprocess_saved_layer(tmp_path, "t2", 1, views="as_archived")
+    top_only = reprocess_saved_layer(tmp_path, "t2", 1, views="top_only")
+
+    assert as_archived["capture"] is None                  # unaffected: nothing to merge
+    assert top_only["capture"]["style"] == "single"         # explicitly labelled anyway
+    assert as_archived["metrics"] == top_only["metrics"]    # identical reconstruction
+    assert not (tmp_path / "t2" / "layer-001" / "views").exists()
+
+
+def test_reprocess_as_archived_builds_a_full_capture_record_from_the_raw_views(tmp_path):
+    """Every one of the four configured views must reappear in the reprocessed
+    CaptureRecord, with the fresh diagnostics this reprocess actually computed."""
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion.service import reprocess_saved_layer
+    _archived_star_take(tmp_path, "t3")
+
+    out = reprocess_saved_layer(tmp_path, "t3", 1, views="as_archived")
+
+    assert out["capture"]["style"] == "star"
+    assert {v["name"] for v in out["capture"]["views"]} == {
+        "top", "star-000", "star-120", "star-240"}
+    assert all(not v["dropped"] for v in out["capture"]["views"])
+    assert out["capture"]["consensus_center_mm"] is not None
+    assert out["capture"]["spread_before_mm"] is not None
+    assert out["capture"]["residual_after_mm"] is not None
+    assert out["metrics"]["valid"], out["metrics"]["warnings"]
+    assert out["geometry"]["bead_width_mean_mm"] > 0
+
+
+def test_reprocess_carries_forward_the_original_drop_reason_for_a_never_captured_view(tmp_path):
+    """A view capture_views could not reach has no pose.json on disk at all --
+    reprocessing must not invent a different story for it than what actually
+    happened at the cell."""
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion.service import reprocess_saved_layer
+    _archived_star_take(tmp_path, "t4", drop="star-120")
+
+    out = reprocess_saved_layer(tmp_path, "t4", 1, views="as_archived")
+
+    views_by_name = {v["name"]: v for v in out["capture"]["views"]}
+    assert views_by_name["star-120"]["dropped"] is True
+    assert "simulated: unreachable at capture time" in views_by_name["star-120"]["drop_reason"]
+    assert not (tmp_path / "t4" / "layer-001" / "views" / "star-120").exists()
+    assert out["capture"]["style"] == "star"        # the other three still merged
+
+
+def test_reprocess_rejects_an_unknown_views_argument(tmp_path):
+    from tasni.modules.extrusion.service import reprocess_saved_layer
+    with pytest.raises(ValueError, match="views must be"):
+        reprocess_saved_layer(tmp_path, "nope", 1, views="everything")
+
+
+# ---------------------------------------------------- Task 7: tools/multiview_ab.py
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import multiview_ab  # noqa: E402
+
+
+def test_the_ab_tool_carries_the_voxel_warning_verbatim(tmp_path):
+    """Reading after_voxel and concluding "no gain" would wrongly kill the
+    feature -- the header has to say so before any table."""
+    lines = multiview_ab.build_report(tmp_path, "nothing-here")
+    assert lines[0] == (
+        "NOTE: the chain voxel-downsamples at 1 mm. Merging four views does NOT "
+        "multiply\nthe surviving point count -- it multiplies the samples each "
+        "voxel averages and\nfills dropouts. Read after_work_roi (pre-voxel), "
+        "never after_voxel.")
+
+
+def test_the_ab_tool_runs_end_to_end_on_an_archived_star_take(tmp_path, capsys):
+    """The tool as the operator actually runs it: point it at a trial, get one
+    clean report comparing the star and single-view reconstructions of the
+    identical capture, with the pre-voxel ROI count named explicitly."""
+    pytest.importorskip("open3d")
+    _archived_star_take(tmp_path, "t5")
+
+    code = multiview_ab.main(["t5", "--root", str(tmp_path)])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert out.startswith("NOTE: the chain voxel-downsamples at 1 mm.")
+    assert "Read after_work_roi (pre-voxel), never after_voxel." in out
+    assert "trial t5: 1 star take(s)" in out
+    assert "reprocess failed" not in out                     # a clean archived take never errors
+    data_lines = [line for line in out.splitlines() if line.startswith("1 | 1 |")]
+    assert len(data_lines) == 1, out                          # layer 1, take 1 -- one row
+
+
+def test_the_ab_tool_reports_no_star_takes_rather_than_crashing_on_a_single_view_trial(tmp_path):
+    """A trial with no views/ directory anywhere is not an error -- it just has
+    nothing this A/B can compare."""
+    from tasni.modules.extrusion.archive import ExtrusionArchive
+    plan = tem.scene_plan()
+    ExtrusionArchive(tmp_path).create_trial("t6", plan, mode="MEASURE_ONLY")
+
+    lines = multiview_ab.build_report(tmp_path, "t6")
+
+    assert any("no star takes found" in line for line in lines)
+
+
+# --------------------------------------- Task 8: capture_style + paper_summary guards
+
+
+def test_capture_style_reports_star_and_paper_summary_refuses_to_pool():
+    """Merged and single-view takes measure the same ring differently, and
+    acquisition_to_path_ms means something different for each. Pooling them
+    would put a number in the paper that describes neither."""
+    from tasni.modules.extrusion.measure import capture_style
+    star = [{"provenance": {"excursion_index": 1, "repeats_in_excursion": 1},
+             "capture": {"style": "star"}} for _ in range(3)]
+    assert capture_style(star) == "star"
+    mixed = star + [{"provenance": {"excursion_index": 2, "repeats_in_excursion": 1},
+                     "capture": {"style": "single"}}]
+    assert capture_style(mixed) == "mixed"
+
+
+def test_capture_style_falls_through_to_parked_re_approach_when_no_take_is_a_star():
+    """A group with no star takes at all must read exactly as it always has --
+    the star check is a short-circuit ahead of the existing logic, not a
+    replacement for it."""
+    from tasni.modules.extrusion.measure import capture_style
+    single_take = [{"capture": {"style": "single"}}]
+    assert capture_style(single_take) == "single"           # len < 2, falls through
+    legacy = [{"provenance": {}}, {"provenance": {}}]        # no capture field at all
+    assert capture_style(legacy) == "re-approach"
+    parked = [{"provenance": {"excursion_index": 1, "repeats_in_excursion": 3}}] * 2
+    assert capture_style(parked) == "parked"
+
+
+def _write_condition_take(root, trial_id, layer_index, take, *, style, rms, mean_abs,
+                          maximum, acq_ms, offset_norm=0.4):
+    """A minimal archived take carrying a given capture.style -- deliberately
+    simpler than a real star capture (no views/ directory, no merged cloud):
+    only the manifest fields paper_summary/capture_style actually read."""
+    from tasni.modules.extrusion.models import CaptureRecord, DeviationMetrics, RingGeometry
+    plan = tem.auto_plan()
+    setup = plan.setup
+    measured_center = (setup.center_x_mm + offset_norm, setup.center_y_mm)
+    manifest = LayerManifest(
+        trial_id=trial_id, layer_index=layer_index, take=take, mode="MEASURE_ONLY",
+        recipe=plan.recipe, toolpath_fingerprint="f" * 64,
+        metrics=DeviationMetrics(mean_absolute_mm=mean_abs, rms_mm=rms, maximum_mm=maximum,
+                                 measured_center_mm=measured_center, measured_radius_mm=40,
+                                 path_completeness=0.99, maximum_angular_gap_deg=4, valid=True,
+                                 center_offset_mm=(offset_norm, 0.0),
+                                 center_offset_norm_mm=offset_norm, shape_rms_mm=0.4),
+        geometry=RingGeometry(top_z_mean_mm=6, top_z_min_mm=5, top_z_max_mm=9, top_z_std_mm=1,
+                              height_mean_mm=6, height_min_mm=5, height_max_mm=9,
+                              height_reference="build_plane", bead_width_mean_mm=8,
+                              bead_width_min_mm=7, bead_width_max_mm=9, bead_width_bins=36),
+        processing={"timings_ms": {"capture_ms": 40.0, "total_ms": acq_ms - 40.0,
+                                   "acquisition_to_path_ms": float(acq_ms)}},
+        capture=(CaptureRecord(style=style) if style else None))
+    from tasni.modules.extrusion.archive import ExtrusionArchive
+    ExtrusionArchive(root).write_layer(manifest, nominal_xyz=np.zeros((4, 3)),
+                                       commanded_xyz=np.zeros((4, 3)))
+
+
+def test_paper_summary_refuses_to_pool_a_star_take_with_a_single_view_one(tmp_path):
+    """Same layer, same (empty) introduced offset -- a merged take and a
+    single-view take must land in DIFFERENT conditions, never be averaged
+    together, and their acquisition_to_path_ms must be reported separately."""
+    from tasni.modules.extrusion.measure import MeasureSession, paper_summary
+    session = MeasureSession.create(tmp_path, tem.auto_plan(), note="rings")
+    t = session.trial_id
+    _write_condition_take(tmp_path, t, 1, 1, style=None, rms=0.5, mean_abs=0.4, maximum=1.1,
+                          acq_ms=900, offset_norm=0.4)
+    _write_condition_take(tmp_path, t, 1, 2, style=None, rms=0.6, mean_abs=0.5, maximum=1.3,
+                          acq_ms=1100, offset_norm=0.5)
+    _write_condition_take(tmp_path, t, 1, 3, style="star", rms=0.2, mean_abs=0.15, maximum=0.4,
+                          acq_ms=5000, offset_norm=0.1)
+
+    summary = paper_summary(tmp_path, t)
+
+    by_name = {c["condition"]: c for c in summary["conditions"]}
+    assert set(by_name) == {"layer 1 - no introduced offset",
+                            "layer 1 - no introduced offset - star capture"}
+    single = by_name["layer 1 - no introduced offset"]
+    star = by_name["layer 1 - no introduced offset - star capture"]
+    assert single["takes"] == 2 and star["takes"] == 1
+    assert single["capture"] == "re-approach"          # never conflated with "star"
+    assert star["capture"] == "star"
+    # The single-view pair's own deviation numbers are untouched by the star take.
+    assert single["rms_mm"]["mean"] == pytest.approx((0.5 + 0.6) / 2)
+    assert star["rms_mm"]["mean"] == pytest.approx(0.2)
+    # acquisition_to_path_ms: the star take's 5000 ms never pollutes the
+    # single-view figure, and is reported in its own block instead.
+    assert summary["timing_ms"]["acquisition_to_path_ms"]["n"] == 2
+    assert summary["timing_ms"]["acquisition_to_path_ms"]["mean"] == pytest.approx(1000.0)
+    assert summary["timing_ms_star"]["acquisition_to_path_ms"]["n"] == 1
+    assert summary["timing_ms_star"]["acquisition_to_path_ms"]["mean"] == pytest.approx(5000.0)
+    assert any("star (merged-view)" in p for p in summary["prose"])
+    from tasni.modules.extrusion.measure import CAPTURE_LABEL
+    assert CAPTURE_LABEL["star"] in summary["markdown"]
+
+
+def test_paper_summary_timing_ms_star_is_none_when_the_trial_has_no_star_takes(tmp_path):
+    """A trial that never used multi-view must not grow a spurious empty block
+    -- None distinguishes "no star takes" from "star takes, nothing timed"."""
+    from tasni.modules.extrusion.measure import MeasureSession, paper_summary
+    session = MeasureSession.create(tmp_path, tem.auto_plan(), note="rings")
+    t = session.trial_id
+    _write_condition_take(tmp_path, t, 1, 1, style=None, rms=0.5, mean_abs=0.4, maximum=1.1,
+                          acq_ms=900)
+
+    summary = paper_summary(tmp_path, t)
+
+    assert summary["timing_ms_star"] is None

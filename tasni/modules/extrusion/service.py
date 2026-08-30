@@ -24,9 +24,10 @@ from .comparison import fit_circle_xy
 from .inspection import (aim_point_mm, cylinder_diameter_mm, framing_standoff,
                          inspection_plan, order_candidates_seed_first,
                          pose_candidates, standoff_fault,
-                         standoff_report, star_view_candidates)
-from .models import CylinderPlan, CylinderRecipe, CylinderSetup, LayerManifest
-from .processing import process_observation
+                         standoff_report, star_view_angles, star_view_candidates)
+from .models import CaptureRecord, CylinderPlan, CylinderRecipe, CylinderSetup, LayerManifest
+from .multiview import ViewCloud, merge_views
+from .processing import observation_points, process_observation, process_points
 from .surface import surface_check
 from .toolpath import generate_cylinder_plan, points_array
 from .valve import instructions_match
@@ -1149,8 +1150,23 @@ class CylinderPrintJob:
 
 
 def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
-                          take: int = 1) -> dict:
-    """Rebuild only derived artifacts from one archived raw RGB-D observation."""
+                          take: int = 1, *, views: str = "as_archived") -> dict:
+    """Rebuild only derived artifacts from one archived raw RGB-D observation.
+
+    ``views`` chooses what the reconstruction is built from -- the same raw
+    capture, two ways, which is what makes the star's on-cell A/B free (Task 7):
+
+    - ``"as_archived"`` (default) -- merge whatever ``layer_dir/views/`` holds.
+      A take with no ``views/`` directory (every take before multi-view, or a
+      star take that never survived capture_views past the top view) is
+      completely unaffected: this is exactly today's single-frame path.
+    - ``"top_only"`` -- rebuild from the top view alone, ignoring ``views/``
+      entirely even when it exists. The control arm of the A/B: the SAME
+      physical ring placement, reconstructed as if it had only ever been a
+      single-view take. ``capture.style`` is reported as ``"single"``.
+    """
+    if views not in ("as_archived", "top_only"):
+        raise ValueError(f"views must be 'as_archived' or 'top_only', not {views!r}")
     archive = ExtrusionArchive(root)
     layer_dir = archive.layer_dir(trial_id, layer_index, take=take)
     trial_dir = layer_dir.parent
@@ -1211,23 +1227,111 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
     plan = generate_cylinder_plan(recipe, setup)
     if layer_index > len(plan.layers):
         raise RuntimeError("archived layer index exceeds the stored recipe")
-    processed = process_observation(
-        color=color, depth=depth, geometry=geometry,
-        T_work_camera=np.asarray(transform, dtype=float),
-        K=np.asarray(intrinsics["K"], dtype=float),
-        # A legacy archive's registration is the IDENTITY (depth K == colour K,
-        # zero extrinsic -- see CameraGeometry.legacy_aligned). Handing
-        # project_to_color the CALIBRATED distortion anyway breaks that: it
-        # re-projects through the distortion map, so uv != (u, v) and the gate
-        # is sampled off-pixel (this checkout's k1=0.1148/k2=-0.2386 moves it a
-        # few px at the ring's radius, tens near the frame edge) -- and
-        # figures._compute_stages already passes dist=None for the same take,
-        # so the reprocess button and the figure would gate it differently.
-        # Protocol-2 takes keep the calibrated distortion, same as a live
-        # capture (Task 9 review, Important 4).
-        dist=None if geometry.legacy else intrinsics.get("dist_coeffs"),
-        plan=plan, layer=plan.layers[layer_index - 1],
-        config=ExtrusionConfig.model_validate(processing_payload))
+    layer = plan.layers[layer_index - 1]
+    cfg = ExtrusionConfig.model_validate(processing_payload)
+    top_dist = None if geometry.legacy else intrinsics.get("dist_coeffs")
+    # A legacy archive's registration is the IDENTITY (depth K == colour K,
+    # zero extrinsic -- see CameraGeometry.legacy_aligned). Handing
+    # project_to_color the CALIBRATED distortion anyway breaks that: it
+    # re-projects through the distortion map, so uv != (u, v) and the gate
+    # is sampled off-pixel (this checkout's k1=0.1148/k2=-0.2386 moves it a
+    # few px at the ring's radius, tens near the frame edge) -- and
+    # figures._compute_stages already passes dist=None for the same take,
+    # so the reprocess button and the figure would gate it differently.
+    # Protocol-2 takes keep the calibrated distortion, same as a live
+    # capture (Task 9 review, Important 4). The same rule applies per view
+    # below -- each view carries its own greeting and can be legacy or not
+    # independently of the top view.
+    view_dir = layer_dir / "views"
+    capture_record = manifest.capture           # unaffected unless a branch below sets it
+    fallback_warning: str | None = None
+    if views == "top_only":
+        processed = process_observation(
+            color=color, depth=depth, geometry=geometry,
+            T_work_camera=np.asarray(transform, dtype=float),
+            K=np.asarray(intrinsics["K"], dtype=float), dist=top_dist,
+            plan=plan, layer=layer, config=cfg)
+        # The control arm of the A/B must say so plainly, regardless of what
+        # this take was originally captured as -- see capture_style()/
+        # paper_summary() (Task 8), which refuse to pool a "star" reconstruction
+        # with a "single" one even when they came from the identical take.
+        capture_record = CaptureRecord(style="single")
+    elif view_dir.is_dir():
+        # "as_archived" and there IS a views/ directory: rebuild every surviving
+        # view from its own archived color/depth/pose.json, then merge and
+        # process exactly as the live star capture does (measure.py's
+        # _merge_star_views/_one_take) -- this seam is the free A/B: the same
+        # raw frames, reconstructed the star's way instead of the top-only way.
+        from .measure import _capture_record_from_merge, _merge_fallback_warning
+        original_views = {v.name: v for v in (manifest.capture.views
+                                              if manifest.capture else [])}
+        clouds: list[ViewCloud] = []
+        diag: dict[str, dict] = {}
+        capture_records: list[dict] = []
+        for name, tilt, azimuth in star_view_angles(cfg):
+            vdir = view_dir / name
+            pose_file = vdir / "pose.json"
+            if not pose_file.is_file():
+                # Never captured at all (capture_views dropped it, or an
+                # older archive) -- carry the ORIGINAL drop reason forward
+                # rather than inventing a rosier or blanker history.
+                original = original_views.get(name)
+                capture_records.append({
+                    "name": name, "tilt_deg": tilt, "azimuth_deg": azimuth,
+                    "dropped": True,
+                    "drop_reason": (original.drop_reason if original is not None
+                                    else "view not present in the archive")})
+                continue
+            pose = json.loads(pose_file.read_text(encoding="utf-8"))
+            if name == "top":
+                v_color, v_depth = color, depth
+            else:
+                v_color_path, v_depth_path = vdir / "color.png", vdir / "depth.npy"
+                if not v_color_path.is_file() or not v_depth_path.is_file():
+                    raise RuntimeError(
+                        f"archived view {name!r} is incomplete (missing color/depth)")
+                v_color = cv2.imread(str(v_color_path), cv2.IMREAD_COLOR)
+                if v_color is None:
+                    raise RuntimeError(f"archived view {name!r} color image "
+                                       "could not be decoded")
+                v_depth = np.load(v_depth_path, allow_pickle=False)
+            v_geom_dict = pose.get("camera_geometry")
+            if v_geom_dict is not None and not v_geom_dict.get("legacy_aligned"):
+                v_geometry = CameraGeometry.from_greeting(v_geom_dict)
+            else:
+                v_geometry = CameraGeometry.legacy_aligned(
+                    np.asarray(intrinsics["K"], float),
+                    (v_depth.shape[1], v_depth.shape[0]))
+            v_transform = pose.get("T_work_camera")
+            if v_transform is None:
+                raise RuntimeError(f"archived view {name!r} carries no camera pose")
+            v_transform = np.asarray(v_transform, dtype=float)
+            v_dist = None if v_geometry.legacy else intrinsics.get("dist_coeffs")
+            points, gated = observation_points(
+                color=v_color, depth=v_depth, geometry=v_geometry,
+                T_work_camera=v_transform, K=np.asarray(intrinsics["K"], dtype=float),
+                dist=v_dist, config=cfg)
+            clouds.append(ViewCloud(name=name, points=points, chroma_gated=gated,
+                                    tilt_deg=float(tilt), azimuth_deg=float(azimuth),
+                                    T_work_camera=v_transform))
+            diag[name] = {"chroma_gated": gated, "points_before_merge": int(len(points))}
+            capture_records.append({
+                "name": name, "tilt_deg": tilt, "azimuth_deg": azimuth,
+                "dropped": False, "drop_reason": None,
+                "T_work_camera": v_transform.tolist(), "roll_deg": pose.get("roll_deg")})
+        merged = merge_views(clouds, plan=plan, layer=layer, config=cfg)
+        fallback_warning = _merge_fallback_warning(merged)
+        processed = process_points(merged.points, plan=plan, layer=layer, config=cfg,
+                                   chroma_gated=merged.chroma_gated)
+        capture_record = _capture_record_from_merge(capture_records, merged, diag)
+    else:
+        # "as_archived" and no views/ directory: an ordinary single-view take,
+        # completely unaffected -- today's path, byte for byte.
+        processed = process_observation(
+            color=color, depth=depth, geometry=geometry,
+            T_work_camera=np.asarray(transform, dtype=float),
+            K=np.asarray(intrinsics["K"], dtype=float), dist=top_dist,
+            plan=plan, layer=layer, config=cfg)
     reprocessed_at = _utcnow()
     # Timing honesty. The capture is the same frame, so its capture_ms stays
     # true; the processing time is now a desktop measurement of a run that
@@ -1251,6 +1355,9 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
     }
     if preserved:
         report["live_timings_ms"] = dict(preserved)
+    warnings = list(processed.metrics.warnings)
+    if fallback_warning:
+        warnings.append(fallback_warning)
     next_manifest = manifest.model_copy(update={
         "measured_path_file": "measured_path.json",
         "corrected_path_file": ("corrected_path.json"
@@ -1263,7 +1370,12 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
         # those statistics while its metrics counted.
         "geometry": processed.geometry,
         "processing": report,
-        "warnings": processed.metrics.warnings,
+        "warnings": warnings,
+        # capture_style()/paper_summary() (Task 8) key their pooling refusal off
+        # this field -- a reprocess must report what IT built, "single" for
+        # views="top_only" even when the archive holds a star, exactly like
+        # merge_views degrading to top-only reports "single" at capture time.
+        "capture": capture_record,
         "provenance": {**provenance, "last_reprocessed_at": reprocessed_at},
     })
     archive.rewrite_processing(
@@ -1288,5 +1400,7 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
         "trial_id": trial_id, "layer_index": layer_index,
         "reprocessed_at": reprocessed_at,
         "metrics": processed.metrics.model_dump(mode="json"),
+        "geometry": processed.geometry.model_dump(mode="json") if processed.geometry else None,
+        "capture": capture_record.model_dump(mode="json") if capture_record is not None else None,
         "run_dir": str(layer_dir),
     }
