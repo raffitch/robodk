@@ -356,6 +356,20 @@ def capture_views(services, ctx: JobContext, plan: CylinderPlan, layer, *,
     A view that cannot be reached or cannot be trusted is recorded and skipped;
     only the TOP view failing fails the take, exactly as today.
     """
+    if not plan.setup.inspection_auto:
+        # A taught target is ONE pose, not a cone -- _build_inspection_move's
+        # manual-mode branch returns that same pose regardless of tilt_deg, so
+        # proceeding here would command the identical taught target three more
+        # times under the star's names and merge four near-identical clouds,
+        # archiving capture.style == "star" with no error and no warning. That
+        # does not merely fail to help; it manufactures the APPEARANCE of
+        # multi-view evidence where there is none. Refuse loudly instead.
+        raise RuntimeError(
+            "multi-view capture needs an automatic (derived) inspection pose -- "
+            f"{plan.setup.work_frame!r} is configured for a taught target "
+            f"({plan.setup.inspection_target!r}), which has no cone to place the "
+            "star's tilt/azimuth views on. Set setup.inspection_auto=True, or "
+            "turn multiview off for this plan.")
     from .inspection import star_view_angles
     ecfg = services.config.extrusion
     out = {"views": [], "records": []}
@@ -627,16 +641,21 @@ def capture_side_photo(services, ctx: JobContext, *, start_joints) -> dict:
     return record
 
 
-def _process_star_take(*, views: list[dict], repeat: int, plan: CylinderPlan, layer,
-                       config, camera_cfg, floor_profile) -> tuple:
-    """Back-project + gate every surviving view's take-``repeat`` frame, merge,
-    then run the UNCHANGED chain (process_points) on the merged cloud.
+def _merge_star_views(*, views: list[dict], repeat: int, plan: CylinderPlan, layer,
+                      config, camera_cfg) -> tuple:
+    """Back-project + gate every surviving view's take-``repeat`` frame and merge.
 
-    This is the seam multi-view sits on (processing.observation_points /
-    process_points, task 4) plus the ring-first merge (multiview.merge_views,
-    task 5) -- nothing here reimplements either. Returns
-    ``(ProcessingResult, MergeResult, per_view_diag)``: the caller archives the
-    merged cloud and builds the manifest's ``CaptureRecord`` from the last two.
+    Split out from running ``process_points`` on the result (below) so a caller
+    keeps the ``MergeResult`` even when process_points itself is what fails --
+    otherwise a merge of four good views would be thrown away, along with the
+    frames, the moment the ROI/branch-guard chain rejected the merged cloud.
+
+    This is the seam multi-view sits on (processing.observation_points, task 4)
+    plus the ring-first merge (multiview.merge_views, task 5) -- nothing here
+    reimplements either. Returns ``(MergeResult, per_view_diag, timings,
+    started)``: ``started`` is the perf_counter() this began at, so a caller
+    that goes on to call ``process_points`` can pass it through and get a
+    ``total_ms`` that still spans the whole star, not just the ROI onward.
     """
     started = time.perf_counter()
     timings: dict = {}
@@ -657,17 +676,33 @@ def _process_star_take(*, views: list[dict], repeat: int, plan: CylinderPlan, la
     mark = time.perf_counter()
     merged = merge_views(clouds, plan=plan, layer=layer, config=config)
     timings["merge_ms"] = (time.perf_counter() - mark) * 1000.0
-    processed = process_points(
-        merged.points, plan=plan, layer=layer, config=config,
-        chroma_gated=merged.chroma_gated, floor_profile=floor_profile,
-        timings=timings, started=started)
-    return processed, merged, diag
+    return merged, diag, timings, started
+
+
+def _merge_fallback_warning(merged: MergeResult) -> "str | None":
+    """The reason the merge gave up and fell back to the top view alone, or
+    None when it did not. ``merge_views`` computes this reason (spec section 8:
+    "mark style='single' with a warning naming what was lost") but has nowhere
+    typed to put it -- it lives only in ``dropped["__merge__"]``, a sentinel key
+    that names no real view. Surfaced here so it reaches the manifest's
+    ``warnings`` instead of being silently dropped on the floor.
+    """
+    reason = merged.dropped.get("__merge__")
+    return f"multi-view merge fell back to the top view alone: {reason}" if reason else None
 
 
 def _capture_record_from_merge(capture_records: list[dict], merged: MergeResult,
                                diag: dict[str, dict]) -> CaptureRecord:
     """Build the manifest's ``CaptureRecord`` from what capture_views and the
     merge each learned about every configured star view.
+
+    ``style`` is derived from what actually happened, not from the fact that a
+    star was ATTEMPTED: "star" only when more than one view genuinely
+    contributed to ``merged.points`` (``len(merged.used) > 1``); a merge that
+    fell back to the top view alone (too few views survived registration) is
+    "single", exactly like the always-single-view path -- spec section 8 is
+    explicit about this, and Task 8's capture_style()/paper_summary() rely on
+    it to refuse pooling a merged take with a single-view one.
 
     Every configured view gets exactly one ``ViewRecord`` regardless of WHERE it
     was dropped -- unreachable pose (capture_views), or failed levelling/arc/
@@ -693,7 +728,7 @@ def _capture_record_from_merge(capture_records: list[dict], merged: MergeResult,
             residual_rms_mm=merged.residual_rms_mm.get(name),
             dropped=merge_reason is not None, drop_reason=merge_reason))
     return CaptureRecord(
-        style="star", views=views,
+        style=("star" if len(merged.used) > 1 else "single"), views=views,
         consensus_center_mm=(list(merged.consensus_center_mm)
                              if merged.consensus_center_mm is not None else None),
         consensus_radius_mm=merged.consensus_radius_mm,
@@ -774,6 +809,17 @@ class RingMeasureJob:
         # every number in the PFH archive came from it (spec section 5.8).
         self.multiview = (services.config.extrusion.multiview_enabled
                           if multiview is None else bool(multiview))
+        # Fail at construction, before any robot motion: capture_views raises
+        # the same error, but only once RUN_ROBOT is already applied and the
+        # readiness camera frame already paid for -- see capture_views for why
+        # a taught target cannot honestly become a star.
+        if self.multiview and not self.plan.setup.inspection_auto:
+            raise RuntimeError(
+                "multiview requires an automatic (derived) inspection pose -- "
+                f"{self.plan.setup.work_frame!r} is configured for a taught target "
+                f"({self.plan.setup.inspection_target!r}), which has no cone to place "
+                "the star's tilt/azimuth views on. Set setup.inspection_auto=True, "
+                "or pass multiview=False.")
         self.results: list[dict] = []
         self.result: dict | None = None
 
@@ -995,6 +1041,8 @@ class RingMeasureJob:
         camera_cfg = services.config.camera
         capture_record = None
         merged: MergeResult | None = None
+        diag: dict[str, dict] = {}
+        fallback_warning: str | None = None
         try:
             if views is None:
                 processed = process_observation(
@@ -1002,22 +1050,45 @@ class RingMeasureJob:
                     T_work_camera=T_work_camera, K=camera_cfg.K, dist=camera_cfg.dist,
                     plan=self.plan, layer=layer, config=ecfg, floor_profile=floor)
             else:
-                processed, merged, diag = _process_star_take(
+                # Split from process_points on purpose: if THAT raises below,
+                # merged/diag are already assigned in this scope, so the except
+                # branch can still archive the merge and the per-view frames
+                # instead of discarding four good captures (spec 5.6's "free
+                # A/B" -- the operator cannot re-place a ring exactly).
+                merged, diag, star_timings, star_started = _merge_star_views(
                     views=views, repeat=repeat, plan=self.plan, layer=layer,
-                    config=ecfg, camera_cfg=camera_cfg, floor_profile=floor)
+                    config=ecfg, camera_cfg=camera_cfg)
+                fallback_warning = _merge_fallback_warning(merged)
+                processed = process_points(
+                    merged.points, plan=self.plan, layer=layer, config=ecfg,
+                    chroma_gated=merged.chroma_gated, floor_profile=floor,
+                    timings=star_timings, started=star_started)
                 capture_record = _capture_record_from_merge(capture_records, merged, diag)
         except Exception as exc:
             # A failed measurement still archives its raw RGB-D: the operator
             # cannot re-place the ring exactly, so the frame is the only thing
-            # that can be reprocessed later.
+            # that can be reprocessed later. In star mode the OTHER captured
+            # views are just as irreplaceable, so archive them (and the merge,
+            # when it got far enough to exist) alongside the top frame rather
+            # than throwing four good captures away because the MERGED cloud
+            # failed process_points.
+            warnings = [str(exc)] + ([fallback_warning] if fallback_warning else [])
+            failure_capture = (_capture_record_from_merge(capture_records, merged, diag)
+                               if (views is not None and merged is not None) else None)
             manifest = LayerManifest(
                 **base, processing={"valid": False, "error": str(exc),
                                     "timings_ms": {"capture_ms": capture_ms}},
-                warnings=[str(exc)])
+                warnings=warnings, capture=failure_capture)
+            failure_kwargs: dict = {}
+            if views is not None:
+                failure_kwargs["views"] = _archive_view_payload(views, repeat)
+                if merged is not None:
+                    failure_kwargs["merged_points_xyz"] = merged.points
             failed_dir = archive.write_layer(
                 manifest, nominal_xyz=nominal, commanded_xyz=nominal,
                 color=frame.color, depth=frame.depth,
-                report={"valid": False, "error": str(exc)})
+                report={"valid": False, "error": str(exc)},
+                **failure_kwargs)
             # A failure the operator cannot see is a failure they cannot
             # reprocess -- and the raw frame that would rescue it is already
             # on disk.
@@ -1040,11 +1111,14 @@ class RingMeasureJob:
             timings["move_to_pose_ms"] = moved["move_ms"]
             timings["settle_ms"] = moved["settle_ms"]
         processed.report["depth_plane_check"] = captured["depth_plane_check"]
+        warnings = list(processed.metrics.warnings)
+        if fallback_warning:
+            warnings.append(fallback_warning)
         manifest = LayerManifest(
             **base, measured_path_file="measured_path.json",
             pointcloud_file="height-or-pointcloud.npy",
             metrics=processed.metrics, geometry=processed.geometry,
-            processing=processed.report, warnings=processed.metrics.warnings,
+            processing=processed.report, warnings=warnings,
             capture=capture_record)
         archive_kwargs: dict = {}
         if views is not None:

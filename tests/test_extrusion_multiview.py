@@ -664,12 +664,15 @@ def test_a_failing_top_view_fails_the_whole_take(tmp_path, monkeypatch):
     assert rdk.events[-1] == ("move-joints", tej.START_JOINTS)         # still comes home
 
 
-def test_a_star_take_that_fails_processing_still_archives_the_top_frame_and_returns_home(
+def test_a_star_take_that_fails_processing_still_archives_the_other_views_and_the_merge(
         tmp_path, monkeypatch):
-    """Distinct from the top-VIEW-capture failing: here every view is captured
-    fine but the merged cloud fails process_points (e.g. not enough deposit
-    points) -- the take must still fail loudly, archive the irreplaceable top
-    RGB-D exactly as the single-view path does, and the arm must still return."""
+    """Review finding 3: distinct from the top-VIEW-capture failing, here every
+    view is captured fine and the MERGE succeeds -- only process_points fails
+    on the merged cloud (e.g. not enough deposit points). The take must still
+    fail loudly and archive the top RGB-D exactly as the single-view path does,
+    but the three OTHER captured views and the merged cloud are just as
+    irreplaceable and must NOT be thrown away (spec 5.6's free-A/B argument),
+    and the arm must still return."""
     svc, rdk, camera = _multiview_env(tmp_path, monkeypatch)
 
     def failing_process_points(points, **kwargs):
@@ -684,10 +687,127 @@ def test_a_star_take_that_fails_processing_still_archives_the_top_frame_and_retu
     layer_dir = session.trial_dir / "layer-001"
     assert (layer_dir / "depth.npy").is_file() and (layer_dir / "color.png").is_file()
     assert "simulated" in (layer_dir / "report.json").read_text()
+    # The merge (via _fake_merge_views) succeeded before process_points failed --
+    # the three OTHER captured views and the merged cloud must survive.
+    for name in ("star-000", "star-120", "star-240"):
+        assert (layer_dir / "views" / name / "color.png").is_file()
+        assert (layer_dir / "views" / name / "depth.npy").is_file()
+    assert (layer_dir / "merged_points.npy").is_file()
     manifest = json.loads((layer_dir / "manifest.json").read_text())
-    assert manifest["capture"] is None       # never built once processing failed
-    assert not (layer_dir / "merged_points.npy").exists()
+    assert manifest["capture"] is not None
+    assert manifest["capture"]["style"] == "star"          # _fake_merge_views used all 4
+    assert len(manifest["capture"]["views"]) == 4
+    assert "simulated" in manifest["warnings"][0]
     assert rdk.events[-1] == ("move-joints", tej.START_JOINTS)         # still comes home
+
+
+def test_a_star_take_whose_backprojection_fails_before_any_merge_archives_only_what_it_has(
+        tmp_path, monkeypatch):
+    """When observation_points itself raises, no MergeResult ever exists -- the
+    capture record must degrade to None rather than being built from nothing,
+    but the frames capture_views already grabbed are still archived."""
+    svc, rdk, camera = _multiview_env(tmp_path, monkeypatch)
+
+    def failing_observation_points(**kwargs):
+        raise RuntimeError("simulated: back-projection failed")
+
+    monkeypatch.setattr(measure_mod, "observation_points", failing_observation_points)
+    plan = tem.auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    with pytest.raises(RuntimeError, match="raw RGB-D archived"):
+        RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True,
+                       multiview=True)(tem.Ctx())
+    layer_dir = session.trial_dir / "layer-001"
+    assert (layer_dir / "views" / "star-000" / "color.png").is_file()   # frames still archived
+    assert not (layer_dir / "merged_points.npy").exists()               # no merge ever ran
+    manifest = json.loads((layer_dir / "manifest.json").read_text())
+    assert manifest["capture"] is None       # nothing to build a record from
+    assert rdk.events[-1] == ("move-joints", tej.START_JOINTS)
+
+
+# ---------------------------------------------- Finding 1: style reflects what happened
+
+def test_a_real_merge_that_falls_back_to_top_only_is_archived_as_single_not_star(
+        tmp_path, monkeypatch):
+    """Review finding 1: drive the REAL merge_views (not the fake) into its
+    top-only fallback -- only the top view's colour gate holds, so every star
+    view is dropped before ever reaching level_points, len(fit_xy) stays under
+    multiview_min_views, and merge_views degrades to top-only. The archived
+    style must say 'single', not 'star', and the fallback reason must reach the
+    manifest's warnings -- Task 8's paper_summary() refuses to pool a merged
+    take with a single-view one based on exactly this field."""
+    svc, rdk, camera = tem.measure_env(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def fake_observation_points(**kwargs):
+        calls["n"] += 1
+        return np.zeros((10, 3)), calls["n"] == 1     # only the FIRST call (top) is gated
+
+    monkeypatch.setattr(measure_mod, "observation_points", fake_observation_points)
+    monkeypatch.setattr(measure_mod, "process_points",
+                        lambda points, **kwargs: tem.fake_measure_processing(**kwargs))
+    tem.fake_measure_processing.calls.clear()
+    # merge_views is left as the REAL one -- not monkeypatched.
+    plan = tem.auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    out = RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True,
+                         multiview=True)(tem.Ctx())
+    manifest = json.loads((Path(out["layer_dir"]) / "manifest.json").read_text())
+    assert manifest["capture"]["style"] == "single"
+    assert manifest["capture"]["consensus_center_mm"] is None
+    assert len(manifest["capture"]["views"]) == 4
+    # Whether TOP's own trivial cloud also fails its annulus check is
+    # merge_views's own business (task 5) -- what matters here is that never
+    # more than one view is counted "used" once the merge degraded.
+    used_names = {v["name"] for v in manifest["capture"]["views"] if not v["dropped"]}
+    assert len(used_names) <= 1
+    dropped_names = {v["name"]: v["drop_reason"] for v in manifest["capture"]["views"]
+                     if v["dropped"]}
+    assert {"star-000", "star-120", "star-240"} <= set(dropped_names)
+    assert any("colour gate abstained" in (dropped_names[n] or "")
+              for n in ("star-000", "star-120", "star-240"))
+    assert any("fell back to the top view alone" in w for w in manifest["warnings"])
+
+
+# ---------------------------------------------- Finding 2: manual mode refuses the star
+
+def _manual_measure_plan():
+    from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup
+    from tasni.modules.extrusion.toolpath import generate_cylinder_plan
+    recipe = CylinderRecipe(radius_mm=40, layer_count=3, layer_height_mm=6, bead_diameter_mm=8,
+                            robot_speed_mm_s=75, extrusion_rate_pct=0, points_per_circle=24)
+    setup = CylinderSetup(print_tool="LongCalibTool", work_frame="Tasni Work Frame",
+                          inspection_tool="Realsense", inspection_target="TaughtInspect",
+                          inspection_auto=False, center_x_mm=200, center_y_mm=150)
+    return generate_cylinder_plan(recipe, setup)
+
+
+def test_multiview_on_a_taught_target_plan_refuses_at_construction(tmp_path, monkeypatch):
+    """Review finding 2: a taught target is ONE pose, not a cone. Letting
+    multi-view proceed would command that same pose four times under the
+    star's names and archive capture.style == 'star' with no error -- silently
+    manufacturing the appearance of multi-view evidence where there is none.
+    Must refuse at job construction, before any robot motion."""
+    svc, rdk, camera = tem.measure_env(tmp_path, monkeypatch)
+    plan = _manual_measure_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    with pytest.raises(RuntimeError, match="inspection_auto"):
+        RingMeasureJob(svc, plan, session, 1, annotation={}, check_collisions=True,
+                       multiview=True)
+    assert rdk.events == []          # refused before any robot motion at all
+
+
+def test_capture_views_itself_also_refuses_manual_mode(tmp_path, monkeypatch):
+    """Defence in depth: capture_views is the single canonical place multi-view
+    capture happens, so it carries the same guard independent of the job-level
+    check above -- exercised directly in case a future caller reaches it
+    without going through RingMeasureJob.__init__."""
+    svc, rdk, camera = tem.measure_env(tmp_path, monkeypatch)
+    plan = _manual_measure_plan()
+    with pytest.raises(RuntimeError, match="inspection_auto"):
+        capture_views(svc, tem.Ctx(), plan, plan.layers[0], inspection_name="X_Inspect",
+                     start_joints=tej.START_JOINTS, seed_pose=None, collisions=True,
+                     artifacts=[])
 
 
 def test_repeats_visits_each_star_pose_once_not_once_per_repeat(tmp_path, monkeypatch):
