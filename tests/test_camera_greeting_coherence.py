@@ -32,13 +32,16 @@ carry no geometry and are left alone.
 from __future__ import annotations
 
 import inspect
+import io
 import json
 import socket
+import struct
 import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import lz4.frame as lz4f
 import numpy as np
 import pytest
 
@@ -318,6 +321,32 @@ def _drain(sock):
         out.extend(chunk)
 
 
+def _split_greeting(wire, preamble=b""):
+    """The greeting this connection was sent, and every byte that followed it.
+
+    Everything after that one line is payload the client will scale with the
+    greeting -- so "what did this connection actually deliver?" is answered by
+    looking at the tail, not by counting acquisitions inside the server.
+    """
+    assert wire.startswith(preamble), f"expected {preamble!r} first, got {wire[:32]!r}"
+    line, sep, tail = wire[len(preamble):].partition(b"\n")
+    assert sep, "the server sent no greeting line at all"
+    return json.loads(line.decode("utf-8")), tail
+
+
+def _depth_frames_in(tail):
+    """Decode the protocol-2 frames in ``tail`` exactly as the host's reader does:
+    ``<I depth_len><I color_len><d ts>`` then lz4(np.save(depth)) then colour JPEG."""
+    frames = []
+    while len(tail) >= 16:
+        depth_len, color_len = struct.unpack("<II", tail[:8])
+        body = tail[16:16 + depth_len + color_len]
+        frames.append(np.load(io.BytesIO(lz4f.decompress(body[:depth_len])),
+                              allow_pickle=False))
+        tail = tail[16 + depth_len + color_len:]
+    return frames
+
+
 def test_a_client_greeted_before_a_rebuild_is_disconnected(monkeypatch, capsys):
     """The 2026-08-30 case: greeted at generation N, still streaming at N+1.
 
@@ -349,17 +378,78 @@ def test_a_client_greeted_before_a_rebuild_is_disconnected(monkeypatch, capsys):
         client_sock.sendall(b"MODE FULL V2\n")
         srv.handle_client(server_sock, ("10.12.172.19", 40437))
 
-        assert len(calls) == 1, (
-            f"served {len(calls)} frames; the connection must end at the first frame "
-            f"after the rebuild")
+        assert len(calls) <= 1, (
+            f"the connection went on acquiring after the rebuild ({len(calls)} "
+            f"acquisitions); it must end at the first frame after the rebuild")
         assert server_sock.fileno() == -1, "the stale connection was not closed"
         wire = _drain(client_sock)
-        greeting = json.loads(wire.split(b"\n", 1)[0].decode("utf-8"))
+        greeting, tail = _split_greeting(wire)
         # It was greeted honestly -- with the open that was live at the time. That is
         # exactly why it cannot be allowed to keep streaming afterwards.
         _assert_greeting_describes_one_open(greeting, "stale")
+        # The measurable contract is BYTES, not acquisitions: one frame is a whole
+        # measurement (CameraClient.grab() reads exactly one per connection), so
+        # "the loop only ran once" is not a pass -- zero frames delivered is.
+        assert tail == b"", (
+            f"{len(_depth_frames_in(tail))} frame(s) ({len(tail)} bytes) were "
+            f"delivered after the rebuild, described by the pre-rebuild greeting")
         assert "camera rebuilt" in capsys.readouterr().out, (
             "a server-initiated close must name its reason in the journal")
+    finally:
+        server_sock.close()
+        client_sock.close()
+
+
+def test_a_rebuild_landing_inside_getframes_leaks_no_frame(monkeypatch, capsys):
+    """The hole left by checking staleness only at the TOP of the serve loop.
+
+    ``getFrames`` runs the Nano's whole filter chain -- roughly a second -- so a
+    rebuild that lands *inside* it has already got past the top-of-loop check. The
+    frame is then compressed and written to the socket under the PRE-rebuild
+    greeting, and only the next iteration notices. One frame is the entire defect:
+    ``CameraClient.grab()`` reads exactly one frame per connection, and that is the
+    per-pose scan capture, the gate grab and the extrusion measurement. Here the
+    reopened device publishes 0.2 mm/count while the greeting still says 1.0, so the
+    leaked frame reads a real 600 mm standoff as 3000 mm -- silently, 5x out.
+    """
+    _fake_jpeg(monkeypatch)
+    _publish("stale", FakePipeline("stale", depth_scale=0.001))
+    depth = np.full((4, 4), 3000, dtype=np.uint16)
+    color = np.zeros((8, 8, 3), dtype=np.uint8)
+    calls = []
+
+    def fake_get_frames(_filters):
+        calls.append(1)
+        if len(calls) == 1:
+            # The rebuild completes DURING the acquisition, and leaves every camera
+            # global bound to the new open the way _rebuild_pipeline does.
+            _publish("fresh")
+            srv._camera_generation += 1
+        if len(calls) > 5:                              # pragma: no cover - failure detail
+            raise _KeptStreaming("the connection never noticed the rebuild at all")
+        return depth, color, 1.0
+
+    monkeypatch.setattr(srv, "getFrames", fake_get_frames)
+    server_sock, client_sock = socket.socketpair()
+    try:
+        client_sock.sendall(b"MODE FULL V2\n")
+        srv.handle_client(server_sock, ("10.12.172.19", 40437))
+        wire = _drain(client_sock)
+        greeting, tail = _split_greeting(wire)
+        _assert_greeting_describes_one_open(greeting, "stale")
+
+        leaked = _depth_frames_in(tail)
+        detail = ""
+        if leaked:                                      # pragma: no cover - failure detail
+            word = float(leaked[0].flat[0])
+            detail = (f" The host reads {word * greeting['depth_unit_mm']:.1f} mm "
+                      f"where the truth is {word * OPENS['fresh']['unit_mm']:.1f} mm.")
+        assert tail == b"", (
+            f"{len(leaked)} frame(s) ({len(tail)} bytes) acquired across the rebuild "
+            f"were sent under the pre-rebuild greeting "
+            f"(depth_unit_mm={greeting['depth_unit_mm']}, the camera now reports "
+            f"{OPENS['fresh']['unit_mm']}).{detail}")
+        assert "camera rebuilt" in capsys.readouterr().out
     finally:
         server_sock.close()
         client_sock.close()
@@ -389,10 +479,55 @@ def test_a_burst_session_ends_when_its_greeting_goes_stale(monkeypatch, capsys):
         client_sock.shutdown(socket.SHUT_WR)            # so a server that ignores the
         srv.stream_burst(server_sock, ("10.12.172.19", 40437))   # rebuild still ends
 
-        assert len(calls) == 1, (
+        assert len(calls) <= 1, (
             f"the burst session captured {len(calls)} frames; the second CAP came "
             f"after the rebuild and would have been described by the first open's "
             f"greeting")
+        assert "camera rebuilt" in capsys.readouterr().out
+    finally:
+        server_sock.close()
+        client_sock.close()
+
+
+def test_a_burst_cap_spanning_a_rebuild_is_neither_buffered_nor_answered(monkeypatch,
+                                                                        capsys):
+    """The burst path has the same hole, in the same place.
+
+    ``CAP`` acquires through ``getFrames`` -- the same ~1 s filter chain -- so a
+    rebuild landing inside it slips past the top-of-loop check. The frame is then
+    appended to the RAM buffer (which a later ``GET`` ships wholesale) and its
+    thumbnail is written to the socket, all under the pre-rebuild greeting. Nothing
+    captured across the rebuild may reach the client or the buffer.
+    """
+    _fake_jpeg(monkeypatch)
+    _publish("stale", FakePipeline("stale", depth_scale=0.001))
+    depth = np.full((4, 4), 3000, dtype=np.uint16)
+    color = np.zeros((8, 8, 3), dtype=np.uint8)
+    calls = []
+
+    def fake_get_frames(_filters):
+        calls.append(1)
+        if len(calls) == 1:
+            _publish("fresh")
+            srv._camera_generation += 1                 # a rebuild completes mid-CAP
+        return depth, color, 1.0
+
+    monkeypatch.setattr(srv, "getFrames", fake_get_frames)
+    server_sock, client_sock = socket.socketpair()
+    try:
+        client_sock.sendall(b"CAP\n")
+        client_sock.shutdown(socket.SHUT_WR)            # so a server that ignores the
+        srv.stream_burst(server_sock, ("10.12.172.19", 40437))   # rebuild still ends
+        server_sock.shutdown(socket.SHUT_WR)   # EOF for _drain (stream_burst does not
+                                               # close; handle_client's caller does)
+
+        greeting, tail = _split_greeting(_drain(client_sock), preamble=b"BURST READY\n")
+        _assert_greeting_describes_one_open(greeting, "stale")
+        assert tail == b"", (
+            f"the burst session answered {len(tail)} byte(s) for a CAP whose frame "
+            f"was acquired across the rebuild; the greeting says depth_unit_mm="
+            f"{greeting['depth_unit_mm']} and the camera now reports "
+            f"{OPENS['fresh']['unit_mm']}")
         assert "camera rebuilt" in capsys.readouterr().out
     finally:
         server_sock.close()

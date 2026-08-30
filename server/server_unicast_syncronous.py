@@ -935,6 +935,45 @@ def _greeting_is_stale(generation) -> bool:
     return generation is not None and generation != _camera_generation
 
 
+def _stale_greeting_close(addr, greeted_generation, detail) -> bool:
+    """True -- after saying so in the journal -- when this connection must end.
+
+    Every serving loop checks staleness TWICE, and this is why:
+
+    * once at the top, so a connection idling through a rebuild ends without
+      spending a second of the Nano's filter chain on a frame it must throw away;
+    * once again after acquisition and immediately before the bytes go out, because
+      ``getFrames`` runs that whole chain -- roughly a second -- and a rebuild that
+      lands *inside* it has already passed the top check. Without the second check
+      the frame is compressed and sent under the pre-rebuild greeting and only the
+      NEXT iteration closes. One frame is the whole defect: ``CameraClient.grab()``
+      reads exactly one frame per connection, so the leaked frame IS the per-pose
+      scan capture / gate grab / extrusion measurement, scaled by the wrong
+      ``depth_unit_mm`` with no error and no log line.
+
+    Ordering, and why the second check is sufficient. ``_rebuild_pipeline`` holds
+    ``_camera_lock`` across the ENTIRE rebuild and bumps ``_camera_generation``
+    after it has rebound ``pipeline`` (and the geometry/options/device globals
+    ``openPipeline`` sets); ``read_frames`` samples ``pipeline`` under that same
+    lock. So an acquisition cannot straddle a rebuild: it sees generation G with the
+    pipeline that belongs to G. Generation only ever increases, the top check read
+    ``g`` before the sample (so G >= g) and this check reads ``g`` after it
+    (so G <= g) -- hence G == g, and the frame in hand provably came from the open
+    the client was greeted with.
+
+    A rebuild completing between this check and ``sendall`` is therefore HARMLESS
+    rather than impossible: the frame was already acquired from the greeted open, so
+    it is honest data honestly described, and the next top-of-loop check ends the
+    connection before anything from the new open can follow it.
+    """
+    if not _greeting_is_stale(greeted_generation):
+        return False
+    print(f"Closing {addr}: camera rebuilt (greeting describes generation "
+          f"{greeted_generation}, camera is now {_camera_generation}); {detail}",
+          flush=True)
+    return True
+
+
 def _first_color_sensor(device):
     """The RGB endpoint, however this librealsense build exposes it, or None.
 
@@ -1161,18 +1200,16 @@ def handle_client(conn, addr):
     greeted_generation = None if color_only else greet(conn)
 
     while True:
-        if _greeting_is_stale(greeted_generation):
-            # This connection's geometry/depth scale describe a camera open that no
-            # longer exists. There is no way to correct it in-band -- one greeting
-            # per connection is the protocol -- so drop the connection and let the
-            # client reconnect into a fresh greeting. Losing the connection is a
-            # condition every host path already handles (the live preview
-            # reconnects after a 1 s backoff, a burst tour falls back to per-pose
-            # grabs, and a per-pose grab opens its own connection anyway); silently
-            # wrong millimetres is not.
-            print(f"Closing {addr}: camera rebuilt (greeting describes generation "
-                  f"{greeted_generation}, camera is now {_camera_generation}); "
-                  f"the client must reconnect for a fresh greeting", flush=True)
+        # This connection's geometry/depth scale describe a camera open that no
+        # longer exists. There is no way to correct it in-band -- one greeting
+        # per connection is the protocol -- so drop the connection and let the
+        # client reconnect into a fresh greeting. Losing the connection is a
+        # condition every host path already handles (the live preview
+        # reconnects after a 1 s backoff, a burst tour falls back to per-pose
+        # grabs, and a per-pose grab opens its own connection anyway); silently
+        # wrong millimetres is not.
+        if _stale_greeting_close(addr, greeted_generation,
+                                 "the client must reconnect for a fresh greeting"):
             break
         if color_only:
             # Fast path: skip the depth filters entirely — they cost the Nano ~a
@@ -1201,6 +1238,17 @@ def handle_client(conn, addr):
         ts = struct.pack('<d', timestamp)
 
         frame_data = length_depth + length_color + ts + depth_compressed + data_color
+        # Second check, with the frame in hand and nothing but the send left to do:
+        # getFrames() is ~1 s of filter chain, so a rebuild can land entirely inside
+        # it and the top-of-loop check above would have waved this frame through.
+        # See _stale_greeting_close for why this placement is sufficient. (No-op for
+        # colour-only clients: their greeted_generation is None.)
+        if _stale_greeting_close(
+                addr, greeted_generation,
+                "DISCARDING the frame captured across the rebuild rather than "
+                "sending it under the old open's numbers; the client must "
+                "reconnect for a fresh greeting"):
+            break
         try:
             conn.sendall(frame_data)
         except (ConnectionResetError, BrokenPipeError, socket.timeout) as e:
@@ -1447,15 +1495,13 @@ def stream_burst(conn, addr, max_frames=64):
     print(f"Burst session opened with {addr}")
     try:
         while True:
-            if _greeting_is_stale(greeted_generation):
-                # Same contract as the streaming path: the buffered frames and the
-                # ones still to come no longer share the geometry this session was
-                # greeted with. End the session (the buffer is dropped in `finally`,
-                # as always) so the client re-opens and is greeted afresh -- the host
-                # falls back to the per-pose grab path on a burst error.
-                print(f"Ending the burst session with {addr}: camera rebuilt "
-                      f"(greeting describes generation {greeted_generation}, camera "
-                      f"is now {_camera_generation})", flush=True)
+            # Same contract as the streaming path: the buffered frames and the
+            # ones still to come no longer share the geometry this session was
+            # greeted with. End the session (the buffer is dropped in `finally`,
+            # as always) so the client re-opens and is greeted afresh -- the host
+            # falls back to the per-pose grab path on a burst error.
+            if _stale_greeting_close(addr, greeted_generation,
+                                     "ending the burst session"):
                 break
             # The next command may be many seconds away (the robot is moving between
             # poses); wait generously rather than dropping the connection.
@@ -1470,6 +1516,23 @@ def stream_burst(conn, addr, max_frames=64):
                 while (depth is None or color is None) and tries < 10:
                     depth, color, _ts = getFrames(depth_filters)
                     tries += 1
+                # Same second check as the streaming path, in the same place: after
+                # acquisition (which here can be up to ten filter-chain passes) and
+                # before this frame reaches EITHER the socket or the RAM buffer that
+                # a later GET ships wholesale. Ending the session drops the frames
+                # buffered BEFORE the rebuild too, even though the greeting still
+                # describes those correctly -- deliberately: the tour has a hole in
+                # it either way (this pose was not captured and no further pose can
+                # be), the protocol is client-driven so the server cannot push the
+                # partial buffer out before closing, and a short buffer delivered as
+                # if complete is a worse failure than none. `_capture` catches the
+                # burst error and falls back to per-pose grabs, each of which opens
+                # its own connection and is greeted afresh.
+                if _stale_greeting_close(
+                        addr, greeted_generation,
+                        "DISCARDING the frame captured across the rebuild and "
+                        "ending the burst session"):
+                    break
                 if depth is None or color is None or len(buffer) >= max_frames:
                     # signal a skip (no frame / buffer full) — index still advances
                     conn.sendall(struct.pack('<I', len(buffer)) + struct.pack('<I', 0))
