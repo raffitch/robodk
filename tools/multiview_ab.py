@@ -59,23 +59,28 @@ def _star_takes(root: Path, trial_id: str) -> list[tuple[int, int]]:
 def _one_row(root, trial_id: str, layer_index: int, take: int) -> dict:
     """Both reconstructions of one take. Never raises: a take that fails to
     reprocess one way (a branch guard exhausted, say) must not silence the
-    report for every OTHER take in the trial."""
+    report for every OTHER take in the trial.
+
+    Both calls pass persist=False -- this is an ANALYSIS tool, not a rewrite
+    tool, and reprocess_saved_layer(persist=True) (the default, used by the
+    app's own reprocess endpoint) would overwrite manifest.json (and, for a
+    session-backed trial, session.json too) with whichever reconstruction ran
+    last. Since this function always runs "as_archived" then "top_only" on
+    the SAME on-disk take, persist=True here would leave every star take this
+    tool examined archived as capture.style == "single" -- silently undoing
+    Task 8's whole point the next time paper_summary() reads that trial.
+    """
     from tasni.modules.extrusion.service import reprocess_saved_layer
     row = {"layer_index": layer_index, "take": take, "star": None,
           "single": None, "error": None}
     try:
         row["star"] = reprocess_saved_layer(root, trial_id, layer_index, take,
-                                            views="as_archived")
+                                            views="as_archived", persist=False)
         row["single"] = reprocess_saved_layer(root, trial_id, layer_index, take,
-                                              views="top_only")
+                                              views="top_only", persist=False)
     except Exception as exc:                                     # noqa: BLE001
         row["error"] = str(exc)
     return row
-
-
-def _report_json(run_dir) -> dict:
-    path = Path(run_dir) / "report.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
 
 
 def _num(value, digits: int = 1) -> str:
@@ -116,8 +121,12 @@ def build_report(root, trial_id: str) -> list[str]:
             continue
         star, single = row["star"], row["single"]
         star_geom, single_geom = star.get("geometry") or {}, single.get("geometry") or {}
-        star_counts = (_report_json(star["run_dir"]).get("counts") or {})
-        single_counts = (_report_json(single["run_dir"]).get("counts") or {})
+        # Read from the reconstruction reprocess_saved_layer just returned, not
+        # from report.json on disk -- persist=False deliberately never writes
+        # it, and it would otherwise still hold whatever the archive's LAST
+        # persisted reprocess wrote (stale, and possibly the OTHER style's).
+        star_counts = ((star.get("processing") or {}).get("counts") or {})
+        single_counts = ((single.get("processing") or {}).get("counts") or {})
         capture = star.get("capture") or {}
         lines.append(" | ".join((
             str(row["layer_index"]), str(row["take"]),

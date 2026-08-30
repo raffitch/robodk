@@ -953,7 +953,11 @@ def _archived_star_take(tmp_path, trial_id: str, *, radius: float = 60.0, bead: 
     rings = [syn.RingSpec(radius, bead, center, height_fn=syn.flat(6.0))]
 
     archive = ExtrusionArchive(tmp_path)
-    archive.create_trial(trial_id, plan, mode="MEASURE_ONLY")
+    if not (tmp_path / trial_id / "trial.json").is_file():
+        # A caller that already created the trial (e.g. via MeasureSession.create,
+        # for a session-backed fixture) owns trial.json/session.json already --
+        # this only fills in the trial when the caller passed a fresh trial_id.
+        archive.create_trial(trial_id, plan, mode="MEASURE_ONLY")
 
     clouds: list[ViewCloud] = []
     diag: dict[str, dict] = {}
@@ -1024,15 +1028,30 @@ def _archived_star_take(tmp_path, trial_id: str, *, radius: float = 60.0, bead: 
     return trial_id
 
 
-def test_reprocess_top_only_equals_the_single_view_result(tmp_path):
+@pytest.fixture(scope="module")
+def shared_star_take(tmp_path_factory):
+    """One real default-parameter 4-view star merge, built ONCE and reused
+    READ-ONLY by every test below that needs the identical capture (three of
+    the four Task 7 reprocess/AB tests use it; the drop= variant still builds
+    its own). reprocess_saved_layer never mutates the raw views/, color.png,
+    depth.npy or merged_points.npy it reads -- every test sharing this
+    fixture also calls it with persist=False, so nothing here is ever written
+    to. Saves roughly a third of this file's real-Open3D reconstruction cost
+    over building the identical capture three separate times."""
+    root = tmp_path_factory.mktemp("shared-star-take")
+    trial_id = _archived_star_take(root, "shared")
+    return root, trial_id
+
+
+def test_reprocess_top_only_equals_the_single_view_result(shared_star_take):
     """The A/B's control arm. Same capture, two reconstructions -- paired on the
     identical ring placement, which the operator cannot reproduce by hand."""
     pytest.importorskip("open3d")
     from tasni.modules.extrusion.service import reprocess_saved_layer
-    _archived_star_take(tmp_path, "t1")
+    root, trial_id = shared_star_take
 
-    merged = reprocess_saved_layer(tmp_path, "t1", 1, views="as_archived")
-    top = reprocess_saved_layer(tmp_path, "t1", 1, views="top_only")
+    merged = reprocess_saved_layer(root, trial_id, 1, views="as_archived", persist=False)
+    top = reprocess_saved_layer(root, trial_id, 1, views="top_only", persist=False)
 
     assert merged["capture"]["style"] == "star"
     assert top["capture"]["style"] == "single"
@@ -1078,14 +1097,14 @@ def test_as_archived_leaves_a_single_view_take_completely_unaffected(tmp_path):
     assert not (tmp_path / "t2" / "layer-001" / "views").exists()
 
 
-def test_reprocess_as_archived_builds_a_full_capture_record_from_the_raw_views(tmp_path):
+def test_reprocess_as_archived_builds_a_full_capture_record_from_the_raw_views(shared_star_take):
     """Every one of the four configured views must reappear in the reprocessed
     CaptureRecord, with the fresh diagnostics this reprocess actually computed."""
     pytest.importorskip("open3d")
     from tasni.modules.extrusion.service import reprocess_saved_layer
-    _archived_star_take(tmp_path, "t3")
+    root, trial_id = shared_star_take
 
-    out = reprocess_saved_layer(tmp_path, "t3", 1, views="as_archived")
+    out = reprocess_saved_layer(root, trial_id, 1, views="as_archived", persist=False)
 
     assert out["capture"]["style"] == "star"
     assert {v["name"] for v in out["capture"]["views"]} == {
@@ -1106,7 +1125,7 @@ def test_reprocess_carries_forward_the_original_drop_reason_for_a_never_captured
     from tasni.modules.extrusion.service import reprocess_saved_layer
     _archived_star_take(tmp_path, "t4", drop="star-120")
 
-    out = reprocess_saved_layer(tmp_path, "t4", 1, views="as_archived")
+    out = reprocess_saved_layer(tmp_path, "t4", 1, views="as_archived", persist=False)
 
     views_by_name = {v["name"]: v for v in out["capture"]["views"]}
     assert views_by_name["star-120"]["dropped"] is True
@@ -1119,6 +1138,25 @@ def test_reprocess_rejects_an_unknown_views_argument(tmp_path):
     from tasni.modules.extrusion.service import reprocess_saved_layer
     with pytest.raises(ValueError, match="views must be"):
         reprocess_saved_layer(tmp_path, "nope", 1, views="everything")
+
+
+def test_persist_false_reprocesses_without_writing_anything(shared_star_take):
+    """persist= proven directly on reprocess_saved_layer itself, not only
+    observed through the CLI tool that consumes it: the reconstruction runs
+    for real (a genuine, correct result comes back) but manifest.json on disk
+    is untouched and no session sync happens."""
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion.service import reprocess_saved_layer
+    root, trial_id = shared_star_take
+    manifest_path = root / trial_id / "layer-001" / "manifest.json"
+    before = manifest_path.read_bytes()
+
+    out = reprocess_saved_layer(root, trial_id, 1, views="top_only", persist=False)
+
+    assert out["capture"]["style"] == "single"          # the reconstruction still ran for real
+    assert out["metrics"]["valid"], out["metrics"]["warnings"]
+    assert out["session_record"] is None                # nothing was synced back
+    assert manifest_path.read_bytes() == before          # and nothing was written
 
 
 # ---------------------------------------------------- Task 7: tools/multiview_ab.py
@@ -1138,20 +1176,22 @@ def test_the_ab_tool_carries_the_voxel_warning_verbatim(tmp_path):
         "never after_voxel.")
 
 
-def test_the_ab_tool_runs_end_to_end_on_an_archived_star_take(tmp_path, capsys):
+def test_the_ab_tool_runs_end_to_end_on_an_archived_star_take(shared_star_take, capsys):
     """The tool as the operator actually runs it: point it at a trial, get one
     clean report comparing the star and single-view reconstructions of the
-    identical capture, with the pre-voxel ROI count named explicitly."""
+    identical capture, with the pre-voxel ROI count named explicitly. Safe to
+    share the fixture -- the tool itself always calls reprocess_saved_layer
+    with persist=False (see multiview_ab._one_row)."""
     pytest.importorskip("open3d")
-    _archived_star_take(tmp_path, "t5")
+    root, trial_id = shared_star_take
 
-    code = multiview_ab.main(["t5", "--root", str(tmp_path)])
+    code = multiview_ab.main([trial_id, "--root", str(root)])
     out = capsys.readouterr().out
 
     assert code == 0
     assert out.startswith("NOTE: the chain voxel-downsamples at 1 mm.")
     assert "Read after_work_roi (pre-voxel), never after_voxel." in out
-    assert "trial t5: 1 star take(s)" in out
+    assert f"trial {trial_id}: 1 star take(s)" in out
     assert "reprocess failed" not in out                     # a clean archived take never errors
     data_lines = [line for line in out.splitlines() if line.startswith("1 | 1 |")]
     assert len(data_lines) == 1, out                          # layer 1, take 1 -- one row
@@ -1167,6 +1207,43 @@ def test_the_ab_tool_reports_no_star_takes_rather_than_crashing_on_a_single_view
     lines = multiview_ab.build_report(tmp_path, "t6")
 
     assert any("no star takes found" in line for line in lines)
+
+
+def test_the_ab_tool_never_writes_to_a_session_backed_trial(tmp_path):
+    """CRITICAL: the A/B tool is an analysis tool and must never mutate the
+    archive it is reading. reprocess_saved_layer's tail (rewrite_processing +
+    sync_take_from_archive) persists unconditionally when persist=True (the
+    default), and _one_row calls reprocess_saved_layer TWICE against the SAME
+    on-disk take ("as_archived" then "top_only") -- with persist=True that
+    second call would silently overwrite the archived star's manifest.json
+    (and, because every real production trial has session.json --
+    MeasureSession.create writes it, and that is the constructor the live
+    RingMeasureJob uses -- its session.json too) with the top_only result,
+    reintroducing the exact cross-style pooling Task 8 exists to prevent the
+    next time paper_summary() reads this trial from disk.
+
+    Built on a SESSION-backed trial (MeasureSession.create, the way
+    production actually creates one) rather than the bare archive.create_trial
+    the other fixtures use, because that is precisely the case the bug in
+    Finding 1 depended on: a fixture using create_trial directly never creates
+    session.json, so sync_take_from_archive was never exercised and this
+    class of corruption stayed invisible."""
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion.measure import MeasureSession
+    plan = tem.scene_plan(radius=60.0, bead=8.0)
+    session = MeasureSession.create(tmp_path, plan, note="rings")
+    _archived_star_take(tmp_path, session.trial_id)
+    manifest_path = tmp_path / session.trial_id / "layer-001" / "manifest.json"
+    session_path = tmp_path / session.trial_id / "session.json"
+    assert manifest_path.is_file() and session_path.is_file()
+    before_manifest = manifest_path.read_bytes()
+    before_session = session_path.read_bytes()
+
+    code = multiview_ab.main([session.trial_id, "--root", str(tmp_path)])
+
+    assert code == 0
+    assert manifest_path.read_bytes() == before_manifest
+    assert session_path.read_bytes() == before_session
 
 
 # --------------------------------------- Task 8: capture_style + paper_summary guards

@@ -1150,7 +1150,8 @@ class CylinderPrintJob:
 
 
 def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
-                          take: int = 1, *, views: str = "as_archived") -> dict:
+                          take: int = 1, *, views: str = "as_archived",
+                          persist: bool = True) -> dict:
     """Rebuild only derived artifacts from one archived raw RGB-D observation.
 
     ``views`` chooses what the reconstruction is built from -- the same raw
@@ -1164,6 +1165,21 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
       entirely even when it exists. The control arm of the A/B: the SAME
       physical ring placement, reconstructed as if it had only ever been a
       single-view take. ``capture.style`` is reported as ``"single"``.
+
+    ``persist`` (default ``True``, today's behaviour, unchanged for every
+    existing caller) controls whether the reconstruction is WRITTEN BACK to
+    the archive (``archive.rewrite_processing`` -- ``manifest.json`` and the
+    derived images/paths) and folded into ``session.json`` via
+    ``MeasureSession.sync_take_from_archive``. Pass ``persist=False`` for a
+    read-only reconstruction: the raw observation on disk is never mutated by
+    ``reprocess_saved_layer`` in the first place (only derived artifacts are),
+    so ``persist=False`` is a pure in-memory rebuild with nothing left behind.
+    This is what an A/B comparing "as_archived" against "top_only" on the SAME
+    take MUST use -- with ``persist=True`` the second call would silently
+    overwrite the archived star's manifest (and its session record) with the
+    top-only result, corrupting the very trial the comparison was reading, and
+    a later paper_summary() would then pool that take into the single-view
+    statistics it exists to keep separate (Task 8).
     """
     if views not in ("as_archived", "top_only"):
         raise ValueError(f"views must be 'as_archived' or 'top_only', not {views!r}")
@@ -1378,23 +1394,24 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
         "capture": capture_record,
         "provenance": {**provenance, "last_reprocessed_at": reprocessed_at},
     })
-    archive.rewrite_processing(
-        next_manifest, measured_xyz=processed.measured_xyz,
-        corrected_xyz=processed.corrected_xyz,
-        pointcloud_xyz=processed.filtered_xyz,
-        derived_images={"segmentation.png": processed.segmentation,
-                        "skeleton.png": processed.skeleton,
-                        "comparison.png": processed.comparison},
-        report=report)
-    # Fold the rescued take back into the measurement session: session.json is
-    # what the next layer's ROI floor and the operator's table read, and a take
-    # that lives only in its manifest is invisible to both.
     session_record = None
-    if (trial_dir / "session.json").is_file():
-        from .measure import MeasureSession        # local: measure.py imports this module
-        session_record = MeasureSession.load(
-            trial_dir.parent, trial_id).sync_take_from_archive(
-                layer_dir, next_manifest.model_dump(mode="json"), processed.measured_xyz)
+    if persist:
+        archive.rewrite_processing(
+            next_manifest, measured_xyz=processed.measured_xyz,
+            corrected_xyz=processed.corrected_xyz,
+            pointcloud_xyz=processed.filtered_xyz,
+            derived_images={"segmentation.png": processed.segmentation,
+                            "skeleton.png": processed.skeleton,
+                            "comparison.png": processed.comparison},
+            report=report)
+        # Fold the rescued take back into the measurement session: session.json
+        # is what the next layer's ROI floor and the operator's table read, and
+        # a take that lives only in its manifest is invisible to both.
+        if (trial_dir / "session.json").is_file():
+            from .measure import MeasureSession    # local: measure.py imports this module
+            session_record = MeasureSession.load(
+                trial_dir.parent, trial_id).sync_take_from_archive(
+                    layer_dir, next_manifest.model_dump(mode="json"), processed.measured_xyz)
     return {
         "session_record": session_record,
         "trial_id": trial_id, "layer_index": layer_index,
@@ -1402,5 +1419,11 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
         "metrics": processed.metrics.model_dump(mode="json"),
         "geometry": processed.geometry.model_dump(mode="json") if processed.geometry else None,
         "capture": capture_record.model_dump(mode="json") if capture_record is not None else None,
+        # The same dict rewrite_processing writes as manifest.processing --
+        # returned regardless of persist so a persist=False caller (the A/B
+        # tool) can read counts (after_work_roi) and timings without ever
+        # reading report.json off disk, which persist=False deliberately never
+        # updates.
+        "processing": report,
         "run_dir": str(layer_dir),
     }
