@@ -3679,3 +3679,91 @@ def test_tour_standoff_ignores_where_the_operator_stood():
     assert len(set(out)) == 1, out
     assert 400.0 < out[0] < 401.0, out
     print("[inert remedy] operator at 350/445/700/1200 mm -> tour standoff", out)
+
+
+# -- 2026-08-30 cell run 20260830-180331: a perfect lock, a rejected scan ---------
+# The operator's green frame sat exactly on the platform; the lock measured it
+# 444.056 x 286.432 mm and recorded WHERE it was. The run kept that SIZE but threw
+# the pose away and re-centred the rectangle on look_point_from_views() -- the mean
+# of the tour cameras' central-patch depth hits, which the +4 boundary-biased views
+# pull off-centre. That landed the rectangle 17.15 mm out in +X and 0.93 deg off in
+# yaw, so the 24 mm edge band of the +X side hung off the platform: support read 27%
+# against a 60% gate and a 16-pose real-robot tour was rejected for a defect in the
+# placement, not in the surface. Re-locking cannot fix it -- the offset is in the aim
+# point, not in the lock.
+_LOCKED_CENTER = np.array([-5.448214191776977, -1388.0053482302833, -161.21474784925644])
+_LOCKED_FRAME = np.array([[0.9998637250218323, 0.016299736576287742, 0.0026172453093564435, -225.1115431663499], [-0.016253238315275725, 0.999725070450707, -0.016900170312634473, -1241.2198107737877], [-0.002891994075473492, 0.01685532853055158, 0.9998537564416082, -158.15868752027643], [0.0, 0.0, 0.0, 1.0]])
+_LOCKED_SIZE = (444.0559455781891, 286.4324765558762)
+_SHIPPED_CENTER = np.array([11.697981649162713, -1382.736017562663, -161.84793734341537])   # what the aim-centred placement produced
+_LOCKED_YAW_DEG = -0.931
+
+
+def _locked_survey_record():
+    return {"center_base": _LOCKED_CENTER.tolist(),
+            "frame_T_base": _LOCKED_FRAME.tolist(),
+            "size_mm": list(_LOCKED_SIZE)}
+
+
+def _tour_plane():
+    """The plane the 16-view tour fitted: normal as measured, in-plane axis arbitrary
+    (RANSAC picked base-X, yaw 0.001 deg, on the real run)."""
+    from tasni.modules.scan.plane import WorkPlane
+    n = np.array([0.0010695291384842085, -0.020264031315264986, 0.9997940913719565])
+    n = n / np.linalg.norm(n)
+    x = np.array([1.0, 0.0, 0.0]) - float(np.array([1.0, 0.0, 0.0]) @ n) * n
+    x /= np.linalg.norm(x)
+    T = np.eye(4)
+    T[:3, 0], T[:3, 1], T[:3, 2] = x, np.cross(n, x), n
+    T[:3, 3] = _LOCKED_CENTER / 1000.0
+    return WorkPlane(frame_T=T, corners=np.zeros((4, 3)), size=(0.0, 0.0), normal=n,
+                     centroid=_LOCKED_CENTER / 1000.0, inlier_count=122418,
+                     inlier_frac=0.5010252317514887)
+
+
+def _platform_points_m():
+    """The real platform: a filled rectangle at exactly the LOCKED pose and size."""
+    hx, hy = _LOCKED_SIZE[0] / 2.0, _LOCKED_SIZE[1] / 2.0
+    uu, vv = np.meshgrid(np.linspace(-hx, hx, 460), np.linspace(-hy, hy, 300))
+    local = np.stack([uu.ravel(), vv.ravel(), np.zeros(uu.size)], -1)
+    return (_LOCKED_CENTER + local @ _LOCKED_FRAME[:3, :3].T) / 1000.0
+
+
+def test_locked_region_is_placed_by_the_lock_not_the_camera_aim():
+    """The locked rectangle must inherit the lock's CENTRE and YAW, not just its size."""
+    from tasni.modules.scan.service import _locked_work_region
+    wp = _locked_work_region(_tour_plane(), _locked_survey_record(), _LOCKED_SIZE,
+                             _SHIPPED_CENTER / 1000.0)
+    got = np.asarray(wp.centroid) * 1000.0
+    off_aim = float(np.linalg.norm((got - _SHIPPED_CENTER)[:2]))
+    off_lock = float(np.linalg.norm((got - _LOCKED_CENTER)[:2]))
+    assert off_lock < 0.5, f"placed {off_lock:.2f} mm from the lock: {got}"
+    assert off_aim > 15.0, f"placed on the camera aim again ({off_aim:.2f} mm)"
+    edge = wp.corners[1] - wp.corners[0]
+    yaw = float(np.degrees(np.arctan2(edge[1], edge[0])))
+    assert abs(yaw - _LOCKED_YAW_DEG) < 0.05, f"yaw {yaw:.3f} deg, locked {_LOCKED_YAW_DEG}"
+    assert np.allclose(np.asarray(wp.size) * 1000.0, _LOCKED_SIZE, atol=1e-6)
+    print(f"[locked placement] on the lock ({off_lock:.2f} mm), "
+          f"{off_aim:.1f} mm off the camera aim, yaw {yaw:.3f} deg")
+
+
+def test_aim_centred_placement_is_what_failed_the_edge_gate():
+    """The gate's own reading, on a platform that IS exactly the locked rectangle:
+    aim-centred fails the 60% edge gate on +X, lock-centred passes. Same surface,
+    same gate, same thresholds -- only the placement differs."""
+    from tasni.modules.scan.plane import bounded_work_plane
+    from tasni.modules.scan.service import _locked_work_region, _surface_coverage
+    scfg = AppConfig().scan
+    pts, tour = _platform_points_m(), _tour_plane()
+    size_m = (_LOCKED_SIZE[0] / 1000.0, _LOCKED_SIZE[1] / 1000.0)
+    aimed = bounded_work_plane(tour, _SHIPPED_CENTER / 1000.0, size_m)
+    locked = _locked_work_region(tour, _locked_survey_record(), _LOCKED_SIZE,
+                                 _SHIPPED_CENTER / 1000.0)
+    cov = {n: _surface_coverage(pts, w, bin_m=scfg.actual_coverage_bin_m,
+                                edge_band_m=scfg.actual_coverage_edge_band_m)
+           for n, w in (("aimed", aimed), ("locked", locked))}
+    gate = float(scfg.min_actual_edge_coverage)
+    assert cov["aimed"]["weakest_edge"] < gate, cov["aimed"]["edges"]
+    assert cov["locked"]["weakest_edge"] >= gate, cov["locked"]["edges"]
+    print("[edge gate] aim-centred weakest {:.0%} (< {:.0%}) -> REJECT;  "
+          "lock-centred weakest {:.0%} -> PASS".format(
+              cov["aimed"]["weakest_edge"], gate, cov["locked"]["weakest_edge"]))

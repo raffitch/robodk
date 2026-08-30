@@ -169,6 +169,24 @@ def test_large_surface_can_be_bounded_around_camera_aim():
     print("[large crop] bounded 2 m plane to a 600×350 mm aimed work region")
 
 
+def test_bounded_region_honours_an_explicit_in_plane_axis():
+    """The caller may supply the in-plane X axis instead of inheriting the fitted
+    frame's. A locked survey knows the platform's own orientation; the RANSAC frame
+    only knows an arbitrary axis it happened to pick, so the lock must be able to
+    impose both its centre and its yaw."""
+    surface = _rect_grid((-1000.0, 1000.0), (-800.0, 800.0), nx=80, ny=60)
+    wp = work_plane_from_points(surface, distance=2.0, min_inlier_frac=0.8)
+    a = np.deg2rad(-0.931)                                # the 2026-08-30 locked yaw
+    x_axis = np.array([np.cos(a), np.sin(a), 0.0])
+    bounded = bounded_work_plane(wp, np.array([-5.45, -8.0, 0.0]), (444.056, 286.432),
+                                 x_axis=x_axis)
+    assert np.allclose(bounded.centroid, [-5.45, -8.0, 0.0], atol=1e-6)
+    edge = bounded.corners[1] - bounded.corners[0]
+    assert np.allclose(edge / np.linalg.norm(edge), x_axis, atol=1e-6), edge
+    assert np.allclose(bounded.size, [444.056, 286.432], atol=1e-6)
+    print("[explicit axis] bounded region took the caller's centre AND yaw")
+
+
 if __name__ == "__main__":
     test_flat_rectangle_frame_convention()
     test_tilted_plane_normal_recovered()
@@ -179,4 +197,5 @@ if __name__ == "__main__":
     test_reticle_square_centered_on_optical_axis()
     test_reticle_square_lies_on_tilted_plane()
     test_large_surface_can_be_bounded_around_camera_aim()
+    test_bounded_region_honours_an_explicit_in_plane_axis()
     print("\nplane.py convention + fit tests passed.")

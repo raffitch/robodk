@@ -464,18 +464,26 @@ def reticle_plane_square(normal: np.ndarray, centroid: np.ndarray,
 
 
 def bounded_work_plane(wp: WorkPlane, center: np.ndarray,
-                       size: tuple[float, float]) -> WorkPlane:
+                       size: tuple[float, float],
+                       x_axis: np.ndarray | None = None) -> WorkPlane:
     """Limit an already-fitted plane to a centered rectangular work region.
 
     Used when the physical plane extends beyond the camera frame (for example a
     large table). The plane inclination remains measured; only the programmable
     footprint is bounded around the surface under the camera reticle.
+
+    ``x_axis`` overrides the in-plane orientation, which otherwise comes from the
+    fitted frame's own X — an axis RANSAC picked, carrying no knowledge of how the
+    platform is actually turned. A caller placing a rectangle whose SIZE was
+    measured elsewhere (a locked survey) must be able to impose that source's yaw
+    too, or the rectangle is the right shape at the wrong angle. It is projected
+    into the plane and normalised here, so an approximate axis is fine.
     """
     z = np.asarray(wp.normal, float)
     z /= np.linalg.norm(z)
     c = np.asarray(center, float).reshape(3)
     c = c - float((c - wp.centroid) @ z) * z
-    x = np.asarray(wp.frame_T[:3, 0], float)
+    x = np.asarray(wp.frame_T[:3, 0] if x_axis is None else x_axis, float).reshape(3)
     x -= float(x @ z) * z
     x /= np.linalg.norm(x)
     y = np.cross(z, x)

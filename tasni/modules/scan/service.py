@@ -3294,6 +3294,48 @@ def _fusion_roi_box(scfg, center_mm):
     return lo, hi
 
 
+def survey_placement(survey) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """The locked surface's in-plane placement — ``(centre_m, x_axis)`` — or
+    ``(None, None)`` when the record cannot supply one. Kept separate from
+    ``_locked_work_region`` so the caller can ask whether a lock CAN place the
+    rectangle before it commits to the log line that says it did."""
+    if not isinstance(survey, dict):
+        return None, None
+    c, f = survey.get("center_base"), survey.get("frame_T_base")
+    if c is None or f is None:
+        return None, None
+    return np.asarray(c, float).reshape(3) / 1000.0, np.asarray(f, float)[:3, 0]
+
+
+def _locked_work_region(wp, survey, size_mm, aim_m):
+    """Place the LOCKED work rectangle on the plane the tour measured.
+
+    The lock is a measurement of the platform: it knows the size, the centre and
+    the yaw, and the tour's standoff was computed from that size. Taking the size
+    from the lock but the position from ``look_point_from_views`` mixes two
+    sources, and that aim point is only the mean of the tour cameras' central-patch
+    depth hits — which the boundary-biased views deliberately pull off-centre. On
+    the 2026-08-30 cell run (20260830-180331) the two disagreed by 17.15 mm in +X
+    and 0.93° in yaw against a 24 mm edge band, so the +X band hung off the
+    platform, the edge gate read 27% against its 60% floor, and a 16-pose
+    real-robot tour was rejected for a defect in the placement rather than in the
+    surface. Re-locking cannot help: the offset is in the aim point.
+
+    The plane INCLINATION still comes from the tour — 16 views beat the lock's
+    one — and only the in-plane placement is the lock's. Falls back to the aim
+    point when the run carries no survey record (an auto-crop overrun locks a size
+    without ever building one), which is the old behaviour, honestly degraded.
+    """
+    size_m = (float(size_mm[0]) / 1000.0, float(size_mm[1]) / 1000.0)
+    center_m, x_axis = survey_placement(survey)
+    if center_m is None:
+        if aim_m is None:                       # caller's guard should prevent this
+            raise RuntimeError("cannot place the locked work region: the run has "
+                               "neither a survey record nor a camera aim point")
+        center_m, x_axis = np.asarray(aim_m, float).reshape(3), None
+    return bounded_work_plane(wp, center_m, size_m, x_axis=x_axis)
+
+
 def _combine_depth_frames(frames) -> tuple[np.ndarray, np.ndarray]:
     """Median-fuse same-pose RGBD frames, ignoring zero-depth holes."""
     colors = [np.asarray(f.color, dtype=np.float32) for f in frames]
@@ -3430,15 +3472,24 @@ class ScanCaptureJob:
                     f"large surface: bounded work region to "
                     f"{self.params.crop_size_mm[0]:.0f}×"
                     f"{self.params.crop_size_mm[1]:.0f} mm around the camera aim")
-            elif self.params.surface_size_mm is not None and center_mm is not None:
-                wp = bounded_work_plane(
-                    wp, center_mm / 1000.0,
-                    (self.params.surface_size_mm[0] / 1000.0,
-                     self.params.surface_size_mm[1] / 1000.0))
+            elif (self.params.surface_size_mm is not None
+                    and (center_mm is not None
+                         or survey_placement(self.params.survey)[0] is not None)):
+                aim_m = None if center_mm is None else center_mm / 1000.0
+                locked_pose = survey_placement(self.params.survey)[0] is not None
+                wp = _locked_work_region(wp, self.params.survey,
+                                         self.params.surface_size_mm, aim_m)
+                placed = np.asarray(wp.centroid, float) * 1000.0
+                where = ("centred on the lock" if locked_pose
+                         else "centred on the camera aim (no survey record)")
+                drift = ("" if center_mm is None or not locked_pose else
+                         f", {np.linalg.norm((placed - center_mm)[:2]):.1f} mm "
+                         f"off the camera aim")
                 ctx.log(
                     f"locked surface: bounded work region to "
                     f"{self.params.surface_size_mm[0]:.0f}×"
-                    f"{self.params.surface_size_mm[1]:.0f} mm from the surface lock")
+                    f"{self.params.surface_size_mm[1]:.0f} mm from the surface lock "
+                    f"({where}{drift})")
 
             # Keep the measured TSDF surface as diagnostic evidence, but insert a
             # dense fitted plane for the operator-facing flat-surface workflow. The
