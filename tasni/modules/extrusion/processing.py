@@ -667,7 +667,8 @@ def process_points(points: np.ndarray, *, plan: CylinderPlan, layer: LayerPath,
                    floor_profile: np.ndarray | None = None,
                    stages: dict | None = None, assemble_arcs: bool = False,
                    counts: dict | None = None,
-                   timings: dict | None = None) -> ProcessingResult:
+                   timings: dict | None = None,
+                   started: float | None = None) -> ProcessingResult:
     """Everything from the work ROI onward, over ONE cloud of any provenance.
 
     ``points`` is already back-projected and transformed into the work frame
@@ -692,11 +693,16 @@ def process_points(points: np.ndarray, *, plan: CylinderPlan, layer: LayerPath,
     radial_trimmed, top_surface). It exists so the method figure can draw what
     this function actually did instead of a second implementation of it that
     could drift. Collecting costs a few copies and changes nothing else.
+
+    ``started`` lets a caller that already timed an earlier stage (back-
+    projection, or a multi-view merge) have ``total_ms`` span that earlier
+    work too, matching what a single monolithic function would have reported.
+    Omitted, ``total_ms`` spans only this function's own work.
     """
     def keep(name: str, cloud: np.ndarray) -> None:
         if stages is not None:
             stages[name] = np.asarray(cloud, dtype=float).copy()
-    started = time.perf_counter()
+    started = time.perf_counter() if started is None else started
     timings = {} if timings is None else timings
     counts = {} if counts is None else counts
 
@@ -931,6 +937,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     implementation of it that could drift. Collecting costs a few copies and
     changes nothing else.
     """
+    started = time.perf_counter()
     counts: dict = {}
     timings: dict = {}
     mark = time.perf_counter()
@@ -943,7 +950,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     return process_points(points, plan=plan, layer=layer, config=config,
                           chroma_gated=chroma_gated, floor_profile=floor_profile,
                           stages=stages, assemble_arcs=assemble_arcs,
-                          counts=counts, timings=timings)
+                          counts=counts, timings=timings, started=started)
 
 
 @dataclass
