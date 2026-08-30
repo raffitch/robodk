@@ -30,6 +30,7 @@
 - The RoboDK item name for a view's program is `<stem>_Inspect` (top, unchanged) or `<stem>_Inspect_star000` / `_star120` / `_star240` (hyphen dropped). Archive directory names keep the hyphen: `views/star-120/`.
 - Every task ends with a commit **and a push**. Commit messages end with `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>` plus your harness's `Claude-Session:` line if it gives you one.
 - The Tasni backend caches imported modules: before any cell test, **restart Tasni** and check `GET /api/health` → `build.stale == false`.
+- **Verify every call signature against the real code before transcribing it.** The code blocks in this plan call existing repo functions, and the plan's author can get a signature wrong. This already happened once: Task 2's `multiview_plan` was written calling `framing_standoff(..., config=config)` and treating its return as a float, when the real signature takes seven explicit keyword arguments (no `config`) and returns a **dict** — a guaranteed `TypeError` that survived authoring *and* review because no test in the task ever called the function. Before you transcribe a call to anything you did not write in this plan, open it and check. And if a task's code introduces a function, make sure at least one test **invokes** it: a function no test calls is a function no one has run.
 
 ---
 
@@ -435,20 +436,47 @@ def multiview_plan(recipe, setup, *, K: np.ndarray, size_px: tuple[int, int],
                    config) -> dict:
     """Descriptors for the whole star: preview, the dry tour, and the job log."""
     aim = aim_point_mm(recipe, setup, 1)
-    standoff = framing_standoff(width_mm=cylinder_diameter_mm(recipe),
-                                height_mm=cylinder_diameter_mm(recipe),
-                                K=K, size_px=size_px, config=config)
+    diameter = cylinder_diameter_mm(recipe)
+    # framing_standoff takes the band explicitly and returns a DICT -- mirror
+    # inspection_plan (inspection.py:252-256) exactly; it has no `config` kwarg.
+    framing = framing_standoff(
+        width_mm=diameter, height_mm=diameter, K=K, size_px=size_px,
+        frame_margin=config.inspection_frame_margin,
+        near_mm=config.inspection_min_mm, far_mm=config.inspection_max_mm)
+    standoff = framing["standoff_mm"]
     return {"standoff_mm": float(standoff), "aim_mm": [float(v) for v in aim],
             "views": [{"name": name, "tilt_deg": tilt, "azimuth_deg": azimuth}
                       for name, tilt, azimuth in star_view_angles(config)]}
 ```
 
-- [ ] **Step 4: Run the tests and make sure they pass**
+- [ ] **Step 4: Add the test that actually CALLS `multiview_plan`**
+
+The other tests exercise the pose maths but never invoke `multiview_plan`, which is how a
+wrong `framing_standoff` call survived both authoring and review on the first pass. Invoke it:
+
+```python
+def test_multiview_plan_executes_and_returns_its_documented_shape():
+    import extrusion_synthetic as syn
+    import test_extrusion_measure as tem          # repo idiom; there is no tests/__init__.py
+    from tasni.modules.extrusion.inspection import multiview_plan
+
+    plan = tem.scene_plan()
+    config = ExtrusionConfig()
+    out = multiview_plan(plan.recipe, plan.setup, K=syn.K_720P,
+                         size_px=syn.SIZE_720P, config=config)
+    assert isinstance(out["standoff_mm"], float)
+    assert config.inspection_min_mm <= out["standoff_mm"] <= config.inspection_max_mm
+    assert len(out["aim_mm"]) == 3
+    assert [v["name"] for v in out["views"]] == ["top", "star-000", "star-120", "star-240"]
+    assert [v["tilt_deg"] for v in out["views"]] == [0.0, 15.0, 15.0, 15.0]
+```
+
+- [ ] **Step 5: Run the tests and make sure they pass**
 
 Run: `py -3.10 -m pytest tests/test_extrusion_multiview.py -q`
-Expected: 9 passed.
+Expected: 10 passed.
 
-- [ ] **Step 5: Commit and push**
+- [ ] **Step 6: Commit and push**
 
 ```bash
 git add tasni/modules/extrusion/inspection.py tests/test_extrusion_multiview.py
