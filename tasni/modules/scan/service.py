@@ -3262,6 +3262,38 @@ def _save_scan_artifacts(run_dir, *, mesh, measured_mesh, reference_mesh, raw_me
     return str(run_dir / "mesh.obj")
 
 
+# The fusion ROI is widened past the crop ROI before it is used as a depth
+# prefilter: wide enough in XY that the "the crop kept too little -> use the full
+# cloud" fallback still has a neighbourhood to fall back to, and padded on every
+# face so voxels near the crop boundary still see the geometry that shapes them.
+_ROI_PREFILTER_SCALE = 2.0
+
+
+def _fusion_roi_box(scfg, center_mm):
+    """The base-frame box (metres) fusion may integrate, or ``None`` for everything.
+
+    The run already crops the fused cloud AND mesh to ``roi_*`` around the camera
+    aim, so every surface outside that box is integrated at full TSDF cost and then
+    thrown away. On the 2026-08-30 cell run that was 22,613,100 of 22,821,703
+    surface voxels (99.1%) -- and at the planned 1.2 mm voxel each touched 16^3
+    volume unit costs 192 KB, so the room ran to tens of GB and the 16-pose tour
+    ended in ``MemoryError: bad allocation``. The aim point is a pure function of
+    the captured views, so it is known BEFORE fusion and the same region can be
+    masked out of the depth instead. Strictly larger than the crop box, so it
+    cannot change what survives the crop.
+    """
+    if center_mm is None or not scfg.roi_enabled:
+        return None
+    if not getattr(scfg, "roi_prefilter", True):
+        return None
+    c = np.asarray(center_mm, float).reshape(3) / 1000.0
+    pad = max(4.0 * float(scfg.sdf_trunc_m), 0.05)
+    rad = float(scfg.roi_radius_m) * _ROI_PREFILTER_SCALE + pad
+    lo = np.array([c[0] - rad, c[1] - rad, c[2] - float(scfg.roi_below_m) - pad])
+    hi = np.array([c[0] + rad, c[1] + rad, c[2] + float(scfg.roi_above_m) + pad])
+    return lo, hi
+
+
 def _combine_depth_frames(frames) -> tuple[np.ndarray, np.ndarray]:
     """Median-fuse same-pose RGBD frames, ignoring zero-depth holes."""
     colors = [np.asarray(f.color, dtype=np.float32) for f in frames]
@@ -3343,15 +3375,24 @@ class ScanCaptureJob:
             voxel_m = (self.params.voxel_size_m
                        if self.params.voxel_size_m is not None else scfg.voxel_size_m)
             ctx.log(f"fusing {len(views)} views (TSDF voxel {voxel_m * 1000:.1f} mm)…")
+            # Where the camera was aimed depends only on the captured views, so it is
+            # known before fusion -- and the region the run is about to crop to can be
+            # masked out of the depth instead of integrated and then discarded.
+            center_mm = look_point_from_views(views)
+            roi_box = _fusion_roi_box(scfg, center_mm)
+            if roi_box is not None:
+                ctx.log(f"fusion ROI: integrating only the "
+                        f"{roi_box[1][0] - roi_box[0][0]:.1f} m box around the aim "
+                        f"(the room outside it is cropped away after fusion anyway)")
             res = fuse_views(views, voxel_size_m=voxel_m,
                              sdf_trunc_m=scfg.sdf_trunc_m,
-                             depth_min_m=scfg.depth_min_m, depth_max_m=scfg.depth_max_m)
+                             depth_min_m=scfg.depth_min_m, depth_max_m=scfg.depth_max_m,
+                             roi_box_m=roi_box)
 
             # Isolate the work surface (the "top layer"): crop to a box around where the
             # camera was aimed so the FLOOR/walls don't dominate the fit (the cause of a
             # room-sized plane). Falls back to the full cloud if the crop is too thin.
             raw_mesh, cloud = res.mesh, res.cloud
-            center_mm = look_point_from_views(views)
             if scfg.roi_enabled:
                 if center_mm is None:
                     ctx.log("ROI: no central depth to locate the aim — using the full cloud")

@@ -177,3 +177,136 @@ if __name__ == "__main__":
     test_fuse_handles_0_1mm_native_units()
     test_measured_mesh_cleaner_drops_disconnected_island()
     print("\nreconstruct.py fusion chain test passed.")
+
+
+# -- 2026-08-30 cell failure: MemoryError: bad allocation after a 16-pose tour ----
+# fuse_views integrated the WHOLE ROOM at the work-surface voxel and the ROI crop
+# then discarded 22,613,100 of 22,821,703 surface voxels (99.1%). Open3D charges
+# 192 KB per touched 16^3 volume unit -- 48 bytes per voxel, because a
+# ScalableTSDFVolume keeps an Eigen::Vector3d colour per voxel even under NoColor --
+# so surface area / voxel^2 sets the bill and a room at 1.2 mm runs to tens of GB.
+
+FLOOR_Z_MM = -750.0          # a far floor plane: the "room" the ROI exists to drop
+
+
+def _render_table_and_floor(T_base_cam):
+    """Depth of the z=0 table square where it is hit, else the far floor plane."""
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    us, vs = np.meshgrid(np.arange(W), np.arange(H))
+    dirs_cam = np.stack([(us - cx) / fx, (vs - cy) / fy, np.ones_like(us, float)], -1)
+    R, t = T_base_cam[:3, :3], T_base_cam[:3, 3]
+    dirs_base = dirs_cam @ R.T
+    dz = dirs_base[..., 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        s_tab = (0.0 - t[2]) / dz
+        s_flr = (FLOOR_Z_MM - t[2]) / dz
+    P = t + s_tab[..., None] * dirs_base
+    on_table = ((np.abs(P[..., 0]) <= SQUARE_HALF_MM) & (np.abs(P[..., 1]) <= SQUARE_HALF_MM)
+                & (s_tab > 0) & np.isfinite(s_tab))
+    s = np.where(on_table, s_tab, s_flr)
+    ok = on_table | ((s_flr > 0) & np.isfinite(s_flr))
+    depth = np.where(ok, np.clip(s, 0, 65000), 0).astype(np.uint16)
+    return np.full((H, W, 3), 128, np.uint8), depth
+
+
+def test_fusion_roi_prefilter_drops_the_room_but_not_the_crop():
+    """Masking the ROI out of the depth BEFORE integration must collapse what the
+    TSDF holds while leaving the cropped result untouched -- the crop discarded that
+    geometry anyway, so paying to integrate it was pure waste (and the OOM)."""
+    pytest.importorskip("open3d", reason="open3d not installed — `pip install -e .[scan]`")
+    from tasni.core.config import AppConfig
+    from tasni.modules.scan import service as scan_service
+
+    scfg = AppConfig().scan
+    poses = [_look_at((0, 0, 500), (0, 0, 0)),
+             _look_at((120, 0, 520), (0, 0, 0)),
+             _look_at((0, 120, 520), (0, 0, 0))]
+    views = [rc.ScanView(*_render_table_and_floor(T), pose_T=T,
+                         geometry=gf.aligned(K, (W, H))) for T in poses]
+
+    center_mm = rc.look_point_from_views(views)
+    assert center_mm is not None and abs(center_mm[2]) < 20.0, center_mm
+    box = scan_service._fusion_roi_box(scfg, center_mm)
+    assert box is not None
+
+    # The prefilter box must be STRICTLY larger than the crop box on every face --
+    # that is what makes the optimisation lossless rather than a silent crop change.
+    c = np.asarray(center_mm, float) / 1000.0
+    lo, hi = box
+    assert lo[0] < c[0] - scfg.roi_radius_m and hi[0] > c[0] + scfg.roi_radius_m
+    assert lo[1] < c[1] - scfg.roi_radius_m and hi[1] > c[1] + scfg.roi_radius_m
+    assert lo[2] < c[2] - scfg.roi_below_m and hi[2] > c[2] + scfg.roi_above_m
+
+    kw = dict(voxel_size_m=0.005, sdf_trunc_m=0.02, depth_min_m=0.2, depth_max_m=1.5)
+    whole_room = rc.fuse_views(views, **kw)
+    prefiltered = rc.fuse_views(views, roi_box_m=box, **kw)
+
+    n_room = len(whole_room.cloud.points)
+    n_pre = len(prefiltered.cloud.points)
+    # The floor is ~15x the table's area here; the real cell run was ~100x worse.
+    assert n_pre < 0.25 * n_room, (n_pre, n_room)
+
+    # ...and nothing the run actually measures gets worse. Compare the fitted plane
+    # and the cleaned measured mesh's COVERAGE -- what the edge-support gate reads --
+    # rather than raw TSDF point counts: dropping a far surface also drops the
+    # sub-surface silhouette skirt the TSDF grows where that surface met a kept one
+    # (here an extreme case, a table floating 750 mm above the floor; on the cell the
+    # platform sits on a continuous table well inside the box).
+    roi = dict(radius_m=scfg.roi_radius_m, below_m=scfg.roi_below_m,
+               above_m=scfg.roi_above_m)
+
+    def _measured(res):
+        cloud = rc.crop_box(res.cloud, c, **roi)
+        pts = rc.cloud_points_m(cloud)
+        wp = work_plane_from_points(pts, distance=0.006, min_inlier_frac=0.5)
+        cleaned, stats = rc.clean_measured_surface_mesh(
+            rc.crop_box(res.mesh, c, **roi), views, wp,
+            plane_band_m=scfg.measured_mesh_plane_band_m,
+            rect_margin_m=scfg.measured_mesh_rect_margin_m,
+            support_tolerance_m=scfg.measured_mesh_support_tolerance_m,
+            min_support_views=scfg.measured_mesh_min_support_views,
+            min_support_ratio=scfg.measured_mesh_min_support_ratio,
+            min_normal_dot=scfg.measured_mesh_min_normal_dot,
+            depth_min_m=scfg.depth_min_m, depth_max_m=scfg.depth_max_m,
+            keep_largest_component=scfg.measured_mesh_keep_largest_component,
+            project_to_plane=scfg.measured_mesh_project_to_plane,
+            neutral_color=scfg.measured_mesh_neutral_color)
+        cov = scan_service._surface_coverage(
+            np.asarray(cleaned.vertices, float), wp,
+            bin_m=scfg.actual_coverage_bin_m,
+            edge_band_m=scfg.actual_coverage_edge_band_m)
+        return len(pts), wp, cov, stats
+
+    n_kept_room, wp_room, cov_room, stats_room = _measured(whole_room)
+    n_kept_pre, wp_pre, cov_pre, stats_pre = _measured(prefiltered)
+    assert n_kept_room > 500, n_kept_room
+    # Same PLANE (a fit's centroid slides freely within the plane, so compare the
+    # normal and the offset along it), and no shrunken extent.
+    assert abs(float(wp_pre.normal @ wp_room.normal)) > 0.999, (wp_pre.normal, wp_room.normal)
+    assert abs(float((wp_pre.centroid - wp_room.centroid) @ wp_room.normal)) < 0.001
+    assert wp_pre.size[0] >= wp_room.size[0] - 0.010, (wp_pre.size, wp_room.size)
+    assert wp_pre.size[1] >= wp_room.size[1] - 0.010, (wp_pre.size, wp_room.size)
+    assert wp_pre.inlier_frac >= wp_room.inlier_frac - 0.01,         (wp_pre.inlier_frac, wp_room.inlier_frac)
+    # The gate must not read WORSE because we stopped integrating the room.
+    assert cov_pre["weakest_edge"] >= cov_room["weakest_edge"] - 0.02,         (cov_pre["weakest_edge"], cov_room["weakest_edge"])
+    assert cov_pre["fill"] >= cov_room["fill"] - 0.02, (cov_pre["fill"], cov_room["fill"])
+    assert cov_pre["interior"] >= cov_room["interior"] - 0.02,         (cov_pre["interior"], cov_room["interior"])
+    # point_count is a raw vertex tally, not a coverage measure: it drops slightly
+    # because the skirt vertices are gone, while fill/interior/weakest_edge above
+    # show those vertices occupied no bin of their own. What must hold is the gate's
+    # VERDICT -- the prefilter may never invent a new rejection reason.
+    assert cov_pre["point_count"] >= 0.9 * cov_room["point_count"],         (cov_pre["point_count"], cov_room["point_count"])
+    reasons_room = scan_service._surface_quality_reasons(cov_room, stats_room, scfg)
+    reasons_pre = scan_service._surface_quality_reasons(cov_pre, stats_pre, scfg)
+    assert len(reasons_pre) <= len(reasons_room), (reasons_pre, reasons_room)
+
+    # roi_enabled=False keeps the old fuse-everything behaviour (the escape hatch).
+    scfg.roi_enabled = False
+    assert scan_service._fusion_roi_box(scfg, center_mm) is None
+    scfg.roi_enabled = True
+    assert scan_service._fusion_roi_box(scfg, None) is None
+
+    print(f"[roi prefilter] integrated {n_room} -> {n_pre} pts ({n_pre / n_room:.1%}); "
+          f"cropped {n_kept_room} vs {n_kept_pre}; weakest edge "
+          f"{cov_room['weakest_edge']:.3f} -> {cov_pre['weakest_edge']:.3f}, fill "
+          f"{cov_room['fill']:.3f} -> {cov_pre['fill']:.3f}")

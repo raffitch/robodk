@@ -59,9 +59,38 @@ def _pose_to_extrinsic_m(pose_T: np.ndarray) -> np.ndarray:
     return invert_T(T)
 
 
+def _outside_box(depth_units: np.ndarray, g, pose_T: np.ndarray,
+                 units_per_m: float, box_min_m, box_max_m) -> np.ndarray:
+    """Boolean HxW mask of depth pixels whose BASE-frame point is outside the box.
+
+    Componentwise on purpose: the temporaries stay a handful of HxW float32 planes
+    (~3.7 MB each at 1280x720) instead of an (H, W, 3) stack, because this runs per
+    view inside fusion -- the one place in the scan that is already memory-critical.
+    """
+    from ...core.depth_geometry import depth_pose
+
+    h, w = depth_units.shape
+    fx, fy = np.float32(g.depth_K[0, 0]), np.float32(g.depth_K[1, 1])
+    cx, cy = np.float32(g.depth_K[0, 2]), np.float32(g.depth_K[1, 2])
+    T = depth_pose(pose_T, g).astype(float)
+    T[:3, 3] /= 1000.0                                   # mm -> m, as integrate wants
+    R, t = T[:3, :3].astype(np.float32), T[:3, 3].astype(np.float32)
+    z = depth_units.astype(np.float32) / np.float32(units_per_m)
+    x = ((np.arange(w, dtype=np.float32) - cx) / fx)[None, :] * z
+    y = ((np.arange(h, dtype=np.float32) - cy) / fy)[:, None] * z
+    lo = np.asarray(box_min_m, np.float32).reshape(3)
+    hi = np.asarray(box_max_m, np.float32).reshape(3)
+    outside = np.zeros((h, w), bool)
+    for i in range(3):
+        c = x * R[i, 0] + y * R[i, 1] + z * R[i, 2] + t[i]
+        outside |= (c < lo[i]) | (c > hi[i])
+    return outside
+
+
 def fuse_views(views: list[ScanView], *, voxel_size_m: float = 0.004,
                sdf_trunc_m: float = 0.02, depth_min_m: float = 0.2,
-               depth_max_m: float = 1.5) -> FusionResult:
+               depth_max_m: float = 1.5,
+               roi_box_m: tuple[np.ndarray, np.ndarray] | None = None) -> FusionResult:
     """Integrate every posed DEPTH view into a TSDF volume (no colour: the scan mesh
     is neutral by contract -- ``clean_measured_surface_mesh`` always repaints it --
     and native depth is not registered pixel-for-pixel to colour the way the old
@@ -76,6 +105,17 @@ def fuse_views(views: list[ScanView], *, voxel_size_m: float = 0.004,
     assumes RealSense's old 1000 (uint16 mm) convention now that protocol 2 streams
     native 0.1 mm units; depth outside ``[depth_min_m, depth_max_m]`` is dropped
     (near-sensor noise / far background).
+
+    ``roi_box_m`` is an optional ``(min_xyz, max_xyz)`` base-frame box in metres:
+    depth whose 3D point falls outside it is dropped BEFORE integration. A
+    ``ScalableTSDFVolume`` allocates a 16^3 ``UniformTSDFVolume`` per touched block,
+    and Open3D stores 48 bytes per voxel (it keeps an ``Eigen::Vector3d`` colour even
+    under ``NoColor``) -- 192 KB per block, whatever the caller asked for. So the
+    volume costs proportionally to the SURFACE AREA it sees divided by voxel^2, and
+    integrating a whole room at work-surface resolution runs to tens of GB. The
+    caller crops the result to this same region anyway, so anything outside is paid
+    for and then discarded: on the 2026-08-30 cell run that was 22.6 M of 22.8 M
+    surface voxels (99.1%), and the tour died with ``MemoryError: bad allocation``.
     """
     import open3d as o3d
     from ...core.depth_geometry import depth_pose
@@ -93,6 +133,8 @@ def fuse_views(views: list[ScanView], *, voxel_size_m: float = 0.004,
         units_per_m = 1000.0 / float(g.depth_unit_mm)   # raw depth units -> metres
         d = depth.copy()
         d[d < float(depth_min_m) * units_per_m] = 0
+        if roi_box_m is not None:
+            d[_outside_box(d, g, v.pose_T, units_per_m, *roi_box_m)] = 0
         grey = np.zeros((h, w, 3), np.uint8)
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             o3d.geometry.Image(grey), o3d.geometry.Image(d),
