@@ -232,9 +232,12 @@ def multiview_plan(recipe, setup, *, K: np.ndarray, size_px: tuple[int, int],
                    config) -> dict:
     """Descriptors for the whole star: preview, the dry tour, and the job log."""
     aim = aim_point_mm(recipe, setup, 1)
-    standoff = framing_standoff(width_mm=cylinder_diameter_mm(recipe),
-                                height_mm=cylinder_diameter_mm(recipe),
-                                K=K, size_px=size_px, config=config)
+    diameter = cylinder_diameter_mm(recipe)
+    framing = framing_standoff(
+        width_mm=diameter, height_mm=diameter, K=K, size_px=size_px,
+        frame_margin=config.inspection_frame_margin,
+        near_mm=config.inspection_min_mm, far_mm=config.inspection_max_mm)
+    standoff = framing["standoff_mm"]
     return {"standoff_mm": float(standoff), "aim_mm": [float(v) for v in aim],
             "views": [{"name": name, "tilt_deg": tilt, "azimuth_deg": azimuth}
                       for name, tilt, azimuth in star_view_angles(config)]}

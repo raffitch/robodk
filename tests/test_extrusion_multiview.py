@@ -58,7 +58,10 @@ def test_old_manifest_without_capture_still_validates(tmp_path):
 
 from tasni.modules.extrusion.inspection import (pose_from_aim,  # noqa: E402
                                                 star_view_angles,
-                                                star_view_candidates)
+                                                star_view_candidates,
+                                                multiview_plan)
+import extrusion_synthetic as syn  # noqa: E402
+import test_extrusion_measure as tem  # noqa: E402
 
 
 def test_star_angles_are_top_first_then_the_configured_azimuths():
@@ -104,3 +107,25 @@ def test_star_views_sit_on_a_cone_and_are_120_deg_apart_in_the_work_frame():
     angles = sorted(round(float(np.degrees(np.arctan2(o[1], o[0]))) % 360.0, 3)
                     for o in offsets)
     assert angles == [0.0, 120.0, 240.0]
+
+
+def test_multiview_plan_executes_and_returns_correct_shape():
+    """multiview_plan must call framing_standoff correctly and return output shape."""
+    config = ExtrusionConfig()
+    plan = tem.scene_plan()
+    result = multiview_plan(plan.recipe, plan.setup, K=syn.K_720P, size_px=syn.SIZE_720P,
+                            config=config)
+    assert isinstance(result, dict)
+    assert "standoff_mm" in result
+    assert isinstance(result["standoff_mm"], float)
+    assert config.inspection_min_mm <= result["standoff_mm"] <= config.inspection_max_mm
+    assert "aim_mm" in result
+    assert len(result["aim_mm"]) == 3
+    assert all(isinstance(v, float) for v in result["aim_mm"])
+    assert "views" in result
+    assert isinstance(result["views"], list)
+    assert len(result["views"]) == 4
+    view_names = [v["name"] for v in result["views"]]
+    assert view_names == ["top", "star-000", "star-120", "star-240"]
+    view_tilts = [v["tilt_deg"] for v in result["views"]]
+    assert view_tilts == [0.0, 15.0, 15.0, 15.0]
