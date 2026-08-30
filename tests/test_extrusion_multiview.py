@@ -293,3 +293,133 @@ def test_the_seam_keeps_total_ms_spanning_back_projection():
     direct = process_points(points, plan=plan, layer=layer, config=config,
                             chroma_gated=gated)
     assert whole_timings["total_ms"] > direct.report["timings_ms"]["total_ms"]
+
+
+# ------------------------------------------------------- multiview: levelling, solve, merge
+
+def test_synthetic_colour_actually_holds_the_chroma_gate():
+    """If this fails, every merge test below is silently testing the fallback."""
+    import cv2
+    rings = [syn.RingSpec(60.0, 8.0, (200.0, 150.0), height_fn=syn.flat(6.0))]
+    T = syn.inspection_camera_T(np.array([200.0, 150.0, 6.0]), 300.0)
+    color = syn.render_color(rings, T)
+    sat = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)[:, :, 1]
+    fraction = float((sat > 60).mean())
+    assert fraction > ExtrusionConfig().deposit_min_chroma_fraction
+
+
+from tasni.modules.extrusion.multiview import (ViewCloud, fit_circle,  # noqa: E402
+                                               level_points, merge_views,
+                                               solve_view_offsets)
+
+
+def _ring_xy(cx, cy, r, n=720, arc_deg=360.0, seed=0):
+    rng = np.random.default_rng(seed)
+    theta = np.radians(np.linspace(0.0, arc_deg, n, endpoint=False))
+    rad = r + rng.normal(0.0, 0.2, n)
+    return np.column_stack((cx + rad * np.cos(theta), cy + rad * np.sin(theta)))
+
+
+def test_fit_circle_recovers_a_known_circle():
+    cx, cy, r = fit_circle(_ring_xy(200.0, 150.0, 40.5))
+    assert (cx, cy, r) == pytest.approx((200.0, 150.0, 40.5), abs=0.05)
+
+
+def test_the_joint_solve_recovers_injected_offsets():
+    truth = {"top": (0.0, 0.0), "star-000": (1.2, -0.7),
+             "star-120": (-0.9, 0.4), "star-240": (0.3, 1.1)}
+    mean = np.mean(list(truth.values()), axis=0)
+    views = {name: _ring_xy(200.0, 150.0, 40.5, seed=i) + np.array(d)
+             for i, (name, d) in enumerate(truth.items())}
+    out = solve_view_offsets(views, ExtrusionConfig())
+    for name, d in truth.items():
+        # Recovered up to the gauge: the solve removes the MEAN displacement,
+        # which is unobservable from the ring alone.
+        expected = np.array(d) - mean
+        assert np.allclose(out["offsets_mm"][name], -expected, atol=0.12), name
+
+
+def test_the_gauge_is_a_consensus_not_an_anchor():
+    """THE test that the old spec's circularity is gone. Displacing the TOP view
+    must move the consensus centre by 1/n of the displacement -- not by zero,
+    which is what anchoring every view to the top view would give."""
+    base = {n: _ring_xy(200.0, 150.0, 40.5, seed=i)
+            for i, n in enumerate(["top", "star-000", "star-120", "star-240"])}
+    before = solve_view_offsets(base, ExtrusionConfig())["consensus_center_mm"]
+    moved = dict(base)
+    moved["top"] = base["top"] + np.array([4.0, 0.0])
+    after = solve_view_offsets(moved, ExtrusionConfig())["consensus_center_mm"]
+    assert after[0] - before[0] == pytest.approx(1.0, abs=0.15)      # 4.0 / 4 views
+    assert after[1] - before[1] == pytest.approx(0.0, abs=0.15)
+
+
+def test_offsets_sum_to_zero():
+    views = {n: _ring_xy(200.0, 150.0, 40.5, seed=i) + np.array([i * 0.6, -i * 0.4])
+             for i, n in enumerate(["top", "star-000", "star-120", "star-240"])}
+    out = solve_view_offsets(views, ExtrusionConfig())
+    total = np.sum(list(out["offsets_mm"].values()), axis=0)
+    assert np.allclose(total, [0.0, 0.0], atol=1e-6)
+
+
+def test_a_scaled_view_surfaces_as_residual_not_absorbed():
+    """One shared radius is the point: a per-view radius would let a view with
+    residual scale error fit itself perfectly and hide the problem."""
+    views = {n: _ring_xy(200.0, 150.0, 40.5, seed=i)
+             for i, n in enumerate(["top", "star-000", "star-120"])}
+    views["star-240"] = _ring_xy(200.0, 150.0, 44.0, seed=9)         # +8.6% scale
+    out = solve_view_offsets(views, ExtrusionConfig())
+    assert out["residual_rms_mm"]["star-240"] > 5 * max(
+        out["residual_rms_mm"][n] for n in ("top", "star-000", "star-120"))
+
+
+def test_levelling_removes_an_injected_plane_tilt():
+    rng = np.random.default_rng(0)
+    xy = rng.uniform(-150.0, 150.0, (6000, 2))
+    tilt = np.radians(8.0)
+    z = xy[:, 0] * np.tan(tilt) + 3.0
+    levelled, diag = level_points(np.column_stack((xy, z)), r_inner_mm=90.0,
+                                  r_outer_mm=150.0, center_xy=(0.0, 0.0),
+                                  config=ExtrusionConfig())
+    inside = np.linalg.norm(levelled[:, :2], axis=1) < 150.0
+    assert abs(float(np.median(levelled[inside, 2]))) < 0.3
+    assert diag["level_mm"] == pytest.approx(3.0, abs=0.5)
+
+
+def _cloud(name, *, gated=True, cx=200.0, cy=150.0, r=40.5, n=1500, seed=0):
+    rng = np.random.default_rng(seed)
+    theta = rng.uniform(0.0, 2 * np.pi, n)
+    rad = r + rng.normal(0.0, 1.0, n)
+    ring = np.column_stack((cx + rad * np.cos(theta), cy + rad * np.sin(theta),
+                            rng.normal(6.0, 0.4, n)))
+    board = np.column_stack((rng.uniform(cx - 160, cx + 160, 8000),
+                             rng.uniform(cy - 160, cy + 160, 8000),
+                             rng.normal(0.0, 0.3, 8000)))
+    return ViewCloud(name=name, points=np.vstack((ring, board)), chroma_gated=gated)
+
+
+def test_an_abstaining_view_is_dropped_not_contributed():
+    plan = tem.scene_plan(radius=40.5, bead=10.0)
+    views = [_cloud("top", seed=0), _cloud("star-000", seed=1),
+             _cloud("star-120", seed=2), _cloud("star-240", gated=False, seed=3)]
+    out = merge_views(views, plan=plan, layer=plan.layers[0], config=ExtrusionConfig())
+    assert "star-240" in out.dropped and "colour gate" in out.dropped["star-240"]
+    assert out.chroma_gated is True                # the merge keeps the 1.5 mm floor
+    assert set(out.used) == {"top", "star-000", "star-120"}
+
+
+def test_all_abstaining_falls_back_to_the_top_view():
+    plan = tem.scene_plan(radius=40.5, bead=10.0)
+    views = [_cloud(n, gated=False, seed=i) for i, n in
+             enumerate(["top", "star-000", "star-120", "star-240"])]
+    out = merge_views(views, plan=plan, layer=plan.layers[0], config=ExtrusionConfig())
+    assert out.used == ["top"] and out.chroma_gated is False
+    np.testing.assert_array_equal(out.points, views[0].points)
+
+
+def test_a_wildly_misregistered_view_is_rejected_and_the_rest_survive():
+    plan = tem.scene_plan(radius=40.5, bead=10.0)
+    views = [_cloud("top", seed=0), _cloud("star-000", seed=1),
+             _cloud("star-120", seed=2), _cloud("star-240", cx=230.0, seed=3)]
+    out = merge_views(views, plan=plan, layer=plan.layers[0], config=ExtrusionConfig())
+    assert "star-240" in out.dropped
+    assert set(out.used) == {"top", "star-000", "star-120"}

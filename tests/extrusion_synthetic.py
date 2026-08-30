@@ -110,3 +110,30 @@ def render_scene(rings: list[RingSpec], T_work_camera: np.ndarray, *,
     parts += [ring.surface_points() for ring in rings]
     return render_depth(np.vstack(parts), T_work_camera, K=K, size_px=size_px,
                         noise_mm=noise_mm, seed=seed)
+
+
+def render_color(rings: list[RingSpec], T_work_camera: np.ndarray, *,
+                 K: np.ndarray = K_720P, size_px: tuple[int, int] = SIZE_720P,
+                 ring_bgr=(40, 90, 190), board_bgr=(180, 180, 180)) -> np.ndarray:
+    """A colour frame where the rings are chromatic and the board is not.
+
+    The real discriminator is saturation (deposit_min_saturation = 60): the clay
+    is chromatic, the printed board is not, and they separate ~20:1 on the cell.
+    A test that leaves colour at zeros makes the gate ABSTAIN, which restores the
+    2.5 mm floor and -- under multiview's per-view rule -- drops the view. So any
+    test that means to exercise the gate-held path must render colour here.
+    """
+    w, h = size_px
+    image = np.full((h, w, 3), board_bgr, np.uint8)          # S ~ 0: reads "board"
+    for ring in rings:
+        pts = ring.surface_points()
+        cam = np.linalg.inv(T_work_camera) @ np.c_[pts, np.ones(len(pts))].T
+        cam = cam[:3].T
+        forward = cam[cam[:, 2] > 1.0]
+        uv = (K @ forward.T).T
+        uv = uv[:, :2] / uv[:, 2:3]
+        u = np.rint(uv[:, 0]).astype(int)
+        v = np.rint(uv[:, 1]).astype(int)
+        ok = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        image[v[ok], u[ok]] = ring_bgr                        # S ~ 200: reads "bead"
+    return image
