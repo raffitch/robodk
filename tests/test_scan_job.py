@@ -3767,3 +3767,65 @@ def test_aim_centred_placement_is_what_failed_the_edge_gate():
     print("[edge gate] aim-centred weakest {:.0%} (< {:.0%}) -> REJECT;  "
           "lock-centred weakest {:.0%} -> PASS".format(
               cov["aimed"]["weakest_edge"], gate, cov["locked"]["weakest_edge"]))
+
+
+def _rejected_run_message(locked_pose=True, crop=None, provenance=None):
+    """Render the rejection text from the real 20260830-180331 evidence."""
+    from types import SimpleNamespace
+    from tasni.modules.scan.plane import WorkPlane
+    from tasni.modules.scan.service import _rejection_message, _surface_quality_reasons
+    rep = {'module': 'scan', 'stamp': '20260830-180331', 'run_dir': 'D:\\DesktopStuff\\RAFFI NO TOUCH\\backuprobodk\\RoboDkClaude\\runs\\scan\\20260830-180331', 'n_views': 16, 'n_points': 244335, 'mesh_vertices': 128448, 'mesh_triangles': 255430, 'mesh_file': 'mesh.obj', 'mesh_kind': 'fitted_flat_surface', 'measured_mesh_file': 'measured_tsdf_mesh.ply', 'reference_mesh_file': 'work_surface_rect.obj', 'raw_mesh_file': 'raw_tsdf_mesh.ply', 'mesh_cleaning': {'input_vertices': 255302, 'input_triangles': 480958, 'plane_band_mm': 12.0, 'rect_margin_mm': 10.0, 'support_tolerance_mm': 8.0, 'min_support_views': 2, 'min_support_ratio': 0.35, 'min_normal_dot': 0.35, 'project_to_plane': True, 'neutral_color': True, 'geometry_vertices': 115323, 'normal_vertices': 110547, 'support_vertices': 104997, 'combined_vertices': 103701, 'support_mean_views': 13.39241955204079, 'support_mean_ratio': 0.890536913907794, 'support_fallback': False, 'components': 63, 'largest_component_area_mm2': 130788.23402576809, 'kept_vertices': 102638, 'kept_triangles': 203273}, 'coverage': {'point_count': 102638, 'bin_mm': 4.0, 'edge_band_mm': 24.0, 'fill': 0.9608134920634921, 'interior': 1.0, 'edges': {'x_min': 1.0, 'x_max': 0.26851851851851855, 'y_min': 0.9553571428571429, 'y_max': 0.9627976190476191}, 'weakest_edge': 0.26851851851851855}, 'boundary_provenance': 'camera measured - complete boundary', 'survey': {'mode': 'compact', 'boundary_provenance': 'camera measured - complete boundary', 'captures': [{'kind': 'compact', 'robot': {'joints': [88.6488724, -72.428093, 147.494, -2.17146, -44.01968, 1.61997], 'camera_T': [[0.9998330082723036, -0.016120801242854366, -0.008606702995016799, -9.929099083752948], [-0.016141680437370454, -0.9998669247231345, -0.0023619901270123403, -1390.1685148890713], [-0.008567480482258073, 0.0025005223435645325, -0.999960172039965, 283.811507639708], [0.0, 0.0, 0.0, 1.0]], 'fetched_at': 70035.781, 'stationary': True}, 'measurement_ts': 1788098236704.0422, 'captured_at': 70035.781, 'n_frames': 5, 'standoff_mm': 444.76884872998966, 'tilt_deg': 1.155798821549719, 'valid_frac': 0.9957030708007295, 'plane_rms_mm': 0.9834799139155279, 'plane_normal_base': [0.002617245309356445, -0.01690017031263448, 0.9998537564416087], 'plane_point_base': [-4.496368574826818, -1386.732674395307, -161.1957278766206]}], 'plane_normal_base': [0.002617245309356445, -0.01690017031263448, 0.9998537564416087], 'plane_point_base': [-4.496368574826818, -1386.732674395307, -161.1957278766206], 'corners_base': [[-225.1115431663499, -1241.2198107737877, -158.15868752027643], [218.88388869755028, -1248.437157882585, -159.44289468406748], [214.21511478279595, -1534.790885686779, -164.27080817823645], [-229.78031708110424, -1527.5735385779815, -162.9866010144454]], 'center_base': [-5.448214191776977, -1388.0053482302833, -161.21474784925644], 'frame_T_base': [[0.9998637250218323, 0.016299736576287742, 0.0026172453093564435, -225.1115431663499], [-0.016253238315275725, 0.999725070450707, -0.016900170312634473, -1241.2198107737877], [-0.002891994075473492, 0.01685532853055158, 0.9998537564416082, -158.15868752027643], [0.0, 0.0, 0.0, 1.0]], 'size_mm': [444.0559455781891, 286.4324765558762], 'quality': {'plane_rms_mm': 0.9834799139155279, 'standoff_mm': 444.76884872998966, 'tilt_deg': 1.155798821549719, 'valid_frac': 0.9957030708007295, 'measure_frames': 5, 'boundary_source': 'depth', 'vision_extent_mm': [429.8, 277.7], 'depth_extent_mm': [444.1, 286.4], 'reason': 'vision boundary is 14 mm SMALLER than the depth extent on axis 0 — segmentation caught something smaller than the surface'}, 'calibration_id': 'cam-e82cdab99c29', 'locked_robot': {'joints': [88.6488724, -72.428093, 147.494, -2.17146, -44.01968, 1.61997], 'camera_T': [[0.9998330082723036, -0.016120801242854366, -0.008606702995016799, -9.929099083752948], [-0.016141680437370454, -0.9998669247231345, -0.0023619901270123403, -1390.1685148890713], [-0.008567480482258073, 0.0025005223435645325, -0.999960172039965, 283.811507639708], [0.0, 0.0, 0.0, 1.0]], 'fetched_at': 70035.781, 'stationary': True}, 'locked_at': 70035.781}, 'quality': {'voxel_size_mm': 1.1907321866608156, 'surface_mesh_spacing_mm': 1.0, 'frames_per_pose': 3}, 'plane': {'frame_T_mm': [[0.9999994280535474, -2.979523095261727e-17, 0.0010695291384842085, -210.3298641518204], [2.1672984350648686e-05, 0.9997946632009674, -0.020264031315264986, -1239.553998857442], [-0.0010693095247944393, 0.02026404290521244, 0.9997940913719565, -158.7083807201539], [0.0, 0.0, 0.0, 1.0]], 'corners_mm': [[233.72582745014589, -1239.5443748398827, -159.1832139723023], [-210.3298641518204, -1239.553998857442, -158.7083807201539], [-210.32986415182046, -1525.927660285443, -164.51266071452847], [233.72582745014583, -1525.9180362678837, -164.98749396667682]], 'size_mm': [444.05594557818904, 286.43247655587606], 'normal': [0.0010695291384842085, -0.020264031315264986, 0.9997940913719565], 'inlier_frac': 0.5010252317514887, 'inlier_count': 122418}, 'rejected': {'gate': 'measured_surface_support', 'reasons': ['weakest edge support 27% on the +X edge (< 60%), ~18 mm of its 24 mm band unmeasured']}}
+    scfg = AppConfig().scan
+    T = np.array(rep["plane"]["frame_T_mm"], float)
+    T[:3, 3] /= 1000.0
+    wp = WorkPlane(frame_T=T, corners=np.array(rep["plane"]["corners_mm"]) / 1000.0,
+                   size=(0.0, 0.0), normal=np.array(rep["plane"]["normal"]),
+                   centroid=T[:3, 3], inlier_count=0, inlier_frac=0.5)
+    params = SimpleNamespace(crop_size_mm=crop,
+                             surface_size_mm=tuple(rep["survey"]["size_mm"]),
+                             boundary_provenance=provenance or rep["boundary_provenance"],
+                             survey=rep["survey"])
+    reasons = _surface_quality_reasons(rep["coverage"], rep["mesh_cleaning"], scfg)
+    return _rejection_message(reasons, wp=wp, coverage=rep["coverage"], params=params,
+                              scfg=scfg, size_mm=rep["plane"]["size_mm"],
+                              run_dir_name=rep["stamp"], locked_pose=locked_pose)
+
+
+def test_rejection_message_sends_the_operator_somewhere_on_the_real_cell():
+    """"+X edge" is exact and unusable at the pendant. The message must also give a
+    base-frame place to stand, name the evidence files, and say where the rectangle
+    came from -- it costs a 16-pose robot tour to read."""
+    msg = _rejected_run_message()
+    assert "+X edge" in msg, msg
+    assert "base X 234" in msg and "Y -1383" in msg, msg      # the real weak edge
+    assert "measured_tsdf_mesh.ply" in msg and "work_surface_rect.obj" in msg, msg
+    assert "runs/scan/20260830-180331/" in msg, msg
+    assert "placed on the lock" in msg, msg
+    assert "scan.min_actual_edge_coverage" in msg, msg
+    print("[reject text] names the edge, a base X/Y, the evidence, and the placement")
+
+
+def test_rejection_message_offers_a_fork_not_a_verdict():
+    """The old text asserted ONE cause and prescribed a remedy that could not work.
+    The replacement must present both causes the evidence distinguishes, and must
+    not tell the operator to retreat (the standoff follows the locked SIZE)."""
+    msg = _rejected_run_message()
+    assert msg.count("  · ") == 2, msg                     # both causes offered
+    assert "overhangs the plate" in msg, msg
+    assert "no depth came back" in msg, msg
+    assert "farther back" not in msg.lower(), msg
+    assert "the same place" in msg, msg                    # retreat is still ruled out
+    print("[reject text] offers both causes as a fork the saved evidence resolves")
+
+
+def test_rejection_message_does_not_claim_a_lock_placed_a_crop():
+    """The region line must not say "you locked" about a crop square, nor claim the
+    lock placed a rectangle that actually fell back to the camera aim."""
+    crop = _rejected_run_message(crop=(1000.0, 1000.0))
+    assert "crop square around the camera aim" in crop, crop
+    assert "you locked" not in crop, crop
+    aimed = _rejected_run_message(locked_pose=False)
+    assert "centred on the camera aim" in aimed, aimed
+    assert "no survey record" in aimed, aimed
+    assert "placed on the lock" not in aimed, aimed
+    print("[reject text] region line names the true source of size AND position")

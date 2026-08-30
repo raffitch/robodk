@@ -3208,6 +3208,45 @@ def edge_support_line(coverage: dict) -> str:
                      for k in ("x_min", "x_max", "y_min", "y_max") if k in edges)
 
 
+def weak_edge_midpoint_mm(wp, coverage: dict) -> np.ndarray | None:
+    """Base-frame midpoint (mm) of the weakest edge, or ``None`` without detail.
+
+    "the +X edge" is exact and useless at the cell: nobody can see the work frame's
+    axes on the physical plate. A base X/Y the operator can read off the pendant
+    turns the rejection into somewhere to go and look.
+    """
+    edges = coverage.get("edges")
+    if not isinstance(edges, dict) or not edges:
+        return None
+    key = min(edges, key=lambda k: float(edges[k]))
+    R = np.asarray(wp.frame_T[:3, :3], float)
+    origin = np.asarray(wp.frame_T[:3, 3], float)
+    corners = np.asarray(wp.corners, float)
+    local = (corners - origin) @ R
+    axis = 0 if key.startswith("x") else 1
+    want = local[:, axis].max() if key.endswith("max") else local[:, axis].min()
+    pair = np.argsort(np.abs(local[:, axis] - want))[:2]
+    return corners[pair].mean(axis=0) * 1000.0
+
+
+def work_region_origin_phrase(params, size_mm, locked_pose: bool) -> str:
+    """How the rejected work rectangle got its size AND its position.
+
+    The distinction decides which half of the advice applies, so the message must
+    not guess: a crop square is placed on the camera aim by design, a locked
+    surface is placed on the lock, and a locked size with no survey record falls
+    back to the aim — which is exactly the mix-up that made the 2026-08-30 run
+    reject a good surface.
+    """
+    w, h = float(size_mm[0]), float(size_mm[1])
+    if getattr(params, "crop_size_mm", None) is not None:
+        return f"the {w:.0f} × {h:.0f} mm crop square around the camera aim"
+    if locked_pose:
+        return f"the {w:.0f} × {h:.0f} mm surface you locked, placed on the lock"
+    return (f"the {w:.0f} × {h:.0f} mm size you locked, centred on the camera aim "
+            f"(this run carried no survey record)")
+
+
 def _surface_quality_reasons(coverage: dict, mesh_stats: dict, scfg) -> list[str]:
     """Reasons a fitted flat surface is not backed by enough measured depth."""
     reasons: list[str] = []
@@ -3234,6 +3273,59 @@ def _surface_quality_reasons(coverage: dict, mesh_stats: dict, scfg) -> list[str
     if bool(mesh_stats.get("support_fallback")) and int(mesh_stats.get("combined_vertices") or 0) == 0:
         reasons.append("no measured vertices had repeated multi-view depth support")
     return reasons
+
+
+def _rejection_message(reasons: list[str], *, wp, coverage: dict, params, scfg,
+                       size_mm, run_dir_name: str, locked_pose: bool) -> str:
+    """What to tell the operator when the support gate rejects a finished tour.
+
+    This costs a 16-pose real-robot tour to read, so it owes the operator three
+    things: the measurement, where on the physical cell to go and look, and a way
+    to tell the possible causes apart. What it must NOT do is assert one cause —
+    the previous text named a single culprit ("re-lock with the whole border under
+    the reticle") and prescribed a remedy that could not work, because the run was
+    misplacing the rectangle rather than mis-sizing it, and no amount of re-locking
+    moves a camera aim point. So the causes are offered as a fork the saved
+    evidence resolves, not as a diagnosis this function is not in a position to
+    make.
+    """
+    lines = ["scan rejected: the work surface is not backed by enough measured depth.",
+             "",
+             f"  {'why:':<9}" + "; ".join(reasons),
+             f"  {'region:':<9}" + work_region_origin_phrase(params, size_mm, locked_pose)]
+    edge_gate = (float(coverage.get("weakest_edge") or 0.0)
+                 < float(scfg.min_actual_edge_coverage))
+    mid, name = weak_edge_midpoint_mm(wp, coverage), weakest_edge_name(coverage)
+    if edge_gate and mid is not None and name:
+        lines.append(f"  {'go look:':<9}the {name} edge, centred near base "
+                     f"X {mid[0]:.0f}, Y {mid[1]:.0f} mm")
+    if not edge_gate:
+        return "\n".join(lines)
+    provenance = getattr(params, "boundary_provenance", None) or "unknown"
+    lines += [
+        "",
+        "Two different faults look identical from here, and the saved evidence",
+        f"separates them. In runs/scan/{run_dir_name}/, open measured_tsdf_mesh.ply",
+        "(what the tour actually measured) against work_surface_rect.obj (the work",
+        "rectangle):",
+        "",
+        "  · the rectangle overhangs the plate there — the lock was sized past the",
+        "    real border. Re-lock with that border fully in frame and evenly lit,",
+        "    so the locked size matches the plate.",
+        f"    (this lock's boundary came from: {provenance})",
+        "",
+        "  · the plate reaches the rectangle but no depth came back — the rim itself",
+        "    went unmeasured: seen only at a grazing angle, or its material/chamfer",
+        "    returns nothing. Add coverage over that edge, or lower",
+        "    scan.min_actual_edge_coverage if that rim cannot be measured at all.",
+        "",
+        # Phrased to keep test_scan_job's blunt "farther back" tripwire useful: that
+        # guard exists to stop the message ADVISING a retreat, and a guard that has
+        # to be loosened to admit a negation of the same phrase stops guarding.
+        "The tour standoff follows the LOCKED SIZE, not where you stood, so re-locking",
+        "from a greater distance sends the robot to exactly the same place.",
+    ]
+    return "\n".join(lines)
 
 
 def _save_scan_artifacts(run_dir, *, mesh, measured_mesh, reference_mesh, raw_mesh,
@@ -3533,8 +3625,8 @@ class ScanCaptureJob:
                     f"(weakest edge {coverage['weakest_edge']:.0%}, "
                     f"interior {coverage['interior']:.0%}"
                     + (f"; edges {edge_line}" if edge_line else "") + "); "
-                    "the locked rectangle reaches past the depth that was actually "
-                    "measured on that side")
+                    "the work rectangle reaches past the depth the tour measured on "
+                    "that side")
 
             report = _result_report(wp, frame_T_mm, corners_mm, n_views=len(views),
                                      n_points=len(pts), mesh=mesh, run_dir=run_dir,
@@ -3566,15 +3658,11 @@ class ScanCaptureJob:
                             f"measured_tsdf_mesh.ply (what depth actually measured) "
                             f"against work_surface_rect.obj (the locked rectangle) to "
                             f"see which edge overhangs")
-                raise RuntimeError(
-                    "scan rejected: the fitted work surface is not backed by enough "
-                    "measured depth (" + "; ".join(quality_reasons) + "). The locked "
-                    "work rectangle extends past the surface the tour actually "
-                    "measured on that edge. Re-lock with the platform's whole real "
-                    "border under the reticle so the locked size matches the plate — "
-                    "the tour standoff is computed from that locked size, not from "
-                    "where you were standing, so backing the camera off and re-locking "
-                    "sends the robot to the same distance and will not change this.")
+                raise RuntimeError(_rejection_message(
+                    quality_reasons, wp=wp, coverage=coverage, params=self.params,
+                    scfg=scfg, size_mm=report["plane"]["size_mm"],
+                    run_dir_name=run_dir.name,
+                    locked_pose=survey_placement(self.params.survey)[0] is not None))
 
             mesh_obj = None
             if self.params.save_artifacts:
