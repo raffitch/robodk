@@ -2390,7 +2390,10 @@ def test_depth_plane_check_scales_raw_depth_words_by_the_frames_own_unit():
     characterize take.
     """
     from tasni.modules.extrusion.measure import depth_plane_check
+    # Rotation matters here: the camera's +Z runs OUT of the lens, so an identity
+    # rotation faces away from the plane. diag(1,-1,-1) is the straight-down pose.
     T = np.eye(4)
+    T[:3, :3] = np.diag([1.0, -1.0, -1.0])
     T[2, 3] = 312.0                                   # camera 312 mm above the plane
     depth_words = np.full((8, 8), 3120, np.uint16)     # 3120 words * 0.1 mm/word = 312 mm
 

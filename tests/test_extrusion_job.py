@@ -34,7 +34,12 @@ SIDE_JOINTS = (10.0, -55.0, 100.0, 0.0, -25.0, 0.0)
 
 # Camera 500 mm above the layer-1 aim point (which sits at z=6 mm), so the
 # fake pose and the fake 500 mm depth frame describe the same geometry.
+# The rotation is not decorative: the camera's +Z runs OUT of the lens (OpenCV),
+# so an identity rotation points the lens straight UP, away from the work plane.
+# Only translation was ever read before, which is how that survived. diag(1,-1,-1)
+# is what pose_from_aim(..., tilt_deg=0) actually produces for a straight-down view.
 FAKE_CAMERA_T = np.eye(4)
+FAKE_CAMERA_T[:3, :3] = np.diag([1.0, -1.0, -1.0])
 FAKE_CAMERA_T[:3, 3] = [0.0, 0.0, 506.0]
 
 
