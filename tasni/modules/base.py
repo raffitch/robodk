@@ -100,3 +100,10 @@ class WorkflowModule(ABC):
         return {"id": self.id, "title": self.title,
                 "description": self.description, "icon": self.icon,
                 "order": self.order}
+
+    def on_runs_deleted(self, stamps: set[str]) -> None:
+        """These run folders were just deleted from disk — forget any cached handle.
+
+        A module that holds a run in memory (the extrusion measure session) would
+        otherwise keep serving a session whose files are gone. Default: nothing cached.
+        """

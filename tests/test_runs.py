@@ -4,6 +4,8 @@ No RoboDK, no camera — a temp ``runs/`` tree and a fake rdk. Covers:
   * path-traversal guard (untrusted module/stamp can't climb out of runs/)
   * load_report / load_meta round-trip + RunNotFound when missing
   * list_runs newest-first + limit + skips the active.json pointer file
+  * list_runs reports size/file-count and flags the applied run
+  * delete_run removes the folder, reports what it freed, and refuses to climb out
   * write_active / read_active atomic round-trip
   * apply_calibration: by run_id (from disk, survives restart) AND in-memory,
     both write the tool and record runs/calibration/active.json provenance
@@ -96,6 +98,56 @@ def test_list_runs_orders_and_skips_active(tmp: Path):
     print("[list] newest-first, limited, active.json skipped")
 
 
+def test_list_runs_reports_size_and_applied(tmp: Path):
+    tmp = tmp / "sizes"                      # own root: __main__ shares one tmp dir
+    _write_run(tmp, "20260101-000000")
+    _write_run(tmp, "20260620-101010")
+    (tmp / "runs" / "calibration" / "20260101-000000" / "cloud.ply").write_bytes(b"x" * 2048)
+    runs.write_active("calibration", {"run_id": "20260620-101010"}, root=tmp)
+    by_stamp = {r["stamp"]: r for r in runs.list_runs(limit=10, root=tmp)}
+    old_run, applied = by_stamp["20260101-000000"], by_stamp["20260620-101010"]
+    assert old_run["files"] == 3 and old_run["bytes"] > 2048     # report + meta + cloud
+    assert applied["files"] == 2 and old_run["bytes"] > applied["bytes"]
+    assert applied["active"] is True and old_run["active"] is False
+    assert runs.active_run_id("calibration", root=tmp) == "20260620-101010"
+    assert runs.active_run_id("scan", root=tmp) is None
+    print("[list] size/file-count reported, applied run flagged")
+
+
+def test_delete_run_frees_and_guards(tmp: Path):
+    tmp = tmp / "deletes"                    # own root: __main__ shares one tmp dir
+    _write_run(tmp, "20260101-000000")
+    _write_run(tmp, "20260620-101010")
+    nested = tmp / "runs" / "calibration" / "20260101-000000" / "clouds"
+    nested.mkdir()
+    (nested / "a.ply").write_bytes(b"x" * 4096)
+    runs.write_active("calibration", {"run_id": "20260620-101010"}, root=tmp)
+
+    out = runs.delete_run("calibration", "20260101-000000", root=tmp)
+    assert out["files"] == 3 and out["bytes"] > 4096            # counts nested files
+    assert not (tmp / "runs" / "calibration" / "20260101-000000").exists()
+    # only that run went: the sibling and the active.json pointer are untouched
+    assert (tmp / "runs" / "calibration" / "20260620-101010").is_dir()
+    assert runs.read_active("calibration", root=tmp)["run_id"] == "20260620-101010"
+
+    # already gone / not a run dir -> RunNotFound (the pointer file is not a run)
+    for stamp in ("20260101-000000", "active.json"):
+        try:
+            runs.delete_run("calibration", stamp, root=tmp)
+            raise AssertionError(f"expected RunNotFound for {stamp!r}")
+        except runs.RunNotFound:
+            pass
+    # a recursive delete must never be steerable out of the runs tree
+    for bad in ("..", "../..", "a/b", "a\\b", "", str(tmp)):
+        try:
+            runs.delete_run("calibration", bad, root=tmp)
+            raise AssertionError(f"expected rejection of stamp {bad!r}")
+        except ValueError:
+            pass
+    assert tmp.exists() and (tmp / "runs").is_dir()
+    print("[delete]", out["files"], "files /", out["bytes"], "bytes freed; guards hold")
+
+
 def test_write_active_atomic_roundtrip(tmp: Path):
     runs.write_active("calibration", {"run_id": "A", "tool": "Realsense"}, root=tmp)
     runs.write_active("calibration", {"run_id": "B", "tool": "Realsense"}, root=tmp)  # overwrite
@@ -182,6 +234,8 @@ if __name__ == "__main__":
         tmp = Path(t)
         test_load_report_roundtrip_and_missing(tmp)
         test_list_runs_orders_and_skips_active(tmp)
+        test_list_runs_reports_size_and_applied(tmp)
+        test_delete_run_frees_and_guards(tmp)
         test_write_active_atomic_roundtrip(tmp)
         test_apply_by_run_id_from_disk(tmp)
         test_apply_in_memory_job(tmp)

@@ -36,6 +36,9 @@ export const apiPost = <T = any>(path: string, body?: unknown): Promise<T> =>
     body: JSON.stringify(body ?? {}),
   }).then(unwrap);
 
+export const apiDelete = <T = any>(path: string): Promise<T> =>
+  fetch(path, { method: "DELETE" }).then(unwrap);
+
 // Helper bound to one module's REST prefix.
 export const moduleApi = (id: string) => ({
   get: <T = any>(p: string) => apiGet<T>(`/api/modules/${id}${p}`),

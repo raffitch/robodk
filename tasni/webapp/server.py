@@ -140,6 +140,43 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         except ValueError as e:                 # rejected module segment
             raise HTTPException(400, str(e))
 
+    @app.delete("/api/runs/{module}/{stamp}")
+    def delete_run(module: str, stamp: str, force: bool = False) -> dict:
+        """Delete one run folder and every file in it (Dashboard housekeeping).
+
+        Two guards, because this is the one endpoint that destroys data:
+        * never while a job runs — the folder being deleted may be the one the
+          robot is writing takes into right now;
+        * never the run currently applied to the cell without ``force=true``, so
+          clearing old runs cannot silently take out the live calibration/scan. The
+          409 is structured so the UI can offer "delete anyway" instead of guessing.
+        """
+        if services.jobs.running:
+            raise HTTPException(409, "a job is running — stop it before deleting runs")
+        # Forgiving by design: an unreadable/absent pointer means "nothing applied".
+        # A bad module segment is rejected below, by delete_run's own guard.
+        was_active = runs_registry.active_run_id(module) == stamp
+        if was_active and not force:
+            raise HTTPException(409, {
+                "code": "run_is_active",
+                "message": f"{module}/{stamp} is the run currently applied to the cell."})
+        try:
+            out = runs_registry.delete_run(module, stamp)
+        except runs_registry.RunNotFound as e:
+            raise HTTPException(404, str(e))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except OSError as e:                    # in use / permission (common on Windows)
+            raise HTTPException(409, f"could not delete {module}/{stamp}: {e}")
+        try:
+            registry.get(module).on_runs_deleted({stamp})
+        except KeyError:                        # a run folder with no live module
+            pass
+        # The pointer keeps its own copy of the payload, so it stays valid as
+        # provenance — but re-applying *by run id* can no longer find the files.
+        out["active_pointer_dangling"] = was_active
+        return out
+
     for module in sorted(registry.all(), key=lambda m: m.order):
         app.include_router(module.router(), prefix=f"/api/modules/{module.id}")
 

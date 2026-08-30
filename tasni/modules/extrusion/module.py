@@ -138,6 +138,18 @@ class ExtrusionModule(WorkflowModule):
     def _measure_root(self):
         return REPO_ROOT / "runs" / "extrusion"
 
+    def on_runs_deleted(self, stamps: set[str]) -> None:
+        """Drop the cached measure session when its run folder was deleted.
+
+        ``_session()`` only re-reads a session whose ``session.json`` still exists,
+        so a cached handle to a deleted trial would otherwise survive forever — the
+        Dashboard clears the run and the Extrusion page still shows its takes.
+        """
+        session = self._measure_session
+        if session is not None and session.trial_id in stamps:
+            self._measure_session = None
+            self._restored_from = None
+
     def _platform(self, services: ServiceContainer, work_frame: str) -> dict | None:
         """The middle of the build platform expressed in ``work_frame``, or ``None``.
 
