@@ -642,21 +642,39 @@ def plan_for_archived_take(manifest: dict, trial: dict, *,
     return generate_cylinder_plan(recipe, setup)
 
 
-def process_observation(*, color: np.ndarray, depth: np.ndarray,
-                        geometry: CameraGeometry, T_work_camera: np.ndarray,
-                        K: np.ndarray, dist: np.ndarray | None,
-                        plan: CylinderPlan, layer: LayerPath, config,
-                        floor_profile: np.ndarray | None = None,
-                        stages: dict | None = None,
-                        assemble_arcs: bool = False) -> ProcessingResult:
-    """Reconstruct one layer from exactly one saved synchronized RGB-D frame.
+def observation_points(*, color: np.ndarray, depth: np.ndarray,
+                       geometry: CameraGeometry, T_work_camera: np.ndarray,
+                       K: np.ndarray, dist: np.ndarray | None, config,
+                       counts: dict | None = None) -> tuple[np.ndarray, bool]:
+    """One frame's chroma-gated points, in the work frame. Nothing ROI-specific.
 
-    ``geometry`` is the frame's own greeting (native depth intrinsics + the
-    depth->colour extrinsic; Task 7's ``CameraGeometry``); ``T_work_camera`` is
-    the COLOUR camera's hand-eye pose, which is what its colour-frame points
-    need. ``K``/``dist`` are the CALIBRATED colour model, used for exactly one
-    thing: projecting registered depth points into the colour image for the
-    chroma gate (see :func:`chroma_gate_mask`).
+    This is the seam multi-view merges at (multiview.py): everything ABOVE it is
+    per-frame by nature -- it needs that frame's own colour, its own registration
+    and its own hand-eye pose -- and everything below it is per-CLOUD and must
+    run exactly once over the merged result, or the ROI, the voxel, the DBSCAN
+    and the crest extraction would each run n times and disagree.
+    """
+    counts = {} if counts is None else counts
+    reg = ColorRegistered.build(depth, geometry, K, dist)
+    keep_mask, chroma_gated = chroma_gate_mask(color, reg, config, counts)
+    points = transform_points(T_work_camera, reg.pts_mm[keep_mask])
+    counts["raw_depth_pixels"] = int(keep_mask.sum())
+    return points, chroma_gated
+
+
+def process_points(points: np.ndarray, *, plan: CylinderPlan, layer: LayerPath,
+                   config, chroma_gated: bool,
+                   floor_profile: np.ndarray | None = None,
+                   stages: dict | None = None, assemble_arcs: bool = False,
+                   counts: dict | None = None,
+                   timings: dict | None = None) -> ProcessingResult:
+    """Everything from the work ROI onward, over ONE cloud of any provenance.
+
+    ``points`` is already back-projected and transformed into the work frame
+    (see :func:`observation_points`) -- a single frame's or a multi-view merge's,
+    this function cannot tell the difference and must not need to. ``chroma_gated``
+    carries whether the colour gate that produced ``points`` actually ran, which
+    sets the deposit floor (see :func:`deposit_floor_mm`).
 
     ``floor_profile`` is the previous layer's measured centreline (Nx3, work
     frame). Given it, the ROI floor becomes that surface's local height at the
@@ -670,26 +688,18 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     turns it on.
 
     ``stages``, when a dict is passed, is filled with a copy of the cloud at
-    each step of the chain (backprojected, work_roi, above_floor,
-    deposit_cluster, radial_trimmed, top_surface). It exists so the method
-    figure can draw what this function actually did instead of a second
-    implementation of it that could drift. Collecting costs a few copies and
-    changes nothing else.
+    each step of the chain (work_roi, above_floor, deposit_cluster,
+    radial_trimmed, top_surface). It exists so the method figure can draw what
+    this function actually did instead of a second implementation of it that
+    could drift. Collecting costs a few copies and changes nothing else.
     """
     def keep(name: str, cloud: np.ndarray) -> None:
         if stages is not None:
             stages[name] = np.asarray(cloud, dtype=float).copy()
     started = time.perf_counter()
-    timings: dict[str, float] = {}
-    counts: dict[str, int] = {}
+    timings = {} if timings is None else timings
+    counts = {} if counts is None else counts
 
-    mark = time.perf_counter()
-    reg = ColorRegistered.build(depth, geometry, K, dist)
-    keep_mask, chroma_gated = chroma_gate_mask(color, reg, config, counts)
-    points = transform_points(T_work_camera, reg.pts_mm[keep_mask])
-    counts["raw_depth_pixels"] = int(keep_mask.sum())
-    timings["backproject_ms"] = (time.perf_counter() - mark) * 1000
-    keep("backprojected", points)
     setup, recipe = plan.setup, plan.recipe
     radius = np.linalg.norm(points[:, :2] - np.array([setup.center_x_mm, setup.center_y_mm]), axis=1)
     max_z = layer.nominal_z_mm + recipe.bead_diameter_mm / 2 + config.deposit_height_margin_mm
@@ -887,6 +897,55 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
                             filtered_xyz=points.copy(), geometry=geometry)
 
 
+def process_observation(*, color: np.ndarray, depth: np.ndarray,
+                        geometry: CameraGeometry, T_work_camera: np.ndarray,
+                        K: np.ndarray, dist: np.ndarray | None,
+                        plan: CylinderPlan, layer: LayerPath, config,
+                        floor_profile: np.ndarray | None = None,
+                        stages: dict | None = None,
+                        assemble_arcs: bool = False) -> ProcessingResult:
+    """Reconstruct one layer from exactly one saved synchronized RGB-D frame.
+
+    ``geometry`` is the frame's own greeting (native depth intrinsics + the
+    depth->colour extrinsic; Task 7's ``CameraGeometry``); ``T_work_camera`` is
+    the COLOUR camera's hand-eye pose, which is what its colour-frame points
+    need. ``K``/``dist`` are the CALIBRATED colour model, used for exactly one
+    thing: projecting registered depth points into the colour image for the
+    chroma gate (see :func:`chroma_gate_mask`).
+
+    ``floor_profile`` is the previous layer's measured centreline (Nx3, work
+    frame). Given it, the ROI floor becomes that surface's local height at the
+    nearest XY sample rather than a single build-plane number -- which is what
+    lets a DISPLACED ring be measured without the exposed crescent of the ring
+    beneath it being dragged into the same skeleton. Omitted, behaviour is
+    exactly as before.
+
+    ``assemble_arcs`` rejoins ring arcs that the height floor or an occlusion
+    split apart; see :func:`_filter_deposit` for why only a characterization
+    turns it on.
+
+    ``stages``, when a dict is passed, is filled with a copy of the cloud at
+    each step of the chain (backprojected, work_roi, above_floor,
+    deposit_cluster, radial_trimmed, top_surface). It exists so the method
+    figure can draw what this function actually did instead of a second
+    implementation of it that could drift. Collecting costs a few copies and
+    changes nothing else.
+    """
+    counts: dict = {}
+    timings: dict = {}
+    mark = time.perf_counter()
+    points, chroma_gated = observation_points(
+        color=color, depth=depth, geometry=geometry, T_work_camera=T_work_camera,
+        K=K, dist=dist, config=config, counts=counts)
+    timings["backproject_ms"] = (time.perf_counter() - mark) * 1000
+    if stages is not None:
+        stages["backprojected"] = np.asarray(points, dtype=float).copy()
+    return process_points(points, plan=plan, layer=layer, config=config,
+                          chroma_gated=chroma_gated, floor_profile=floor_profile,
+                          stages=stages, assemble_arcs=assemble_arcs,
+                          counts=counts, timings=timings)
+
+
 @dataclass
 class CharacterizationResult:
     """What a physical ring actually IS, measured with no recipe assumption."""
@@ -933,10 +992,9 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, geometry: CameraG
     counts: dict[str, int] = {}
     # The same gate as the layer measurements: characterization defines the
     # recipe they are then judged against, so the two must see the same cloud.
-    reg = ColorRegistered.build(depth, geometry, K, dist)
-    keep_mask, chroma_gated = chroma_gate_mask(color, reg, config, counts)
-    points = transform_points(T_work_camera, reg.pts_mm[keep_mask])
-    counts["raw_depth_pixels"] = int(keep_mask.sum())
+    points, chroma_gated = observation_points(
+        color=color, depth=depth, geometry=geometry, T_work_camera=T_work_camera,
+        K=K, dist=dist, config=config, counts=counts)
     center = np.asarray(search_center_mm, dtype=float)
     min_z = deposit_floor_mm(config, chroma_gated)
     radial = np.linalg.norm(points[:, :2] - center, axis=1)

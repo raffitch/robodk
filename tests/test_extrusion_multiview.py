@@ -223,3 +223,33 @@ def test_a_backward_facing_pose_names_the_real_cause_not_just_the_angle():
     oblique = depth_plane_check(_frame(300.0), pose_from_aim(AIM, 300.0, tilt_deg=80.0),
                                 ExtrusionConfig(), unit_mm=1.0)
     assert "away" not in (oblique.get("refused") or "").lower()
+
+
+def test_the_seam_reproduces_process_observation_exactly():
+    """observation_points + process_points must equal process_observation. If it
+    does not, every archived number silently changes meaning."""
+    pytest.importorskip("open3d")
+    import geometry_fixtures as gf
+    from tasni.modules.extrusion.inspection import aim_point_mm
+    from tasni.modules.extrusion.processing import (observation_points,
+                                                    process_observation,
+                                                    process_points)
+
+    plan = tem.scene_plan()
+    layer = plan.layers[0]
+    T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, 1), 300.0)
+    rings = [syn.RingSpec(60.0, 8.0, (200.0, 150.0), height_fn=syn.flat(6.0))]
+    depth = syn.render_scene(rings, T, plane_center_xy_mm=(200.0, 150.0))
+    color = np.zeros((syn.SIZE_720P[1], syn.SIZE_720P[0], 3), np.uint8)
+    geom, config = gf.aligned(syn.K_720P, syn.SIZE_720P), ExtrusionConfig()
+
+    whole = process_observation(color=color, depth=depth, geometry=geom,
+                                T_work_camera=T, K=syn.K_720P, dist=None,
+                                plan=plan, layer=layer, config=config)
+    points, gated = observation_points(color=color, depth=depth, geometry=geom,
+                                       T_work_camera=T, K=syn.K_720P, dist=None,
+                                       config=config)
+    split = process_points(points, plan=plan, layer=layer, config=config,
+                           chroma_gated=gated)
+    np.testing.assert_allclose(split.measured_xyz, whole.measured_xyz)
+    assert split.metrics.model_dump() == whole.metrics.model_dump()
