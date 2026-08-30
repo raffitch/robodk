@@ -877,10 +877,40 @@ ACHIEVED_OPTIONS = {}       # read-back values, set by openPipeline
 DEVICE_INFO = {}
 
 
+def _first_color_sensor(device):
+    """The RGB endpoint, however this librealsense build exposes it, or None.
+
+    ``device.first_color_sensor()`` is not present in every pyrealsense2 build, so
+    fall back to scanning the sensors by name ("RGB Camera" on a D435i). Returns
+    None rather than raising: a colour endpoint we cannot find must degrade to a log
+    line, never to an exception on the startup path -- the unit is Restart=always
+    with no start limit, so that would be an infinite crash-loop with the camera
+    dark for every module."""
+    try:
+        found = device.first_color_sensor()
+        if found is not None:
+            return found
+    except Exception:
+        pass                        # older/newer binding without that convenience
+    try:
+        sensors = list(device.query_sensors())
+    except Exception as e:
+        _log(f"WARNING: could not enumerate sensors to find the colour endpoint: {e}")
+        return None
+    for s in sensors:
+        try:
+            name = str(s.get_info(rs.camera_info.name)).lower()
+        except Exception:
+            continue
+        if "rgb" in name or "color" in name or "colour" in name:
+            return s
+    return None
+
+
 def openPipeline():
     """Start depth 720p + colour 1080p (no infrared: nobody reads it), configure the
-    depth sensor with read-back, record the as-found ASIC JSON, and extract the
-    static geometry the greeting carries. Returns the pipeline."""
+    depth and colour sensors with read-back, record the as-found ASIC JSON, and
+    extract the static geometry the greeting carries. Returns the pipeline."""
     global STATIC_GEOMETRY, ACHIEVED_OPTIONS, DEVICE_INFO
     cfg = rs.config()
     cfg.enable_stream(rs.stream.depth, DEPTH_SIZE[0], DEPTH_SIZE[1], rs.format.z16, 30)
@@ -901,10 +931,31 @@ def openPipeline():
         sensor = device.first_depth_sensor()
         ACHIEVED_OPTIONS = rs_config.configure_depth_sensor(
             sensor, rs, laser_power=RS_LASER_POWER, visual_preset=RS_VISUAL_PRESET, log=_log)
+        # auto_exposure_priority is registered on the COLOUR endpoint on the D400
+        # series (librealsense src/ds5/ds5-color.cpp:161), so it has to be set on the
+        # colour sensor; asking the depth one only ever logged "unsupported". Without
+        # it AE can stretch colour exposure past the frame period in dim light, the
+        # sensor drops below 30 fps, wait_for_frames stalls and the supervisor
+        # rebuilds the pipeline. Guarded end to end: a colour sensor we cannot find,
+        # or an option that will not take, is a log line and the server carries on.
+        color_achieved = {}
+        try:
+            color_sensor = _first_color_sensor(device)
+            if color_sensor is None:
+                _log("RealSense: no colour sensor found - auto_exposure_priority not set")
+            else:
+                color_achieved = rs_config.configure_color_sensor(color_sensor, rs, log=_log)
+        except Exception as e:
+            _log(f"WARNING: colour sensor configuration failed: {e}")
         DEVICE_INFO = {
             "serial": device.get_info(rs.camera_info.serial_number),
             "fw": device.get_info(rs.camera_info.firmware_version),
             "librealsense": rs_config.librealsense_version(rs),
+            # Carried in the greeting's `device` block (rs_geometry.build_greeting
+            # splats DEVICE_INFO into it, so this needs no greeting schema change and
+            # the host's CameraGeometry.from_greeting keeps it verbatim: it does
+            # `device=dict(d.get("device") or {})`). None = not readable/not set.
+            "color_auto_exposure_priority": color_achieved.get("auto_exposure_priority"),
         }
         STATIC_GEOMETRY = rs_geometry.static_geometry(profile, rs)     # raises on a bad extrinsic
         gte = rs_config.read_global_time_enabled(sensor, rs, log=_log)
@@ -1122,13 +1173,37 @@ def stream_h264(conn, addr, bitrate_kbps, scan_telemetry=False):
 
     def feeder():
         last_telemetry = 0.0
+        # ONE pointcloud processing block for the life of this feeder thread, instead
+        # of a fresh one per telemetry tick. rs.pointcloud() is a librealsense
+        # processing block with internal allocation/frame-queue caching that a
+        # per-tick rebuild threw away. This is the right scope on three counts:
+        #   - not module scope: the host test suite imports this file with a stubbed
+        #     `rs` namespace, so constructing one at import time would raise there;
+        #   - it survives a recovery rebuild: the block is handed a depth frame
+        #     explicitly by calculate() and holds no reference to the pipeline, so
+        #     _rebuild_pipeline() swapping the device out underneath it is a no-op
+        #     for it (it re-reads the stream profile off each frame);
+        #   - per-thread, not shared: two concurrent telemetry clients get their own
+        #     block rather than racing inside one processing block.
+        # Its existence IS the telemetry enable flag in the loop below, so a
+        # construction failure costs telemetry rather than the whole H.264 stream
+        # this thread feeds (the try: below catches CameraUnavailable/OSError from
+        # streaming, not a construction failure).
+        pointcloud = None
+        if scan_telemetry:
+            try:
+                pointcloud = rs.pointcloud()
+            except Exception as e:                       # noqa: BLE001
+                print(f"H264: no pointcloud block ({e}); scan telemetry disabled",
+                      flush=True)
         try:
             while not stop.is_set():
                 frames = read_frames()
                 color = frames.get_color_frame()
                 if not color:
                     continue
-                if scan_telemetry and time.monotonic() - last_telemetry >= SCAN_TELEMETRY_PERIOD_S:
+                if pointcloud is not None and (
+                        time.monotonic() - last_telemetry >= SCAN_TELEMETRY_PERIOD_S):
                     depth = frames.get_depth_frame()
                     if depth:
                         try:
@@ -1139,7 +1214,6 @@ def stream_h264(conn, addr, bitrate_kbps, scan_telemetry=False):
                             depth_to_color = depth_profile.get_extrinsics_to(color_profile)
                             R_vec = STATIC_GEOMETRY.R_dc          # row-major, asserted at start
                             t_dc_mm = STATIC_GEOMETRY.t_dc_mm
-                            pointcloud = rs.pointcloud()
                             depth_points = pointcloud.calculate(depth)
                             depth_vertices_mm = (
                                 np.asanyarray(depth_points.get_vertices())

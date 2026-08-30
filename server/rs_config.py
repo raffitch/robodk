@@ -51,8 +51,10 @@ def _read(sensor, name, option, log) -> float | None:
 
 def configure_depth_sensor(sensor, rs, *, laser_power: float, visual_preset: int,
                            log=print) -> dict:
-    """Set emitter on, optional laser/preset, depth_units, AE priority off; return
-    the ACHIEVED values (read back) keyed by option name, plus ``depth_unit_mm``."""
+    """Set emitter on, optional laser/preset and depth_units; return the ACHIEVED
+    values (read back) keyed by option name, plus ``depth_unit_mm``.
+
+    AE priority is NOT a depth option on this family -- see configure_color_sensor."""
     achieved: dict = {}
     if visual_preset >= 0:
         achieved["visual_preset"] = _set_with_readback(
@@ -72,16 +74,55 @@ def configure_depth_sensor(sensor, rs, *, laser_power: float, visual_preset: int
         sensor, "emitter_enabled", _opt(rs, "emitter_enabled"), 1.0, log)
     achieved["depth_units"] = _set_with_readback(
         sensor, "depth_units", _opt(rs, "depth_units"), DEPTH_UNITS_M, log)
-    # Frame rate is a contract for every client of the shared pipeline; AE priority
-    # lets the sensor drop below 30 fps in dim light and stalls wait_for_frames.
-    achieved["auto_exposure_priority"] = _set_with_readback(
-        sensor, "auto_exposure_priority", _opt(rs, "auto_exposure_priority"), 0.0, log)
+    # NOTE: auto_exposure_priority is NOT set here. On the D400 series it is
+    # registered on the COLOUR endpoint (librealsense src/ds5/ds5-color.cpp:161,
+    # color_ep.register_pu(RS2_OPTION_AUTO_EXPOSURE_PRIORITY)), so asking the depth
+    # sensor for it only ever logged "unsupported on this device/build - skipped" --
+    # a misleading line, and the 30 fps guard was never actually in place. See
+    # configure_color_sensor() below.
     try:
         achieved["depth_unit_mm"] = float(sensor.get_depth_scale()) * 1000.0
     except Exception as e:  # noqa: BLE001
         log(f"WARNING: could not read depth scale: {e}")
         achieved["depth_unit_mm"] = None
     log(f"RealSense: depth_unit_mm = {achieved['depth_unit_mm']}")
+    return achieved
+
+
+def configure_color_sensor(sensor, rs, *, log=print) -> dict:
+    """Pin the COLOUR stream's frame rate ahead of its exposure; return the ACHIEVED
+    values (read back) keyed by option name.
+
+    Frame rate is a contract for every client of the shared pipeline. With
+    ``auto_exposure_priority`` on, AE is free to stretch exposure past the frame
+    period in dim light and the sensor drops below 30 fps, which stalls
+    ``wait_for_frames`` and costs the pipeline a recovery rebuild -- the colour
+    stream being the one running at 1920x1080, so the one closest to its deadline.
+
+    This option lives on the colour endpoint on the D400 series, not the depth one
+    (librealsense src/ds5/ds5-color.cpp:161). It is a UVC passthrough option, so
+    librealsense does not force a default and the endpoint inherits whatever the
+    device had -- hence the PREVIOUS value is logged before it is changed: this is a
+    live behavioural change to colour exposure and the operator has to be able to
+    see what it was.
+
+    Same contract as configure_depth_sensor: never raise over one option (the unit
+    is Restart=always with no start limit, so an exception on the startup path is an
+    infinite crash-loop with the camera dark).
+    """
+    achieved: dict = {}
+    # Labelled "colour ..." in the journal on purpose: the old line ("auto_exposure_
+    # priority unsupported on this device/build - skipped", emitted while asking the
+    # DEPTH sensor) read as "this device cannot do it" when the truth was "we asked
+    # the wrong endpoint". Which endpoint was asked is now in the log itself.
+    label = "colour auto_exposure_priority"
+    option = _opt(rs, "auto_exposure_priority")
+    previous = _read(sensor, label, option, log)
+    if previous is None:
+        log(f"RealSense: {label} was not readable before the change")
+    else:
+        log(f"RealSense: {label} was {previous:g} before this change")
+    achieved["auto_exposure_priority"] = _set_with_readback(sensor, label, option, 0.0, log)
     return achieved
 
 

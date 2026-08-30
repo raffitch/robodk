@@ -60,6 +60,72 @@ def test_depth_units_are_set_and_read_back_as_0_1_mm():
     assert achieved["visual_preset"] == 0.0
 
 
+def test_auto_exposure_priority_is_not_asked_of_the_depth_sensor():
+    """It is registered on the COLOUR endpoint on D400 (ds5-color.cpp), so asking the
+    depth sensor only ever logged a misleading 'unsupported ... skipped'."""
+    s = _sensor()
+    lines = []
+    achieved = rs_config.configure_depth_sensor(s, FAKE_RS, laser_power=-1, visual_preset=-1,
+                                                log=lines.append)
+    assert "auto_exposure_priority" not in s.values
+    assert "auto_exposure_priority" not in achieved
+    assert not any("auto_exposure_priority" in ln for ln in lines)
+
+
+def test_color_auto_exposure_priority_is_set_and_read_back():
+    """Frame rate is a contract for the shared pipeline: AE priority must end at 0,
+    and the PREVIOUS value must be logged first (live change to colour exposure)."""
+    s = FakeSensor(supported={"auto_exposure_priority"},
+                   ranges={"auto_exposure_priority": (0, 1)},
+                   initial={"auto_exposure_priority": 1.0})
+    lines = []
+    achieved = rs_config.configure_color_sensor(s, FAKE_RS, log=lines.append)
+    assert s.values["auto_exposure_priority"] == 0.0
+    assert achieved["auto_exposure_priority"] == 0.0          # read back off the device
+    assert any("was 1" in ln for ln in lines), lines          # previous value logged
+    assert any("device reports 0" in ln for ln in lines), lines
+
+
+def test_color_sensor_readback_reports_what_the_device_kept_not_what_we_asked():
+    """A device that refuses the write must be reported as it actually is."""
+    class Stubborn(FakeSensor):
+        def set_option(self, opt, v): pass                    # accepts, ignores
+    s = Stubborn(supported={"auto_exposure_priority"},
+                 ranges={"auto_exposure_priority": (0, 1)},
+                 initial={"auto_exposure_priority": 1.0})
+    achieved = rs_config.configure_color_sensor(s, FAKE_RS, log=lambda *_: None)
+    assert achieved["auto_exposure_priority"] == 1.0
+
+
+def test_color_unsupported_option_is_skipped_not_fatal():
+    s = FakeSensor(supported=set(), ranges={})
+    lines = []
+    achieved = rs_config.configure_color_sensor(s, FAKE_RS, log=lines.append)
+    assert achieved["auto_exposure_priority"] is None
+    assert "auto_exposure_priority" not in s.values
+    assert any("not readable" in ln for ln in lines), lines
+    assert any("unsupported" in ln for ln in lines), lines
+
+
+def test_color_option_absent_from_the_rs_build_is_skipped_not_fatal():
+    """A librealsense build without the enum member must not raise (the unit is
+    Restart=always: an exception here is a crash-loop with the camera dark)."""
+    rs = SimpleNamespace(option=SimpleNamespace(), __version__="2.55.1")
+    s = FakeSensor(supported={"auto_exposure_priority"},
+                   ranges={"auto_exposure_priority": (0, 1)})
+    assert rs_config.configure_color_sensor(s, rs, log=lambda *_: None) == {
+        "auto_exposure_priority": None}
+
+
+def test_color_sensor_that_raises_does_not_take_the_service_down():
+    class Angry(FakeSensor):
+        def get_option(self, opt): raise RuntimeError("uvc read failed")
+        def set_option(self, opt, v): raise RuntimeError("uvc write failed")
+    s = Angry(supported={"auto_exposure_priority"}, ranges={"auto_exposure_priority": (0, 1)})
+    achieved = rs_config.configure_color_sensor(s, FAKE_RS, log=lambda *_: None)
+    assert achieved["auto_exposure_priority"] is None
+
+
 def test_unsupported_option_is_skipped_not_fatal():
     s = FakeSensor(supported={"emitter_enabled"}, ranges={"emitter_enabled": (0, 1)})
     achieved = rs_config.configure_depth_sensor(s, FAKE_RS, laser_power=300, visual_preset=4,

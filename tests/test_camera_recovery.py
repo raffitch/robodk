@@ -7,10 +7,10 @@ server stayed ``active``, kept LISTENING on 1024 and kept accepting clients. The
 operator saw an app that connected normally and then showed nothing, with no
 error anywhere near the UI, and eight sockets piled up in CLOSE_WAIT.
 
-Nothing in the server ever rebuilt the pipeline: ``pipeline``/``align`` are built
-once under ``if __name__ == '__main__'`` and every client thread reads those
-globals forever. So a stall that librealsense could often recover from could only
-ever be cleared by a human restarting the service.
+Nothing in the server ever rebuilt the pipeline: the camera state was built once
+under ``if __name__ == '__main__'`` and every client thread read those globals
+forever. So a stall that librealsense could often recover from could only ever be
+cleared by a human restarting the service.
 
 That specific camera turned out to be dead at the USB layer (it stopped
 answering ``setup address`` with -71 and never re-enumerated), which no software
@@ -19,6 +19,16 @@ must not sit there pretending to serve. It retries briefly, rebuilds the pipelin
 once if the stall persists, and if that cannot be done it stops claiming to be a
 camera -- ``Restart=always``/``RestartSec=3`` then makes the failure visible in
 the journal instead of invisible in the UI.
+
+"Camera state" is more than the pipeline. ``openPipeline()`` returns the pipeline
+(protocol 2 dropped the ``rs2::align`` it used to return alongside it) and, as a
+side effect, rebinds the module globals that describe what those frames MEAN:
+``STATIC_GEOMETRY`` (depth->colour extrinsics + both intrinsics), ``ACHIEVED_OPTIONS``
+and ``DEVICE_INFO`` -- all three served by ``make_greeting()`` -- while
+``_rebuild_pipeline`` re-reads ``depth_unit_mm`` off the new device. A rebuild that
+swapped only the pipeline would stream frames from the new open and describe them
+with the dead device's numbers: no exception, no log line, just silently wrong
+millimetres downstream. These tests hold that whole set together.
 
     py -3.10 -m pytest tests/test_camera_recovery.py
 """
@@ -41,14 +51,26 @@ from server import server_unicast_syncronous as srv  # noqa: E402
 
 TIMEOUT = "Frame didn't arrive within 5000"
 
+# Everything a client is served from: the frame source, and the numbers that turn
+# its frames into millimetres. A rebuild has to refresh all of them together.
+CAMERA_GLOBALS = ("pipeline", "depth_unit_mm", "STATIC_GEOMETRY",
+                  "ACHIEVED_OPTIONS", "DEVICE_INFO")
+
 
 class FakePipeline:
-    """Stands in for rs.pipeline: hands out frames, or wedges like the real one."""
+    """Stands in for rs.pipeline: hands out frames, or wedges like the real one.
 
-    def __init__(self, name="pipe", timeouts=0, always_wedged=False):
+    ``depth_scale`` is the device's metres-per-count, as ``_rebuild_pipeline`` reads
+    it back off the reopened device. Left None, ``get_active_profile()`` raises the
+    way a binding that cannot report it would, which the rebuild swallows on purpose
+    ("same device; the startup value still holds").
+    """
+
+    def __init__(self, name="pipe", timeouts=0, always_wedged=False, depth_scale=None):
         self.name = name
         self.remaining_timeouts = timeouts
         self.always_wedged = always_wedged
+        self.depth_scale = depth_scale
         self.calls = 0
         self.stopped = False
         self._lock = threading.Lock()
@@ -62,6 +84,13 @@ class FakePipeline:
                 raise RuntimeError(TIMEOUT)
         return f"frames-from-{self.name}"
 
+    def get_active_profile(self):
+        if self.depth_scale is None:
+            raise RuntimeError("no active profile")
+        sensor = SimpleNamespace(get_depth_scale=lambda: self.depth_scale)
+        device = SimpleNamespace(first_depth_sensor=lambda: sensor)
+        return SimpleNamespace(get_device=lambda: device)
+
     def stop(self):
         self.stopped = True
 
@@ -70,14 +99,71 @@ class FakePipeline:
 def _clean_camera_state(monkeypatch):
     """Each test starts from a healthy, un-wedged supervisor and never sleeps."""
     monkeypatch.setattr(srv, "_recovery_sleep", lambda _s: None)
+    # Re-set each camera global to its own current value purely to register the
+    # undo, so a test that installs a fake camera cannot leak it into the next one.
+    for name in CAMERA_GLOBALS:
+        monkeypatch.setattr(srv, name, getattr(srv, name))
     srv._reset_camera_state()
     yield
     srv._reset_camera_state()
 
 
-def _install(pipeline):
+def _install(pipeline, tag="stale"):
+    """Put the server in the state a previous open left behind.
+
+    Tagging every camera global lets a test tell "produced by THIS open" from
+    "whatever happened to be there before the stall".
+    """
     srv.pipeline = pipeline
-    srv.align = SimpleNamespace(name="align")
+    srv.depth_unit_mm = 1.0
+    srv.STATIC_GEOMETRY = SimpleNamespace(tag=tag)
+    srv.ACHIEVED_OPTIONS = {"tag": tag}
+    srv.DEVICE_INFO = {"tag": tag, "serial": f"serial-{tag}",
+                       "color_auto_exposure_priority": 0}
+
+
+def _opener(pipeline, tag, opened=None, lock=None):
+    """A stand-in for openPipeline with the same side effects as the real one.
+
+    The real ``openPipeline`` declares ``global STATIC_GEOMETRY, ACHIEVED_OPTIONS,
+    DEVICE_INFO`` and rebinds all three while starting the streams, then returns the
+    pipeline alone. Anything that models it has to do both halves.
+    """
+    def fake_open():
+        if opened is not None:
+            if lock is not None:
+                with lock:
+                    opened.append(1)
+            else:
+                opened.append(1)
+        srv.STATIC_GEOMETRY = SimpleNamespace(tag=tag)
+        srv.ACHIEVED_OPTIONS = {"tag": tag}
+        srv.DEVICE_INFO = {"tag": tag, "serial": f"serial-{tag}",
+                           "color_auto_exposure_priority": 1}
+        return pipeline
+    return fake_open
+
+
+def _assert_serves_one_camera(tag):
+    """Frames and the numbers that describe them must come from the SAME open.
+
+    ``make_greeting()`` serves STATIC_GEOMETRY, depth_unit_mm, ACHIEVED_OPTIONS and
+    DEVICE_INFO; ``stream_h264``'s telemetry loop back-projects live frames through
+    ``STATIC_GEOMETRY.R_dc``/``t_dc_mm`` and scales raw counts by ``depth_unit_mm``.
+    All of those are module globals, so a rebuild that rebinds ``pipeline`` and
+    nothing else leaves the server streaming the new device through the old device's
+    geometry -- a silent metric error, not a crash. This is the check that catches it.
+    """
+    assert srv.pipeline.name == tag, "frames are not coming from the newest open"
+    assert srv.STATIC_GEOMETRY.tag == tag, (
+        "STATIC_GEOMETRY is stale: the greeting and the telemetry back-projection "
+        "would describe new frames with the pre-stall extrinsics")
+    assert srv.ACHIEVED_OPTIONS.get("tag") == tag, (
+        "ACHIEVED_OPTIONS is stale: the greeting would report options the reopened "
+        "sensor was never actually configured with")
+    assert srv.DEVICE_INFO.get("tag") == tag, (
+        "DEVICE_INFO is stale: the greeting would report the pre-stall serial/"
+        "firmware and colour auto_exposure_priority")
 
 
 def test_healthy_pipeline_is_left_alone(monkeypatch):
@@ -107,14 +193,9 @@ def test_a_brief_stall_is_retried_rather_than_rebuilt(monkeypatch):
 
 def test_a_persistent_stall_rebuilds_the_pipeline(monkeypatch):
     """The 2026-08-29 signature: every frame times out until something acts."""
-    fresh = FakePipeline(name="fresh")
+    fresh = FakePipeline(name="fresh", depth_scale=0.0001)
     opened = []
-
-    def fake_open():
-        opened.append(1)
-        return fresh, SimpleNamespace(name="fresh-align")
-
-    monkeypatch.setattr(srv, "openPipeline", fake_open)
+    monkeypatch.setattr(srv, "openPipeline", _opener(fresh, "fresh", opened))
     wedged = FakePipeline(name="wedged", always_wedged=True)
     _install(wedged)
 
@@ -122,18 +203,48 @@ def test_a_persistent_stall_rebuilds_the_pipeline(monkeypatch):
     assert len(opened) == 1, "expected exactly one rebuild"
     assert wedged.stopped, "the wedged pipeline must be released before reopening"
     assert srv.pipeline is fresh, "the new pipeline must become the shared one"
-    assert srv.align.name == "fresh-align", "align must be rebound too"
+    # ...and the pipeline is only half of it: everything the greeting and the
+    # telemetry loop read must have been rebound by the same open.
+    _assert_serves_one_camera("fresh")
+    assert srv.depth_unit_mm == pytest.approx(0.1), (
+        "depth_unit_mm was not re-read off the reopened device; protocol 2 sends "
+        "raw counts, so a stale scale silently mis-sizes every depth the host reads")
+
+
+def test_a_rebuild_that_forgets_to_rebind_is_caught(monkeypatch):
+    """Proof that the rebind assertions above can actually FAIL.
+
+    The defect modelled here is one line: drop ``global STATIC_GEOMETRY,
+    ACHIEVED_OPTIONS, DEVICE_INFO`` from openPipeline and its three assignments
+    become function locals -- the streams restart, the pipeline is returned and
+    rebound, and the module keeps the geometry of the device that just died. Nothing
+    raises; frames flow again; the greeting and the telemetry back-projection go on
+    using the pre-stall numbers forever.
+
+    So: run the supervisor against exactly that opener, confirm the failure really is
+    invisible from the frames alone, and confirm the invariant check catches it.
+    """
+    fresh = FakePipeline(name="fresh")
+    monkeypatch.setattr(srv, "openPipeline", lambda: fresh)   # rebinds nothing else
+    _install(FakePipeline(name="wedged", always_wedged=True), tag="dead-device")
+
+    assert srv.read_frames() == "frames-from-fresh"     # looks perfectly healthy
+    assert srv.pipeline is fresh                        # ...and the pipeline IS fresh
+    assert srv.STATIC_GEOMETRY.tag == "dead-device"     # but the geometry is not
+
+    with pytest.raises(AssertionError, match="STATIC_GEOMETRY is stale"):
+        _assert_serves_one_camera("fresh")
 
 
 def test_frames_flow_again_for_every_later_caller(monkeypatch):
     """A rebuild is only useful if the OTHER client threads pick it up."""
     fresh = FakePipeline(name="fresh")
-    monkeypatch.setattr(srv, "openPipeline",
-                        lambda: (fresh, SimpleNamespace(name="fresh-align")))
+    monkeypatch.setattr(srv, "openPipeline", _opener(fresh, "fresh"))
     _install(FakePipeline(name="wedged", always_wedged=True))
 
     srv.read_frames()
     assert srv.read_frames() == "frames-from-fresh"
+    _assert_serves_one_camera("fresh")
 
 
 def test_a_real_error_is_not_mistaken_for_a_stall(monkeypatch):
@@ -172,14 +283,8 @@ def test_concurrent_clients_rebuild_the_camera_only_once(monkeypatch):
     which is exactly the hammering that precedes a dead host controller."""
     fresh = FakePipeline(name="fresh")
     opened = []
-    open_lock = threading.Lock()
-
-    def fake_open():
-        with open_lock:
-            opened.append(1)
-        return fresh, SimpleNamespace(name="fresh-align")
-
-    monkeypatch.setattr(srv, "openPipeline", fake_open)
+    monkeypatch.setattr(srv, "openPipeline",
+                        _opener(fresh, "fresh", opened, threading.Lock()))
     _install(FakePipeline(name="wedged", always_wedged=True))
 
     results, errors = [], []
@@ -199,6 +304,9 @@ def test_concurrent_clients_rebuild_the_camera_only_once(monkeypatch):
     assert not errors, f"clients failed: {errors}"
     assert len(opened) == 1, f"camera re-opened {len(opened)} times, expected 1"
     assert results == ["frames-from-fresh"] * 8
+    # One rebuild, one set of globals: the eight threads must not have left a
+    # half-updated camera behind (new pipeline, some earlier open's geometry).
+    _assert_serves_one_camera("fresh")
 
 
 def test_an_unrecoverable_camera_stops_pretending(monkeypatch):
@@ -279,8 +387,8 @@ def test_a_camera_that_reopens_but_never_streams_is_not_rebuilt_forever(monkeypa
 
     def fake_open():
         opened.append(1)
-        return (FakePipeline(name=f"dud{len(opened)}", always_wedged=True),
-                SimpleNamespace(name="dud-align"))
+        dud = FakePipeline(name=f"dud{len(opened)}", always_wedged=True)
+        return _opener(dud, f"dud{len(opened)}")()
 
     monkeypatch.setattr(srv, "openPipeline", fake_open)
     gave_up = []
@@ -300,8 +408,7 @@ def test_a_camera_that_really_recovers_is_forgiven(monkeypatch):
     """Sustained streaming after a rebuild clears the count, so a camera that
     hiccups once a day is never eventually declared dead for it."""
     fresh = FakePipeline(name="fresh")
-    monkeypatch.setattr(srv, "openPipeline",
-                        lambda: (fresh, SimpleNamespace(name="fresh-align")))
+    monkeypatch.setattr(srv, "openPipeline", _opener(fresh, "fresh"))
     _install(FakePipeline(name="wedged", always_wedged=True))
 
     srv.read_frames()                       # triggers the rebuild
@@ -329,6 +436,27 @@ def test_every_acquisition_site_goes_through_the_supervisor():
     for func in (srv.getFrames, srv.handle_client, srv.stream_h264):
         assert "read_frames()" in inspect.getsource(func), (
             f"{func.__name__} does not acquire through the supervisor")
+
+
+def test_openpipeline_returns_the_pipeline_alone():
+    """Protocol 2 removed rs2::align, so openPipeline returns ONE object and the
+    rebuild installs it directly. If it ever grows a second return value again,
+    ``pipeline = openPipeline()`` silently becomes a tuple and EVERY acquisition
+    dies with 'tuple object has no attribute wait_for_frames' -- which is exactly
+    how this test module rotted. Pin the contract at both ends."""
+    import inspect
+    src = inspect.getsource(srv.openPipeline)
+    returns = [line.split("#")[0].strip() for line in src.splitlines()
+               if line.strip().startswith("return ")]
+    assert returns == ["return pipeline"], (
+        f"openPipeline's return contract changed: {returns}")
+
+    calls = [line.strip() for line in inspect.getsource(srv._rebuild_pipeline).splitlines()
+             if "openPipeline()" in line and not line.strip().startswith("#")]
+    assert calls, "_rebuild_pipeline no longer re-opens through openPipeline"
+    for line in calls:
+        assert "," not in line.split("=")[0], (
+            f"_rebuild_pipeline unpacks openPipeline's result as a tuple: {line}")
 
 
 def test_client_threads_surface_the_failure(monkeypatch):
