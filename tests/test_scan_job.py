@@ -3389,3 +3389,165 @@ def test_finite_or_none_guards_payload_metrics():
     assert scan_service._finite_or_none(float("inf")) is None
     assert scan_service._finite_or_none(1.25) == 1.25
     assert scan_service._finite_or_none(None) is None
+
+
+# ---------------------------------------------------------------------------
+# 2026-08-30 scan/survey defect fixes: one framing predicate, a visible
+# seed-fallback, and the coverage_frac denominator.
+# ---------------------------------------------------------------------------
+
+# The workstation D435i's own calibrated colour model (tasni.config.json).
+REAL_CAM_K = np.array([[889.8742117827221, 0.0, 648.9804252459749],
+                       [0.0, 890.8099396048351, 362.00464151468503],
+                       [0.0, 0.0, 1.0]])
+REAL_CAM_SIZE = (1280, 720)
+REAL_CAM_DIST = np.array([0.11480838161001118, -0.23856355593822276,
+                          -0.0018212469331017086, 0.0004210400812176703, 0.0])
+
+
+def _framing_rect(length_mm, width_mm, z_mm):
+    hx, hy = length_mm / 2.0, width_mm / 2.0
+    return [[-hx, -hy, z_mm], [hx, -hy, z_mm], [hx, hy, z_mm], [-hx, hy, z_mm]]
+
+
+def _live_framed(corners, camera_cfg, scfg):
+    """``fully_framed`` as the LIVE HUD computes it, through the real payload builder."""
+    raw = {"detected": True, "distance_mm": float(corners[0][2]), "tilt_deg": 0.5,
+           "valid_frac": 0.9, "surface_mode": "crop", "fully_framed": False,
+           "rectangle_corners_color_mm": corners,
+           "_received_at": time.time(), "timestamp": time.time()}
+    return scan_service.live_scan_telemetry_payload(raw, scfg, camera_cfg=camera_cfg)
+
+
+def test_live_hud_and_lock_use_the_same_framing_predicate():
+    """Defect 1: two copies of "are the corners in frame?", two DIFFERENT lens models.
+
+    04e5760 switched ``survey._corners_in_frame`` to a PINHOLE projection, but the
+    live-HUD copy here (``live_scan_telemetry_payload``) kept projecting through
+    the CALIBRATED model. On 04e5760's own fold-back fixture they disagreed --
+    pinhole "not framed", calibrated "framed" -- so the HUD showed FRAMED and the
+    lock then raised LargeSurfaceRequired: exactly the false-refusal symptom that
+    commit was written to kill. Both call sites now go through
+    ``survey.corners_in_color_frame``, checked here on BOTH sides of the design
+    tradeoff:
+
+      * the fold-back rectangle (pinhole radius 1.404, past the 1.035 monotonic
+        limit of this camera's radial polynomial) -> NOT framed on both paths;
+      * an 821 x 410 mm platform at 600 mm (the boundary case pinhole containment
+        gets WRONG: framed calibrated, not framed pinhole) -> framed on both.
+    """
+    from tasni.core.config import ScanConfig
+    from tasni.modules.scan.survey import corners_in_color_frame
+    scfg = ScanConfig()
+    margin = float(scfg.live_frame_margin_uv)
+
+    # (a) fold-back: small test K, real distortion, corners far outside the frame.
+    fold_cfg = SimpleNamespace(K=K, dist=REAL_CAM_DIST, size=(W, H))
+    fold = _framing_rect(1400.0, 100.0, 500.0)
+    lock_fold = corners_in_color_frame(fold, fold_cfg.K, fold_cfg.dist,
+                                       fold_cfg.size, margin_uv=margin)
+    hud_fold = _live_framed(fold, fold_cfg, scfg)
+    assert lock_fold is False, "the lock-time predicate must reject fold-back"
+    assert hud_fold["fully_framed"] is False, hud_fold
+    assert hud_fold["surface_mode"] == "crop", hud_fold
+
+    # (b) frame boundary: real 1280x720 K/dist, a platform that genuinely fits.
+    real_cfg = SimpleNamespace(K=REAL_CAM_K, dist=REAL_CAM_DIST, size=REAL_CAM_SIZE)
+    edge = _framing_rect(821.0, 410.0, 600.0)
+    lock_edge = corners_in_color_frame(edge, real_cfg.K, real_cfg.dist,
+                                       real_cfg.size, margin_uv=margin)
+    hud_edge = _live_framed(edge, real_cfg, scfg)
+    assert lock_edge is True, (
+        "821x410 mm at 600 mm is inside the real colour frame -- refusing it is "
+        "a false LargeSurfaceRequired")
+    assert hud_edge["fully_framed"] is True, hud_edge
+    assert hud_edge["surface_mode"] == "full", hud_edge
+    print(f"[one predicate] fold-back HUD={hud_fold['fully_framed']} "
+          f"lock={lock_fold}; boundary HUD={hud_edge['fully_framed']} "
+          f"lock={lock_edge}")
+
+
+def test_live_framing_ignores_corners_behind_the_camera():
+    """Defect 1, second half: ``_project_color_corners_uv`` had no ``z <= 0``
+    guard (``survey.py`` always had one), so a corner behind the image plane
+    divided by a non-positive z, produced a finite-but-meaningless pixel, and fed
+    the edge-angle / framing / outline overrides as if it were real. It must now
+    decline to override at all, leaving the server's own verdict standing."""
+    from tasni.core.config import ScanConfig
+    scfg = ScanConfig()
+    real_cfg = SimpleNamespace(K=REAL_CAM_K, dist=REAL_CAM_DIST, size=REAL_CAM_SIZE)
+    assert scan_service._project_color_corners_uv(
+        _framing_rect(200.0, 200.0, -600.0), real_cfg) is None
+    straddle = _framing_rect(200.0, 200.0, 600.0)
+    straddle[0][2] = 0.0
+    assert scan_service._project_color_corners_uv(straddle, real_cfg) is None
+    out = _live_framed(straddle, real_cfg, scfg)
+    assert out["fully_framed"] is False, out       # the server's value, untouched
+    assert "edge_angle_deg" not in out, out
+
+
+def test_gate_payload_reports_a_silent_seed_fallback():
+    """Defect 2: the reticle-seeded plane fit degrades to whole-cloud RANSAC when
+    the seed region is empty -- measured consequence, a centroid at 1070 mm (the
+    floor) instead of 450 mm (the platform). That reversion must reach the record
+    and the operator, not just happen."""
+    reading = SimpleNamespace(
+        to_dict=lambda: {"gates": {"detected": True, "distance": True,
+                                   "angle": True}, "ok": True},
+        gates={"detected": True})
+    common = dict(detected=True, fully_framed=True, outline_uv=None, grid_uv=None,
+                  grid_spacing_mm=None, extent_mm=(300.0, 200.0),
+                  fov_deg=(69.0, 42.0), points_uv=None)
+
+    fell_back = SimpleNamespace(**common, plane_seed_used=False,
+                                plane_seed_status="seed_region_empty",
+                                plane_seed_points=0)
+    payload = scan_service.scan_gate_payload(reading, fell_back)
+    assert payload["plane_seed_used"] is False, payload
+    assert payload["plane_seed_status"] == "seed_region_empty", payload
+    warnings = payload.get("warnings") or []
+    assert any("reticle" in w for w in warnings), warnings
+
+    healthy = SimpleNamespace(**common, plane_seed_used=True,
+                              plane_seed_status="seeded", plane_seed_points=1234)
+    ok_payload = scan_service.scan_gate_payload(reading, healthy)
+    assert ok_payload["plane_seed_used"] is True, ok_payload
+    assert ok_payload["plane_seed_points"] == 1234, ok_payload
+    assert not (ok_payload.get("warnings") or []), ok_payload
+    print(f"[seed fallback] gate payload warns: {warnings[0][:60]}...")
+
+
+def test_coverage_frac_denominator_matches_the_sampled_grid():
+    """Defect 3: ``n_grid_total`` floored (``(h//stride) * (w//stride)``) while
+    ``backproject`` samples ``d[::stride, ::stride]`` (ceil), so ``coverage_frac``
+    could exceed 1.0 and the corner-coverage gate was that much more permissive
+    than its configured threshold. At the live 1280x720 / stride 6 that is 25,560
+    vs 25,680 = +0.47%; this fixture uses a width the stride does not divide, so a
+    fully-covered frame must read exactly 1.0, never more."""
+    h, w, stride = 240, 322, 6
+    assert w % stride != 0, "fixture needs a width the stride does not divide"
+    Kc = np.array([[300.0, 0.0, w / 2.0], [0.0, 300.0, h / 2.0], [0.0, 0.0, 1.0]])
+    depth = np.full((h, w), 500, np.uint16)          # every pixel valid, all coplanar
+    pts, purity, coverage = scan_service._deproject_plane_points_mm(
+        depth, gf.aligned(Kc, (w, h)), np.eye(4),
+        plane_normal_cam=np.array([0.0, 0.0, 1.0]),
+        plane_point_cam=np.array([0.0, 0.0, 500.0]), band_mm=6.0, stride=stride)
+
+    n_sampled = depth[::stride, ::stride].size
+    assert len(pts) == n_sampled, (len(pts), n_sampled)
+    assert purity == 1.0, purity
+    assert coverage == pytest.approx(1.0, abs=1e-12), coverage
+    assert coverage <= 1.0, (
+        "a fully covered frame cannot be more than 100% covered -- the floored "
+        "denominator is back", coverage)
+    # The live-cell shape too: 1280x720 stride 6 must count 25,680, not 25,560.
+    big = np.full((720, 1280), 500, np.uint16)
+    Kb = np.array([[900.0, 0.0, 640.0], [0.0, 900.0, 360.0], [0.0, 0.0, 1.0]])
+    _p, _pu, cov_big = scan_service._deproject_plane_points_mm(
+        big, gf.aligned(Kb, (1280, 720)), np.eye(4),
+        plane_normal_cam=np.array([0.0, 0.0, 1.0]),
+        plane_point_cam=np.array([0.0, 0.0, 500.0]), band_mm=6.0, stride=6)
+    assert cov_big == pytest.approx(1.0, abs=1e-12), cov_big
+    print(f"[coverage] {w}x{h} stride {stride}: {len(pts)}/{n_sampled} -> "
+          f"{coverage:.6f} (floored denominator gave "
+          f"{len(pts) / ((h // stride) * (w // stride)):.6f})")

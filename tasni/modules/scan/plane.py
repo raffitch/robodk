@@ -70,9 +70,17 @@ def _plane_basis(normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return u, v
 
 
+SEED_OK = "seeded"
+SEED_NOT_REQUESTED = "not_requested"
+SEED_TOO_FEW_POINTS = "seed_region_empty"
+SEED_FIT_FAILED = "seed_fit_failed"
+SEED_GREW_TOO_FEW = "seed_plane_grew_too_few"
+
+
 def fit_plane(points: np.ndarray, *, distance: float = 0.006,
               n_iterations: int = 1000, seed: int = 0,
-              seed_mask: np.ndarray | None = None
+              seed_mask: np.ndarray | None = None,
+              report: dict | None = None
               ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """RANSAC the dominant plane, then least-squares refine on its inliers.
 
@@ -92,19 +100,44 @@ def fit_plane(points: np.ndarray, *, distance: float = 0.006,
     (typically the aiming reticle / centre-patch region, which is what the
     operator is actually looking at): a plane is first fit using ONLY those
     points (recursively, through this same function, so a noisy seed patch is
-    still RANSAC-robust) -- a much smaller, deliberately-scoped candidate set,
-    so a bigger unrelated cluster elsewhere in the frame is never even in
-    contention. That seed plane's inlier set is then GROWN across the full
-    cloud (everything within ``distance`` of that specific plane) and
-    least-squares refined -- the same refine step the unseeded path already
-    does, just anchored at the caller's intent instead of raw popularity.
+    still RANSAC-robust) -- a much smaller, deliberately-scoped candidate set.
+    That seed plane's inlier set is then GROWN across the full cloud (everything
+    within ``distance`` of that specific plane) and least-squares refined -- the
+    same refine step the unseeded path already does, just anchored at the
+    caller's intent instead of raw popularity.
+
+    The scoping is by INTENT, not by size, and it is not unconditional: the seed
+    fit is itself maximal-consensus RANSAC *within the seed region*, so a cluster
+    that out-votes the platform INSIDE that region still wins. Concretely, at the
+    default ``center_patch_frac=0.25`` a platform narrower than roughly 12-13% of
+    the frame's width does not fill the reticle box, and the floor/table visible
+    around it inside that same box can carry the seed fit instead. What seeding
+    removes is the much larger class of "a bigger unrelated cluster ELSEWHERE in
+    the frame wins on raw point count"; a surface smaller than the reticle box is
+    a real remaining limitation, not a solved case. (An earlier version of this
+    docstring claimed such a cluster "is never even in contention" -- an
+    overclaim, corrected here.)
 
     Falls back to the unseeded (whole-cloud, today's) behavior when
-    ``seed_mask`` is ``None``, selects fewer than 3 points, or fails to fit a
-    plane on its own -- so a genuinely single-surface scene, or one where the
-    seed region happens to be empty, degrades exactly to the pre-existing
-    algorithm.
+    ``seed_mask`` is ``None``, selects fewer than 3 points, fails to fit a plane
+    on its own, or grows to fewer than 3 inliers -- so a genuinely single-surface
+    scene degrades exactly to the pre-existing algorithm.
+
+    That fallback used to be SILENT, which made it indistinguishable from a
+    correct fit: measured 2026-08-30, an empty seed region put the plane centroid
+    at 1070 mm (the floor) instead of 450 mm (the platform) -- the exact defect
+    seeding was added to fix, silently reverted, with nothing in the record to
+    say so. Pass ``report`` (a dict) to get it back: it is filled in with
+    ``{"seed_requested", "seed_points", "seed_used", "seed_status"}``, where
+    ``seed_status`` is one of the ``SEED_*`` constants above. Purely an
+    OUT-parameter -- the return contract is unchanged, so the other five
+    ``fit_plane`` call sites need no edit.
     """
+    if report is not None:
+        report.update({"seed_requested": seed_mask is not None, "seed_points": 0,
+                       "seed_used": False,
+                       "seed_status": (SEED_NOT_REQUESTED if seed_mask is None
+                                       else SEED_TOO_FEW_POINTS)})
     pts = np.asarray(points, dtype=float).reshape(-1, 3)
     n = len(pts)
     if n < 3:
@@ -115,13 +148,18 @@ def fit_plane(points: np.ndarray, *, distance: float = 0.006,
         if seed_mask.shape[0] != n:
             raise ValueError("seed_mask must have one entry per point")
         seed_pts = pts[seed_mask]
+        if report is not None:
+            report["seed_points"] = int(len(seed_pts))
         if len(seed_pts) >= 3:
             try:
                 seed_normal, seed_centroid, _ = fit_plane(
                     seed_pts, distance=distance, n_iterations=n_iterations, seed=seed)
             except ValueError:
                 seed_normal = None
-            if seed_normal is not None:
+            if seed_normal is None:
+                if report is not None:
+                    report["seed_status"] = SEED_FIT_FAILED
+            else:
                 grown = np.abs((pts - seed_centroid) @ seed_normal) < distance
                 if int(grown.sum()) >= 3:
                     inl = pts[grown]
@@ -132,9 +170,16 @@ def fit_plane(points: np.ndarray, *, distance: float = 0.006,
                     if normal[2] < 0:
                         normal = -normal
                     mask = np.abs((pts - centroid) @ normal) < distance
+                    if report is not None:
+                        report.update({"seed_used": True, "seed_status": SEED_OK})
                     return normal, centroid, mask
+                if report is not None:
+                    report["seed_status"] = SEED_GREW_TOO_FEW
         # Seed region empty / too sparse / failed to fit on its own -- fall
-        # through to the unseeded whole-cloud RANSAC below.
+        # through to the unseeded whole-cloud RANSAC below. ``report`` (when the
+        # caller passed one) now carries WHICH of those happened, so the fallback
+        # is visible in the survey record instead of silently masquerading as a
+        # correctly seeded fit.
 
     rng = np.random.default_rng(seed)
 

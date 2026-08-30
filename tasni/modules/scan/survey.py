@@ -23,6 +23,7 @@ Conventions match ``depth_gate.py``:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import numpy as np
 
@@ -74,6 +75,19 @@ class SurveyMeasurement:
     survey_max_tilt_deg: float
     corners_cam_mm: np.ndarray | None = None  # oriented-rectangle corners (4,3) in CAMERA frame (mm)
     points_uv: list | None = None             # decimated plane-inlier pixels, normalized 0-1, for the HUD dot overlay
+    # -- provenance of the plane selection (2026-08-30 silent-fallback fix) -----
+    # ``plane_seed_used`` is False whenever the reticle seed could NOT drive the
+    # fit and ``fit_plane`` degraded to whole-cloud maximal-consensus RANSAC.
+    # That degradation is exactly the pre-seeding behaviour the seeding was added
+    # to replace -- measured: an empty seed region put the centroid at 1070 mm
+    # (the floor) instead of 450 mm (the platform) -- so it must never again be
+    # invisible in the record. ``plane_seed_status`` names WHICH way it degraded
+    # (one of plane.SEED_*); ``plane_seed_points`` is how many sampled points the
+    # reticle box actually contained. Defaults describe "no seed was requested",
+    # which is what the unseeded callers/archived records mean.
+    plane_seed_used: bool = False
+    plane_seed_status: str = "not_requested"
+    plane_seed_points: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -100,6 +114,14 @@ class SurveyMeasurement:
             "corners_cam_mm": (np.asarray(self.corners_cam_mm, float).tolist()
                                if self.corners_cam_mm is not None else None),
             "points_uv": self.points_uv,
+            # Plane-selection provenance. Additive keys: every existing consumer
+            # reads by name, and an archived record that predates them simply
+            # lacks them -- readers must treat a MISSING key as "unknown", not as
+            # "seeded" (the dataclass defaults say "not_requested" for the same
+            # reason). See the field comments above.
+            "plane_seed_used": bool(self.plane_seed_used),
+            "plane_seed_status": str(self.plane_seed_status),
+            "plane_seed_points": int(self.plane_seed_points),
             # Backward-compatible fields for the frontend that expects the old
             # ScanGateReading shape (so the HUD can render either reading).
             "ideal_distance_mm": (self.accurate_min_mm + self.accurate_max_mm) / 2,
@@ -138,6 +160,125 @@ def _snap_125(rough_mm: float) -> float:
         if m * base >= rough:
             return max(m * base, 1.0)
     return max(10.0 * base, 1.0)
+
+
+# --------------------------------------------------------------------------
+# "Are the fitted rectangle's corners inside the colour frame?" -- ONE predicate
+#
+# There used to be two independent copies of this question with two DIFFERENT
+# lens models: this module's own ``_corners_in_frame`` (pinhole, since 04e5760)
+# and the live-HUD copy in ``scan/service.py`` (calibrated). Measured on
+# 04e5760's own fold-back fixture they DISAGREED -- pinhole said "not framed",
+# calibrated said "framed" -- so the HUD showed FRAMED and the subsequent lock
+# raised ``LargeSurfaceRequired``: exactly the false-refusal symptom 04e5760 was
+# written to kill. Both call sites now go through ``corners_in_color_frame``
+# below, so they cannot disagree again.
+# --------------------------------------------------------------------------
+
+@lru_cache(maxsize=16)
+def _radial_monotonic_limit(dist_key: tuple, r_max: float) -> float:
+    """First pinhole normalized radius at which the calibrated radial map stops
+    increasing (``inf`` if it never does within ``r_max``).
+
+    ``dist_key`` is an OpenCV distortion vector as a tuple
+    (``[k1, k2, p1, p2, k3, k4, k5, k6, ...]``). The radial term is evaluated in
+    its general rational form, so both the 5-coefficient polynomial model this
+    cell uses and a rational (8-coefficient) one are handled by the same scan;
+    tangential/thin-prism terms are ignored deliberately -- they are tiny
+    (p1 = -1.8e-3, p2 = 4.2e-4 on this D435i) and do not create the fold-back.
+    Cached because the coefficients change only when calibration re-solves."""
+    k = np.zeros(14, dtype=float)
+    n = min(len(dist_key), 14)
+    k[:n] = np.asarray(dist_key, dtype=float)[:n]
+    r = np.linspace(0.0, float(r_max), 4001)
+    r2 = r * r
+    num = 1.0 + k[0] * r2 + k[1] * r2 ** 2 + k[4] * r2 ** 3
+    den = 1.0 + k[5] * r2 + k[6] * r2 ** 2 + k[7] * r2 ** 3
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rd = r * num / den
+    bad = ~np.isfinite(rd)
+    drop = np.nonzero(bad[1:] | (np.diff(rd) <= 0.0))[0]
+    return float(r[int(drop[0])]) if len(drop) else float("inf")
+
+
+def color_model_domain_radius(K_color, dist_color, image_size) -> float:
+    """Largest pinhole normalized radius at which ``dist_color`` may be trusted.
+
+    cv2's FORWARD Brown-Conrady polynomial is only well-behaved inside the domain
+    it was fit on. Past the radius where it stops being monotonic it FOLDS BACK,
+    mapping a point that is genuinely far outside the frame to a pixel that lands
+    back inside it. Measured with this workstation's real calibration
+    (k1=0.1148, k2=-0.2386): the map turns non-monotonic at normalized radius
+    **1.035** and re-enters the image's own (distorted) corner radius at **1.200**
+    -- against an image corner radius of only **0.835** at 1280x720. So anything
+    past the monotonic limit is unambiguously outside the frame, and the
+    calibrated projection's answer for it is meaningless.
+
+    Clamped to be no smaller than the image's own corner radius, so this guard is
+    only ever a REJECTOR of points that the pinhole model already places outside
+    the frame -- a pathological calibration that goes non-monotonic inside the
+    image itself can never make a genuinely in-frame corner read "not framed".
+    Returns ``inf`` for a zero/absent distortion vector (nothing to fold back)."""
+    K = np.asarray(K_color, dtype=float)
+    W, H = float(image_size[0]), float(image_size[1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    r_corner = float(np.hypot(max(cx, W - cx) / float(K[0, 0]),
+                              max(cy, H - cy) / float(K[1, 1])))
+    if dist_color is None:
+        return float("inf")
+    d = np.asarray(dist_color, dtype=float).reshape(-1)
+    if d.size == 0 or not np.any(np.abs(d) > 1e-12):
+        return float("inf")
+    limit = _radial_monotonic_limit(tuple(float(v) for v in d),
+                                    round(4.0 * max(r_corner, 1e-6), 6))
+    return max(limit, r_corner)
+
+
+def corners_in_color_frame(corners_cam_mm, K_color, dist_color, image_size,
+                           *, margin_uv: float = 0.02) -> bool:
+    """Do all four rectangle corners (COLOUR-camera mm) sit inside the colour
+    image with a ``margin_uv`` border? The single framing predicate.
+
+    Projection uses the **calibrated** model, which is the physically correct
+    answer to "where does this 3D point appear in the image the operator is
+    looking at" -- guarded by :func:`color_model_domain_radius` so the one way
+    that model can lie (fold-back, far outside its fitted domain) is rejected up
+    front instead of silently reported as "framed".
+
+    Why not simply project with the pinhole model everywhere (04e5760's fix)?
+    Measured with this repo's real K/dist at 1280x720 and the default
+    ``frame_margin_uv`` = 0.02 (a 25.6 px / 14.4 px border):
+
+      * along the frame boundary the two models disagree by up to 40.6 px in u
+        and 23.5 px in v -- larger than the margin itself, so classifications
+        genuinely flip near the edge;
+      * an **821 x 410 mm rectangle at 600 mm standoff** reads framed under the
+        calibrated model and NOT framed under pinhole. The largest still-framed
+        half-width for that aspect at 600 mm is 414.0 mm calibrated vs 408.2 mm
+        pinhole -- i.e. pinhole *widens* the false-refusal band that 04e5760 set
+        out to close, by declaring genuinely in-view platforms "too large";
+      * the guard reproduces the calibrated answer exactly in that boundary case
+        (414.0 mm, framed) while still rejecting 04e5760's fold-back fixture,
+        whose corners sit at pinhole radius 1.404 -- well past the 1.035
+        monotonic limit.
+
+    So: calibrated inside the fitted domain, hard reject outside it."""
+    cc = np.asarray(corners_cam_mm, dtype=float).reshape(-1, 3)
+    if cc.shape[0] < 4 or not np.all(np.isfinite(cc)):
+        return False
+    if bool(np.any(cc[:, 2] <= 0)):        # behind (or on) the image plane
+        return False
+    r_pinhole = np.hypot(cc[:, 0] / cc[:, 2], cc[:, 1] / cc[:, 2])
+    if float(np.max(r_pinhole)) > color_model_domain_radius(
+            K_color, dist_color, image_size):
+        return False
+    W, H = float(image_size[0]), float(image_size[1])
+    uv = project_to_color(cc, K_color, dist_color) / np.array([W, H], float)
+    if not np.all(np.isfinite(uv)):
+        return False
+    frac = float(margin_uv)
+    return bool(np.all((uv[:, 0] >= frac) & (uv[:, 0] <= 1.0 - frac)
+                       & (uv[:, 1] >= frac) & (uv[:, 1] <= 1.0 - frac)))
 
 
 def survey_surface(
@@ -189,7 +330,15 @@ def survey_surface(
         stride = int(np.ceil((n_valid / float(th.max_samples)) ** 0.5))
     pts_mm, _uv_depth = backproject(d, geometry, stride=stride)
     if len(pts_mm) > th.max_samples:
-        pts_mm = pts_mm[::int(np.ceil(len(pts_mm) / th.max_samples))]
+        # ascontiguousarray, not just the slice: a strided view makes
+        # cv2.projectPoints (via project_to_color, two lines below) raise
+        # "npoints >= 0 && (depth == CV_32F || CV_64F)" and take the whole survey
+        # down. Reachable whenever the 2D stride-subsample above still overshoots
+        # max_samples -- e.g. 72,000 valid depth pixels in a 320x240 frame -> the
+        # grid stride lands on 8,027 points, one decimation pass short of the
+        # 8,000 cap. Found by the seed-fallback fixture below; pre-existing.
+        pts_mm = np.ascontiguousarray(
+            pts_mm[::int(np.ceil(len(pts_mm) / th.max_samples))])
 
     # 2b. Seed region (2026-08-30 false-refusal fix): the colour-image centre
     # patch, same box convention as ColorRegistered._center_patch_bounds / the
@@ -207,9 +356,15 @@ def survey_surface(
                 & (seed_uv[:, 1] >= sy0) & (seed_uv[:, 1] < sy1))
 
     # 3. RANSAC plane fit (COLOUR camera frame), then re-orient the normal to face it.
+    # ``seed_report`` captures whether the reticle seed actually drove the fit: when
+    # it did not (empty/too-sparse seed region, or a seed plane that failed on its
+    # own), fit_plane degrades to whole-cloud maximal-consensus RANSAC -- the
+    # pre-seeding behaviour, which measured a 1070 mm floor instead of a 450 mm
+    # platform. That used to happen silently; it is now carried on the measurement.
+    seed_report: dict = {}
     try:
         normal, centroid, _ = fit_plane(pts_mm, distance=th.ransac_distance_mm,
-                                        seed_mask=seed_mask)
+                                        seed_mask=seed_mask, report=seed_report)
     except ValueError:
         return _not_detected(th, fov_deg)
 
@@ -250,40 +405,13 @@ def survey_surface(
     # 1:1 to colour pixels, so a border test in depth-pixel space cannot answer "is this
     # inside the COLOUR frame?" at all; the fitted-rectangle test below is now the only
     # framing decision.)
-    def _corners_in_frame(corners, frac=float(th.frame_margin_uv)) -> bool:
-        """Containment uses the PINHOLE projection (``dist_color=None``), never the
-        calibrated Brown-Conrady model, even though every other projection in this
-        module (outline_uv/grid_uv/points_uv, below) deliberately DOES use it.
-
-        cv2's forward radial-distortion polynomial is only well-behaved inside the
-        domain it was fit on (roughly the image plus a modest margin); past that it
-        can turn non-monotonic and FOLD BACK, mapping a point that is genuinely far
-        outside the frame to a pixel that lands back inside it. Measured with a real
-        workstation calibration (k1=0.115, k2=-0.239): a point at normalized radius
-        ~1.3-1.6 (i.e. roughly 2x the frame's own half-diagonal) projects INSIDE the
-        image even though the pinhole projection of the same point is nowhere near
-        it -- confirmed both by direct sweep and by round-tripping a synthetic
-        oversized rectangle through this exact function (see
-        ``test_scan_survey.py``'s regression test). A corner that far out can only
-        arise from a genuinely oversized/overrunning fitted rectangle -- exactly the
-        case this test exists to catch -- so silently reporting it "framed" would
-        hide the one situation the framing gate is for.
-
-        The pinhole model has no such failure mode: u is a strictly monotonic,
-        unbounded function of the normalized coordinate, so a point that is truly
-        outside the frame always projects outside it, at any distance. Near the
-        REAL image boundary the two models differ by only a few pixels (far under
-        ``frac``'s margin), so no genuinely in-frame corner's classification
-        changes -- this only changes the verdict for corners that were already far
-        outside, from a spurious True to the correct False."""
-        cc = np.asarray(corners, float).reshape(-1, 3)
-        if cc.shape[0] < 4 or bool(np.any(cc[:, 2] <= 0)):
-            return False
-        uv = project_to_color(cc, K_color, None) / np.array([W, H], float)
-        return bool(np.all((uv[:, 0] >= frac) & (uv[:, 0] <= 1.0 - frac)
-                           & (uv[:, 1] >= frac) & (uv[:, 1] <= 1.0 - frac)))
-
-    fully_framed = _corners_in_frame(corners3d)
+    # Containment goes through the ONE shared predicate (see
+    # ``corners_in_color_frame`` above for the model choice and the measured
+    # numbers behind it) -- the live-HUD copy in ``scan/service.py`` calls the
+    # same function, so the HUD's "FRAMED" lamp and this lock-time test can
+    # never disagree the way they did before 2026-08-30.
+    fully_framed = corners_in_color_frame(
+        corners3d, K_color, dist_color, (W, H), margin_uv=float(th.frame_margin_uv))
 
     # When the surface overruns the view, its real edges are not in frame, so the
     # board rectangle above would over-run the table. Replace the operator overlay +
@@ -399,4 +527,7 @@ def survey_surface(
         survey_max_tilt_deg=th.survey_max_tilt_deg,
         corners_cam_mm=np.asarray(corners3d, float),
         points_uv=points_uv,
+        plane_seed_used=bool(seed_report.get("seed_used", False)),
+        plane_seed_status=str(seed_report.get("seed_status", "not_requested")),
+        plane_seed_points=int(seed_report.get("seed_points", 0)),
     )

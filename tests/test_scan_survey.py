@@ -17,7 +17,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tasni.modules.scan.survey import (  # noqa: E402
-    SurveyThresholds, survey_surface)
+    SurveyThresholds, color_model_domain_radius, corners_in_color_frame,
+    survey_surface)
+
+# The workstation D435i's own calibrated colour model (tasni.config.json), used by
+# every containment test below so the numbers tie to real hardware, not an invented
+# polynomial: 1280x720 intrinsics + the measured Brown-Conrady coefficients.
+REAL_K = np.array([[889.8742117827221, 0.0, 648.9804252459749],
+                   [0.0, 890.8099396048351, 362.00464151468503],
+                   [0.0, 0.0, 1.0]])
+REAL_SIZE = (1280, 720)
+REAL_DIST = np.array([0.11480838161001118, -0.23856355593822276,
+                      -0.0018212469331017086, 0.0004210400812176703, 0.0])
+
+
+def _rect_corners(length_mm: float, width_mm: float, z_mm: float) -> np.ndarray:
+    """Four corners of a centred, fronto-parallel rectangle at ``z_mm`` (camera mm)."""
+    hx, hy = length_mm / 2.0, width_mm / 2.0
+    return np.array([[-hx, -hy, z_mm], [hx, -hy, z_mm],
+                     [hx, hy, z_mm], [-hx, hy, z_mm]])
 
 import geometry_fixtures as gf  # noqa: E402
 
@@ -295,6 +313,160 @@ def test_fully_framed_survives_distortion_fold_back():
           "mm correctly NOT framed despite calibrated-model fold-back")
 
 
+def test_framing_predicate_rejects_corners_past_the_distortion_domain():
+    """The fold-back rejection, as a direct unit test of the ONE predicate.
+
+    04e5760 fixed fold-back by switching containment to the PINHOLE model. That
+    has its own cost at the frame boundary (next test), so the predicate now keeps
+    the calibrated projection and guards its DOMAIN instead. This pins the guard:
+    the fold-back fixture's corners project (calibrated) to u in 0.108..0.897 --
+    comfortably 'inside' the frame, a spurious True -- while their pinhole radius
+    is 1.404, past the 1.035 radius at which this camera's radial polynomial stops
+    being monotonic. Only the domain guard can reject them, so removing it (i.e.
+    plain calibrated containment) fails here."""
+    corners = _rect_corners(1400.0, 100.0, 500.0)
+    r_pinhole = float(np.max(np.hypot(corners[:, 0] / corners[:, 2],
+                                      corners[:, 1] / corners[:, 2])))
+    r_domain = color_model_domain_radius(K, REAL_DIST, (W, H))
+    assert abs(r_domain - 1.0353) < 0.005, r_domain
+    assert r_pinhole > r_domain, (r_pinhole, r_domain)
+    # Proof the calibrated projection alone WOULD say "framed" here.
+    from tasni.core.depth_geometry import project_to_color
+    uv = project_to_color(corners, K, REAL_DIST) / np.array([W, H], float)
+    assert bool(np.all((uv >= 0.02) & (uv <= 0.98))), (
+        "fixture no longer exercises fold-back -- the calibrated projection must "
+        "spuriously land these corners inside the frame", uv.tolist())
+    assert corners_in_color_frame(corners, K, REAL_DIST, (W, H),
+                                  margin_uv=0.02) is False
+    print(f"[domain guard] pinhole radius {r_pinhole:.3f} > domain {r_domain:.3f}"
+          f" -> rejected despite calibrated uv {np.round(uv[:, 0], 3).tolist()}")
+
+
+def test_framing_predicate_keeps_the_calibrated_verdict_at_the_frame_boundary():
+    """Why NOT just project with pinhole everywhere (04e5760's fix).
+
+    With this repo's real K/dist at 1280x720 and frame_margin_uv = 0.02 (a
+    25.6 px / 14.4 px border) the two models disagree by up to 40.6 px in u and
+    23.5 px in v along the frame boundary -- more than the margin itself -- so
+    classifications genuinely flip. Measured: an 821 x 410 mm rectangle at 600 mm
+    standoff reads FRAMED under the calibrated model and NOT framed under pinhole;
+    the largest still-framed half-width for that aspect is 414.0 mm calibrated vs
+    408.2 mm pinhole. Pinhole therefore *widens* the false-refusal band 04e5760
+    set out to close, by calling genuinely in-view platforms too large. The
+    predicate must return the calibrated answer here (the guard is inert: max
+    pinhole radius 0.765 << the 1.035 domain limit)."""
+    corners = _rect_corners(821.0, 410.0, 600.0)
+    r_pinhole = float(np.max(np.hypot(corners[:, 0] / corners[:, 2],
+                                      corners[:, 1] / corners[:, 2])))
+    assert r_pinhole < color_model_domain_radius(REAL_K, REAL_DIST, REAL_SIZE)
+    assert corners_in_color_frame(corners, REAL_K, REAL_DIST, REAL_SIZE,
+                                  margin_uv=0.02) is True, (
+        "an 821x410 mm platform at 600 mm is inside the real colour frame; "
+        "calling it unframed is a false LargeSurfaceRequired refusal")
+    # ...and the pinhole model (04e5760's containment) would refuse it -- this is
+    # the regression the guard exists to avoid re-introducing.
+    assert corners_in_color_frame(corners, REAL_K, None, REAL_SIZE,
+                                  margin_uv=0.02) is False
+    print("[boundary] 821x410 mm @600 mm: calibrated+guard FRAMED, pinhole NOT")
+
+
+def test_framing_predicate_rejects_corners_behind_the_camera():
+    """z <= 0 is unprojectable, not 'framed' (the guard survey.py always had, now
+    shared with the live-HUD copy in scan/service.py which was missing it)."""
+    behind = np.array([[-100.0, -100.0, -500.0], [100.0, -100.0, -500.0],
+                       [100.0, 100.0, -500.0], [-100.0, 100.0, -500.0]])
+    assert corners_in_color_frame(behind, REAL_K, REAL_DIST, REAL_SIZE) is False
+    straddle = _rect_corners(200.0, 200.0, 600.0)
+    straddle[0, 2] = 0.0
+    assert corners_in_color_frame(straddle, REAL_K, REAL_DIST, REAL_SIZE) is False
+    assert corners_in_color_frame(np.zeros((3, 3)), REAL_K, REAL_DIST, REAL_SIZE) is False
+
+
+def test_seeded_plane_fit_reports_when_the_reticle_seed_was_empty():
+    """Defect 2: the reticle-seeded fit falls back to whole-cloud RANSAC when the
+    seed region has < 3 points -- and used to do it SILENTLY.
+
+    Same two-population fixture as the plane-selection test above (a 450 mm
+    platform centred inside a 1070 mm floor), but with the aiming reticle's own
+    box blanked so the seed selects nothing. Measured consequence: the fit
+    degrades to plain maximal-consensus RANSAC and lands on the FLOOR (~1070 mm)
+    instead of the platform (~450 mm) -- exactly the defect the seeding was added
+    to fix, silently reverted. The measurement must now SAY so."""
+    th = SurveyThresholds()
+    d = np.full((H, W), 1070, dtype=np.uint16)
+    pf = 0.4
+    x0, x1 = int(W * (1 - pf) / 2), int(W * (1 + pf) / 2)
+    y0, y1 = int(H * (1 - pf) / 2), int(H * (1 + pf) / 2)
+    d[y0:y1, x0:x1] = 450
+    # Blank exactly the reticle box the seed mask is built from (center_patch_frac).
+    cw, ch = int(W * th.center_patch_frac), int(H * th.center_patch_frac)
+    sx0, sy0 = (W - cw) // 2, (H - ch) // 2
+    d[sy0:sy0 + ch, sx0:sx0 + cw] = 0
+
+    m = survey_surface(d, gf.aligned(K, (W, H)), K, None, th)
+    assert m.detected, m.to_dict()
+    assert m.plane_seed_used is False, m.to_dict()
+    assert m.plane_seed_status == "seed_region_empty", m.plane_seed_status
+    assert m.plane_seed_points == 0, m.plane_seed_points
+    # The measured consequence the flag is there to explain.
+    assert m.standoff_mm > 900.0, (
+        "fixture no longer reproduces the silent reversion -- the fallback must "
+        "actually land on the floor for the flag to be worth reporting",
+        m.standoff_mm)
+    assert m.to_dict()["plane_seed_used"] is False
+    assert m.to_dict()["plane_seed_status"] == "seed_region_empty"
+    print(f"[seed fallback] reticle empty -> whole-cloud RANSAC picked "
+          f"{m.standoff_mm:.0f} mm (the floor), reported as "
+          f"{m.plane_seed_status!r} instead of silently")
+
+
+def test_seeded_plane_fit_reports_a_healthy_seed_as_used():
+    """The companion positive: a normal aim must report the seed DROVE the fit, so
+    ``plane_seed_used`` distinguishes the two cases rather than always reading
+    False (which would make the flag useless as evidence)."""
+    th = SurveyThresholds()
+    d = np.full((H, W), 1070, dtype=np.uint16)
+    pf = 0.4
+    x0, x1 = int(W * (1 - pf) / 2), int(W * (1 + pf) / 2)
+    y0, y1 = int(H * (1 - pf) / 2), int(H * (1 + pf) / 2)
+    d[y0:y1, x0:x1] = 450
+    m = survey_surface(d, gf.aligned(K, (W, H)), K, None, th)
+    assert m.detected and m.plane_seed_used is True, m.to_dict()
+    assert m.plane_seed_status == "seeded", m.plane_seed_status
+    assert m.plane_seed_points > 0, m.plane_seed_points
+    assert abs(m.standoff_mm - 450.0) < 10.0, m.standoff_mm
+    print(f"[seed fallback] healthy aim: {m.plane_seed_points} seed points -> "
+          f"platform at {m.standoff_mm:.0f} mm, seed_used=True")
+
+
+def test_survey_survives_the_decimation_slice_being_non_contiguous():
+    """Pre-existing crash found while building the seed-fallback fixture above.
+
+    ``survey_surface`` subsamples twice: a 2D stride grid, then a 1D decimation
+    slice if that still overshoots ``max_samples``. The second one yields a
+    STRIDED VIEW, and ``cv2.projectPoints`` (reached one line later via
+    ``project_to_color``, for the seed mask) rejects a non-contiguous array with
+    "npoints >= 0 && (depth == CV_32F || CV_64F)" -- taking the whole survey, and
+    the live HUD with it, down. It is reachable on ordinary input: any frame whose
+    stride-grid point count lands just above the cap. This fixture pins that
+    window explicitly rather than relying on another test happening to hit it."""
+    th = SurveyThresholds()
+    d = _render([0, 0, 1], 500)
+    # Blank a block so the grid stride drops to 3 and the resulting point count
+    # (8027) sits one decimation pass above max_samples (8000).
+    d[90:150, 120:200] = 0
+    n_valid = int(np.count_nonzero(d))
+    stride = int(np.ceil((n_valid / float(th.max_samples)) ** 0.5))
+    n_grid = int(np.count_nonzero(d[::stride, ::stride]))
+    assert n_grid > th.max_samples, (
+        "fixture must overshoot max_samples so the decimation slice is taken",
+        n_grid, th.max_samples)
+    m = survey_surface(d, gf.aligned(K, (W, H)), K, None, th)   # must not raise
+    assert m.detected and abs(m.standoff_mm - 500.0) < 8.0, m.to_dict()
+    print(f"[contiguity] {n_valid} valid -> stride {stride} -> {n_grid} points "
+          f"(> {th.max_samples}) decimated without crashing")
+
+
 def test_surface_dots_are_a_stable_lattice():
     """points_uv is the actual measured surface hits snapped to a FIXED image grid
     (one dot per occupied cell), not a per-frame random pixel subsample — so the HUD
@@ -352,6 +524,12 @@ if __name__ == "__main__":
     test_dominant_plane_selection_prefers_the_aimed_at_surface_not_the_bigger_one()
     test_dominant_plane_selection_falls_back_to_global_ransac_with_one_surface()
     test_fully_framed_survives_distortion_fold_back()
+    test_framing_predicate_rejects_corners_past_the_distortion_domain()
+    test_framing_predicate_keeps_the_calibrated_verdict_at_the_frame_boundary()
+    test_framing_predicate_rejects_corners_behind_the_camera()
+    test_seeded_plane_fit_reports_when_the_reticle_seed_was_empty()
+    test_seeded_plane_fit_reports_a_healthy_seed_as_used()
+    test_survey_survives_the_decimation_slice_being_non_contiguous()
     test_surface_dots_are_a_stable_lattice()
     test_to_dict_serializable()
     print("\nsurvey.py tests passed.")

@@ -60,7 +60,7 @@ from .plane import (_oriented_rectangle, bounded_work_plane, fit_plane, rectangl
 from .planner import (ScanPlan, _largest_contiguous_empty_block, _tile_grid_dims,
                      plan_rect_tour, plan_scan)
 from .sam_boundary import sam_work_boundary
-from .survey import SurveyThresholds, survey_surface
+from .survey import SurveyThresholds, corners_in_color_frame, survey_surface
 from .survey_contract import (
     GOAL_FRAME_ONLY, GOAL_FULL_SCAN, MODE_COMPACT, MODE_FIVE_POSITION,
     MODE_USER_SPECIFIED, PROVENANCE_BY_MODE, SCOPE_DECLARED_REGION,
@@ -413,10 +413,23 @@ def _outline_edge_angle_deg(outline_uv) -> float | None:
 def _project_color_corners_uv(corners_color, camera_cfg):
     """Project color-camera 3D corners (mm) to normalized uv through the workstation
     RealSense calibration (K + distortion). Returns an ``(N, 2)`` array in 0-1 image
-    coords, or ``None`` if any projected point is non-finite."""
+    coords, or ``None`` if the corners are unusable.
+
+    Unusable means: non-finite input, a point at or BEHIND the image plane
+    (``z <= 0``), or a non-finite projection. The ``z <= 0`` guard mirrors
+    ``survey.corners_in_color_frame``'s (2026-08-30: this copy was missing it, so a
+    corner behind the camera divided by a non-positive z and produced a finite but
+    meaningless pixel, which then fed the edge-angle/framing/outline overrides
+    below as if it were a real measurement). ``None`` makes every caller skip its
+    override and keep the server's own values, which is the conservative answer for
+    a degenerate rectangle."""
     if corners_color is None:
         return None
     corners = np.asarray(corners_color, dtype=np.float64).reshape(-1, 3)
+    if corners.size == 0 or not np.all(np.isfinite(corners)):
+        return None
+    if bool(np.any(corners[:, 2] <= 0)):
+        return None
     projected, _ = cv2.projectPoints(
         corners, np.zeros(3), np.zeros(3), camera_cfg.K, camera_cfg.dist)
     W, H = camera_cfg.size
@@ -1163,7 +1176,13 @@ def _deproject_plane_points_mm(depth, geometry, T_base_cam, *, plane_normal_cam,
     if d.ndim != 2 or d.size == 0 or geometry is None:
         return np.zeros((0, 3), dtype=float), 0.0, 0.0
     h, w = d.shape
-    n_grid_total = (h // stride) * (w // stride)
+    # CEIL, not floor: ``backproject`` samples ``d[::stride, ::stride]``, which keeps
+    # ``ceil(h/stride) * ceil(w/stride)`` grid positions. Floor undercounted the
+    # denominator -- at 1280x720 stride 6 it said 120*213 = 25,560 against the 120*214
+    # = 25,680 positions actually sampled -- so ``coverage_frac`` could exceed 1.0 by
+    # ~0.47% and the corner-coverage gate was that much more permissive than its
+    # configured threshold. Same expression as numpy's own slice length.
+    n_grid_total = -(-h // stride) * -(-w // stride)
     pts_cam, _uv_depth = backproject(d, geometry, stride=stride)
     n_valid = len(pts_cam)
     if n_valid == 0:
@@ -1808,7 +1827,27 @@ def scan_gate_payload(reading, survey) -> dict:
             "extent_mm": list(survey.extent_mm) if survey.extent_mm is not None else None,
             "fov_deg": list(survey.fov_deg),
             "points_uv": survey.points_uv,
+            # Plane-selection provenance (2026-08-30). survey_surface seeds its
+            # RANSAC from the aiming reticle so the fit locks onto the surface the
+            # operator is pointing at; when the seed region is empty/too sparse the
+            # fit SILENTLY degraded to whole-cloud maximal-consensus RANSAC, which
+            # is what put the centroid on the floor (1070 mm) instead of the
+            # platform (450 mm) in the first place. Publish it so the reversion is
+            # visible in the lock record and to the operator instead of being
+            # indistinguishable from a good fit.
+            "plane_seed_used": bool(getattr(survey, "plane_seed_used", False)),
+            "plane_seed_status": str(getattr(survey, "plane_seed_status",
+                                             "not_requested")),
+            "plane_seed_points": int(getattr(survey, "plane_seed_points", 0)),
         })
+        if (getattr(survey, "plane_seed_status", "not_requested")
+                not in ("seeded", "not_requested")):
+            payload.setdefault("warnings", []).append(
+                "the aiming reticle had too little depth to seed the surface fit "
+                f"({int(getattr(survey, 'plane_seed_points', 0))} points), so the "
+                "plane was chosen from the whole frame by point count — it may be "
+                "the floor or table rather than the platform you are aiming at; "
+                "re-aim so the reticle sits on the surface and remeasure.")
         payload["gates"] = {**payload.get("gates", {}),
                             "framed": bool(survey.fully_framed)}
     return payload
@@ -1879,12 +1918,19 @@ def live_scan_telemetry_payload(raw: dict | None, scfg,
             # trimmed fit) are the reliable "does the object fit the view" signal, so
             # the host overrides the server's over-eager crop here. The framing test
             # deliberately uses the RAW corners (the full object extent).
+            #
+            # 2026-08-30: this test used to be an inline copy that projected with
+            # the CALIBRATED model while survey._corners_in_frame (the lock-time
+            # copy) projected with the PINHOLE one. On 04e5760's own fold-back
+            # fixture the two disagreed -- pinhole "not framed", calibrated
+            # "framed" -- so the HUD lit FRAMED and the lock then raised
+            # LargeSurfaceRequired. Both now call the ONE predicate in survey.py
+            # (calibrated projection + a distortion-domain guard); see its
+            # docstring for the measured numbers behind that choice.
             frame_margin = float(getattr(scfg, "live_frame_margin_uv", 0.02))
-            rectangle_in_frame = bool(np.all(
-                (calibrated_uv[:, 0] >= frame_margin)
-                & (calibrated_uv[:, 0] <= 1.0 - frame_margin)
-                & (calibrated_uv[:, 1] >= frame_margin)
-                & (calibrated_uv[:, 1] <= 1.0 - frame_margin)))
+            rectangle_in_frame = corners_in_color_frame(
+                corners_color, camera_cfg.K, camera_cfg.dist, camera_cfg.size,
+                margin_uv=frame_margin)
             fully_framed = rectangle_in_frame
             surface_mode = "full" if rectangle_in_frame else "crop"
             if rectangle_in_frame:
