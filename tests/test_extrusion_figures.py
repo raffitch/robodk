@@ -741,3 +741,390 @@ def test_a_characterizations_pipeline_figure_reruns_its_own_coarse_plan(tmp_path
     assert stages and "result" in stages
     assert len(stages["backprojected"]) > len(stages["work_roi"]) > 0
     assert stages["result"].measured_xyz is not None
+
+
+# ------------------------------- the lens model the method figure re-gates with
+
+# Real coefficients from this cell's calibrated colour model: what a protocol-2
+# take's provenance actually records, and what the measurement gated through.
+CALIBRATED_DIST = [0.11480838161001118, -0.23856355593822276,
+                   -0.0018212469331017086, 0.0004210400812176703, 0.0]
+
+
+def _patch_provenance(layer_dir, **fields):
+    """Rewrite one archived take's provenance -- the archive is the contract."""
+    manifest_file = Path(layer_dir) / "manifest.json"
+    report_file = Path(layer_dir) / "report.json"
+    target = manifest_file if manifest_file.is_file() else report_file
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    provenance = payload.setdefault("provenance", {})
+    for key, value in fields.items():
+        if value is None:
+            provenance.pop(key, None)
+        else:
+            provenance[key] = value
+    target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return Path(layer_dir)
+
+
+def _protocol_2(K=None, size=None):
+    """A protocol-2 greeting whose registration is numerically the identity.
+
+    The synthetic depth these fixtures archive is rendered in the legacy
+    convention (aligned, 1 mm), so the greeting keeps that geometry and changes
+    only what is under test: the take is no longer ``legacy``, which is what
+    decides whether the chroma gate is re-sampled through the calibrated lens.
+    """
+    K = syn.K_720P if K is None else K
+    size = syn.SIZE_720P if size is None else size
+    return gf.offset(color_K=K, color_size=size, depth_K=K, depth_size=size,
+                     depth_unit_mm=1.0, rot_deg=(0.0, 0.0, 0.0),
+                     t_mm=(0.0, 0.0, 0.0)).to_dict()
+
+
+def _spy_on_the_chain(monkeypatch):
+    """Capture the kwargs the method figure hands ``process_observation``."""
+    from tasni.modules.extrusion import processing
+
+    seen: dict = {}
+    real = processing.process_observation
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(processing, "process_observation", spy)
+    return seen
+
+
+def test_the_method_figure_gates_through_the_lens_model_the_measurement_used(
+        tmp_path, monkeypatch):
+    """A protocol-2 take was measured through the CALIBRATED colour model.
+
+    The chroma gate is read at the pixels the registration projects to, so
+    re-running the method figure through a different lens model samples it
+    somewhere else: on the cell's own protocol-2 characterization that is
+    2.7% of registered points flipping bead/board, the fitted centre moving
+    0.27 mm and the RMS moving 0.12 mm. A published method figure that
+    disagrees with the number it is captioned with is the failure that matters.
+    """
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion import figures
+
+    layer_dir = _patch_provenance(
+        write_take(tmp_path, trial_id="t-v2"),
+        camera_geometry=_protocol_2(),
+        camera_intrinsics={"K": syn.K_720P.tolist(), "dist_coeffs": CALIBRATED_DIST})
+    seen = _spy_on_the_chain(monkeypatch)
+    figures._STAGE_CACHE.clear()
+
+    take = figures.load_take(layer_dir)
+    assert take.geometry.legacy is False, "fixture must be a protocol-2 take"
+    stages = figures.take_stages(take)
+
+    assert stages is not None and "result" in stages
+    assert seen["dist"] is not None, "the figure re-gated with a different lens model"
+    assert np.allclose(np.asarray(seen["dist"], float), CALIBRATED_DIST)
+    assert not (stages.get("notes") or []), "nothing to warn about: the model is recorded"
+
+
+def test_a_legacy_take_is_re_run_with_the_identity_registration_it_was_measured_with(
+        tmp_path, monkeypatch):
+    """The mirror image, and the reason the fix is not "always pass dist".
+
+    A pre-protocol-2 take arrived already aligned to colour; its registration is
+    the identity, so pushing the calibrated distortion through it would sample
+    the gate off-pixel. ``service.reprocess_layer`` drops it for exactly this
+    case and the figure has to agree, recorded coefficients or not.
+    """
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion import figures
+
+    layer_dir = _patch_provenance(
+        write_take(tmp_path, trial_id="t-legacy"),
+        camera_intrinsics={"K": syn.K_720P.tolist(), "dist_coeffs": CALIBRATED_DIST})
+    seen = _spy_on_the_chain(monkeypatch)
+    figures._STAGE_CACHE.clear()
+
+    take = figures.load_take(layer_dir)
+    assert take.geometry.legacy is True, "fixture must be a legacy take"
+    assert take.dist_coeffs is not None, "the archive DOES record coefficients"
+    assert figures.take_stages(take) is not None
+
+    assert seen["dist"] is None
+
+
+def test_a_protocol_2_take_with_no_recorded_distortion_says_so_on_the_figure(
+        tmp_path, monkeypatch, caplog):
+    """What cannot be known must not be guessed silently.
+
+    Nothing in the archive says which coefficients were applied, so the figure
+    falls back to the undistorted model -- the same fallback the reprocess path
+    takes -- and prints the caveat instead of passing it off as the measurement.
+    """
+    pytest.importorskip("open3d")
+    import logging
+    from tasni.modules.extrusion import figures
+
+    layer_dir = _patch_provenance(
+        write_take(tmp_path, trial_id="t-v2-nodist"),
+        camera_geometry=_protocol_2(),
+        camera_intrinsics={"K": syn.K_720P.tolist()})
+    seen = _spy_on_the_chain(monkeypatch)
+    figures._STAGE_CACHE.clear()
+
+    take = figures.load_take(layer_dir)
+    with caplog.at_level(logging.WARNING):
+        stages = figures.take_stages(take)
+
+    assert seen["dist"] is None
+    assert any("distortion not recorded" in note for note in stages.get("notes") or [])
+    assert "distortion not recorded" in caplog.text
+
+    fig = figures._figure_pipeline(figures._pyplot(), take)
+    try:
+        assert "distortion not recorded" in " ".join(t.get_text() for t in fig.texts)
+    finally:
+        figures._pyplot().close(fig)
+
+
+def test_a_characterizations_method_figure_uses_its_own_recorded_lens_model(
+        tmp_path, monkeypatch):
+    """Ring 1 is a characterization, so the paper's method figure comes through
+    this path -- it must gate the same way ``characterize_ring`` did."""
+    pytest.importorskip("open3d")
+    from tasni.modules.extrusion import figures
+
+    char_dir = _patch_provenance(
+        write_characterization(tmp_path, trial_id="c-v2"),
+        camera_geometry=_protocol_2(),
+        camera_intrinsics={"K": syn.K_720P.tolist(), "dist_coeffs": CALIBRATED_DIST})
+    seen = _spy_on_the_chain(monkeypatch)
+    figures._STAGE_CACHE.clear()
+
+    stages = figures.take_stages(figures.load_take(char_dir))
+
+    assert stages is not None and "result" in stages
+    assert np.allclose(np.asarray(seen["dist"], float), CALIBRATED_DIST)
+
+
+# ---------------------------------------------- a failed re-run is not a figure
+
+def _break_the_chain(monkeypatch, message="synthetic chain failure"):
+    """Fail ``process_observation`` after it has filled the early stages."""
+    from tasni.modules.extrusion import processing
+
+    def boom(**kwargs):
+        stages = kwargs.get("stages")
+        if stages is not None:
+            stages["backprojected"] = np.column_stack(
+                (np.full(40, CENTER[0]) + np.linspace(-30, 30, 40),
+                 np.full(40, CENTER[1]) + np.linspace(-30, 30, 40),
+                 np.linspace(0.0, 6.0, 40)))
+            stages["work_roi"] = stages["backprojected"][:20].copy()
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(processing, "process_observation", boom)
+
+
+def test_a_characterization_whose_re_run_failed_is_marked_incomplete(
+        tmp_path, monkeypatch, caplog):
+    """A partial method figure that reads as a finished one is how a paper ends
+    up illustrating a chain that never ran to the end."""
+    pytest.importorskip("open3d")
+    import logging
+    from tasni.modules.extrusion import figures
+
+    char_dir = write_characterization(tmp_path)
+    _break_the_chain(monkeypatch)
+    figures._STAGE_CACHE.clear()
+
+    take = figures.load_take(char_dir)
+    with caplog.at_level(logging.WARNING):
+        stages = figures.take_stages(take)
+
+    assert stages is not None, "the stages it did reach are still worth drawing"
+    assert "result" not in stages
+    assert "synthetic chain failure" in (stages.get("error") or "")
+    assert "synthetic chain failure" in caplog.text, "the failure was swallowed"
+
+    fig = figures._figure_pipeline(figures._pyplot(), take)
+    try:
+        text = " ".join(t.get_text() for t in fig.texts)
+        assert "INCOMPLETE" in text
+        assert "synthetic chain failure" in text
+        titles = {ax.get_title() for ax in fig.axes}
+        assert any("not re-run" in title for title in titles), \
+            "the last panel is the archived path, not this run's output"
+    finally:
+        figures._pyplot().close(fig)
+
+
+def test_a_layer_take_whose_re_run_failed_is_marked_incomplete_too(
+        tmp_path, monkeypatch, caplog):
+    import logging
+    from tasni.modules.extrusion import figures
+
+    layer_dir = write_take(tmp_path)
+    _break_the_chain(monkeypatch, "layer chain failure")
+    figures._STAGE_CACHE.clear()
+
+    take = figures.load_take(layer_dir)
+    with caplog.at_level(logging.WARNING):
+        stages = figures.take_stages(take)
+
+    assert stages and "layer chain failure" in (stages.get("error") or "")
+    assert "layer chain failure" in caplog.text
+
+
+# ------------------------------------- the box carries the stated exaggeration
+
+def _bare_take(figures, *, radius: float, z: float = 6.0):
+    """A take with no depth frame: enough for a 3-D view, nothing to re-run.
+
+    A small ring is what exposes the defect -- ``_work_window`` never frames
+    tighter than 60 mm, so a 10 mm ring sits in a window ~10x its own relief.
+    """
+    return figures.TakeData(
+        layer_dir=Path("."),
+        manifest={"trial_id": "box", "layer_index": 1, "take": 1, "mode": "MEASURE_ONLY",
+                  "recipe": {"radius_mm": radius}, "metrics": {},
+                  "provenance": {"work_frame": "Tasni Work Frame"}},
+        nominal=_ring_xyz(radius=radius, z=z),
+        measured=_ring_xyz(radius=radius, z=z, wave=.5),
+        cloud=_cloud_xyz(radius=radius, z=z, bead=radius / 3.0),
+        depth=None, K=None, T_work_camera=None)
+
+
+def _drawn_z(ax) -> np.ndarray:
+    values = [np.asarray(line.get_data_3d()[2], float) for line in ax.get_lines()
+              if len(line.get_data_3d()[2])]
+    for collection in ax.collections:
+        offsets = getattr(collection, "_offsets3d", None)
+        if offsets is not None:
+            values.append(np.asarray(offsets[2], float))
+    return np.concatenate([v for v in values if v.size])
+
+
+def _drawn_exaggeration(ax, factor: float) -> float:
+    """How many times taller a millimetre of Z is DRAWN than a millimetre of X.
+
+    Black-box: the box proportions and the axis limits together, which is what a
+    reader measures off the page -- not the number the code intended.
+    """
+    box = np.asarray(ax.get_box_aspect(), float)
+    x0, x1 = ax.get_xlim()
+    z0, z1 = ax.get_zlim()
+    return (box[2] / box[0]) * ((x1 - x0) / (z1 - z0)) * factor
+
+
+def test_the_oblique_view_draws_exactly_the_exaggeration_it_states(tmp_path):
+    """Recorded defect: ``set_box_aspect`` was floored at .12, so the drawing
+    exaggerated Z past the factor the caption quotes -- and for a factor of 1.0
+    the caption quotes nothing at all. The floor now raises the FACTOR, which
+    the plotted data, the Z axis and the caption all carry."""
+    import re
+    from tasni.modules.extrusion import figures
+
+    take = _bare_take(figures, radius=10.0)
+    fig = figures.render_view(take, plt=figures._pyplot())
+    try:
+        ax = fig.axes[0]
+        caption = fig.texts[-1].get_text()
+        match = re.search(r"vertical exaggeration ×([\d.]+)", caption)
+        assert match, caption
+        factor = float(match.group(1))
+        assert np.allclose(
+            np.asarray(ax.get_lines()[-1].get_data_3d()[2], float),
+            take.measured[:, 2] * factor), "the data must carry the stated factor"
+
+        box = np.asarray(ax.get_box_aspect(), float)
+        x0, x1 = ax.get_xlim()
+        drawn = np.ptp(_drawn_z(ax))          # == span * factor, by construction
+        # The box's Z:X is the data's Z:X, give or take the padding both share.
+        # A floor here would make the ratio larger than the data warrants --
+        # exaggeration nobody can read off the figure.
+        assert box[2] / box[0] == pytest.approx(drawn / (x1 - x0), rel=.11)
+        # ...and end to end: a millimetre of height is drawn exactly ``factor``
+        # times a millimetre of width, which is what the caption promises.
+        assert _drawn_exaggeration(ax, factor) == pytest.approx(factor, rel=1e-6)
+    finally:
+        figures._pyplot().close(fig)
+
+
+def test_a_normal_ring_is_drawn_at_the_exaggeration_its_caption_states(tmp_path):
+    """The cell's own geometry, where the box floor never bit: the caption still
+    has to match the drawing (it was 10% out -- Z was autoscaled with a margin
+    while X was pinned to the window)."""
+    import re
+    from tasni.modules.extrusion import figures
+
+    take = figures.load_take(write_take(tmp_path))
+    fig = figures._figure_iso(figures._pyplot(), take)
+    try:
+        ax = fig.axes[0]
+        match = re.search(r"vertical exaggeration ×([\d.]+)", fig.texts[-1].get_text())
+        assert match
+        factor = float(match.group(1))
+        assert _drawn_exaggeration(ax, factor) == pytest.approx(factor, rel=1e-6)
+    finally:
+        figures._pyplot().close(fig)
+
+
+def test_the_legibility_floor_is_stated_in_the_caption_not_hidden_in_the_box(tmp_path):
+    """The floor is still applied -- a 3-D box has to read as one -- but through
+    the number the figure prints, so a reader can undo it."""
+    from tasni.modules.extrusion import figures
+
+    take = _bare_take(figures, radius=10.0)
+    cloud, window = figures._view_cloud(take)
+    zs = [a[:, 2] for a in (cloud, take.measured, take.nominal) if a is not None]
+    span = float(np.ptp(np.concatenate(zs)))
+    dx, dy = figures._view_extent(cloud, window)
+    plain = figures._z_exaggeration(take.radius, span)
+
+    assert span * plain / max(dx, dy) < figures.MIN_RELIEF_RATIO, \
+        "fixture must be one the old box floor would have silently stretched"
+    raised = figures._legible_factor(plain, span, max(dx, dy))
+    assert raised > plain
+    assert span * raised / max(dx, dy) == pytest.approx(figures.MIN_RELIEF_RATIO, abs=.02)
+
+    fig = figures.render_view(take, plt=figures._pyplot())
+    try:
+        assert f"vertical exaggeration ×{raised:g}" in fig.texts[-1].get_text()
+    finally:
+        figures._pyplot().close(fig)
+
+
+def test_every_three_d_panel_draws_exactly_the_z_scale_it_states(tmp_path):
+    """The same defect as the oblique view, in every other 3-D panel.
+
+    Measured on the cell's own takes: the method figure's oblique panel stated
+    ``Z × 1.7`` and drew ×14.9 (no box aspect at all, so matplotlib's default
+    box was the exaggeration), and the tube figure captioned "True scale" over
+    a flat ``(1, 1, .55)`` box. A panel that quotes a factor has to draw it.
+    """
+    pytest.importorskip("open3d")
+    import re
+    from tasni.modules.extrusion import figures
+
+    plt = figures._pyplot()
+    take = figures.load_take(write_take(tmp_path))
+    checked = []
+    for name, fig in (("pipeline", figures._figure_pipeline(plt, take)),
+                      ("mesh", figures._figure_mesh(plt, take)),
+                      ("stack", figures._figure_stack(plt, [take], "t1")),
+                      ("tube", figures._figure_tube(plt, [take], "t1"))):
+        assert fig is not None, f"{name} must be drawable from this fixture"
+        try:
+            for ax in fig.axes:
+                if not hasattr(ax, "get_zlim"):
+                    continue                       # a colourbar or a plan panel
+                match = re.search(r"×\s?([\d.]+)", ax.get_title())
+                factor = float(match.group(1)) if match else 1.0
+                assert _drawn_exaggeration(ax, factor) == pytest.approx(factor, rel=1e-6), \
+                    f"{name}: {ax.get_title()!r} states ×{factor:g}"
+                checked.append(f"{name}:{factor:g}")
+        finally:
+            plt.close(fig)
+    assert len(checked) >= 4, checked

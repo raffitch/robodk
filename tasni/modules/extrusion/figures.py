@@ -31,6 +31,7 @@ not require a display, and ``tasni`` must still import when matplotlib is absent
 from __future__ import annotations
 
 import json
+import logging
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,10 +41,24 @@ import numpy as np
 from ...core.depth_geometry import CameraGeometry
 from .processing import depth_to_work_points
 
+log = logging.getLogger(__name__)
+
 LAYER_FIGURES = ("plan", "heightmap", "mesh", "iso", "birdseye", "profile", "pipeline")
 TRIAL_FIGURES = ("stack", "tube")
 FORMATS = ("png", "pdf")
 DPI = 300
+
+# The clouds ``process_observation`` hands back through its ``stages`` collector,
+# in the order it holds them. Used to tell "the chain produced nothing" from
+# "the chain stopped part-way" -- see ``_incomplete``.
+STAGE_KEYS = ("backprojected", "work_roi", "above_floor", "deposit_cluster",
+              "radial_trimmed", "top_surface")
+
+# A 3-D box flatter than this reads as a pancake rather than a surface. The
+# extra relief goes into the exaggeration FACTOR -- which multiplies the plotted
+# Z, is printed on the Z axis and is stated in the caption -- and NEVER into the
+# box aspect on its own: a floor on the box is exaggeration no reader can see.
+MIN_RELIEF_RATIO = .12
 
 # Heights that can plausibly belong to the work surface, in mm about the build
 # plane. A raw D435i frame reaches the rest of the room: the failed take
@@ -113,6 +128,32 @@ class TakeData:
     K: np.ndarray | None
     T_work_camera: np.ndarray | None
     geometry: CameraGeometry | None = None
+    dist_coeffs: np.ndarray | None = None
+
+    @property
+    def chroma_dist(self) -> "np.ndarray | None":
+        """The colour lens model the MEASUREMENT sampled the chroma gate through.
+
+        The chain projects registered depth points into the colour image and
+        reads the bead/board gate at those pixels, so this choice decides which
+        pixels are read -- a method figure that re-runs with a different model
+        can show a DIFFERENT segmentation from the number it is captioned with
+        (on the cell's protocol-2 characterization take 2.7% of registered
+        points flip class, moving the fitted centre 0.27 mm and the RMS 0.12 mm).
+
+        The rule is the measurement's, not the figure's, and both the live
+        capture and offline reprocessing already follow it (see
+        ``service.reprocess_layer``): a protocol-2 take registers native,
+        unaligned depth into colour through the CALIBRATED model, so the gate is
+        read at distorted pixels; a legacy (pre-protocol-2) take arrived already
+        aligned, its registration is the identity (depth K == colour K, zero
+        extrinsic), and pushing distortion through it would sample the gate
+        off-pixel. ``None`` for a legacy take is therefore the model it used,
+        not an omission.
+        """
+        if self.geometry is None or self.geometry.legacy:
+            return None
+        return self.dist_coeffs
 
     @property
     def _nominal_circle(self) -> tuple[tuple[float, float], float] | None:
@@ -211,16 +252,24 @@ def expected_ring(take: TakeData) -> np.ndarray | None:
     return moved
 
 
-def _intrinsics(manifest: dict, layer_dir: Path) -> np.ndarray | None:
-    """K from the layer's provenance, falling back to the trial's."""
-    found = ((manifest.get("provenance") or {}).get("camera_intrinsics") or {}).get("K")
-    if found is None:
-        trial_file = layer_dir.parent / "trial.json"
-        if trial_file.is_file():
-            trial = json.loads(trial_file.read_text(encoding="utf-8"))
-            found = (((trial.get("provenance") or {}).get("camera_intrinsics") or {})
-                     .get("K"))
-    return None if found is None else np.asarray(found, dtype=float)
+def _camera_model(manifest: dict, layer_dir: Path
+                  ) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """The archived colour model (K, dist_coeffs) for this take.
+
+    The take's own ``camera_intrinsics`` block first, the trial's as the
+    fallback -- the same order (and the same block, never K from one and the
+    distortion from the other) that ``service.reprocess_layer`` reads them in.
+    """
+    blocks = [(manifest.get("provenance") or {}).get("camera_intrinsics") or {}]
+    trial_file = layer_dir.parent / "trial.json"
+    if trial_file.is_file():
+        trial = json.loads(trial_file.read_text(encoding="utf-8"))
+        blocks.append((trial.get("provenance") or {}).get("camera_intrinsics") or {})
+    block = next((b for b in blocks if b.get("K") is not None), {})
+    K = block.get("K")
+    dist = block.get("dist_coeffs")
+    return (None if K is None else np.asarray(K, dtype=float),
+            None if dist is None else np.asarray(dist, dtype=float))
 
 
 def geometry_for_take(manifest: dict, K: np.ndarray | None,
@@ -293,14 +342,14 @@ def load_take(layer_dir: Path) -> TakeData:
         cloud = None                                   # a height map, not a cloud
     transform = (manifest.get("provenance") or {}).get("T_work_camera")
     depth = np.load(depth_file) if depth_file.is_file() else None
-    K = _intrinsics(manifest, layer_dir)
+    K, dist = _camera_model(manifest, layer_dir)
     return TakeData(
         layer_dir=layer_dir, manifest=manifest,
         nominal=_points(layer_dir / "nominal_path.json"),
         measured=_points(layer_dir / "measured_path.json"),
         cloud=cloud, depth=depth, K=K,
         T_work_camera=None if transform is None else np.asarray(transform, dtype=float),
-        geometry=geometry_for_take(manifest, K, depth))
+        geometry=geometry_for_take(manifest, K, depth), dist_coeffs=dist)
 
 
 # -- shared drawing helpers --------------------------------------------------
@@ -358,6 +407,105 @@ def _z_exaggeration(radius: float, z_span: float) -> float:
     if z_span <= 0:
         return 1.0
     return max(1.0, round((radius * .5) / z_span, 1))
+
+
+def _legible_factor(factor: float, z_span: float, scale: float) -> float:
+    """Raise a stated exaggeration until the 3-D box is legible -- never the box.
+
+    ``set_box_aspect`` used to be floored at ``MIN_RELIEF_RATIO`` while the
+    caption kept quoting the unfloored factor, so the drawing exaggerated Z past
+    what it claimed. It bites whenever the window is wide for the ring: a 10 mm
+    ring lands in the 60 mm minimum window of ``_work_window`` at ~0.05, i.e.
+    2.3x more relief than the caption states (and, when the factor is 1.0, the
+    caption states nothing at all).
+
+    Putting the floor on the FACTOR instead keeps one number: it multiplies the
+    plotted Z, labels the Z axis and is printed in the caption, and the box then
+    carries exactly the data it is given.
+    """
+    if z_span <= 0 or scale <= 0:
+        return factor
+    return max(factor, round(MIN_RELIEF_RATIO * scale / z_span, 1))
+
+
+def _view_extent(cloud, window) -> tuple[float, float]:
+    """The X/Y extent a 3-D view will actually be framed to, in mm."""
+    if window is not None:
+        return float(window[1] - window[0]), float(window[3] - window[2])
+    if cloud is not None and len(cloud):
+        return float(np.ptp(cloud[:, 0])), float(np.ptp(cloud[:, 1]))
+    return 1.0, 1.0
+
+
+def _true_box(ax, *, dx: float, dy: float, z_lo: float, z_hi: float,
+              factor: float = 1.0) -> None:
+    """Give a 3-D axes a box and Z limits that carry EXACTLY ``factor``.
+
+    Both have to be set together, and X/Y have to be pinned by the caller:
+
+    * with no box aspect at all, matplotlib's default box is what exaggerates --
+      the method figure's oblique panel stated x1.7 and drew x14.9;
+    * with a box sized from the raw span but Z left to autoscale, matplotlib's
+      ~5% margin a side shrinks the relief BELOW what is stated (the cell's
+      take 5 stated x1.4 and drew x1.27);
+    * with a FLOOR on the box (the old ``max(..., .12)``) the drawing gains
+      exaggeration nobody can read off the figure. The floor belongs on the
+      factor -- see ``_legible_factor`` -- where the caption carries it.
+
+    A scene with no relief at all gets a merely drawable box: there is nothing
+    to state and nothing to overstate.
+    """
+    scale = max(dx, dy, 1e-6)
+    span = (float(z_hi) - float(z_lo)) * float(factor)
+    try:
+        if span > 0:
+            pad = .05 * span
+            low, high = z_lo * factor - pad, z_hi * factor + pad
+            ax.set_zlim(low, high)
+            ax.set_box_aspect((dx / scale, dy / scale, (high - low) / scale))
+        else:
+            ax.set_box_aspect((dx / scale, dy / scale, MIN_RELIEF_RATIO))
+    except Exception:
+        pass
+
+
+def _note(stages: dict, message: str) -> None:
+    """Something a reader of the method figure has to be told, on the figure."""
+    stages.setdefault("notes", []).append(message)
+
+
+def _incomplete(stages: dict, take: "TakeData", exc: BaseException) -> "dict | None":
+    """A re-run that failed must never render as a finished method figure.
+
+    The chain is re-run to draw what it actually held; when it raises part-way
+    the earlier stages are still real and worth showing, but the figure is then
+    evidence of a PARTIAL reconstruction and has to say so. Logged either way --
+    a swallowed exception behind a paper figure is the failure mode that matters.
+    """
+    log.warning("method figure: the chain could not be re-run to the end for %s: %s",
+                take.layer_dir, exc, exc_info=True)
+    if not any(key in stages for key in STAGE_KEYS):
+        return None
+    stages["error"] = f"{type(exc).__name__}: {exc}"
+    return stages
+
+
+def _chroma_dist(take: "TakeData", stages: dict) -> "np.ndarray | None":
+    """The lens model to re-run this take's chroma gate through -- see
+    ``TakeData.chroma_dist``. A protocol-2 take whose archive never recorded the
+    coefficients cannot be reproduced exactly; it falls back to the undistorted
+    model (what ``service.reprocess_layer`` also does with a missing
+    ``dist_coeffs``, so the figure and the reprocess button still agree), and
+    says so on the figure rather than passing the guess off as the measurement.
+    """
+    dist = take.chroma_dist
+    if dist is None and take.geometry is not None and not take.geometry.legacy:
+        message = ("colour distortion not recorded for this take: the chroma gate "
+                   "was re-sampled through an undistorted lens model, so this "
+                   "segmentation may differ from the archived measurement")
+        _note(stages, message)
+        log.warning("method figure: %s: %s", take.layer_dir, message)
+    return dist
 
 
 # -- the four layer figures --------------------------------------------------
@@ -524,10 +672,18 @@ def render_view(take: TakeData, *, azim: float = -58.0, elev: float = 26.0,
             half = max(window[1] - window[0], window[3] - window[2]) / 2.0 * 1.15
             window = (cx - half, cx + half, cy - half, cy + half)
     zs = [a[:, 2] for a in (cloud, take.measured, take.nominal) if a is not None and len(a)]
-    span = float(np.ptp(np.concatenate(zs))) if zs else 0.0
+    z_lo = min(float(z.min()) for z in zs) if zs else 0.0
+    z_hi = max(float(z.max()) for z in zs) if zs else 0.0
+    span = z_hi - z_lo
+    # The frame the view is drawn in, needed BEFORE the factor: the legibility
+    # floor that used to be applied to the box aspect is applied to the factor
+    # instead, and the factor has to be settled before anything is plotted with it.
+    dx, dy = _view_extent(cloud, window)
+    scale = max(dx, dy, 1e-6)
     # A top-down view has no perspective for height to read through, so there
     # is nothing honest to exaggerate -- Z is drawn true and said so.
-    factor = 1.0 if birdseye else _z_exaggeration(take.radius, span)
+    factor = (1.0 if birdseye
+              else _legible_factor(_z_exaggeration(take.radius, span), span, scale))
 
     fig = plt.figure(figsize=(7.2, 6.6) if birdseye else (6.6, 5.4))
     ax = fig.add_subplot(111, projection="3d")
@@ -574,17 +730,10 @@ def render_view(take: TakeData, *, azim: float = -58.0, elev: float = 26.0,
     if cloud is not None and len(cloud):
         ax.legend(loc="upper left", fontsize=8)
     # The box has to carry the SAME proportions as the data, or the drawing
-    # exaggerates by whatever the box happens to be, on top of (or instead
-    # of) the stated factor -- see ``_draw_mesh_pair``'s box-aspect trap.
-    try:
-        dx = (window[1] - window[0]) if window is not None else (
-            float(np.ptp(cloud[:, 0])) if cloud is not None and len(cloud) else 1.0)
-        dy = (window[3] - window[2]) if window is not None else (
-            float(np.ptp(cloud[:, 1])) if cloud is not None and len(cloud) else 1.0)
-        scale = max(dx, dy, 1e-6)
-        ax.set_box_aspect((dx / scale, dy / scale, max(span * factor / scale, .12)))
-    except Exception:
-        pass
+    # exaggerates by whatever the box happens to be, on top of (or instead of)
+    # the stated factor. ``_legible_factor`` has already raised ``factor`` far
+    # enough for the box to read, so no floor is needed here.
+    _true_box(ax, dx=dx, dy=dy, z_lo=z_lo, z_hi=z_hi, factor=factor)
     caption = take.caption
     if factor != 1.0:
         caption += f" · vertical exaggeration ×{factor:g}"
@@ -680,12 +829,16 @@ def _compute_stages(take: TakeData) -> "dict | None":
     try:
         result = process_observation(
             color=image, depth=take.depth, geometry=take.geometry,
-            T_work_camera=take.T_work_camera, K=take.K, dist=None, plan=plan,
+            T_work_camera=take.T_work_camera, K=take.K,
+            # The lens model the MEASUREMENT gated with, not a second choice --
+            # see TakeData.chroma_dist.
+            dist=_chroma_dist(take, stages), plan=plan,
             layer=plan.layers[index - 1],
             config=ExtrusionConfig.model_validate(config_payload), stages=stages)
-    except Exception:
-        # A take that cannot be reconstructed still gets its other figures.
-        return stages or None
+    except Exception as exc:
+        # A take that cannot be reconstructed still gets its other figures --
+        # but the method figure is then partial, and has to be marked and logged.
+        return _incomplete(stages, take, exc)
     stages["result"] = result
     return stages
 
@@ -731,7 +884,11 @@ def _compute_characterization_stages(take: TakeData) -> "dict | None":
             inspection_tool=trial_setup.get("inspection_tool") or "unknown",
             inspection_auto=True, center_x_mm=float(center[0]), center_y_mm=float(center[1]))
         plan = generate_cylinder_plan(recipe, setup)
-    except Exception:
+    except Exception as exc:
+        # No plan means no method figure at all (rather than a partial one), but
+        # it is still a failure and must not disappear.
+        log.warning("method figure: %s's coarse plan could not be rebuilt: %s",
+                    take.layer_dir, exc, exc_info=True)
         return None
     stages: dict = {}
     colour = take.layer_dir / (take.manifest.get("color_file") or "color.png")
@@ -745,10 +902,16 @@ def _compute_characterization_stages(take: TakeData) -> "dict | None":
     try:
         result = process_observation(
             color=image, depth=take.depth, geometry=take.geometry,
-            T_work_camera=take.T_work_camera, K=take.K, dist=None, plan=plan,
+            T_work_camera=take.T_work_camera, K=take.K,
+            # ``characterize_ring`` gated this take through the CALIBRATED
+            # colour model; re-running the figure with a different one samples
+            # the gate at different pixels and can segment the ring differently
+            # from the number the figure is captioned with -- see
+            # TakeData.chroma_dist.
+            dist=_chroma_dist(take, stages), plan=plan,
             layer=plan.layers[0], config=config, stages=stages, assemble_arcs=True)
-    except Exception:
-        return stages or None
+    except Exception as exc:
+        return _incomplete(stages, take, exc)
     stages["result"] = result
     return stages
 
@@ -792,6 +955,10 @@ def _figure_pipeline(plt, take: TakeData):
     ROI, the deposit cluster, the top surface, and the extracted centreline
     against nominal. Panels 1-3 share one window so the reader can watch points
     being removed rather than re-reading three different scales.
+
+    A re-run that stopped part-way still draws the stages it reached, but is
+    banner-marked INCOMPLETE: a partial method figure that reads as a finished
+    one is the way a paper ends up illustrating a chain that never ran.
     """
     stages = take_stages(take)
     if not stages:
@@ -824,8 +991,17 @@ def _figure_pipeline(plt, take: TakeData):
     ax = fig.add_subplot(grid[0, 1], projection="3d")
     tall = near[(near[:, 2] > band[0]) & (near[:, 2] < band[1] + 4.0)]
     thin = tall[:: max(1, len(tall) // 9000)] if len(tall) else tall
-    factor = _z_exaggeration(radius or 40.0,
-                             float(np.ptp(thin[:, 2])) if len(thin) else 0.0)
+    z_lo = float(thin[:, 2].min()) if len(thin) else 0.0
+    z_hi = float(thin[:, 2].max()) if len(thin) else 0.0
+    panel_dx, panel_dy = _view_extent(thin if len(thin) else None, window)
+    # Settled BEFORE anything is plotted with it -- the panel states this number
+    # in its title, so it is the number the drawing has to carry. The rule is
+    # ``_relief_factor``'s, not ``_z_exaggeration``'s: this panel shows a whole
+    # frame standing proud of a board, so the relief is judged against the
+    # panel's own footprint (the ring's radius would leave it a flat smear now
+    # that the box is honest about it).
+    factor = _legible_factor(_relief_factor(panel_dx, panel_dy, z_hi - z_lo),
+                             z_hi - z_lo, max(panel_dx, panel_dy, 1e-6))
     if len(thin):
         ax.scatter(thin[:, 0], thin[:, 1], thin[:, 2] * factor, s=.7, c=thin[:, 2],
                    cmap="viridis", vmin=band[0], vmax=band[1], linewidths=0)
@@ -834,6 +1010,7 @@ def _figure_pipeline(plt, take: TakeData):
     if window:
         ax.set_xlim(window[0], window[1])
         ax.set_ylim(window[2], window[3])
+    _true_box(ax, dx=panel_dx, dy=panel_dy, z_lo=z_lo, z_hi=z_hi, factor=factor)
     for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
         axis.set_tick_params(labelsize=6)
     ax.set_xlabel("X (mm)", fontsize=7)
@@ -869,20 +1046,41 @@ def _figure_pipeline(plt, take: TakeData):
 
     # 6 -- what the paper measures.
     ax = fig.add_subplot(grid[1, 2])
+    error = stages.get("error")
     measured = result.measured_xyz if result is not None else take.measured
     if take.nominal is not None:
         ax.plot(take.nominal[:, 0], take.nominal[:, 1], color=NOMINAL, linewidth=1.3,
                 linestyle="--", label="nominal")
     if measured is not None and len(measured):
+        # With no result the panel is the ARCHIVED path, not this re-run's
+        # output; label it as such so the last panel cannot be read as evidence
+        # the chain reached it.
         ax.plot(measured[:, 0], measured[:, 1], color=MEASURED, linewidth=2.0,
-                label="extracted")
+                label="extracted" if result is not None else "archived path")
     ax.legend(loc="upper right", fontsize=7.5)
-    ax.set_title("6 · extracted vs nominal", fontsize=10)
+    ax.set_title("6 · extracted vs nominal" if result is not None
+                 else "6 · archived path (not re-run)", fontsize=10)
     _square(ax, measured if measured is not None else take.nominal)
 
-    fig.suptitle(f"From one RGB-D frame to a measured centreline — {take.label}",
-                 fontsize=12)
-    fig.text(.5, .012, take.caption, ha="center", fontsize=7.5, color="#4b5563")
+    title = f"From one RGB-D frame to a measured centreline — {take.label}"
+    fig.suptitle(f"{title} — INCOMPLETE" if error else title, fontsize=12)
+    if error:
+        # A chain failure carries its whole diagnostic payload; unwrapped it runs
+        # off both edges of the figure and reads as nothing at all.
+        detail = " ".join(str(error).split())
+        if len(detail) > 200:
+            detail = detail[:197] + "..."
+        banner = "\n".join(textwrap.wrap(
+            f"INCOMPLETE: the chain could not be re-run to the end ({detail}). "
+            "Stages after the failure are missing.", width=150)) or detail
+        fig.text(.5, .965, banner, ha="center", va="top", fontsize=8,
+                 color=MEASURED, weight="bold", linespacing=1.25)
+    caption = take.caption
+    notes = stages.get("notes") or []
+    if notes:
+        caption = " · ".join([caption, *notes]) if caption else " · ".join(notes)
+    fig.text(.5, .012, wrap_caption(caption, width=150), ha="center", va="bottom",
+             fontsize=7.5, color="#4b5563")
     return fig
 
 
@@ -1135,7 +1333,8 @@ def _draw_mesh_pair(fig, grid, row: int, panel: MeshPanel, mesh: MeshSurface) ->
                               float(mesh.y.min()), float(mesh.y.max()))
     dx, dy = window[1] - window[0], window[3] - window[2]
     dz = float(mesh.z.max() - mesh.z.min())
-    factor = _relief_factor(dx, dy, dz)
+    scale = max(dx, dy, 1e-6)
+    factor = _legible_factor(_relief_factor(dx, dy, dz), dz, scale)
     turned = fig.add_subplot(grid[row, 1], projection="3d")
     surface = turned.plot_trisurf(tri, mesh.z * factor, cmap=CMAP, antialiased=False,
                                   linewidth=.08 if edged_3d else 0,
@@ -1151,16 +1350,14 @@ def _draw_mesh_pair(fig, grid, row: int, panel: MeshPanel, mesh: MeshSurface) ->
     turned.set_zlabel(f"Z × {factor:g} (mm)", fontsize=7)
     turned.set_xlim(window[0], window[1])
     turned.set_ylim(window[2], window[3])
-    try:
-        # The box has to carry the SAME proportions as the data, or the drawing
-        # exaggerates by whatever the box happens to be (a flat (1, 1, .55) box
-        # stretched this bead ~6x while the axis claimed x2). X and Y keep the
-        # ring round; Z is the stated factor and nothing more.
-        scale = max(dx, dy, 1e-6)
-        turned.set_box_aspect((dx / scale, dy / scale,
-                               max(dz * factor / scale, .12)))
-    except Exception:
-        pass
+    # The box has to carry the SAME proportions as the data, or the drawing
+    # exaggerates by whatever the box happens to be (a flat (1, 1, .55) box
+    # stretched this bead ~6x while the axis claimed x2). X and Y keep the ring
+    # round; Z is the stated factor and nothing more -- the legibility floor
+    # lives in ``_legible_factor``, which raises the factor the title and the Z
+    # axis both quote rather than the box alone.
+    _true_box(turned, dx=dx, dy=dy, z_lo=float(mesh.z.min()), z_hi=float(mesh.z.max()),
+              factor=factor)
     return f"{panel.title}: {len(mesh.triangles)} triangles at {mesh.cell_mm:.2f} mm"
 
 
@@ -1313,10 +1510,21 @@ def _figure_tube(plt, takes: list[TakeData], trial_id: str):
     ax.set_title(f"Commanded bead against what was measured — {trial_id}", fontsize=10)
     ax.legend(loc="upper left", fontsize=8)
     ax.view_init(elev=18, azim=-62)
-    try:                                   # keep the ring round, not an ellipse
-        ax.set_box_aspect((1, 1, .55))
-    except Exception:
-        pass
+    # The caption says TRUE SCALE, so the box has to be true: a flat (1, 1, .55)
+    # box over autoscaled axes drew this ring's few mm of height ~50x its width
+    # ratio while the caption promised none. X and Y also keep the ring round.
+    paths = [a for take in drawable for a in (take.measured, take.nominal)
+             if a is not None and len(a)]
+    if paths:
+        points = np.vstack(paths)
+        edge = bead / 2.0                  # the pipe/ribbon reaches half a bead out
+        x_lo, x_hi = float(points[:, 0].min()) - edge, float(points[:, 0].max()) + edge
+        y_lo, y_hi = float(points[:, 1].min()) - edge, float(points[:, 1].max()) + edge
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_ylim(y_lo, y_hi)
+        _true_box(ax, dx=x_hi - x_lo, dy=y_hi - y_lo,
+                  z_lo=float(points[:, 2].min()) - edge,
+                  z_hi=float(points[:, 2].max()) + edge)
     caption = "True scale. Each layer sits at its own height."
     if deposited:
         caption += (" Commanded bead Ø %.1f mm; measured footprint %.1f mm wide."
@@ -1394,10 +1602,23 @@ def _figure_stack(plt, takes: list[TakeData], trial_id: str):
     flat = fig.add_subplot(1, 2, 1)
     oblique = fig.add_subplot(1, 2, 2, projection="3d")
     colours = plt.get_cmap("plasma")(np.linspace(.1, .8, max(len(takes), 1)))
-    zs = [t.measured[:, 2] for t in takes if t.measured is not None and len(t.measured)]
+    drawn = [t.measured for t in takes if t.measured is not None and len(t.measured)]
+    zs = [a[:, 2] for a in drawn]
     span = float(np.ptp(np.concatenate(zs))) if zs else 0.0
     radius = takes[0].radius
-    factor = _z_exaggeration(radius, span)
+    # The oblique panel quotes this factor in its title AND its Z label, so it
+    # is settled here -- before anything is plotted with it -- against the frame
+    # the panel will actually be drawn in.
+    if drawn:
+        points = np.vstack(drawn)
+        pad = .05 * max(float(np.ptp(points[:, 0])), float(np.ptp(points[:, 1])), 1.0)
+        box = (float(points[:, 0].min()) - pad, float(points[:, 0].max()) + pad,
+               float(points[:, 1].min()) - pad, float(points[:, 1].max()) + pad)
+        z_lo, z_hi = float(points[:, 2].min()), float(points[:, 2].max())
+    else:
+        box, z_lo, z_hi = (0.0, 1.0, 0.0, 1.0), 0.0, 0.0
+    factor = _legible_factor(_z_exaggeration(radius, span), span,
+                             max(box[1] - box[0], box[3] - box[2], 1e-6))
     labelled_truth = False
     for colour, take in zip(colours, takes):
         index = take.manifest.get("layer_index")
@@ -1433,6 +1654,10 @@ def _figure_stack(plt, takes: list[TakeData], trial_id: str):
     oblique.set_zlabel(f"Z × {factor:g} (mm)", fontsize=9)
     oblique.set_title(f"Stack, vertical exaggeration ×{factor:g}", fontsize=10)
     oblique.view_init(elev=24, azim=-58)
+    oblique.set_xlim(box[0], box[1])
+    oblique.set_ylim(box[2], box[3])
+    _true_box(oblique, dx=box[1] - box[0], dy=box[3] - box[2],
+              z_lo=z_lo, z_hi=z_hi, factor=factor)
     fig.suptitle(f"Ring stack — {trial_id}", fontsize=11)
     fig.tight_layout(rect=(0, .02, 1, .97))
     return fig
