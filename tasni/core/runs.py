@@ -20,13 +20,25 @@ over that tree, plus the "which run is currently applied" pointer:
 against traversal (no separators / ``..`` / absolute). ``root=`` is a test seam,
 mirroring :func:`tasni.core.logging.new_run_dir`. This stays in core and imports no
 ``modules.*`` so every workflow (scan/print next) reuses the same shape.
+
+**``runs/`` is not only run buckets.** People park things there too — a figures
+backup, a measurement archive — and on 2026-08-30 a ``list_runs`` that treated every
+directory under ``runs/`` as a module offered those as deletable rows and the
+Dashboard's "select all" swept them (``runs/`` is gitignored: unrecoverable). So the
+enumerable set is now *declared*, not discovered: the caller passes the registered
+module ids (``modules=``), and :func:`is_run_bucket` / :func:`looks_like_run` are the
+two filters both listing and deleting go through. ``modules=`` is keyword-**required**
+on exactly those two functions, so a future caller that forgets it fails loudly
+instead of quietly re-opening the hole.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
+from collections.abc import Collection
 from pathlib import Path
 
 from .logging import REPO_ROOT
@@ -34,6 +46,11 @@ from .logging import REPO_ROOT
 ACTIVE_FILE = "active.json"
 REPORT_FILE = "report.json"
 META_FILE = "meta.json"
+
+#: The ``YYYYmmdd-HHMMSS`` stamp :func:`tasni.core.logging.new_run_dir` names a run
+#: after. Matched with ``search`` because callers decorate it at either end:
+#: ``intrinsics-20260830-120000``, ``20260830-163556-2a8b558b``.
+_STAMP_RE = re.compile(r"\d{8}-\d{6}")
 
 
 class RunNotFound(FileNotFoundError):
@@ -61,6 +78,34 @@ def _safe_segment(name: str, kind: str) -> str:
 
 def module_dir(module_id: str, root: Path | None = None) -> Path:
     return runs_root(root) / _safe_segment(module_id, "module")
+
+
+def is_run_bucket(name: str, modules: Collection[str]) -> bool:
+    """Is ``runs/<name>/`` a run bucket owned by one of ``modules``?
+
+    A bucket is either a registered module id (``scan``) or that id with a
+    ``-<kind>`` suffix — modules name variant buckets after themselves
+    (``extrusion-dry-run``, ``extrusion-quick-simulation`` in
+    ``modules/extrusion/service.py``), and those are real runs the operator must
+    still be able to see and clear. Anything else under ``runs/`` — a figures
+    backup, a characterization archive, a stray folder — is *not* a bucket and is
+    therefore neither listed nor deletable through this API.
+    """
+    return any(name == m or name.startswith(f"{m}-") for m in modules)
+
+
+def looks_like_run(path: Path) -> bool:
+    """Does ``path`` look like one run's artifact folder (vs. something parked
+    inside a bucket)? True when its name carries a run stamp, or it holds a
+    ``report.json``/``meta.json``. Deliberately permissive — it is the second net
+    under :func:`is_run_bucket`, not a schema check — but it does mean a recursive
+    delete cannot be aimed at an arbitrary subdirectory of a real bucket.
+    """
+    if not path.is_dir():
+        return False
+    if _STAMP_RE.search(path.name):
+        return True
+    return (path / REPORT_FILE).is_file() or (path / META_FILE).is_file()
 
 
 def run_dir(module_id: str, stamp: str, root: Path | None = None) -> Path:
@@ -123,9 +168,15 @@ def active_run_id(module_id: str, root: Path | None = None) -> str | None:
     return (active or {}).get("run_id")
 
 
-def list_runs(limit: int = 20, root: Path | None = None) -> list[dict]:
-    """Recent run folders across all modules, newest first (by stamp). The
-    per-module ``active.json`` pointer is a file, not a run dir, so it is skipped.
+def list_runs(limit: int = 20, root: Path | None = None, *,
+              modules: Collection[str]) -> list[dict]:
+    """Recent run folders newest-first (by stamp), across the buckets owned by
+    ``modules`` — the registered module ids. The per-module ``active.json`` pointer
+    is a file, not a run dir, so it is skipped.
+
+    ``modules`` is required and unfiltered listing is not offered on purpose: every
+    row here is a *delete button* in the Dashboard, so anything parked under
+    ``runs/`` that no module owns must never reach the list.
 
     Each row also carries ``files``/``bytes`` (what deleting it frees) and ``active``
     (it is the run currently applied to the cell). Sizes are measured only for the
@@ -136,10 +187,10 @@ def list_runs(limit: int = 20, root: Path | None = None) -> list[dict]:
     items: list[dict] = []
     if base.exists():
         for mdir in base.iterdir():
-            if not mdir.is_dir():
+            if not mdir.is_dir() or not is_run_bucket(mdir.name, modules):
                 continue
             for run in mdir.iterdir():
-                if run.is_dir():
+                if looks_like_run(run):
                     items.append({"module": mdir.name, "stamp": run.name,
                                   "path": str(run)})
     items.sort(key=lambda r: r["stamp"], reverse=True)
@@ -165,20 +216,39 @@ def _force_writable(func, path, _exc) -> None:
     func(path)
 
 
-def delete_run(module_id: str, stamp: str, root: Path | None = None) -> dict:
+def delete_run(module_id: str, stamp: str, root: Path | None = None, *,
+               modules: Collection[str]) -> dict:
     """Delete ``runs/<module>/<stamp>/`` and every file under it. Returns what was
     freed (``files``/``bytes``, measured before the delete).
 
-    Both segments are guarded by :func:`run_dir`, and the *resolved* target must still
-    sit under ``runs/`` — so a symlinked stamp cannot aim the recursive delete at a
-    directory outside the tree. Raises :class:`RunNotFound` when there is no such run.
+    Four guards, because this is the call that destroys data and both segments come
+    off the HTTP surface:
+
+    * :func:`run_dir` rejects separators / ``..`` / absolutes in either segment;
+    * ``module_id`` must name a bucket owned by ``modules``
+      (:func:`is_run_bucket`) — a hand-crafted ``DELETE /api/runs/<anything>/<x>``
+      cannot reach a directory under ``runs/`` that no module owns;
+    * the target must :func:`looks_like_run` — not just any subdirectory of a real
+      bucket;
+    * the *resolved* target must still sit under ``runs/`` — so a symlinked stamp
+      cannot aim the recursive delete outside the tree.
+
+    Raises :class:`ValueError` when a guard refuses and :class:`RunNotFound` when
+    there is simply no such run.
     """
+    if not is_run_bucket(_safe_segment(module_id, "module"), modules):
+        raise ValueError(f"refusing to delete under {module_id!r}: not a module's "
+                         f"run bucket (known modules: {', '.join(sorted(modules))})")
     path = run_dir(module_id, stamp, root)
     if not path.is_dir():
         raise RunNotFound(f"no run {module_id}/{stamp}")
     base = runs_root(root).resolve()
     if base not in path.resolve().parents:
         raise ValueError(f"refusing to delete outside the runs tree: {path}")
+    if not looks_like_run(path):
+        raise ValueError(f"refusing to delete {module_id}/{stamp}: it does not look "
+                         "like a run folder (no run stamp in the name, no "
+                         f"{REPORT_FILE}/{META_FILE})")
     files, total = dir_stats(path)
     shutil.rmtree(path, onerror=_force_writable)
     return {"module": module_id, "stamp": stamp, "files": files, "bytes": total}

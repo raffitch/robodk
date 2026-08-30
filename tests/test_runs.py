@@ -5,6 +5,7 @@ No RoboDK, no camera — a temp ``runs/`` tree and a fake rdk. Covers:
   * load_report / load_meta round-trip + RunNotFound when missing
   * list_runs newest-first + limit + skips the active.json pointer file
   * list_runs reports size/file-count and flags the applied run
+  * ONLY a registered module's buckets are listed/deletable (the 2026-08-30 loss)
   * delete_run removes the folder, reports what it freed, and refuses to climb out
   * write_active / read_active atomic round-trip
   * apply_calibration: by run_id (from disk, survives restart) AND in-memory,
@@ -36,6 +37,10 @@ from tasni.core.config import AppConfig  # noqa: E402
 from tasni.modules.calibration import service as service_mod  # noqa: E402
 
 X_TRUE = [[1, 0, 0, 40], [0, 1, 0, -15], [0, 0, 1, 55], [0, 0, 0, 1]]
+
+#: What the webapp passes as ``modules=``: the registered module ids (see
+#: ``tasni/modules/registry.py::build_registry``).
+MODULES = ("calibration", "scan", "extrusion")
 
 
 def _write_run(root: Path, stamp: str, *, tool="Realsense", verdict="pass",
@@ -89,12 +94,12 @@ def test_list_runs_orders_and_skips_active(tmp: Path):
     for s in ("20260101-000000", "20260620-101010", "20260315-120000"):
         _write_run(tmp, s)
     runs.write_active("calibration", {"run_id": "20260620-101010"}, root=tmp)
-    listed = runs.list_runs(limit=20, root=tmp)
+    listed = runs.list_runs(limit=20, root=tmp, modules=MODULES)
     stamps = [r["stamp"] for r in listed]
     assert stamps == sorted(stamps, reverse=True)        # newest first
     assert "active.json" not in stamps                   # the pointer file is not a run
     assert all(r["module"] == "calibration" for r in listed)
-    assert len(runs.list_runs(limit=2, root=tmp)) == 2   # limit honoured
+    assert len(runs.list_runs(limit=2, root=tmp, modules=MODULES)) == 2   # limit honoured
     print("[list] newest-first, limited, active.json skipped")
 
 
@@ -104,7 +109,7 @@ def test_list_runs_reports_size_and_applied(tmp: Path):
     _write_run(tmp, "20260620-101010")
     (tmp / "runs" / "calibration" / "20260101-000000" / "cloud.ply").write_bytes(b"x" * 2048)
     runs.write_active("calibration", {"run_id": "20260620-101010"}, root=tmp)
-    by_stamp = {r["stamp"]: r for r in runs.list_runs(limit=10, root=tmp)}
+    by_stamp = {r["stamp"]: r for r in runs.list_runs(limit=10, root=tmp, modules=MODULES)}
     old_run, applied = by_stamp["20260101-000000"], by_stamp["20260620-101010"]
     assert old_run["files"] == 3 and old_run["bytes"] > 2048     # report + meta + cloud
     assert applied["files"] == 2 and old_run["bytes"] > applied["bytes"]
@@ -112,6 +117,65 @@ def test_list_runs_reports_size_and_applied(tmp: Path):
     assert runs.active_run_id("calibration", root=tmp) == "20260620-101010"
     assert runs.active_run_id("scan", root=tmp) is None
     print("[list] size/file-count reported, applied run flagged")
+
+
+def test_only_module_buckets_are_listed_and_deletable(tmp: Path):
+    """Regression for the 2026-08-30 data loss.
+
+    ``runs/`` is not only run buckets — a figures backup and a characterization
+    archive were parked there. ``list_runs`` treated every directory under ``runs/``
+    as a module, so those appeared as ordinary deletable rows and "select all"
+    swept them (``runs/`` is gitignored: unrecoverable). Only a registered module's
+    bucket may be listed, and the delete guard must refuse the rest even when the
+    URL is hand-crafted rather than clicked.
+    """
+    tmp = tmp / "buckets"                    # own root: __main__ shares one tmp dir
+    _write_run(tmp, "20260830-101010")                       # a real module run
+    # a module's own variant bucket ("<id>-<kind>") is still a real run bucket
+    sim = tmp / "runs" / "extrusion-quick-simulation" / "20260830-120000"
+    sim.mkdir(parents=True)
+    (sim / "report.json").write_text("{}", encoding="utf-8")
+    # ...and these two are not runs at all: nobody registered them
+    backup = tmp / "runs" / "_figures-backup-pre-3733d1b" / "figures"
+    backup.mkdir(parents=True)
+    (backup / "plan.png").write_bytes(b"x" * 4096)
+    archive = tmp / "runs" / "characterization" / "20260813-090000"
+    archive.mkdir(parents=True)
+    (archive / "report.json").write_text("{}", encoding="utf-8")
+    # a non-run folder parked *inside* a real bucket must not become a row either
+    parked = tmp / "runs" / "calibration" / "board-photos"
+    parked.mkdir(parents=True)
+    (parked / "a.png").write_bytes(b"x" * 16)
+
+    listed = {(r["module"], r["stamp"])
+              for r in runs.list_runs(limit=50, root=tmp, modules=MODULES)}
+    assert listed == {("calibration", "20260830-101010"),
+                      ("extrusion-quick-simulation", "20260830-120000")}, listed
+
+    # Defence in depth: the same refusal without going through the listing.
+    for module, stamp in (("_figures-backup-pre-3733d1b", "figures"),   # unknown bucket
+                          ("characterization", "20260813-090000"),      # unknown bucket
+                          ("calibration", "board-photos")):             # not a run
+        try:
+            runs.delete_run(module, stamp, root=tmp, modules=MODULES)
+            raise AssertionError(f"expected refusal of {module}/{stamp}")
+        except ValueError:
+            pass
+    assert (backup / "plan.png").is_file()
+    assert (archive / "report.json").is_file()
+    assert (parked / "a.png").is_file()
+
+    # the allowlist is required — a caller that forgets it fails loudly
+    try:
+        runs.list_runs(limit=50, root=tmp)   # type: ignore[call-arg]
+        raise AssertionError("expected list_runs to require modules=")
+    except TypeError:
+        pass
+    # a real run in a real bucket still deletes
+    out = runs.delete_run("extrusion-quick-simulation", "20260830-120000",
+                          root=tmp, modules=MODULES)
+    assert out["files"] == 1 and not sim.exists()
+    print("[buckets] non-module dirs neither listed nor deletable; real runs still go")
 
 
 def test_delete_run_frees_and_guards(tmp: Path):
@@ -123,7 +187,7 @@ def test_delete_run_frees_and_guards(tmp: Path):
     (nested / "a.ply").write_bytes(b"x" * 4096)
     runs.write_active("calibration", {"run_id": "20260620-101010"}, root=tmp)
 
-    out = runs.delete_run("calibration", "20260101-000000", root=tmp)
+    out = runs.delete_run("calibration", "20260101-000000", root=tmp, modules=MODULES)
     assert out["files"] == 3 and out["bytes"] > 4096            # counts nested files
     assert not (tmp / "runs" / "calibration" / "20260101-000000").exists()
     # only that run went: the sibling and the active.json pointer are untouched
@@ -133,19 +197,63 @@ def test_delete_run_frees_and_guards(tmp: Path):
     # already gone / not a run dir -> RunNotFound (the pointer file is not a run)
     for stamp in ("20260101-000000", "active.json"):
         try:
-            runs.delete_run("calibration", stamp, root=tmp)
+            runs.delete_run("calibration", stamp, root=tmp, modules=MODULES)
             raise AssertionError(f"expected RunNotFound for {stamp!r}")
         except runs.RunNotFound:
             pass
     # a recursive delete must never be steerable out of the runs tree
     for bad in ("..", "../..", "a/b", "a\\b", "", str(tmp)):
         try:
-            runs.delete_run("calibration", bad, root=tmp)
+            runs.delete_run("calibration", bad, root=tmp, modules=MODULES)
             raise AssertionError(f"expected rejection of stamp {bad!r}")
         except ValueError:
             pass
+    # ...and the allowlist is not optional: forgetting it is a loud TypeError,
+    # never a silent "delete anything under runs/".
+    try:
+        runs.delete_run("calibration", "20260620-101010", root=tmp)  # type: ignore[call-arg]
+        raise AssertionError("expected delete_run to require modules=")
+    except TypeError:
+        pass
+    assert (tmp / "runs" / "calibration" / "20260620-101010").is_dir()
     assert tmp.exists() and (tmp / "runs").is_dir()
     print("[delete]", out["files"], "files /", out["bytes"], "bytes freed; guards hold")
+
+
+def test_api_refuses_non_module_dirs(tmp: Path):
+    """The same guarantee at the HTTP surface: GET /api/runs never offers a
+    non-module directory, and a hand-crafted DELETE /api/runs/<anything>/<x> is
+    refused (400) instead of recursively deleting it."""
+    from fastapi.testclient import TestClient
+
+    from tasni.webapp.server import create_app
+
+    tmp = tmp / "api"                        # own root: __main__ shares one tmp dir
+    _write_run(tmp, "20260830-131313")
+    backup = tmp / "runs" / "_figures-backup-pre-3733d1b" / "figures"
+    backup.mkdir(parents=True)
+    (backup / "plan.png").write_bytes(b"x" * 512)
+    (tmp / "runs" / "characterization" / "20260813-090000").mkdir(parents=True)
+
+    runs.REPO_ROOT = tmp                     # redirect the default root for this call
+    try:
+        client = TestClient(create_app(AppConfig()))
+        listed = client.get("/api/runs?limit=50").json()["runs"]
+        assert [(r["module"], r["stamp"]) for r in listed] == [
+            ("calibration", "20260830-131313")], listed
+        for module, stamp in (("_figures-backup-pre-3733d1b", "figures"),
+                              ("characterization", "20260813-090000")):
+            r = client.delete(f"/api/runs/{module}/{stamp}")
+            assert r.status_code == 400, (module, r.status_code, r.text)
+            assert "run bucket" in r.text
+        assert (backup / "plan.png").is_file()
+        assert (tmp / "runs" / "characterization" / "20260813-090000").is_dir()
+        # ...while a real run still deletes through the same endpoint
+        assert client.delete("/api/runs/calibration/20260830-131313").status_code == 200
+        assert not (tmp / "runs" / "calibration" / "20260830-131313").exists()
+    finally:
+        runs.REPO_ROOT = _ORIG_ROOT
+    print("[api] non-module dirs: not listed, DELETE -> 400, files intact")
 
 
 def test_write_active_atomic_roundtrip(tmp: Path):
@@ -235,7 +343,9 @@ if __name__ == "__main__":
         test_load_report_roundtrip_and_missing(tmp)
         test_list_runs_orders_and_skips_active(tmp)
         test_list_runs_reports_size_and_applied(tmp)
+        test_only_module_buckets_are_listed_and_deletable(tmp)
         test_delete_run_frees_and_guards(tmp)
+        test_api_refuses_non_module_dirs(tmp)
         test_write_active_atomic_roundtrip(tmp)
         test_apply_by_run_id_from_disk(tmp)
         test_apply_in_memory_job(tmp)

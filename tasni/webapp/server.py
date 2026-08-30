@@ -125,10 +125,17 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
                     "tool": c.camera_tool, "missing": [c.robot_name],
                     "error": str(e)}
 
+    # The only directories under runs/ this API may enumerate or delete: the
+    # registered module ids (plus their own ``<id>-<kind>`` buckets — see
+    # runs.is_run_bucket). Anything else parked in runs/ — a figures backup, a
+    # measurement archive — is invisible here and therefore undeletable. The
+    # registry is fixed once built, so resolve the set once.
+    run_module_ids = frozenset(m.id for m in registry.all())
+
     @app.get("/api/runs")
     def runs(limit: int = 20) -> dict:
-        """Recent run-artifact folders across all modules, newest first."""
-        return {"runs": runs_registry.list_runs(limit)}
+        """Recent run-artifact folders across the registered modules, newest first."""
+        return {"runs": runs_registry.list_runs(limit, modules=run_module_ids)}
 
     @app.get("/api/runs/active")
     def active_run(module: str) -> dict:
@@ -144,24 +151,30 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
     def delete_run(module: str, stamp: str, force: bool = False) -> dict:
         """Delete one run folder and every file in it (Dashboard housekeeping).
 
-        Two guards, because this is the one endpoint that destroys data:
+        Three guards, because this is the one endpoint that destroys data:
         * never while a job runs — the folder being deleted may be the one the
           robot is writing takes into right now;
         * never the run currently applied to the cell without ``force=true``, so
           clearing old runs cannot silently take out the live calibration/scan. The
-          409 is structured so the UI can offer "delete anyway" instead of guessing.
+          409 is structured so the UI can offer "delete anyway" instead of guessing;
+        * never outside a registered module's run bucket, and never a directory
+          that does not look like a run — ``runs/`` also holds things nobody
+          registered (a figures backup, an archive) and this endpoint must not be
+          able to reach them, however the URL is hand-crafted. Both refusals are
+          400s: the request names something that is not a run, so retrying it
+          unchanged (or with ``force``) can never be right.
         """
         if services.jobs.running:
             raise HTTPException(409, "a job is running — stop it before deleting runs")
         # Forgiving by design: an unreadable/absent pointer means "nothing applied".
-        # A bad module segment is rejected below, by delete_run's own guard.
+        # A bad or unknown module segment is rejected below, by delete_run's guards.
         was_active = runs_registry.active_run_id(module) == stamp
         if was_active and not force:
             raise HTTPException(409, {
                 "code": "run_is_active",
                 "message": f"{module}/{stamp} is the run currently applied to the cell."})
         try:
-            out = runs_registry.delete_run(module, stamp)
+            out = runs_registry.delete_run(module, stamp, modules=run_module_ids)
         except runs_registry.RunNotFound as e:
             raise HTTPException(404, str(e))
         except ValueError as e:
