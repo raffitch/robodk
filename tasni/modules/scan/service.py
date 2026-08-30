@@ -3182,12 +3182,39 @@ def _surface_coverage(points_m: np.ndarray, wp, *, bin_m: float,
     }
 
 
+_EDGE_LABELS = {"x_min": "-X", "x_max": "+X", "y_min": "-Y", "y_max": "+Y"}
+
+
+def weakest_edge_name(coverage: dict) -> str | None:
+    """Which edge of the work rectangle is the weakest ("-X"/"+X"/"-Y"/"+Y").
+
+    ``_surface_coverage`` reports only the weakest VALUE, which cannot tell an
+    operator (or the next run's diagnosis) whether the locked rectangle overhangs
+    the measured surface on one side or the whole rim is missing. Returns ``None``
+    for a coverage dict without per-edge detail (older records, test stubs)."""
+    edges = coverage.get("edges")
+    if not isinstance(edges, dict) or not edges:
+        return None
+    key = min(edges, key=lambda k: float(edges[k]))
+    return _EDGE_LABELS.get(key, key)
+
+
+def edge_support_line(coverage: dict) -> str:
+    """All four edge-support values, in work-frame terms, for the log/error."""
+    edges = coverage.get("edges")
+    if not isinstance(edges, dict) or not edges:
+        return ""
+    return ", ".join(f"{_EDGE_LABELS.get(k, k)} {float(edges[k]):.0%}"
+                     for k in ("x_min", "x_max", "y_min", "y_max") if k in edges)
+
+
 def _surface_quality_reasons(coverage: dict, mesh_stats: dict, scfg) -> list[str]:
     """Reasons a fitted flat surface is not backed by enough measured depth."""
     reasons: list[str] = []
     point_count = int(coverage.get("point_count") or 0)
     fill = float(coverage.get("fill") or 0.0)
     weakest_edge = float(coverage.get("weakest_edge") or 0.0)
+    weak_name = weakest_edge_name(coverage)
     if point_count < int(scfg.min_actual_surface_points):
         reasons.append(
             f"only {point_count} supported measured mesh vertices "
@@ -3197,12 +3224,42 @@ def _surface_quality_reasons(coverage: dict, mesh_stats: dict, scfg) -> list[str
             f"measured surface fill {fill:.0%} "
             f"(< {float(scfg.min_actual_fill_coverage):.0%})")
     if weakest_edge < float(scfg.min_actual_edge_coverage):
+        band_mm = float(coverage.get("edge_band_mm") or 0.0)
+        short = (f", ~{(1.0 - weakest_edge) * band_mm:.0f} mm of its {band_mm:.0f} mm "
+                 f"band unmeasured" if band_mm else "")
         reasons.append(
             f"weakest edge support {weakest_edge:.0%} "
-            f"(< {float(scfg.min_actual_edge_coverage):.0%})")
+            + (f"on the {weak_name} edge " if weak_name else "")
+            + f"(< {float(scfg.min_actual_edge_coverage):.0%}){short}")
     if bool(mesh_stats.get("support_fallback")) and int(mesh_stats.get("combined_vertices") or 0) == 0:
         reasons.append("no measured vertices had repeated multi-view depth support")
     return reasons
+
+
+def _save_scan_artifacts(run_dir, *, mesh, measured_mesh, reference_mesh, raw_mesh,
+                         preview_mm, preview_colors, report: dict, stamp: str,
+                         tool_name: str) -> str:
+    """Write one run's meshes + preview + report.json, and return the mesh.obj path.
+
+    Shared by the accepted path and the quality-REJECTED path. A rejection used to
+    raise before this ran, so a rejected run left an EMPTY run directory: the whole
+    16-pose real-robot tour destroyed its own evidence and there was nothing to
+    diagnose the rejection from (2026-08-30 cell run 20260830-161918). Saving does
+    not soften the gate -- ``report["rejected"]`` marks the run and ``insert_scan``
+    refuses it, so a rejected surface still never reaches RoboDK.
+    """
+    save_mesh(mesh, str(run_dir / "mesh.obj"))
+    save_mesh(mesh, str(run_dir / "mesh.ply"))
+    save_mesh(measured_mesh, str(run_dir / "measured_tsdf_mesh.obj"))
+    save_mesh(measured_mesh, str(run_dir / "measured_tsdf_mesh.ply"))
+    save_mesh(reference_mesh, str(run_dir / "work_surface_rect.obj"))
+    save_mesh(raw_mesh, str(run_dir / "raw_tsdf_mesh.ply"))
+    np.savez_compressed(run_dir / "preview.npz",
+                        points_mm=preview_mm, colors=preview_colors)
+    (run_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    runs.write_meta("scan", stamp, {"module": "scan", "stamp": stamp,
+                                    "tool_name": tool_name})
+    return str(run_dir / "mesh.obj")
 
 
 def _combine_depth_frames(frames) -> tuple[np.ndarray, np.ndarray]:
@@ -3378,17 +3435,14 @@ class ScanCaptureJob:
                 edge_band_m=scfg.actual_coverage_edge_band_m)
             quality_reasons = _surface_quality_reasons(coverage, mesh_stats, scfg)
             if coverage["weakest_edge"] < float(scfg.min_actual_edge_coverage):
+                edge_line = edge_support_line(coverage)
                 ctx.log(
                     f"WARNING: measured mesh edge support is weak "
                     f"(weakest edge {coverage['weakest_edge']:.0%}, "
-                    f"interior {coverage['interior']:.0%}); expect visible gaps "
-                    f"or re-scan with better edge coverage")
-            if quality_reasons and getattr(scfg, "actual_coverage_hard_fail", False):
-                raise RuntimeError(
-                    "scan rejected: the fitted work surface is not backed by enough "
-                    "measured depth (" + "; ".join(quality_reasons) + "). "
-                    "Move farther back so the whole surface stays framed in every "
-                    "target, then lock and create targets again.")
+                    f"interior {coverage['interior']:.0%}"
+                    + (f"; edges {edge_line}" if edge_line else "") + "); "
+                    "the locked rectangle reaches past the depth that was actually "
+                    "measured on that side")
 
             report = _result_report(wp, frame_T_mm, corners_mm, n_views=len(views),
                                      n_points=len(pts), mesh=mesh, run_dir=run_dir,
@@ -3399,21 +3453,40 @@ class ScanCaptureJob:
                                      mesh_kind="fitted_flat_surface",
                                      provenance=self.params.boundary_provenance,
                                      survey=self.params.survey)
+            save_kwargs = dict(
+                mesh=mesh, measured_mesh=measured_mesh, reference_mesh=reference_mesh,
+                raw_mesh=raw_mesh, preview_mm=preview_mm, preview_colors=cc,
+                report=report, stamp=stamp, tool_name=self.tool_name)
+
+            if quality_reasons and getattr(scfg, "actual_coverage_hard_fail", False):
+                report["rejected"] = {"gate": "measured_surface_support",
+                                      "reasons": list(quality_reasons)}
+                if self.params.save_artifacts:
+                    _save_scan_artifacts(run_dir, **save_kwargs)
+                    # The discriminating datum for the 2026-08-30 failure mode: a lock
+                    # whose extent came from VISION is deliberately sized past where
+                    # depth reaches (the rim under-reach _corners_from_boundary_on_plane
+                    # documents), so a depth-support gate on the outer band is testing
+                    # the one place depth is known to be blind. Name it in the log.
+                    ctx.log(f"diagnostics for the REJECTED scan saved to "
+                            f"{run_dir.name}/ (boundary provenance: "
+                            f"{self.params.boundary_provenance or 'unknown'}) — compare "
+                            f"measured_tsdf_mesh.ply (what depth actually measured) "
+                            f"against work_surface_rect.obj (the locked rectangle) to "
+                            f"see which edge overhangs")
+                raise RuntimeError(
+                    "scan rejected: the fitted work surface is not backed by enough "
+                    "measured depth (" + "; ".join(quality_reasons) + "). The locked "
+                    "work rectangle extends past the surface the tour actually "
+                    "measured on that edge. Re-lock with the platform's whole real "
+                    "border under the reticle so the locked size matches the plate — "
+                    "the tour standoff is computed from that locked size, not from "
+                    "where you were standing, so backing the camera off and re-locking "
+                    "sends the robot to the same distance and will not change this.")
+
             mesh_obj = None
             if self.params.save_artifacts:
-                save_mesh(mesh, str(run_dir / "mesh.obj"))
-                save_mesh(mesh, str(run_dir / "mesh.ply"))
-                save_mesh(measured_mesh, str(run_dir / "measured_tsdf_mesh.obj"))
-                save_mesh(measured_mesh, str(run_dir / "measured_tsdf_mesh.ply"))
-                save_mesh(reference_mesh, str(run_dir / "work_surface_rect.obj"))
-                save_mesh(raw_mesh, str(run_dir / "raw_tsdf_mesh.ply"))
-                mesh_obj = str(run_dir / "mesh.obj")
-                np.savez_compressed(run_dir / "preview.npz",
-                                    points_mm=preview_mm, colors=cc)
-                (run_dir / "report.json").write_text(json.dumps(report, indent=2),
-                                                     encoding="utf-8")
-                runs.write_meta("scan", stamp, {"module": "scan", "stamp": stamp,
-                                                "tool_name": self.tool_name})
+                mesh_obj = _save_scan_artifacts(run_dir, **save_kwargs)
 
             self.result = ScanResult(
                 report=report, run_dir=str(run_dir), frame_T_mm=frame_T_mm,
@@ -3581,6 +3654,17 @@ def insert_scan(services, *, job: "ScanCaptureJob | None" = None,
         stamp_id, source = report.get("stamp"), "reference"
     elif run_id is not None:
         report = runs.load_report("scan", run_id)
+        # A quality-REJECTED run now saves its meshes + report.json so the failure can
+        # be diagnosed (see _save_scan_artifacts). That evidence must never become a
+        # back door around the gate that rejected it: refuse to insert a run whose own
+        # report says it failed the measured-support gate.
+        rejected = report.get("rejected")
+        if rejected:
+            reasons = "; ".join(rejected.get("reasons") or []) or "measured support"
+            raise RuntimeError(
+                f"scan run {run_id} was REJECTED by the measured-support gate "
+                f"({reasons}) — its files are kept for diagnosis only and cannot be "
+                f"inserted. Re-lock the surface and run again.")
         plane = report["plane"]
         frame_T_mm = np.asarray(plane["frame_T_mm"], float)
         corners_mm = np.asarray(plane["corners_mm"], float)

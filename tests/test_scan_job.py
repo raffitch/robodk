@@ -3551,3 +3551,131 @@ def test_coverage_frac_denominator_matches_the_sampled_grid():
     print(f"[coverage] {w}x{h} stride {stride}: {len(pts)}/{n_sampled} -> "
           f"{coverage:.6f} (floored denominator gave "
           f"{len(pts) / ((h // stride) * (w // stride)):.6f})")
+
+
+# -- 2026-08-30 cell failure: a rejected scan must leave evidence, and its --------
+# -- remedy text must not tell the operator to do something inert ----------------
+# Cell run 20260830-161918 was rejected with "weakest edge support 53% (< 60%)" and
+# left an EMPTY run directory: the RuntimeError fired before every save_mesh /
+# report.json write, so a 16-pose real-robot tour destroyed its own evidence. The
+# printed remedy ("Move farther back so the whole surface stays framed in every
+# target") is also inert: plan_scan derives the tour standoff from the MEASURED
+# EXTENT and K alone (d_fit = max(margin*Sx*fx/W, margin*Sy*fy/H), clipped to the
+# accurate band), so re-locking from farther back sends the robot to the same
+# distance. Both are fixed; these tests hold them fixed.
+
+def test_rejection_reason_names_the_weak_edge_and_the_shortfall():
+    """The reject text must say WHICH edge failed and by how much.
+
+    "weakest edge support 53%" alone cannot distinguish "the locked rectangle
+    overhangs the measured surface on one side" (re-lock) from "the whole rim has
+    no depth" (a sensor/standoff problem) — and those have opposite remedies."""
+    cfg = AppConfig().scan
+    coverage = {
+        "point_count": 90000, "fill": 0.91, "interior": 1.0,
+        "bin_mm": 4.0, "edge_band_mm": 24.0,
+        "edges": {"x_min": 0.99, "x_max": 0.53, "y_min": 0.97, "y_max": 0.81},
+        "weakest_edge": 0.53,
+    }
+    reasons = scan_service._surface_quality_reasons(coverage, {}, cfg)
+    assert len(reasons) == 1, reasons
+    r = reasons[0]
+    assert "weakest edge support 53%" in r, r
+    assert "+X" in r, r                      # names the failing edge
+    assert "11 mm of its 24 mm band" in r, r  # (1 - 0.53) * 24 mm
+    assert scan_service.weakest_edge_name(coverage) == "+X"
+    assert scan_service.edge_support_line(coverage) == "-X 99%, +X 53%, -Y 97%, +Y 81%"
+    # A coverage dict without per-edge detail (older records / stubs) still works.
+    assert scan_service.weakest_edge_name({"weakest_edge": 0.0}) is None
+    assert scan_service.edge_support_line({"weakest_edge": 0.0}) == ""
+    print("[reject text]", r)
+
+
+def test_rejected_scan_saves_diagnostics_and_still_cannot_be_inserted():
+    """A quality-rejected run must (a) keep its meshes + report.json so the
+    failure can be diagnosed, (b) mark itself rejected, (c) still be refused by
+    insert_scan, and (d) not tell the operator to move farther back."""
+    pytest.importorskip("open3d", reason="open3d not installed — `pip install -e .[scan]`")
+    services, state = _build_fakes()
+    assert services.config.scan.actual_coverage_hard_fail is True
+
+    locked = scan_service.lock_scan_surface(services)
+    scan_service.generate_scan_targets(services, locked)
+
+    with tempfile.TemporaryDirectory() as t:
+        runs.REPO_ROOT = Path(t)
+
+        def fake_new_run_dir(mid, stamp):
+            d = Path(t) / "runs" / mid / stamp
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        orig = scan_service.new_run_dir
+        scan_service.new_run_dir = fake_new_run_dir
+        try:
+            # The fake table is 300x300 mm; lock a 400x400 mm rectangle onto it so
+            # the outer band genuinely has no measured depth — the real failure mode,
+            # not a contrived threshold.
+            job = scan_service.ScanCaptureJob(
+                services, scan_service.ScanParams(surface_size_mm=(400.0, 400.0),
+                                                  boundary_provenance="vision"))
+            with pytest.raises(RuntimeError) as exc:
+                job(_Ctx())
+            msg = str(exc.value)
+            assert "scan rejected" in msg, msg
+            assert "weakest edge support" in msg, msg
+            # The old remedy was inert: the tour standoff comes from the locked
+            # SIZE, not from where the operator stood.
+            assert "farther back" not in msg.lower(), msg
+            assert "re-lock" in msg.lower(), msg
+
+            run_dirs = sorted((Path(t) / "runs" / "scan").iterdir())
+            assert len(run_dirs) == 1, run_dirs
+            rd = run_dirs[0]
+            kept = {p.name for p in rd.iterdir()}
+            for wanted in ("report.json", "measured_tsdf_mesh.ply",
+                           "work_surface_rect.obj", "raw_tsdf_mesh.ply",
+                           "preview.npz"):
+                assert wanted in kept, (wanted, kept)
+
+            report = runs.load_report("scan", rd.name)
+            assert report["rejected"]["gate"] == "measured_surface_support"
+            assert any("weakest edge support" in r
+                       for r in report["rejected"]["reasons"]), report["rejected"]
+            # The provenance that discriminates "vision sized the rectangle past
+            # where depth reaches" from a genuine capture hole is on record.
+            assert report["boundary_provenance"] == "vision"
+            assert report["coverage"]["edges"], report["coverage"]
+
+            # ...and the kept evidence is NOT a back door around the gate.
+            with pytest.raises(RuntimeError) as exc2:
+                scan_service.insert_scan(services, run_id=rd.name)
+            assert "REJECTED" in str(exc2.value), str(exc2.value)
+        finally:
+            scan_service.new_run_dir = orig
+            runs.REPO_ROOT = _ORIG_ROOT
+    print("[rejected run] kept", len(kept), "artifacts, insert refused")
+
+
+def test_tour_standoff_ignores_where_the_operator_stood():
+    """Proves the old remedy was inert: plan_scan's standoff is a function of the
+    measured extent and K only, so "move farther back" cannot change the tour."""
+    from tasni.modules.scan.planner import plan_scan as _plan
+    from tasni.modules.scan.survey import SurveyMeasurement as _SM
+    scfg = AppConfig().scan
+    Kc = np.array([[1334.811317674083, 0, 973.47], [0, 1336.2149094072527, 543.0],
+                   [0, 0, 1.0]])
+    out = []
+    for standoff in (350.0, 445.0, 700.0, 1200.0):
+        sm = _SM(detected=True, standoff_mm=standoff, tilt_deg=0.0, tilt_b_deg=0.0,
+                 tilt_c_deg=0.0, normal_cam=np.array([0.0, 0.0, -1.0]),
+                 centroid_cam_mm=np.array([0.0, 0.0, standoff]),
+                 extent_mm=(441.0, 289.0), shape="rect", fully_framed=True,
+                 fov_deg=(69.4, 44.0), outline_uv=None, grid_uv=None,
+                 grid_spacing_mm=None, ok=True, gates={},
+                 accurate_min_mm=scfg.accurate_min_mm,
+                 accurate_max_mm=scfg.accurate_max_mm,
+                 survey_max_tilt_deg=scfg.survey_max_tilt_deg)
+        out.append(round(_plan(sm, Kc, (1920, 1080), scfg).standoff_mm, 3))
+    assert len(set(out)) == 1, out
+    assert 400.0 < out[0] < 401.0, out
+    print("[inert remedy] operator at 350/445/700/1200 mm -> tour standoff", out)
