@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import cv2
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -117,6 +118,51 @@ def test_gate_reads_the_reticle_through_the_colour_model_not_the_depth_centre():
     r = evaluate_depth_gate(depth, geom, K, None, ScanGateThresholds(center_patch_frac=0.2,
                                                                      min_valid_depth_frac=0.2))
     assert r.detected and abs(r.distance_mm - 500.0) < 1.0 and r.tilt_deg < 1.0
+
+
+def test_valid_frac_is_not_inflated_by_the_factory_colour_k():
+    """DETECT must trip at the coverage it advertises.
+
+    ``ColorRegistered._density_ratio`` used to divide by the greeting's FACTORY
+    colour K while ``uv`` was projected with the host's CALIBRATED one. On this
+    D435i (factory fx,fy = 1362.15/1362.21 vs calibrated 1334.81/1336.21) that was
+    a flat x1.0403 on every ``valid_frac``, so ``min_valid_depth_frac = 0.5``
+    actually tripped at a true coverage of 0.4806 -- and the inflated number is
+    what gets written into the scan record, where no later reader can back it out.
+
+    Fixture: this camera's real colour resolution and its real two K's, a depth
+    camera that IS the factory colour camera (same size, zero extrinsic), and a
+    plane filling only the colour reticle's RIGHT half. Coverage of the centre
+    patch is then 0.5 by construction, independent of the K's or of the stride=2
+    subsampling the gate uses -- measured 0.4999 with the fix, 0.5201 without. So a
+    ``min_valid_depth_frac`` set between the two lit DETECT on a scene that had not
+    met it. Only the plain fraction is asserted with a tolerance tight enough to
+    separate 0.500 from 0.520; the lamp assertions then follow from it.
+    """
+    size = (1920, 1080)
+    k_factory = np.array([[1362.15, 0, 960.0], [0, 1362.21, 540.0], [0, 0, 1.0]])
+    k_calib = np.array([[1334.81, 0, 960.0], [0, 1336.21, 540.0], [0, 0, 1.0]])
+    bias = (k_factory[0, 0] * k_factory[1, 1]) / (k_calib[0, 0] * k_calib[1, 1])
+    assert bias == pytest.approx(1.0403, abs=5e-4), bias   # the fixture IS the defect
+
+    geom = gf.offset(color_K=k_factory, color_size=size, depth_K=k_factory,
+                     depth_size=size, rot_deg=(0, 0, 0), t_mm=(0, 0, 0))
+    depth = np.full((size[1], size[0]), 5000, np.uint16)   # 500 mm at 0.1 mm units
+    depth[:, :size[0] // 2] = 0                            # right half of the view only
+
+    th = ScanGateThresholds(ideal_distance_mm=500, distance_tol_mm=120,
+                            min_valid_depth_frac=0.51)
+    r = evaluate_depth_gate(depth, geom, k_calib, None, th)
+    assert r.valid_frac == pytest.approx(0.5, abs=0.01), r.valid_frac
+    assert not r.detected and not r.ok, r.to_dict()        # 0.500 < 0.51, honestly
+
+    # ... and the same scene still detects once the bar is genuinely below it.
+    r2 = evaluate_depth_gate(depth, geom, k_calib, None,
+                             ScanGateThresholds(ideal_distance_mm=500, distance_tol_mm=120,
+                                                min_valid_depth_frac=0.49))
+    assert r2.detected and abs(r2.distance_mm - 500.0) < 1.0, r2.to_dict()
+    print("[factory-K bias] half-covered patch reads", round(r.valid_frac, 4),
+          "(was 0.5201 =", round(bias, 4), "x too high)")
 
 
 def test_live_telemetry_uses_surface_appropriate_standoff():

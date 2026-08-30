@@ -3187,8 +3187,9 @@ class ScanCaptureJob:
         scfg = cfg.scan
         rdk: RdkIO = self.services.rdk
         cam = self.services.camera
-        K = cfg.camera.K
-        width, height = cfg.camera.size
+        # No colour K/size is unpacked here: every capture carries its own
+        # CameraGeometry (protocol 2), so fusion and mesh cleaning read
+        # intrinsics/pose/unit per view rather than from one shared model.
         prefix = scfg.target_prefix
 
         ensure_camera_tool(self.services, log=ctx.log)
@@ -3302,7 +3303,7 @@ class ScanCaptureJob:
             reference_mesh = planar_rectangle_mesh(
                 wp.corners, spacing_m=scfg.surface_mesh_spacing_m)
             measured_mesh, mesh_stats = clean_measured_surface_mesh(
-                raw_mesh, views, wp, K, width, height,
+                raw_mesh, views, wp,
                 plane_band_m=scfg.measured_mesh_plane_band_m,
                 rect_margin_m=scfg.measured_mesh_rect_margin_m,
                 support_tolerance_m=scfg.measured_mesh_support_tolerance_m,

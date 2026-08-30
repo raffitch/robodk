@@ -9,7 +9,6 @@ from __future__ import annotations
 import numpy as np
 
 from tasni.core.depth_geometry import CameraGeometry
-from tasni.core.geometry import Rt_to_T
 
 
 def aligned(K, size, *, depth_unit_mm: float = 1.0) -> CameraGeometry:

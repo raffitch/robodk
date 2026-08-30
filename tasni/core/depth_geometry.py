@@ -144,22 +144,38 @@ def ray_point(u, v, z_mm, K_color, dist_color) -> np.ndarray:
 
 
 class ColorRegistered:
-    """One frame's valid depth points with their positions in the colour image."""
+    """One frame's valid depth points with their positions in the colour image.
+
+    Note the two independent sources here: ``color_size`` (the canvas every
+    ``in_polygon`` / ``in_center_patch`` test is measured against) comes from the
+    GREETING, while ``uv`` comes from the caller's CALIBRATED ``K_color``, which
+    the host selects by the ``camera.resolution`` config string. If those two
+    describe different image sizes, nothing in this class notices -- the points
+    simply land in the wrong part of the canvas. ``CameraClient.check_color_size``
+    is what keeps them consistent for live frames; archive readers build both from
+    one take's own K/size via :meth:`CameraGeometry.legacy_aligned`."""
 
     def __init__(self, pts_mm, uv, uv_depth, color_size, depth_size, stride,
-                 depth_K, color_K_factory):
+                 depth_K, color_K=None, *, color_K_factory=None):
         self.pts_mm = np.asarray(pts_mm, float)
         self.uv = np.asarray(uv, float)
         self.uv_depth = np.asarray(uv_depth, int)
         self.color_size = (int(color_size[0]), int(color_size[1]))
         self.depth_size = (int(depth_size[0]), int(depth_size[1]))
         self.stride = int(stride)
-        # R25: the geometry's own depth/colour K matrices, so _density_ratio can
-        # compute the depth-px/colour-px ratio ANALYTICALLY instead of estimating
-        # it from the registered points' footprint (which was biased ~27% low --
-        # see _density_ratio's docstring).
+        # R25: the geometry's own depth K and the colour K that PRODUCED ``uv``, so
+        # _density_ratio can compute the depth-px/colour-px ratio ANALYTICALLY
+        # instead of estimating it from the registered points' footprint (which was
+        # biased ~27% low -- see _density_ratio's docstring). ``color_K`` must be
+        # the same matrix ``build`` projected with (the CALIBRATED model), not the
+        # greeting's factory K: the two disagree by ~2% per axis on this D435i, and
+        # it is the projection that sets where the points land.
+        # ``color_K_factory=`` is a deprecated keyword alias for ``color_K``.
+        K_c = color_K if color_K is not None else color_K_factory
+        if K_c is None:
+            raise TypeError("ColorRegistered needs the colour K that produced `uv`")
         self._depth_K = np.asarray(depth_K, float)
-        self._color_K = np.asarray(color_K_factory, float)
+        self._color_K = np.asarray(K_c, float)
         self._tree = None
 
     @classmethod
@@ -168,8 +184,9 @@ class ColorRegistered:
         pts, uv_depth = backproject(depth, geom, stride=stride)
         uv = project_to_color(pts, K_color, dist_color)
         d = np.asarray(depth)
+        # K_color (calibrated), NOT geom.color_K_factory: uv above came out of it.
         return cls(pts, uv, uv_depth, geom.color_size, (d.shape[1], d.shape[0]), stride,
-                   geom.depth_K, geom.color_K_factory)
+                   geom.depth_K, K_color)
 
     def __len__(self) -> int:
         return len(self.pts_mm)
@@ -216,9 +233,30 @@ class ColorRegistered:
         ``(z/fx_c)*(z/fy_c)``; z cancels, so the ratio is exactly
         ``(fx_d*fy_d)/(fx_c*fy_c)`` -- a constant of the two cameras' intrinsics,
         independent of distance or how much of the frame is actually covered.
-        For ``legacy_aligned`` geometry ``depth_K == color_K`` so this is exactly
-        1.0, matching the pre-protocol-2 convention (depth pixel == colour pixel)
-        by construction.
+
+        ``fx_c/fy_c`` are the CALIBRATED colour focal lengths -- the ones
+        ``build`` projected the points with -- NOT the greeting's factory K.
+        ``uv`` is where the points landed, so the density of registered points
+        per colour pixel is governed by the matrix that put them there; dividing
+        by anything else is a constant bias. This one was measurable: on this
+        D435i the factory K reads fx,fy = 1362.15, 1362.21 against the
+        calibration's 1334.81, 1336.21, so the factory denominator inflated
+        ``valid_frac`` by a flat x1.0403 -- a fully covered synthetic patch read
+        1.0376 instead of 1.0, and ``evaluate_depth_gate``'s
+        ``min_valid_depth_frac = 0.5`` actually tripped at a true coverage of
+        0.4806. It erred permissive (an early DETECT, never a false refusal) and
+        the gate clamps with ``min(1.0, ...)``, but the biased number is also
+        persisted into scan records, where a later reader cannot see the bias.
+        Fixing it makes the DETECT gate ~4% stricter; a real live scene measures
+        ~0.92 against the 0.5 threshold, so the headroom is ample.
+
+        For ``legacy_aligned`` geometry the archive callers hand the SAME config
+        K to ``legacy_aligned`` (which makes it ``depth_K``) and to ``build``
+        (which makes it ``color_K``) -- ``extrusion/service.py``'s reprocess and
+        ``extrusion/figures.py``'s ``geometry_for_take``/``_compute_stages`` both
+        read one ``intrinsics["K"]``/``take.K`` -- so ``(a*b)/(a*b)`` is exactly
+        1.0 at stride 1, matching the pre-protocol-2 convention (depth pixel ==
+        colour pixel) by construction.
 
         This REPLACES a footprint-based estimate (total depth pixels after stride,
         over the colour-image area the registered points' own bounding box

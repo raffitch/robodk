@@ -233,6 +233,54 @@ class CameraClient:
         self.geometry = geom
         return geom
 
+    def check_color_size(self, geom: CameraGeometry | None) -> None:
+        """Fail loudly when the live colour stream is not the size ``config.K`` is for.
+
+        The host picks its CALIBRATED colour intrinsics by a config *string*:
+        ``CameraConfig.K`` indexes ``intrinsics[resolution]`` and ``CameraConfig.size``
+        parses the same string. The size the camera is ACTUALLY sending arrives
+        independently, in the protocol-2 greeting (``CameraGeometry.color_size``).
+        Nothing else compares them, and a registration holds both halves at once:
+        :class:`~.depth_geometry.ColorRegistered` takes its canvas from the greeting
+        and its pixel coordinates from the config K. A stale ``camera.resolution``
+        (say 1280x720 left over while the server streams 1920x1080) therefore does
+        not fail — it silently squashes every registered point into the top-left
+        ~44% of the colour canvas, so polygon/centre-patch tests select the wrong
+        pixels and the chroma gate reads the wrong colours. Measured on a synthetic
+        full-frame plane at 450 mm: u spans -186..2148 with the correct K and
+        -124..1432 with the stale one, and the centre-patch population changes 2.3x.
+
+        A wrong measurement published quietly is worse than a loud stop, so this
+        raises. It runs where a protocol-2 connection is first PUT TO WORK (a frame
+        produced, a burst pose buffered, a live stream opened) rather than the
+        instant the greeting is parsed: merely opening and closing a connection
+        never uses the intrinsics, so it is not made to care about them.
+        Colour-only paths pass ``geom=None`` (they read no greeting) and are
+        skipped; ``CameraGeometry.legacy_aligned`` is built by the ARCHIVE readers
+        from a take's own K/size and never reaches a :class:`CameraClient`."""
+        if geom is None:
+            return
+        got = (int(geom.color_size[0]), int(geom.color_size[1]))
+        try:
+            want = tuple(self.config.size)
+        except (ValueError, AttributeError) as e:
+            # config.size just splits the string on "x"; a malformed one would
+            # otherwise surface as a bare ValueError from inside the frame loop.
+            raise CameraError(
+                f"camera.resolution is not a WIDTHxHEIGHT string "
+                f"({self.config.resolution!r}); the camera is streaming "
+                f"{got[0]}x{got[1]} — set that in tasni.config.json.") from e
+        if got != want:
+            raise CameraError(
+                f"camera colour size mismatch: the camera is streaming "
+                f"{got[0]}x{got[1]} but camera.resolution is "
+                f"'{self.config.resolution}' ({want[0]}x{want[1]}), so the host "
+                f"would project depth through colour intrinsics for the wrong image "
+                f"size and every registered point would land at the wrong pixel. "
+                f"Set \"camera\": {{\"resolution\": \"{got[0]}x{got[1]}\"}} in "
+                f"tasni.config.json (and make sure camera.intrinsics has an entry "
+                f"for that size), then restart the Tasni backend.")
+
     def _read_raw(self, sock: socket.socket) -> "tuple[bytes, bytes, float]":
         """Read one frame's raw bytes (depth_raw, color_raw, timestamp) from an
         already-connected socket, without decoding. The server always sends depth
@@ -255,6 +303,7 @@ class CameraClient:
         """Read + decode exactly one frame from an already-connected socket.
         ``geometry`` is the greeting already read for this connection (None on a
         colour-only path, which never reads one)."""
+        self.check_color_size(geometry)
         depth_raw, color_raw, timestamp = self._read_raw(sock)
         color = self._decode_color(color_raw)
         depth = self._decode_depth(depth_raw) if with_depth else None
@@ -445,6 +494,9 @@ class _BurstSession:
         """Tell the server to grab + buffer one depth+color frame. Returns a small
         color thumbnail (JPEG bytes) for the live per-pose strip, or ``None`` if the
         server skipped it (no valid frame, or the buffer is full)."""
+        # Checked here as well as in _read_frame() so a stale camera.resolution stops
+        # the tour at its FIRST pose, not after the robot has visited every one.
+        self._client.check_color_size(self._geometry)
         self._sock.sendall(b"CAP\n")
         _idx = struct.unpack("<I", self._client._recv_exact(self._sock, 4))[0]
         thumb_len = struct.unpack("<I", self._client._recv_exact(self._sock, 4))[0]
@@ -531,6 +583,12 @@ class _CameraStream:
         self._sock = sock
         self._telemetry_reader = telemetry_reader
         self._geometry = geometry
+        # read() builds its Frame directly (it owns the drain loop) and so does not
+        # go through CameraClient._read_frame -- check once here, at construction,
+        # so a live preview against a stale camera.resolution fails before the first
+        # frame instead of once per frame. stream() constructs this INSIDE its
+        # try/finally, so the socket is still closed if this raises.
+        client.check_color_size(geometry)
 
     def read(self, *, with_depth: bool = False, drain: bool = False) -> Frame:
         """Return the next frame. With ``drain=True``, first skip any frames

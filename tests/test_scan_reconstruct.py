@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -61,11 +62,7 @@ def _render(T_base_cam):
 
 
 def test_fuse_and_plane_end_to_end():
-    try:
-        import open3d  # noqa: F401
-    except Exception:
-        print("[skip] open3d not installed — `pip install -e .[scan]`")
-        return
+    pytest.importorskip("open3d", reason="open3d not installed — `pip install -e .[scan]`")
 
     poses = [_look_at((0, 0, 500), (0, 0, 0)),
              _look_at((120, 0, 520), (0, 0, 0)),
@@ -107,11 +104,7 @@ def test_fuse_handles_0_1mm_native_units():
     hard-coded 1000 (uint16-mm) constant -- protocol 2 streams native 0.1 mm raw
     depth. Re-quantizing the SAME synthetic scene at 0.1 mm units (10x the raw
     integer value, same real-world mm) must fuse to the same plane."""
-    try:
-        import open3d  # noqa: F401
-    except Exception:
-        print("[skip] open3d not installed — `pip install -e .[scan]`")
-        return
+    pytest.importorskip("open3d", reason="open3d not installed — `pip install -e .[scan]`")
 
     poses = [_look_at((0, 0, 500), (0, 0, 0)),
              _look_at((120, 0, 520), (0, 0, 0)),
@@ -140,11 +133,8 @@ def test_fuse_handles_0_1mm_native_units():
 
 
 def test_measured_mesh_cleaner_drops_disconnected_island():
-    try:
-        import open3d as o3d
-    except Exception:
-        print("[skip] open3d not installed — `pip install -e .[scan]`")
-        return
+    o3d = pytest.importorskip("open3d",
+                              reason="open3d not installed — `pip install -e .[scan]`")
 
     surface = np.array([
         [-0.15, -0.15, 0.0], [0.15, -0.15, 0.0],
@@ -162,7 +152,7 @@ def test_measured_mesh_cleaner_drops_disconnected_island():
 
     wp = work_plane_from_points(surface[:4], distance=0.002, min_inlier_frac=0.9)
     cleaned, stats = rc.clean_measured_surface_mesh(
-        raw, [], wp, K, W, H,
+        raw, [], wp,
         plane_band_m=0.01,
         rect_margin_m=0.0,
         support_tolerance_m=0.005,

@@ -238,11 +238,7 @@ def _expected_framed_views(services) -> int:
 
 
 def test_generate_run_insert():
-    try:
-        import open3d  # noqa: F401
-    except Exception:
-        print("[skip] open3d not installed — `pip install -e .[scan]`")
-        return
+    pytest.importorskip("open3d", reason="open3d not installed — `pip install -e .[scan]`")
     services, state = _build_fakes()
     rdk = services.rdk
 
@@ -340,11 +336,7 @@ def test_provenance_flows_lock_to_insert():
     return dict, ScanParams/ScanCaptureJob carry them into the run report, and
     insert_scan carries them into the runs/scan/active.json payload -- reading
     provenance and geometry from the SAME resolved source (job.result)."""
-    try:
-        import open3d  # noqa: F401
-    except Exception:
-        print("[skip] open3d not installed — `pip install -e .[scan]`")
-        return
+    pytest.importorskip("open3d", reason="open3d not installed — `pip install -e .[scan]`")
     services, state = _build_fakes()
 
     locked = scan_service.lock_scan_surface(services)
@@ -394,11 +386,7 @@ def test_provenance_absent_when_survey_record_is_none():
     legitimate record-less path is a fully framed surface that classify_compact
     rejects, so that is how the lock is produced now; the pipeline assertions
     are unchanged."""
-    try:
-        import open3d  # noqa: F401
-    except Exception:
-        print("[skip] open3d not installed — `pip install -e .[scan]`")
-        return
+    pytest.importorskip("open3d", reason="open3d not installed — `pip install -e .[scan]`")
     global TABLE_HALF_MM
     saved = TABLE_HALF_MM
     try:
@@ -1457,11 +1445,7 @@ def test_targets_report_surface_coverage_from_footprint():
 def test_burst_capture_path():
     """With scan.burst_capture on, the job captures via the burst session, fuses the
     same table, and CLEARs the Jetson buffer (no data left on the device)."""
-    try:
-        import open3d  # noqa: F401
-    except Exception:
-        print("[skip] open3d not installed — `pip install -e .[scan]`")
-        return
+    pytest.importorskip("open3d", reason="open3d not installed — `pip install -e .[scan]`")
     services, state = _build_fakes()
     services.config.scan.burst_capture = True
 
@@ -1497,11 +1481,7 @@ def test_burst_capture_path():
 def test_save_views_persists_per_pose_frames():
     """scan.save_views writes each pose's color+depth+pose under <run>/views/ for a
     later camera-perspective coverage overlay (off by default, opt-in diagnostic)."""
-    try:
-        import open3d  # noqa: F401
-    except Exception:
-        print("[skip] open3d not installed — `pip install -e .[scan]`")
-        return
+    pytest.importorskip("open3d", reason="open3d not installed — `pip install -e .[scan]`")
     import json as _json
 
     services, _state = _build_fakes()

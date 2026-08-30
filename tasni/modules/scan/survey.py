@@ -36,7 +36,6 @@ class SurveyThresholds:
     accurate_min_mm: float = 300.0        # near edge of camera's accurate band
     accurate_max_mm: float = 800.0        # far edge; beyond → reference mode
     survey_max_tilt_deg: float = 6.0      # survey squareness requirement
-    border_margin_px: int = 10            # pixel margin for fully_framed test
     min_valid_depth_frac: float = 0.3     # fraction of frame that must have valid depth
     ransac_distance_mm: float = 6.0       # RANSAC plane inlier band (mm)
     max_samples: int = 8000               # max points passed to RANSAC (stride-subsample)
@@ -246,10 +245,11 @@ def survey_surface(
     # well-margined object read as an overrun and fall back to the generic square.
     # Instead TRUST THE FITTED RECTANGLE: if its projected corners sit inside the
     # frame with a margin, the object is bounded in view and we keep its rectangle.
-    # (``border_margin_px``'s old raw-pixel-in-the-DEPTH-image test is gone with it —
-    # native depth pixels no longer correspond 1:1 to colour pixels, so a border test
-    # in depth-pixel space cannot answer "is this inside the COLOUR frame?" at all;
-    # the fitted-rectangle test below is now the only framing decision.)
+    # (That old test's ``border_margin_px`` threshold went with it — it has now been
+    # deleted from SurveyThresholds entirely. Native depth pixels no longer correspond
+    # 1:1 to colour pixels, so a border test in depth-pixel space cannot answer "is this
+    # inside the COLOUR frame?" at all; the fitted-rectangle test below is now the only
+    # framing decision.)
     def _corners_in_frame(corners, frac=float(th.frame_margin_uv)) -> bool:
         """Containment uses the PINHOLE projection (``dist_color=None``), never the
         calibrated Brown-Conrady model, even though every other projection in this

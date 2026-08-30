@@ -313,8 +313,8 @@ def _view_support_counts(vertices_m: np.ndarray, views: list[ScanView], *,
     return supported, observable
 
 
-def clean_measured_surface_mesh(mesh, views: list[ScanView], wp, K: np.ndarray,
-                                width: int, height: int, *, plane_band_m: float,
+def clean_measured_surface_mesh(mesh, views: list[ScanView], wp,
+                                *, plane_band_m: float,
                                 rect_margin_m: float, support_tolerance_m: float,
                                 min_support_views: int, min_support_ratio: float,
                                 min_normal_dot: float,
@@ -334,11 +334,10 @@ def clean_measured_surface_mesh(mesh, views: list[ScanView], wp, K: np.ndarray,
       4. drop disconnected islands so loose fragments not attached to the rectangle
          are not imported into RoboDK.
 
-    ``K``/``width``/``height`` are kept in the signature for the callers that
-    already have the colour model handy here, but are no longer forwarded into
-    support counting (Task 10): each view now carries its OWN ``geometry``
+    Takes no camera model of its own: each view carries its OWN ``geometry``
     (protocol 2), so ``_view_support_counts`` reads intrinsics/pose/unit per view
-    instead of assuming one shared colour K/size for every capture.
+    instead of assuming one shared colour K/size for every capture. (The old
+    ``K``/``width``/``height`` parameters survived Task 10 unused and are gone.)
     """
     vertices = np.asarray(mesh.vertices, dtype=float)
     triangles = np.asarray(mesh.triangles, dtype=np.int32)

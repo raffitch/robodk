@@ -105,6 +105,18 @@ def _make_color(w=64, h=48) -> np.ndarray:
     return img
 
 
+def _cfg(size=(64, 48)) -> CameraConfig:
+    """A config whose colour resolution matches the size the fixture greeting
+    advertises, so ``CameraClient.check_color_size`` sees a coherent host+camera
+    pair. The default ``CameraConfig()`` says 1920x1080, which is a real mismatch
+    against these 64x48 fixtures -- exactly what that guard exists to catch."""
+    w, h = int(size[0]), int(size[1])
+    key = f"{w}x{h}"
+    return CameraConfig(resolution=key,
+                        intrinsics={key: [[80.0, 0.0, w / 2], [0.0, 80.0, h / 2],
+                                          [0.0, 0.0, 1.0]]})
+
+
 def _assert_color_roundtrip(decoded: np.ndarray, original: np.ndarray) -> None:
     """JPEG is lossy and rings at the sharp block edges, so check the *interior* of
     each block (near-exact) and the overall mean (no gross corruption / channel
@@ -318,7 +330,7 @@ def test_burst_session_roundtrip():
     order (depth+color+ts lossless); CLEAR drops the Jetson buffer."""
     import tasni.core.camera as camera_mod
 
-    client = CameraClient(CameraConfig())
+    client = CameraClient(_cfg())
     colors = [_make_color() for _ in range(3)]
     depths = [np.arange(64 * 48, dtype=np.uint16).reshape(48, 64) * (k + 1) for k in range(3)]
     frames_in = list(zip(colors, depths, [1.0, 2.0, 3.0]))
@@ -392,7 +404,7 @@ def _patched_socket(sock):
 
 
 def test_grab_with_depth_sends_v2_and_reads_the_greeting_first():
-    client = CameraClient(CameraConfig())
+    client = CameraClient(_cfg())
     color = _make_color()
     depth = (np.arange(64 * 48, dtype=np.uint16).reshape(48, 64) * 3)
     frame_bytes, _ = _server_encode(color, depth, 7.0)
@@ -415,7 +427,7 @@ def test_stream_with_depth_sends_v2_and_reads_the_greeting_before_the_first_fram
     it's long-lived and retried against a real camera, unlike the one-shot
     grab(). Mirrors test_grab_with_depth_sends_v2_and_reads_the_greeting_first
     but through stream()/_CameraStream.read()."""
-    client = CameraClient(CameraConfig())
+    client = CameraClient(_cfg())
     color = _make_color()
     depth = (np.arange(64 * 48, dtype=np.uint16).reshape(48, 64) * 3)
     frame_bytes, _ = _server_encode(color, depth, 7.0)
@@ -517,7 +529,7 @@ def test_color_only_grab_has_no_geometry_and_no_v2_token():
 
 
 def test_burst_reads_ready_then_greeting():
-    client = CameraClient(CameraConfig())
+    client = CameraClient(_cfg())
     color = _make_color()
     depth = np.full((48, 64), 4000, np.uint16)
     frame_bytes, _ = _server_encode(color, depth, 2.0)
@@ -584,6 +596,121 @@ def test_burst_greeting_parse_failure_after_ready_closes_the_socket():
     print("[v2] burst greeting-parse failure closes the socket instead of leaking it")
 
 
+# -- the host's colour model must match the stream the greeting describes ----
+
+def _stale_client() -> CameraClient:
+    """A host whose ``camera.resolution`` names a DIFFERENT size than the greeting
+    (which says 64x48). This is the latent production bug in miniature: the host
+    picks K by the config string, the camera announces its real size in the
+    greeting, and until this guard nothing compared them."""
+    return CameraClient(_cfg((32, 24)))
+
+
+def _assert_mismatch_message(err: CameraError) -> None:
+    msg = str(err)
+    assert "64x48" in msg, f"the error must name the STREAM size: {msg}"
+    assert "32x24" in msg, f"the error must name the CONFIGURED size: {msg}"
+    assert "camera.resolution" in msg, f"the error must name the setting: {msg}"
+    assert "tasni.config.json" in msg, f"the error must name the file: {msg}"
+
+
+def test_stale_camera_resolution_fails_the_depth_grab_instead_of_misprojecting():
+    """A stale ``camera.resolution`` does not fail on its own: ColorRegistered takes
+    its canvas from the greeting (``color_size``) and its pixel coordinates from the
+    config K, so a 720p K on a 1080p stream silently squashes every registered point
+    into the top-left ~44% of the colour image -- measured on a synthetic full-frame
+    plane at 450 mm, u spans -186..2148 correctly vs -124..1432 stale, and the
+    centre-patch population changes 2.3x. The chroma gate then samples the wrong
+    pixels and misclassifies bead vs board. A quietly wrong measurement is worse
+    than a loud stop, so the depth path must raise."""
+    client = _stale_client()
+    color = _make_color()                                   # 64x48, like the greeting
+    depth = np.full((48, 64), 4000, np.uint16)
+    frame_bytes, _ = _server_encode(color, depth, 7.0)
+    sock = FakeSocket(_greeting_bytes() + frame_bytes)
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        try:
+            client.grab(with_depth=True)
+        except CameraError as e:
+            _assert_mismatch_message(e)
+        else:
+            raise AssertionError(
+                "a colour-size mismatch must raise, not return a frame whose depth "
+                "would be projected through the wrong colour intrinsics")
+    finally:
+        camera_mod.socket.socket = orig
+    print("[guard] grab(with_depth) refuses a stream whose size camera.resolution disagrees with")
+
+
+def test_stale_camera_resolution_fails_the_live_stream_before_the_first_frame():
+    """stream() is the long-lived live-preview/HUD path, so it must fail when the
+    connection opens rather than once per frame -- and without leaking the socket
+    (same contract the protocol refusal already has)."""
+    client = _stale_client()
+    frame_bytes, _ = _server_encode(_make_color(), np.full((48, 64), 4000, np.uint16), 7.0)
+    sock = FakeSocket(_greeting_bytes() + frame_bytes)
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        try:
+            with client.stream() as feed:
+                feed.read(with_depth=True)
+        except CameraError as e:
+            _assert_mismatch_message(e)
+        else:
+            raise AssertionError("a colour-size mismatch must raise on the stream path")
+    finally:
+        camera_mod.socket.socket = orig
+    assert sock.closed, "the socket must be closed before the mismatch propagates"
+    print("[guard] stream() refuses the mismatch at open and closes the socket")
+
+
+def test_stale_camera_resolution_fails_burst_at_the_first_pose():
+    """burst() only decodes frames in fetch_all(), i.e. AFTER the robot has toured
+    every pose. Checking at the first CAP means a stale config costs one pose, not
+    a whole tour."""
+    client = _stale_client()
+    # A COMPLETE CAP reply, so without the guard capture() succeeds and the test
+    # fails on "must raise" rather than on the fake socket running out of bytes.
+    payload = (b"BURST READY\n" + _greeting_bytes()
+               + struct.pack("<I", 0) + struct.pack("<I", 5) + b"thumb")
+    sock = FakeSocket(payload, chunk=64)
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        try:
+            with client.burst() as bs:
+                bs.capture()
+        except CameraError as e:
+            _assert_mismatch_message(e)
+        else:
+            raise AssertionError("a colour-size mismatch must raise on the burst path")
+    finally:
+        camera_mod.socket.socket = orig
+    print("[guard] burst() refuses the mismatch at the first CAP, before the tour")
+
+
+def test_color_only_paths_ignore_camera_resolution_mismatch():
+    """Proof the guard cannot false-trip the paths that never read a greeting:
+    MODE COLOR carries no geometry (nothing back-projects), so a config resolution
+    that disagrees with the JPEG's size must NOT break the live preview or a
+    colour-only grab. Same reason archived takes are safe: their geometry is built
+    by the archive readers (``CameraGeometry.legacy_aligned``) and never passes
+    through a CameraClient."""
+    client = _stale_client()
+    color = _make_color()
+    frame_bytes, _ = _server_encode(color, None, 1.0)
+    sock = FakeSocket(frame_bytes)
+    camera_mod, orig = _patched_socket(sock)
+    try:
+        frame = client.grab(color_only=True)
+    finally:
+        camera_mod.socket.socket = orig
+    assert frame.geometry is None
+    _assert_color_roundtrip(frame.color, color)
+    client.check_color_size(None)          # explicit: no greeting -> nothing to check
+    print("[guard] colour-only paths are untouched by the colour-size guard")
+
+
 if __name__ == "__main__":
     test_full_frame_roundtrip()
     test_color_only_means_depth_len_zero()
@@ -604,4 +731,8 @@ if __name__ == "__main__":
     test_burst_reads_ready_then_greeting()
     test_burst_refusal_carries_the_restart_hint_not_a_generic_message()
     test_burst_greeting_parse_failure_after_ready_closes_the_socket()
+    test_stale_camera_resolution_fails_the_depth_grab_instead_of_misprojecting()
+    test_stale_camera_resolution_fails_the_live_stream_before_the_first_frame()
+    test_stale_camera_resolution_fails_burst_at_the_first_pose()
+    test_color_only_paths_ignore_camera_resolution_mismatch()
     print("\nCamera wire-format round-trip tests passed.")

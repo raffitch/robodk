@@ -158,6 +158,76 @@ def test_valid_frac_in_center_patch_reads_near_1_for_full_coverage_r25():
     assert abs(reg2.valid_frac_in_center_patch(0.25) - 1.0) < 0.1
 
 
+def test_density_ratio_divides_by_the_calibrated_colour_k_that_produced_uv():
+    """The colour K in ``_density_ratio``'s denominator must be the one ``build``
+    PROJECTED with, not the greeting's factory K.
+
+    ``build`` computes ``uv = project_to_color(pts, K_color, dist_color)`` from the
+    caller's CALIBRATED colour model, but used to hand ``_density_ratio`` the
+    greeting's ``color_K_factory`` instead. ``uv`` is what ``in_center_patch``
+    counts, so the density of registered points per colour pixel is governed by the
+    calibrated K; the factory K is a flat multiplicative bias. On this D435i
+    (factory fx,fy = 1362.15/1362.21 vs calibrated 1334.81/1336.21) it inflated
+    ``valid_frac`` by x1.0403, so a fully covered patch read ~1.04 instead of 1.0
+    and ``evaluate_depth_gate``'s ``min_valid_depth_frac = 0.5`` really tripped at a
+    true coverage of 0.4806. Permissive, never a false refusal -- but the biased
+    number is persisted into scan records where no later reader can undo it.
+
+    The fixture reproduces exactly that, at this camera's real colour resolution
+    and with its real two K's: a depth camera that IS the factory colour camera
+    (same size, zero extrinsic) and a saturated depth image -- a 100%-covered
+    surface by construction, whose honest reading is 1.0 and whose factory-K
+    reading is 1.0403. Measured: 0.9974 with the fix, 1.0376 without (the 0.26%
+    shortfall is the depth grid landing on integer colour pixels, an order of
+    magnitude smaller than the bias being caught).
+    """
+    size = (1920, 1080)
+    k_factory = np.array([[1362.15, 0, 960.0], [0, 1362.21, 540.0], [0, 0, 1.0]])
+    k_calib = np.array([[1334.81, 0, 960.0], [0, 1336.21, 540.0], [0, 0, 1.0]])
+    bias = (k_factory[0, 0] * k_factory[1, 1]) / (k_calib[0, 0] * k_calib[1, 1])
+    assert bias == pytest.approx(1.0403, abs=5e-4), bias   # the fixture IS the defect
+
+    g = gf.offset(color_K=k_factory, color_size=size, depth_K=k_factory,
+                  depth_size=size, rot_deg=(0, 0, 0), t_mm=(0, 0, 0))
+    depth = np.full((size[1], size[0]), 5000, np.uint16)   # 500 mm at 0.1 mm units
+    reg = dg.ColorRegistered.build(depth, g, k_calib, DIST0)
+
+    # depth_K == k_factory, so the calibrated denominator IS the bias factor and the
+    # factory denominator would be exactly 1.0 -- the two answers cannot be confused.
+    assert reg._density_ratio() == pytest.approx(bias, rel=1e-12)
+    assert abs(reg._density_ratio() - 1.0) > 0.03
+    assert reg.valid_frac_in_center_patch(0.25) == pytest.approx(1.0, abs=0.01)
+
+
+def test_legacy_aligned_density_ratio_is_exactly_one_and_stride_still_divides_it():
+    """Two properties the calibrated-K fix must not disturb.
+
+    (1) EXACTLY 1.0 on the archive path. ``CameraGeometry.legacy_aligned`` (ARCHIVED
+        takes only) is always fed the same config K the caller then hands ``build``
+        -- ``extrusion/service.py``'s reprocess reads one ``intrinsics["K"]``,
+        ``figures.py``'s ``geometry_for_take``/``_compute_stages`` one ``take.K``, and
+        ``geometry_fixtures.aligned`` one ``K`` -- so ``(a*b)/(a*b)`` is 1.0 to the
+        bit, preserving the pre-protocol-2 "one depth pixel == one colour pixel"
+        convention rather than merely landing near it.
+    (2) ``stride**2`` stays in the denominator. A ``stride=2`` build (what
+        ``evaluate_depth_gate`` does on every live HUD tick) samples 1-in-4 native
+        depth pixels, so the registered-point count a fully covered patch can reach
+        drops by 4. Dropping the divisor would silently re-break every stride>1
+        caller's DETECT lamp.
+    """
+    g = gf.aligned(K_C, SIZE_C)
+    depth = np.full((SIZE_C[1], SIZE_C[0]), 500, dtype=np.uint16)
+
+    reg = dg.ColorRegistered.build(depth, g, K_C, DIST0)
+    assert reg._density_ratio() == 1.0                     # exact, not approx
+    assert reg.valid_frac_in_center_patch(0.25) == pytest.approx(1.0, abs=1e-6)
+
+    reg2 = dg.ColorRegistered.build(depth, g, K_C, DIST0, stride=2)
+    assert reg2.stride == 2
+    assert reg2._density_ratio() == 0.25                   # 1.0 / stride**2
+    assert reg2.valid_frac_in_center_patch(0.25) == pytest.approx(1.0, abs=1e-6)
+
+
 def test_legacy_geometry_flags_itself():
     g = gf.aligned(K_C, SIZE_C)
     assert g.legacy is True and g.depth_unit_mm == 1.0
