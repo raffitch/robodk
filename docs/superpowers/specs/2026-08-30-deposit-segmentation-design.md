@@ -1,7 +1,7 @@
 # Deposit segmentation without colour — design
 
 **Status:** design agreed with the operator on 2026-08-30, after an offline validation
-run against the archive. **Supersedes** the chroma gate introduced in `041ad1b`
+run against the archive. Revised the same day by a code-verifying review — see §12. **Supersedes** the chroma gate introduced in `041ad1b`
 (2026-08-29) and the handoff that condemned it,
 `docs/deposit-segmentation-handoff-2026-08-30.md` (`8b2db77`).
 
@@ -66,8 +66,14 @@ is attributable to segmentation alone.
 | new — fitted substrate + 3σ | 8/8 | 0.992–0.993 | 40.98 | 0.107 | 1.08 | 0.070 |
 
 Completeness, validity and centre-offset repeatability are unchanged with **no colour
-input at all**. The radius σ difference is **not significant**: F = 3.66 on 7 and 7 df,
-p = 0.109, against 4.99 needed at 5%. See §11 for what the investigation did find.
+input at all**. The radius σ difference (0.056 → 0.107 mm) **cannot be resolved at
+n = 8**: two-sided F = 3.66 on 7 and 7 df, p = 0.109 against 4.99 needed at 5%; in the
+one direction that matters (new worse than old) p ≈ 0.054. Eight takes have little
+power, so the honest statement is "not distinguishable here, and below the 0.132 mm
+raster-quantisation floor (§7)" — not "proven absent". The golden harness therefore
+pins radius σ across the eight takes at ≤ 0.15 mm (§5), so a real repeatability cost
+surfaces instead of hiding under an unchanged mean. See §11 for what the
+investigation did find.
 
 ### 2.2 Substrate separation
 
@@ -156,9 +162,11 @@ primitive (`Open3D segment_plane`), and it fails two requirements:
 The fit is guarded: if the recovered normal is more than ~25° off the work frame's up
 axis, the frame is refused rather than measured against a wall or a fixture.
 
-The fit region is the neighbourhood of the ROI (`r < 150 mm` about the plan centre) —
-the work frame supplies the up-axis and the search band. **No ring geometry is used**, so
-the estimator carries no assumption about what is being deposited.
+The fit region is the neighbourhood of the ROI (`r < 150 mm` about the plan centre,
+configurable as `substrate_fit_radius_mm` — the §8 mitigation "the fit region can be
+widened" has to be operable without a code change) — the work frame supplies the
+up-axis and the search band. **No ring geometry is used**, so the estimator carries no
+assumption about what is being deposited.
 
 ### 3.3 Scale from the uncontaminated half
 
@@ -166,8 +174,9 @@ the estimator carries no assumption about what is being deposited.
 positive side, so the lower half is pure sensor noise and a one-sided estimator is both
 robust and unbiased here, where a two-sided MAD is inflated by the bead.
 
-Measured: `sigma_low` returns 0.55–0.61 mm against a ground-truth substrate σ of
-0.44–0.52 — conservative in the safe direction, and stable across takes.
+Measured on the four ground-truth cell frames of §3.2: `sigma_low` returns
+0.55–0.61 mm against a ground-truth substrate σ of 0.44–0.52 — conservative in the
+safe direction, and stable across takes.
 
 ### 3.4 The threshold is derived, not constant
 
@@ -175,10 +184,16 @@ Measured: `sigma_low` returns 0.55–0.61 mm against a ground-truth substrate σ
 floor = clamp(k · substrate.sigma_mm, floor_min, floor_max)     # k default 3.0
 ```
 
-On the archive this yields 1.55–1.74 mm — it *reproduces* today's hard-coded 1.5 mm on
-today's geometry, and adapts at a different standoff or incidence where the constant is
-silently wrong. The clamp exists so a pathological fit cannot open the floor to
-everything or close it to nothing.
+On the archive this yields 1.55–1.74 mm across the eight layer-1 takes — it
+*reproduces* today's hard-coded 1.5 mm on today's geometry, and adapts at a different
+standoff or incidence where the constant is silently wrong. (That floor range implies
+per-take σ down to 0.52 mm — a different frame set from §3.3's four ground-truth
+frames, which is why the two ranges do not coincide exactly; the golden harness
+records per-take `sigma_mm` baselines and is the authoritative reconciliation.) The
+clamp exists so a pathological fit cannot open the floor to everything or close it to
+nothing. **Defaults: `substrate_floor_clamp_mm = [1.0, 2.0]`** — the ceiling sits
+safely under the measured k = 4 cliff at 2.25 mm, the lower bound under anything the
+archive's noise justified (3σ never measured below 1.55 mm).
 
 `k = 4.0` was measured to fall off a cliff (completeness 0.358): at a 2.25 mm floor the
 cut eats into a ring whose crest is 2.9–4.9 mm over much of its circumference. `k` is
@@ -212,12 +227,28 @@ topology alone.
 - Config: `deposit_min_saturation`, `deposit_min_chroma_fraction`,
   `deposit_min_height_no_chroma_mm`.
 - `deposit_floor_mm`, and the `plane_distance_threshold_m` / `deposit_min_height_mm`
-  coupling that fed it.
+  coupling that fed it. With the function gone both fields are dead — no other
+  consumer exists in the extrusion chain — so they are removed too, not left as
+  clutter.
 - `K` and `dist` from `process_observation`'s signature: in the extrusion module
   `ColorRegistered` exists *only* to serve the gate (`processing.py:707`, `:956`). The
   front of the chain becomes `depth_to_work_points`, which already exists and is already
   what `figures.py` uses. The scan module's use of `ColorRegistered` is untouched.
-- The `floor_profile` parameter, replaced by a `SubstrateModel` argument.
+- The `floor_profile` parameter, replaced by a `SubstrateModel` argument — **end to
+  end**, because it has consumers beyond `process_observation`: `ring_geometry`'s
+  reference argument, `Session.floor_profile` (`measure.py:134`), the
+  measure-layer-N−1-first 409 guard and its `allow_missing_floor` escape
+  (`module.py:768–776`, `:93`), `layer_floor_margin_mm`, and the web UI's client-side
+  copy of the same gate (`Extrusion.tsx:998`, `:1217`). `Session.tops` **stays
+  recorded**: the UI renders it, and the future layer-N−1 provider (§11) would be
+  built from it — only its consumers go.
+
+One trap the deletions must clear: `ExtrusionConfig` is `extra="forbid"`, and the
+archive's per-take `processing_config` is re-validated on every reprocess and figure
+build (`service.py:1213`, `figures.py:837`, `:874`). Deleting fields therefore breaks
+every existing archive unless retired keys are stripped first — a `from_archive()`
+constructor drops (never reinterprets) the retired keys, and those three call sites go
+through it.
 
 The colour frame keeps being captured and archived. It is evidence and figure material;
 it takes no part in any decision.
@@ -232,9 +263,13 @@ recovered signal.
 ### 3.7 One seam for live, reprocess and figures
 
 `measure.py`, `service.reprocess_saved_layer` and `figures.py` currently call
-`process_observation` with **different arguments for the same take** — `assemble_arcs` is
-`True` live and `False` in both others, and `reprocess_saved_layer` passes no
-`floor_profile` at all.
+`process_observation` with **different arguments for the same take** — `assemble_arcs`
+is `layer_index == 1` live and `False` in both others, and `reprocess_saved_layer`
+passes no `floor_profile` at all. (Verified against the code, there are five direct
+callers, not three: `measure.py:866` live measure, `service.py:1051` live-print
+inspection, `service.py:1197` reprocess, `figures.py:830` take figure and
+`figures.py:912` characterization figure — plus `characterize_ring`'s own refined
+pass at `processing.py:1005`. All of them route through the seam.)
 
 This is the whole of the handoff's "`floor_profile` is `None` in production, and the test
 asserts otherwise" mystery (§3 of that document, flagged as the highest-value thing to
@@ -242,8 +277,12 @@ chase). There is no production/test contradiction: **all three archived layer-2 
 carry `offline_reprocess: True`**, so they are reprocess output that overwrote the live
 measurement. The live path did receive its floor.
 
-Introduce one `measure_take(...)` entry point that all three call, taking the substrate
-provider and `assemble_arcs` explicitly. This lands **first**, because without it the
+Introduce one `measure_take(...)` entry point that every caller uses. `assemble_arcs`
+stops being caller-chosen: the seam derives it from the take itself
+(`layer_index == 1`, the isolated-ring case), so the same take gets the same answer on
+every path. Deliberate behaviour change: the live-print layer-1 inspection and the
+layer-1 reprocess/figure paths flip to assembly ON, aligning them with the live
+measure — the divergence was the defect. This lands **first**, because without it the
 offline validation in §5 proves nothing.
 
 ---
@@ -268,11 +307,17 @@ returning a low completeness that reads like a placement fault.
   output across repeated fits** (the RANSAC failure mode, pinned).
 - **Unit**: `compactness_filter` rejects a compact patch and keeps an arc of equal pixel
   count; asserts the fail-open bypass.
-- **Golden**: the eleven archived takes reprocessed, metrics compared against recorded
-  baselines. Layer-1 acceptance: 8/8 valid, completeness ≥ 0.990, radius mean within
-  0.10 mm of 41.0. Layer-2 acceptance: completeness within 0.05 of the archived value —
-  these takes are *expected to remain invalid* (§2.4) and the test pins that, so a future
-  change that "fixes" them is caught as the false positive it would be.
+- **Golden**: the eleven archived takes reprocessed (read-only — the harness must
+  never write into `runs/`), metrics compared against recorded baselines. Layer-1
+  acceptance: 8/8 valid, completeness ≥ 0.990, radius mean within 0.10 mm of 41.0,
+  **radius σ across the eight takes ≤ 0.15 mm** (§2.1 — the σ question is
+  underpowered, so the harness holds the line instead). Layer-2 acceptance:
+  completeness within 0.05 of the archived value — these takes are *expected to
+  remain invalid* (§2.4) and the test pins that, so a future change that "fixes" them
+  is caught as the false positive it would be. The harness lands right after the seam
+  and records the OLD chain's numbers first, so the front-end swap is judged against
+  a baseline the same harness produced. `runs/` is git-ignored: the golden tests skip,
+  loudly, on a machine without the archive.
 - **Contract**: the three call sites of §3.7 return identical results for one take.
 
 Per `~/.claude/memory`, the full suite is too slow to run: use `pytest -k` on the
@@ -288,9 +333,12 @@ extrusion tests plus an import check, and `npm run build` if any frontend touche
 | `tasni/modules/extrusion/processing.py` | remove gate + `deposit_floor_mm`; take a `SubstrateModel`; drop `K`/`dist` |
 | `tasni/modules/extrusion/measure.py` | build the substrate, call the seam |
 | `tasni/modules/extrusion/service.py` | `reprocess_saved_layer` through the seam |
-| `tasni/modules/extrusion/figures.py` | stage renders through the seam |
-| `tasni/core/config.py` | remove 3 fields; add `substrate_sigma_k`, `substrate_floor_clamp_mm`, `deposit_min_length_beads` |
-| `tests/test_extrusion_processing.py`, `tests/test_extrusion_measure.py` | ~9 gate tests replaced |
+| `tasni/modules/extrusion/figures.py` | stage renders through the seam; `_chroma_dist` and the K/dist plumbing die with the gate |
+| `tasni/modules/extrusion/module.py` | remove the measure-layer-N−1-first 409 guard + `allow_missing_floor` (obsolete with `floor_profile`) |
+| `tasni/modules/extrusion/paper_docx.py` | methods text stops describing the chroma gate / constant floor; renders `report["substrate"]` (legacy archives keep their `.get` fallbacks) |
+| `tasni/webui/src/pages/Extrusion.tsx` | drop the client-side previous-layer gate (`tops`-presence checks); keep the `tops` rendering |
+| `tasni/core/config.py` | remove 6 fields (`deposit_min_saturation`, `deposit_min_chroma_fraction`, `deposit_min_height_no_chroma_mm`, `plane_distance_threshold_m`, `deposit_min_height_mm`, `layer_floor_margin_mm`); add `substrate_sigma_k`, `substrate_floor_clamp_mm`, `substrate_fit_radius_mm`, `deposit_min_length_beads`; add `ExtrusionConfig.from_archive` (strips retired keys — `extra="forbid"` otherwise refuses every existing archive) |
+| `tests/test_extrusion_processing.py`, `tests/test_extrusion_measure.py` | ~9 gate tests replaced; the `ring1`/`ring2` fixture READMEs re-scoped |
 
 ---
 
@@ -324,6 +372,14 @@ extrusion tests plus an import check, and `npm run build` if any frontend touche
 - **A deposit that covers most of the ROI.** IRLS assumes the substrate is the majority.
   For a dense raster or a wide print this inverts. Mitigation: the fit region is a
   neighbourhood, not the ROI, and can be widened; `inlier_fraction` is reported.
+- **The 2026-08-29 crash frame is unvalidated.** The offline run used the 2026-08-30
+  archive; the branch-guard fixture
+  (`tests/fixtures/extrusion/ring1/ring1_take04_branchguard_20260829.npz`) — a
+  pre-protocol-2 capture whose board patch sits *raised* 2.9–5.9 mm and welded near
+  the ring's flank — is the hard case for §3.5 and has not been run through the new
+  chain. The implementation plan measures it before pinning, and stops the change if
+  the patch is silently included in a valid measurement (a refusal, by contrast, is
+  an acceptable outcome — the 2026-08-29 ruling stands: the crash was the good one).
 - **Layer N on layer N−1.** With `floor_profile` deleted, a stacked layer is measured
   against the base plane, so its ROI ceiling must accommodate the full stack height.
   §2.4 shows previous-layer referencing made things worse on the only stacked data we
@@ -363,3 +419,26 @@ Recorded because these were the proposed design until the archive said otherwise
    against evidence; building it now would be speculative.
 4. **The radius regression is not a regression** (§2.1, §7). p = 0.109 at n = 8. It was
    about to become the first task in the plan.
+
+---
+
+## 12. What the 2026-08-30 design review added
+
+A second pass verified every code fact against `main` and amended, without changing the
+direction:
+
+1. **The σ claim was over-stated as settled** — reframed as underpowered at n = 8, and
+   the golden harness now pins radius σ ≤ 0.15 mm so the question stays measured (§2.1,
+   §5).
+2. **The `floor_profile` deletion was under-scoped** — its consumers reach
+   `ring_geometry`, `Session.floor_profile`, the `module.py` 409 guard +
+   `allow_missing_floor`, `layer_floor_margin_mm` and the web UI's client-side gate;
+   `Session.tops` recording deliberately survives (§3.6, §6).
+3. **The clamp had no stated defaults** — now `[1.0, 2.0]` mm, with the reasoning (§3.4).
+4. **§3.3's and §3.4's σ ranges do not exactly coincide** — attributed to their
+   different frame sets; the golden baselines are the authoritative per-take record
+   (§3.4).
+5. **Two facts the implementation would have tripped over**: there are five
+   `process_observation` callers plus `characterize_ring`'s internal pass, not three
+   (§3.7); and `ExtrusionConfig` is `extra="forbid"`, so field retirement without a
+   `from_archive` key-stripper breaks every archived take's reprocess (§3.6, §6).
