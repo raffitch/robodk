@@ -168,7 +168,8 @@ class FakeRdk:
 
 
 class FakeCamera:
-    def __init__(self): self.grabs = 0; self.depth_grabs = 0; self.witness_grabs = 0
+    def __init__(self):
+        self.grabs = 0; self.depth_grabs = 0; self.witness_grabs = 0; self.streams = 0
     def grab(self, **kwargs):
         self.grabs += 1
         # Colour-only grabs are the flange-camera motion witness taken either side
@@ -182,6 +183,11 @@ class FakeCamera:
         return Frame(color=np.zeros((16, 16, 3), np.uint8),
                      depth=np.full((16, 16), 500, np.uint16), timestamp=1.0,
                      geometry=gf.aligned(syn.K_720P, (16, 16)))
+    def stream(self, **kwargs):
+        self.streams += 1
+        camera = self
+        return nullcontext(SimpleNamespace(
+            read=lambda **read_kwargs: camera.grab(**read_kwargs)))
 
 
 def plan(*, layers=2, correction=True, auto_inspection=False):

@@ -114,7 +114,10 @@ correctness traps (deposit-band colour range; FITTED not averaged nominal centre
 captures **five consecutive RGB-D frames at the stationary inspection pose** and
 processes their per-pixel nonzero depth median; the five raw depth frames are archived
 as `depth-frames.npy`, the fused observation remains `depth.npy`, and the full burst
-time is reported as `capture_ms`. Layer 1 now uses the same guarded ring-arc assembly as
+time is reported as `capture_ms`. The burst uses one held-open stream; changing greeting
+telemetry such as device temperature is not mistaken for changed camera geometry, while
+resolution, depth scale, intrinsics and extrinsics remain guarded. Layer 1 now uses the
+same guarded ring-arc assembly as
 Characterize (only layer 1: there is no lower ring to fuse into it). Session
 `20260830-190622-925d7178` measured each trip in 7.6–8.6 s but then held the arm at the
 inspection pose for 90–108 s of Matplotlib work per take; figures are now on-demand.
@@ -123,6 +126,17 @@ returns home and stops the remaining trips. Median replay of the five old single
 still reaches only 68.5 % completeness, so this is an evidence-backed improvement,
 **not yet a cell proof that a single top view can measure this thin reflective ring**.
 Restart the backend before the next take and check `/api/health` → `build.stale: false`.
+
+**2026-08-30 19:56 session:** all four characterizations in
+`20260830-195630-925d7178` correctly failed the shape gate although RGB shows a complete
+pale ring on the green cutting mat. Offline replay measured 31–33 % maximum angular
+coverage in each of the five raw depth frames, 30.6 % in their median and 30.6 % in a
+closest-of-five composite: fusion did not discard a recoverable ring. Disabling the
+legacy saturation gate raised the best candidate to only 56.9 % while admitting 883,087
+background depth points, so removing the gate is not a safe fix. Measured conclusion:
+the current colour/depth selection does not support this pale-ring/green-mat combination;
+the 70 % completeness gate must remain. A replacement colour model needs evidence from
+these archived frames, not a relaxed shape threshold.
 
 > **Picking this up? Read [docs/live-print-next-session.md](docs/live-print-next-session.md)**
 > — the continuation handoff: current state, the full decision tree for each bisect

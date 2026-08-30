@@ -333,6 +333,37 @@ def _nonzero_median_depth(depth_frames) -> np.ndarray:
     return np.rint(np.nan_to_num(fused, nan=0.0)).astype(stack.dtype)
 
 
+def _same_reconstruction_geometry(first, candidate) -> bool:
+    """Whether two greetings describe the same depth-to-colour reconstruction.
+
+    A protocol-2 greeting also carries live device temperature and achieved
+    settings. Those are provenance, not geometry, and can legitimately change
+    between connections. Comparing ``to_dict()`` therefore produced intermittent
+    false failures during fusion. Keep the guard on only the values that can move
+    a reconstructed point or change the frame layout.
+    """
+    if first is None or candidate is None:
+        return first is candidate
+    scalars_match = (
+        first.protocol == candidate.protocol
+        and first.legacy == candidate.legacy
+        and first.depth_size == candidate.depth_size
+        and first.color_size == candidate.color_size
+        and np.isclose(first.depth_unit_mm, candidate.depth_unit_mm, rtol=0, atol=1e-12)
+    )
+    def same_array(a, b) -> bool:
+        left, right = np.asarray(a), np.asarray(b)
+        return left.shape == right.shape and np.allclose(left, right, rtol=0, atol=1e-10)
+
+    arrays_match = all(same_array(a, b) for a, b in (
+        (first.depth_K, candidate.depth_K),
+        (first.depth_dist, candidate.depth_dist),
+        (first.color_K_factory, candidate.color_K_factory),
+        (first.T_color_depth, candidate.T_color_depth),
+    ))
+    return bool(scalars_match and arrays_match)
+
+
 def _capture_at_pose(services, ctx: JobContext, T_work_camera) -> dict:
     """Grab and median-fuse validated RGB-D frames at one stationary pose."""
     ecfg = services.config.extrusion
@@ -343,50 +374,54 @@ def _capture_at_pose(services, ctx: JobContext, T_work_camera) -> dict:
     retries, frozen = 0, False
     previous = None
     check = None
-    while len(frames) < wanted:
-        ctx.check_cancel()
-        frame = services.camera.grab(with_depth=True, timeout=ecfg.grab_timeout_s)
-        if frame.depth is None:
-            raise RuntimeError("RGB-D capture returned no depth")
-        # Checked before any depth word is interpreted as millimetres: a missing
-        # greeting on a 0.1 mm-unit frame would otherwise look ten times too far.
-        if frame.geometry is None:
-            raise RuntimeError("depth frame arrived without a protocol-2 greeting")
-        if frames:
-            first = frames[0]
-            if (frame.depth.shape != first.depth.shape
-                    or frame.color.shape != first.color.shape
-                    or frame.geometry.to_dict() != first.geometry.to_dict()):
-                raise RuntimeError("camera geometry changed inside one depth-fusion burst")
-        candidate = depth_plane_check(frame.depth, T_work_camera, ecfg,
-                                      unit_mm=frame.geometry.depth_unit_mm)
-        if not candidate["agrees"]:
-            if previous is not None and np.array_equal(previous, frame.depth):
-                frozen = True
+    # One connection means one protocol greeting and no TCP handshake/slow-start
+    # per frame. It also makes the five samples a genuinely consecutive burst.
+    with services.camera.stream(timeout=ecfg.grab_timeout_s) as stream:
+        while len(frames) < wanted:
+            ctx.check_cancel()
+            frame = stream.read(with_depth=True)
+            if frame.depth is None:
+                raise RuntimeError("RGB-D capture returned no depth")
+            # Checked before any depth word is interpreted as millimetres: a missing
+            # greeting on a 0.1 mm-unit frame would otherwise look ten times too far.
+            if frame.geometry is None:
+                raise RuntimeError("depth frame arrived without a protocol-2 greeting")
+            if frames:
+                first = frames[0]
+                if (frame.depth.shape != first.depth.shape
+                        or frame.color.shape != first.color.shape
+                        or not _same_reconstruction_geometry(first.geometry, frame.geometry)):
+                    raise RuntimeError(
+                        "camera reconstruction geometry changed inside one depth-fusion burst")
+            candidate = depth_plane_check(frame.depth, T_work_camera, ecfg,
+                                          unit_mm=frame.geometry.depth_unit_mm)
+            if not candidate["agrees"]:
+                if previous is not None and np.array_equal(previous, frame.depth):
+                    frozen = True
+                previous = frame.depth
+                if retries >= attempts:
+                    check = candidate
+                    detail = (
+                        "every grab returned a byte-identical depth buffer, so the camera's "
+                        "depth stream is FROZEN - restart it with `py -3.10 "
+                        "tools/jetson_deploy.py restart`, then measure again."
+                        if frozen else
+                        "the depth is changing but does not match this pose. Check that the "
+                        "work frame still sits on the physical surface.")
+                    raise RuntimeError(
+                        f"the depth frame does not describe this pose: median depth "
+                        f"{check['observed_depth_mm']:.0f} mm with the camera "
+                        f"{check['camera_z_mm']:.0f} mm above the work plane (expected "
+                        f"{check['accepted_range_mm'][0]:.0f}-"
+                        f"{check['accepted_range_mm'][1]:.0f} mm), after {retries} retry(s). "
+                        + detail)
+                retries += 1
+                ctx.log(f"depth said {candidate['observed_depth_mm']:.0f} mm with the camera "
+                        f"{candidate['camera_z_mm']:.0f} mm above the work plane - discarding "
+                        f"it and grabbing again ({retries}/{attempts})")
+                continue
+            frames.append(frame)
             previous = frame.depth
-            if retries >= attempts:
-                check = candidate
-                detail = (
-                    "every grab returned a byte-identical depth buffer, so the camera's depth "
-                    "stream is FROZEN - restart it with `py -3.10 "
-                    "tools/jetson_deploy.py restart`, then measure again."
-                    if frozen else
-                    "the depth is changing but does not match this pose. Check that the work "
-                    "frame still sits on the physical surface.")
-                raise RuntimeError(
-                    f"the depth frame does not describe this pose: median depth "
-                    f"{check['observed_depth_mm']:.0f} mm with the camera "
-                    f"{check['camera_z_mm']:.0f} mm above the work plane (expected "
-                    f"{check['accepted_range_mm'][0]:.0f}-"
-                    f"{check['accepted_range_mm'][1]:.0f} mm), after {retries} retry(s). "
-                    + detail)
-            retries += 1
-            ctx.log(f"depth said {candidate['observed_depth_mm']:.0f} mm with the camera "
-                    f"{candidate['camera_z_mm']:.0f} mm above the work plane - discarding it "
-                    f"and grabbing again ({retries}/{attempts})")
-            continue
-        frames.append(frame)
-        previous = frame.depth
 
     raw_depths = np.stack([np.asarray(item.depth) for item in frames])
     fused_depth = _nonzero_median_depth(raw_depths)

@@ -1003,6 +1003,22 @@ def test_nonzero_depth_median_does_not_turn_missing_pixels_into_near_surfaces():
         [0, 110, 110], [210, 110, 110]]
 
 
+def test_fusion_geometry_ignores_live_telemetry_but_not_calibration_changes():
+    """Temperature is not geometry; an intrinsics change still stops fusion."""
+    from dataclasses import replace
+    from tasni.modules.extrusion.measure import _same_reconstruction_geometry
+
+    first = gf.aligned(syn.K_720P, (16, 16))
+    changed_telemetry = replace(
+        first, temps={"projector_c": 48.2},
+        raw={**first.raw, "temps": {"projector_c": 48.2}})
+    changed_intrinsics = replace(first, depth_K=first.depth_K.copy())
+    changed_intrinsics.depth_K[0, 0] += 1.0
+
+    assert _same_reconstruction_geometry(first, changed_telemetry) is True
+    assert _same_reconstruction_geometry(first, changed_intrinsics) is False
+
+
 def test_measure_fuses_five_top_frames_and_archives_the_raw_burst(tmp_path, monkeypatch):
     svc, rdk, camera = measure_env(tmp_path, monkeypatch)
     svc.config.extrusion.measure_depth_fusion_frames = 5
@@ -1017,6 +1033,7 @@ def test_measure_fuses_five_top_frames_and_archives_the_raw_burst(tmp_path, monk
     manifest = json.loads((layer / "manifest.json").read_text())
     fusion = manifest["provenance"]["depth_fusion"]
     assert camera.grabs == 6                         # readiness + five-frame burst
+    assert camera.streams == 1                       # one greeting/connection for the burst
     assert raw.shape == (5, 16, 16)
     assert fusion["captured_frames"] == 5
     assert fusion["method"] == "per-pixel nonzero median"
@@ -2457,6 +2474,13 @@ class StaleThenFreshCamera:
         return Frame(color=np.zeros((16, 16, 3), np.uint8),
                      depth=np.full((16, 16), value, np.uint16), timestamp=1.0,
                      geometry=gf.aligned(syn.K_720P, (16, 16)))
+
+    def stream(self, **kwargs):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        camera = self
+        return nullcontext(SimpleNamespace(
+            read=lambda **read_kwargs: camera.grab(**read_kwargs)))
 
 
 def test_a_depth_frame_from_the_wrong_pose_is_grabbed_again(tmp_path, monkeypatch):
