@@ -113,13 +113,24 @@ correctness traps (deposit-band colour range; FITTED not averaged nominal centre
 > — the continuation handoff: current state, the full decision tree for each bisect
 > outcome, where the code is, and the fallback options with their real costs.
 
-**2026-08-29 — multi-view inspection + side photo: DESIGNED, not built.** The mock rings are
-thin and one top-down frame under-samples them, so the operator wants (as optional toggles,
-default OFF) a top + three 20°-tilted views at 120° azimuths merged into one registered
-work-frame cloud, and a separately-timed near-horizontal RGB side photo per ring for the
-paper. Spec: `docs/superpowers/specs/2026-08-29-multiview-inspection-design.md` (poses,
-levelling + centre registration, archive layout, reprocess `top_only`, capture-mode timing
-groups, the on-cell A/B in §8, ten implementation tasks). Next step: `writing-plans` from it.
+**2026-08-30 — multi-view inspection: DESIGNED (revamped), not built.** The mock rings are
+thin and one top-down frame under-samples them, so the operator wants — as an optional
+toggle, default OFF — a top view plus three **15°**-tilted views at 120° azimuths merged
+into one work-frame cloud. Spec:
+`docs/superpowers/specs/2026-08-30-multiview-inspection-design.md`; plan:
+`docs/superpowers/plans/2026-08-30-multiview-inspection.md`. This **supersedes** the
+2026-08-29 pair (`a1cafa0` / `c31c720`), retired because protocol 2 removed the ≈2 % scale
+mismatch their registration existed to correct, the voxel moved 2 mm → 1 mm, and the side
+photo half **shipped** meanwhile with taught targets.
+
+Three things to know before touching it. (1) **Do not start before the PFH paper's cell run
+is done** — it edits the shared capture path and redefines `acquisition_to_path_ms`.
+(2) `measure.py:203 depth_plane_check` assumes a straight-down view and **rejects tilted
+frames above ~18° at 300 mm, lower at longer standoffs**; the fix reads the incidence off
+`T_work_camera` (`cos = -T[2,2]`) so tilt 0 reduces exactly. (3) **ChArUco is out of scope
+by operator decision** — it belongs to hand-eye calibration only; registration is
+ring-first (level on the surface annulus, then a gauge-fixed joint solve against one
+shared circle).
 
 **2026-08-29 — detection error is PAIRED.** A top ring "placed true" by eye sits 1–3 mm
 from the plan centre before anything is introduced, so scoring a shift against the plan

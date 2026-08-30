@@ -371,13 +371,18 @@ Constraints and expectations:
 - Discard every `runs/extrusion/20260828-*-f088cf48` trial: those predate the ring
   selector fix and measure an empty board. Keep their raw frames as evidence only.
 
-## 4b. Designed, not yet built: multi-view capture + side photo
+## 4b. Designed, not yet built: multi-view capture
 
 For the thin mock rings the operator wants the top view plus three tilted views merged
-into one registered cloud, and a side RGB photo per ring for the paper — both optional
-toggles, default OFF, so nothing above changes until they are switched on. Design and the
-on-cell A/B that decides whether merged takes go in the paper:
-`docs/superpowers/specs/2026-08-29-multiview-inspection-design.md`.
+into one cloud, as an optional toggle defaulting OFF, so nothing above changes until it
+is switched on. Design and the on-cell A/B that decides whether merged takes go in the
+paper: `docs/superpowers/specs/2026-08-30-multiview-inspection-design.md`.
+
+**Do not start it before this paper's cell run is finished.** It edits the shared capture
+path and it redefines `acquisition_to_path_ms`, which is number #3 in the table above.
+
+(The side photo half of that old design is **already built** — taught `SideCapture` /
+`TowardsSideCapture` targets, on by default, `measure.py:443 capture_side_photo`.)
 
 ## 5. Known-good numbers you can already cite
 
