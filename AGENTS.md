@@ -113,24 +113,31 @@ correctness traps (deposit-band colour range; FITTED not averaged nominal centre
 > — the continuation handoff: current state, the full decision tree for each bisect
 > outcome, where the code is, and the fallback options with their real costs.
 
-**2026-08-30 — multi-view inspection: DESIGNED (revamped), not built.** The mock rings are
-thin and one top-down frame under-samples them, so the operator wants — as an optional
-toggle, default OFF — a top view plus three **15°**-tilted views at 120° azimuths merged
-into one work-frame cloud. Spec:
+**2026-08-30 — multi-view inspection: BUILT, opt-in, default OFF, awaiting the on-cell
+A/B.** The mock rings are thin and one top-down frame under-samples them, so — as an
+optional toggle, default OFF — a top view plus three **15°**-tilted views at 120°
+azimuths are captured, levelled, registered against one shared circle and merged
+into one work-frame cloud the unchanged downstream chain processes. Two independent
+checkboxes on the measure card (multi-view, side photo — neither implies the other);
+`multiview: bool | None` on both `MeasureLayerBody` and `CharacterizeBody`
+(`None` = follow config). `RingCharacterizeJob` accepts `multiview` for API symmetry
+but its capture path is not wired to the star — a known, disclosed gap — so the UI
+withholds the toggle there. Spec:
 `docs/superpowers/specs/2026-08-30-multiview-inspection-design.md`; plan:
-`docs/superpowers/plans/2026-08-30-multiview-inspection.md`. This **supersedes** the
+`docs/superpowers/plans/2026-08-30-multiview-inspection.md`; module reference and the
+cell A/B protocol: `docs/extrusion-current-handoff.md`. This **supersedes** the
 2026-08-29 pair (`a1cafa0` / `c31c720`), retired because protocol 2 removed the ≈2 % scale
 mismatch their registration existed to correct, the voxel moved 2 mm → 1 mm, and the side
 photo half **shipped** meanwhile with taught targets.
 
-Three things to know before touching it. (1) **Do not start before the PFH paper's cell run
-is done** — it edits the shared capture path and redefines `acquisition_to_path_ms`.
-(2) `measure.py:203 depth_plane_check` assumes a straight-down view and **rejects tilted
-frames above ~18° at 300 mm, lower at longer standoffs**; the fix reads the incidence off
-`T_work_camera` (`cos = -T[2,2]`) so tilt 0 reduces exactly. (3) **ChArUco is out of scope
-by operator decision** — it belongs to hand-eye calibration only; registration is
-ring-first (level on the surface annulus, then a gauge-fixed joint solve against one
-shared circle).
+Three things to know. (1) **The code is built but the on-cell A/B has not run — do not
+start it before the PFH paper's own cell run is done.** It edits the shared capture path
+and redefines `acquisition_to_path_ms`, the paper's number #3. (2) `depth_plane_check`
+used to assume a straight-down view and reject tilted frames above ~18° at 300 mm (lower
+at longer standoffs); that is now fixed — it reads the incidence off the pose
+(`cos = -T[2,2]`), so tilt 0 reduces exactly. (3) **ChArUco is out of scope by operator
+decision** — it belongs to hand-eye calibration only; registration is ring-first (level
+on the surface annulus, then a gauge-fixed joint solve against one shared circle).
 
 **2026-08-29 — detection error is PAIRED.** A top ring "placed true" by eye sits 1–3 mm
 from the plan centre before anything is introduced, so scoring a shift against the plan

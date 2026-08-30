@@ -165,6 +165,13 @@ you drive the real cell, not an empty station). Run it on Windows with
   is the task page (deadline 1 Sep 2026). **Paper figures** (`modules/extrusion/figures.py`): plan view,
   bird's-eye height map, oblique and unrolled profile per take + a per-trial stack, all
   rendered from the archive with no robot — `pip install -e .[figures]`.
+  **Multi-view ring capture (built 2026-08-30, opt-in, default OFF):** top view + three
+  15°-tilted views at 120° azimuths, levelled and registered against one shared circle,
+  merged into one work-frame cloud for the unchanged downstream chain; two independent
+  measure-card toggles (multi-view, side photo). Do not run its on-cell A/B before the
+  paper's own cell run finishes — see
+  [docs/extrusion-current-handoff.md](docs/extrusion-current-handoff.md) for the protocol
+  and decision rule.
 - Then integrate the rest into the same app: scan (with **TSDF fusion** — biggest quality
   win), ArUco-to-plane, target generation. The RealSense options + filter chain live in
   `server/server_unicast_syncronous.py` (device runs a Custom preset, NOT High Accuracy;

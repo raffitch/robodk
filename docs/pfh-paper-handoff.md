@@ -371,18 +371,33 @@ Constraints and expectations:
 - Discard every `runs/extrusion/20260828-*-f088cf48` trial: those predate the ring
   selector fix and measure an empty board. Keep their raw frames as evidence only.
 
-## 4b. Designed, not yet built: multi-view capture
+## 4b. Built, opt-in, default OFF: multi-view capture — its own A/B still to run
 
-For the thin mock rings the operator wants the top view plus three tilted views merged
-into one cloud, as an optional toggle defaulting OFF, so nothing above changes until it
-is switched on. Design and the on-cell A/B that decides whether merged takes go in the
-paper: `docs/superpowers/specs/2026-08-30-multiview-inspection-design.md`.
+For the thin mock rings, the top view plus three 15°-tilted views at 120° azimuths are
+now captured, levelled, registered against one shared circle and merged into one
+work-frame cloud — an optional toggle defaulting OFF (`extrusion.multiview_enabled`,
+plus a per-request `multiview: bool | None` on the measure and characterize request
+bodies), so nothing above changes until it is switched on. Two independent checkboxes
+on the measure card (multi-view, side photo) let either, both or neither be exercised
+per take. Module reference: `docs/extrusion-current-handoff.md` ("Multi-view ring
+inspection"); design: `docs/superpowers/specs/2026-08-30-multiview-inspection-design.md`.
+
+**The on-cell A/B that decides whether merged takes go in the paper has not run yet.**
+It is its own protocol, separate from everything above: one ring, multi-view ON,
+`repeats = 3` at tilt 10 then 15 then 20 (nine takes, one placement), then every take
+reprocessed both ways (`views="as_archived"` / `views="top_only"`) offline with
+`py -3.10 tools/multiview_ab.py <trial_id>`. Full protocol, decision rule and traps
+(the 1 mm voxel count trap; read `after_work_roi`, not `after_voxel`) are in
+`docs/extrusion-current-handoff.md` §"The cell A/B that decides whether merged takes
+go in the paper".
 
 **Do not start it before this paper's cell run is finished.** It edits the shared capture
-path and it redefines `acquisition_to_path_ms`, which is number #3 in the table above.
+path and it redefines `acquisition_to_path_ms`, which is number #3 in the table above —
+running it early would change what that number means for every take captured after.
 
-(The side photo half of that old design is **already built** — taught `SideCapture` /
-`TowardsSideCapture` targets, on by default, `measure.py:443 capture_side_photo`.)
+(The side photo half of the original combined design is a separate, **already built**
+feature — taught `SideCapture` / `TowardsSideCapture` targets, on by default,
+`measure.py:capture_side_photo` — unaffected by multi-view either way.)
 
 ## 5. Known-good numbers you can already cite
 

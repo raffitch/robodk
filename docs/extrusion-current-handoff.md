@@ -428,6 +428,109 @@ The first real depth capture and its transforms are stored (npz-compressed) in
 corrected metrics above. Colour is intentionally omitted because this selector is
 geometric and must not depend on material colour.
 
+## Multi-view ring inspection — opt-in, default OFF (built 2026-08-30)
+
+Design: `docs/superpowers/specs/2026-08-30-multiview-inspection-design.md`; plan:
+`docs/superpowers/plans/2026-08-30-multiview-inspection.md`. Supersedes the
+2026-08-29 pair (`a1cafa0` / `c31c720`), retired because protocol 2 removed the
+scale mismatch their registration existed to correct.
+
+For a thin mock ring, one top-down RGB-D frame under-samples the wall. Multi-view
+captures the top view plus three **15°**-tilted views at 120° azimuths (a "Mercedes
+star"), levels each against the surrounding surface annulus, registers all four
+against one shared circle (gauge-fixed joint solve — no ICP, no ChArUco), and merges
+them into a single work-frame cloud that the unchanged downstream chain (ROI →
+deposit → crest → skeleton → spline) processes exactly as it processes a single-view
+take.
+
+- **Opt-in, off by default.** `extrusion.multiview_enabled` (config) plus a
+  per-request `multiview: bool | None` on `MeasureLayerBody` and `CharacterizeBody`
+  (`tasni/modules/extrusion/module.py`) — `None` follows the config default. Every
+  number already in the PFH archive came from the single-view chain, and
+  `multiview=False` is proven to reduce to exactly that path.
+- **Two independent toggles on the measure card** (`Extrusion.tsx`): multi-view
+  capture (unchecked by default) and side photo (checked by default, an unrelated,
+  pre-existing feature). Either, both, or neither — nothing disables or implies the
+  other.
+- **`RingCharacterizeJob` accepts `multiview` for API symmetry but does not act on
+  it** — a known, disclosed gap: characterize's capture path does not reach the
+  observation_points/process_points seam the star capture merges at. The UI
+  withholds the toggle from the "Characterize ring 1" step for exactly this reason;
+  do not expect enabling it there to change behaviour.
+- **A view that cannot be reached, cannot see enough ring, or whose colour gate
+  abstains is dropped, logged, and the take still completes** on the views that
+  remain; if only the top view survives, the result is exactly today's single-view
+  result.
+- **The arrival gate reads incidence off the pose.** `depth_plane_check`
+  (`measure.py`) used to assume a straight-down view and reject tilted frames above
+  roughly 18° at a 300 mm standoff (lower at longer standoffs); it now computes
+  `cos = -T[2,2]` from the actual camera pose, so tilt 0 reduces to the old check
+  exactly.
+- **ChArUco is out of scope by operator decision.** It belongs to hand-eye
+  calibration only, and the board will not always be under the rings; registration
+  is ring-first.
+- **Offline A/B tool:** `py -3.10 tools/multiview_ab.py <trial_id>` reprocesses every
+  archived star take (any take with a `layer-*/views/` directory) both ways —
+  `views="as_archived"` (the merged star) and `views="top_only"` (the identical
+  physical capture, top view only) — from the raw RGB-D already on disk, no robot
+  time. It prints bead/height/completeness/gap for both reconstructions plus the
+  pre- and post-correction inter-view residual (`capture.spread_before_mm` /
+  `capture.residual_after_mm`) and the centre spread across repeats
+  (`measure.py:centre_spread`).
+
+### The cell A/B that decides whether merged takes go in the paper (spec §10)
+
+**Do not start this before the PFH paper's own single-view cell run is finished.**
+Multi-view edits the shared capture path and redefines `acquisition_to_path_ms`,
+which is the paper's number #3 (`docs/pfh-paper-handoff.md`) — running it early would
+silently change what that number means for every take captured afterward.
+
+Protocol:
+
+1. Place **one ring**. Do not move it for the whole protocol.
+2. Measure with multi-view **ON**, `repeats = 3`, at `multiview_tilt_deg` = 10, then
+   15, then 20 — nine takes total, one ring placement, no re-placement between them.
+   `multiview_tilt_deg` (`ExtrusionConfig`) is a startup config value with no
+   per-request override — there is no tilt field on `MeasureLayerBody`. Change it in
+   `tasni.config.json`'s `extrusion` block and **restart the Tasni backend**
+   (`GET /api/health` → `build.stale == false`) between each of the three tilt
+   conditions.
+3. Reprocess every take **both ways** with `py -3.10 tools/multiview_ab.py <trial_id>`
+   (`views="as_archived"` and `views="top_only"`) — this is the paired comparison and
+   needs no further cell time. Every star take is its own paired control.
+
+Read, in this order: did the profile improve (bead width spread, crest height range,
+in `geometry`)? Did coverage improve (completeness, max angular gap, in `metrics`)?
+Was the merge trustworthy (pre-correction inter-view spread vs post-correction
+residual)? Did repeatability improve (centre spread across the 3 repeats)? Which
+tilt wins, across 10/15/20°?
+
+**The count trap, stated loudly.** The chain voxel-downsamples at **1 mm**
+(`_deposit_clusters`, `ExtrusionConfig.voxel_size_m = 0.001`). Merging four views
+does **not** multiply the surviving point count — it multiplies the samples each
+voxel averages and fills dropouts. Reading `after_voxel` and concluding "no gain" is
+reading the wrong number; **the pre-voxel `counts["after_work_roi"]` is the one that
+moves**, together with validity, completeness and the profile metrics above. Anyone
+who reads `after_voxel` and concludes "no gain" would wrongly kill a feature that is
+actually working.
+
+**The decision:**
+
+- Profile metrics improve **and** the post-correction residual is below the cell's
+  own hand-eye floor (**1.26 mm** board consistency) → merged takes may go in the
+  paper, with the residual reported alongside them, and the tilt that won becomes
+  the default.
+- Profile improves but the residual is at or above that floor → report the
+  improvement as **qualitative** (a better-sampled cross-section), do **not** claim
+  improved accuracy, and keep the default OFF.
+- No improvement → keep it OFF, keep the code (it is opt-in and costs nothing
+  switched off), and **write the negative result down**. A measured negative result
+  about view geometry is worth having.
+
+**The error floor still binds.** Hand-eye verdict `borderline`, board consistency
+1.26 mm, work-plane RMS 1.39 mm. Multi-view does not lower it, and nothing here may
+claim sub-millimetre accuracy on top of it.
+
 ## Exact operator retry sequence
 
 1. Refresh the Cylinder Test page and connect/refresh the RoboDK station.
