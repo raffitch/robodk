@@ -86,6 +86,10 @@ class MeasureLayerBody(FingerprintBody):
     # SideCapture / TowardsSideCapture targets. None = follow the configured
     # default (on); pass false to skip it for a take that does not need one.
     side_photo: bool | None = None
+    # Capture the ring from the top view plus three tilted views merged into one
+    # cloud. None = follow the configured default (off). Independent of
+    # side_photo: either, both or neither.
+    multiview: bool | None = None
     # Escape hatch for a layer whose floor can never be measured (every take of
     # the layer below failed). Deliberately not in the UI: the floor is
     # load-bearing, and skipping it silently would produce a number the paper
@@ -99,6 +103,10 @@ class CharacterizeBody(BaseModel):
     confirm_robot_motion: bool = False
     confirm_close_range_tool_clear: bool = False
     collision_check_enabled: bool = False
+    # Capture the ring from the top view plus three tilted views merged into one
+    # cloud. None = follow the configured default (off). Independent of
+    # side_photo: either, both or neither.
+    multiview: bool | None = None
 
 
 class SurfaceCenterBody(BaseModel):
@@ -694,7 +702,8 @@ class ExtrusionModule(WorkflowModule):
             self._active_measure_job = RingCharacterizeJob(
                 services, self._plan, session,
                 check_collisions=body.collision_check_enabled,
-                close_range_tool_clear=body.confirm_close_range_tool_clear)
+                close_range_tool_clear=body.confirm_close_range_tool_clear,
+                multiview=body.multiview)
             try:
                 services.jobs.start(self._active_measure_job, name="extrusion-characterize")
             except JobBusy as exc:
@@ -769,7 +778,7 @@ class ExtrusionModule(WorkflowModule):
                 annotation=body.annotation, check_collisions=body.collision_check_enabled,
                 close_range_tool_clear=body.confirm_close_range_tool_clear,
                 repeats=body.repeats, excursions=body.excursions,
-                side_photo=body.side_photo)
+                side_photo=body.side_photo, multiview=body.multiview)
             try:
                 services.jobs.start(self._active_measure_job, name="extrusion-measure")
             except JobBusy as exc:

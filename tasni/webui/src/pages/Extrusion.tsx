@@ -156,6 +156,10 @@ interface RunStep {
   moves?: boolean;
   offsetInput?: boolean;
   axisAck?: boolean;
+  /** This step's press calls /measure/layer, so the capture toggles apply to it.
+   *  False for "ring1" (characterize — multiview is accepted there but not yet
+   *  wired to the star capture, so the toggle must not appear on it). */
+  capture?: boolean;
 }
 
 /** The archive's own naming: take 1 keeps the historical name, repeats get a suffix. */
@@ -436,6 +440,13 @@ export default function Extrusion() {
     if (!guideOpen && dialog.open) dialog.close();
   }, [guideOpen]);
   const [confirmMotion, setConfirmMotion] = useState(false);
+  // Independent of each other and of everything else on the run: merged-with-
+  // no-photo, single-view-with-photo, both, neither — all reachable. Defaults
+  // mirror the config the job falls back to when a request omits the field
+  // (multiview off, side photo on), so leaving these untouched behaves exactly
+  // like the pre-toggle backend default.
+  const [multiview, setMultiview] = useState(false);
+  const [sidePhoto, setSidePhoto] = useState(true);
   const [paper, setPaper] = useState<string | null>(null);
   const [openTake, setOpenTake] = useState<string | null>(null);
   const [showStack, setShowStack] = useState(false);
@@ -793,6 +804,7 @@ export default function Extrusion() {
                       phase: takePhase || undefined, note: measureNote },
         confirm_robot_motion: confirmMotion,
         collision_check_enabled: false, repeats, excursions,
+        side_photo: sidePhoto, multiview,
       });
       // Echo the ground truth back: it is the number every detection-error
       // figure is measured against, and nothing else on screen repeats it.
@@ -1039,7 +1051,7 @@ export default function Extrusion() {
       button: `Measure ${owed} frame${owed === 1 ? "" : "s"} — one trip, arm parked`,
       records: annotationLabel(over.layer, over.phase, offset),
       onRun: () => measure({ layer: over.layer, phase: over.phase, offset, repeats: owed }),
-      moves: true, disabled: stalled, blocked: motionBlocked,
+      moves: true, disabled: stalled, blocked: motionBlocked, capture: true,
     });
   };
   /** The top ring, PLACED off-centre: the controlled error the paper shows. */
@@ -1070,7 +1082,7 @@ export default function Extrusion() {
       onRun: () => measure(needsAxis
         ? { layer, phase: "axis check", offset: [0, 0] }
         : { layer, phase: "top ring shifted", offset: offsetVector, repeats: owed }),
-      moves: true, disabled: stalled, blocked: motionBlocked,
+      moves: true, disabled: stalled, blocked: motionBlocked, capture: true,
       offsetInput: !needsAxis, axisAck: true,
       note: "This ring arrives already displaced, so it has no undisplaced take of its own "
         + `to be scored against. It is paired against the measured centre of ring ${layer - 1} `
@@ -1128,7 +1140,7 @@ export default function Extrusion() {
       records: annotationLabel(1, "noise floor", [0, 0]),
       onRun: () => measure({ layer: 1, phase: "noise floor", offset: [0, 0],
                              excursions: Math.max(1, NOISE_TRIPS - noiseTakes) }),
-      moves: true, disabled: stalled, blocked: motionBlocked,
+      moves: true, disabled: stalled, blocked: motionBlocked, capture: true,
       note: "The only step that re-approaches the ring for every take, so it is the only one "
         + "whose spread contains the robot as well as the camera. Every later condition is "
         + "measured with the arm parked and read against this. A trip that fails keeps the "
@@ -1142,7 +1154,7 @@ export default function Extrusion() {
       button: `Measure take ${Math.min(replacedTakes + 1, REPEATS)} of ${REPEATS}`,
       records: annotationLabel(1, "re-placed", [0, 0]),
       onRun: () => measure({ layer: 1, phase: "re-placed", offset: [0, 0] }),
-      moves: true, disabled: stalled, blocked: motionBlocked,
+      moves: true, disabled: stalled, blocked: motionBlocked, capture: true,
       note: "How repeatably a hand places a ring — separate from how well the chain sees it.",
     }),
     parkedStep({
@@ -1484,6 +1496,22 @@ export default function Extrusion() {
 
         {active.records && <p className="records"><span className="k">Records</span>
           <b>{active.records}</b></p>}
+
+        {/* Independent of each other: neither disables nor implies the other, so
+            merged-with-no-photo, single-view-with-photo, both and neither all stay
+            reachable. Only shown on steps that actually call /measure/layer —
+            "Characterize ring 1" accepts multiview for API symmetry but does not
+            yet wire it to a star capture, so the toggle would promise nothing there. */}
+        {active.capture && <div className="step-go capture-toggles">
+          <label className="go-confirm">
+            <input type="checkbox" checked={multiview}
+                   onChange={(e) => setMultiview(e.target.checked)} />
+            Multi-view capture — 4 trips instead of 1 (~15 s of arm time)</label>
+          <label className="go-confirm">
+            <input type="checkbox" checked={sidePhoto}
+                   onChange={(e) => setSidePhoto(e.target.checked)} />
+            Side photo — one extra excursion after the capture</label>
+        </div>}
 
         <div className="step-go">
           {active.moves && <label className="go-confirm">
