@@ -54,3 +54,53 @@ def test_old_manifest_without_capture_still_validates(tmp_path):
                       toolpath_fingerprint="abc")
     assert m.capture is None
     assert LayerManifest.model_validate_json(m.model_dump_json()).capture is None
+
+
+from tasni.modules.extrusion.inspection import (pose_from_aim,  # noqa: E402
+                                                star_view_angles,
+                                                star_view_candidates)
+
+
+def test_star_angles_are_top_first_then_the_configured_azimuths():
+    names = star_view_angles(ExtrusionConfig())
+    assert names[0] == ("top", 0.0, 0.0)
+    assert [n for n, _, _ in names] == ["top", "star-000", "star-120", "star-240"]
+    assert [round(t, 3) for _, t, _ in names[1:]] == [15.0, 15.0, 15.0]
+    assert [a for _, _, a in names[1:]] == [0.0, 120.0, 240.0]
+
+
+def test_star_angles_honour_the_tilt_cap():
+    c = ExtrusionConfig(multiview_tilt_deg=40.0, multiview_max_tilt_deg=25.0)
+    assert all(t == 25.0 for _, t, _ in star_view_angles(c)[1:])
+
+
+def test_star_candidates_vary_roll_only_never_tilt_or_azimuth():
+    """A fallback may re-roll the wrist. It may NOT quietly become another view."""
+    cands = star_view_candidates([0.0, 0.0, 5.0], 300.0, ExtrusionConfig(),
+                                 tilt_deg=15.0, azimuth_deg=120.0)
+    assert len(cands) == len(ExtrusionConfig().inspection_roll_candidates_deg)
+    assert {c["tilt_deg"] for c in cands} == {15.0}
+    assert {c["azimuth_deg"] for c in cands} == {120.0}
+    assert [c["roll_deg"] for c in cands] == ExtrusionConfig().inspection_roll_candidates_deg
+
+
+def test_every_star_view_keeps_the_aim_point_on_axis_at_the_standoff():
+    aim = np.array([10.0, -20.0, 5.0])
+    for _, tilt, azimuth in star_view_angles(ExtrusionConfig()):
+        T = pose_from_aim(aim, 300.0, tilt_deg=tilt, azimuth_deg=azimuth)
+        camera, axis = T[:3, 3], T[:3, 2]
+        assert abs(np.linalg.norm(camera - aim) - 300.0) < 1e-6      # exact standoff
+        to_aim = (aim - camera) / np.linalg.norm(aim - camera)
+        assert np.dot(axis, to_aim) > 1.0 - 1e-9                     # exactly on axis
+
+
+def test_star_views_sit_on_a_cone_and_are_120_deg_apart_in_the_work_frame():
+    aim = np.array([0.0, 0.0, 5.0])
+    cams = [pose_from_aim(aim, 300.0, tilt_deg=t, azimuth_deg=a)[:3, 3]
+            for _, t, a in star_view_angles(ExtrusionConfig())[1:]]
+    offsets = [c[:2] - aim[:2] for c in cams]
+    radii = [float(np.linalg.norm(o)) for o in offsets]
+    assert max(radii) - min(radii) < 1e-6                            # one cone
+    angles = sorted(round(float(np.degrees(np.arctan2(o[1], o[0]))) % 360.0, 3)
+                    for o in offsets)
+    assert angles == [0.0, 120.0, 240.0]

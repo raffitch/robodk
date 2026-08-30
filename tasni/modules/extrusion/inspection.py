@@ -188,6 +188,58 @@ def pose_candidates(aim_mm, standoff_mm: float, config,
     return candidates
 
 
+def star_view_angles(config) -> list[tuple[str, float, float]]:
+    """The (name, tilt, azimuth) table for one multi-view star, top view first.
+
+    A "Mercedes star": the top view as today plus one ring of the scan module's
+    dome at a single cone angle. All views share the aim point and the standoff
+    (pose_from_aim guarantees both), so the ring fills the frame identically
+    from every side and no view is better framed than another.
+
+    Azimuth is measured in the WORK frame from +X -- the axis the paired
+    detection offset is expressed along -- so a star has the same orientation
+    across takes and across sessions.
+    """
+    tilt = min(float(config.multiview_tilt_deg), float(config.multiview_max_tilt_deg))
+    views = [("top", 0.0, 0.0)]
+    for azimuth in config.multiview_azimuths_deg:
+        views.append((f"star-{int(round(float(azimuth))):03d}", tilt, float(azimuth)))
+    return views
+
+
+def star_view_candidates(aim_mm, standoff_mm: float, config, *, tilt_deg: float,
+                         azimuth_deg: float, reference_x=None) -> list[dict]:
+    """Ordered candidate poses for ONE view of the star.
+
+    Roll varies; tilt and azimuth never do. That asymmetry is the point:
+    ``pose_candidates`` treats tilt and azimuth as FALLBACKS for an unreachable
+    fronto-parallel pose, but here they are what the view IS. Substituting them
+    would silently hand the merge two clouds of the same flank and none of the
+    other, which no diagnostic downstream could detect.
+    """
+    candidates = []
+    for roll in config.inspection_roll_candidates_deg:
+        candidates.append({
+            "T_work_camera": pose_from_aim(aim_mm, standoff_mm, tilt_deg=tilt_deg,
+                                           azimuth_deg=azimuth_deg, roll_deg=roll,
+                                           reference_x=reference_x),
+            "tilt_deg": float(tilt_deg), "azimuth_deg": float(azimuth_deg),
+            "roll_deg": float(roll)})
+    return candidates
+
+
+def multiview_plan(recipe, setup, *, K: np.ndarray, size_px: tuple[int, int],
+                   config) -> dict:
+    """Descriptors for the whole star: preview, the dry tour, and the job log."""
+    aim = aim_point_mm(recipe, setup, 1)
+    standoff = framing_standoff(width_mm=cylinder_diameter_mm(recipe),
+                                height_mm=cylinder_diameter_mm(recipe),
+                                K=K, size_px=size_px, config=config)
+    return {"standoff_mm": float(standoff), "aim_mm": [float(v) for v in aim],
+            "views": [{"name": name, "tilt_deg": tilt, "azimuth_deg": azimuth}
+                      for name, tilt, azimuth in star_view_angles(config)]}
+
+
 def inspection_plan(recipe, setup, *, K: np.ndarray, size_px: tuple[int, int],
                     config, reference_x=None) -> dict:
     """The complete derived inspection geometry for one cylinder — JSON-safe.
