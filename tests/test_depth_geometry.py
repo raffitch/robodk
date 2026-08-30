@@ -232,3 +232,27 @@ def test_legacy_geometry_flags_itself():
     g = gf.aligned(K_C, SIZE_C)
     assert g.legacy is True and g.depth_unit_mm == 1.0
     assert g.to_dict()["legacy_aligned"] is True
+
+
+def test_color_registered_takes_no_factory_k_alias():
+    """``ColorRegistered`` must ask for the colour K that PRODUCED ``uv``, by that
+    name only -- no ``color_K_factory=`` alias, and no default.
+
+    The alias existed for exactly one test's call site and is a live hazard: a
+    parameter named for the greeting's factory K invites a caller to pass
+    ``geom.color_K_factory``, which is the ~4% ``valid_frac`` bias the calibrated-K
+    fix removed (see ``test_density_ratio_divides_by_the_calibrated_colour_k_that_
+    produced_uv``). Wrong-but-plausible must not be spellable.
+    """
+    import inspect
+
+    params = inspect.signature(dg.ColorRegistered.__init__).parameters
+    assert "color_K_factory" not in params, list(params)
+    assert "color_K" in params
+    # Required, not defaulted: omitting it is a TypeError from Python itself rather
+    # than a silently None colour model that only surfaces inside _density_ratio.
+    assert params["color_K"].default is inspect.Parameter.empty
+    with pytest.raises(TypeError):
+        dg.ColorRegistered(
+            pts_mm=np.zeros((0, 3)), uv=np.zeros((0, 2)), uv_depth=np.zeros((0, 2), int),
+            color_size=(320, 240), depth_size=(160, 120), stride=1, depth_K=np.eye(3))

@@ -156,7 +156,7 @@ class ColorRegistered:
     one take's own K/size via :meth:`CameraGeometry.legacy_aligned`."""
 
     def __init__(self, pts_mm, uv, uv_depth, color_size, depth_size, stride,
-                 depth_K, color_K=None, *, color_K_factory=None):
+                 depth_K, color_K):
         self.pts_mm = np.asarray(pts_mm, float)
         self.uv = np.asarray(uv, float)
         self.uv_depth = np.asarray(uv_depth, int)
@@ -170,12 +170,12 @@ class ColorRegistered:
         # the same matrix ``build`` projected with (the CALIBRATED model), not the
         # greeting's factory K: the two disagree by ~2% per axis on this D435i, and
         # it is the projection that sets where the points land.
-        # ``color_K_factory=`` is a deprecated keyword alias for ``color_K``.
-        K_c = color_K if color_K is not None else color_K_factory
-        if K_c is None:
-            raise TypeError("ColorRegistered needs the colour K that produced `uv`")
+        # It is REQUIRED, and named for what it must be. A ``color_K_factory=``
+        # keyword alias briefly survived here for one test's benefit; a parameter
+        # named for the factory K is an invitation to pass ``geom.color_K_factory``,
+        # which is exactly the ~4% density bias this argument exists to prevent.
         self._depth_K = np.asarray(depth_K, float)
-        self._color_K = np.asarray(K_c, float)
+        self._color_K = np.asarray(color_K, float)
         self._tree = None
 
     @classmethod

@@ -782,6 +782,25 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
         spur_bead_mm = min(spur_bead_mm, measured_bead_mm)
     counts["spur_guard_bead_mm"] = round(float(spur_bead_mm), 3)
 
+    # The surface cloud already spans the bead width and raster dilation adds
+    # roughly another half-width.  Prune only twigs no longer than that combined
+    # footprint; longer arms remain safety-significant branches.
+    #
+    # Hoisted out of the attempt loop, where it was recomputed identically every
+    # pass: nothing in it depends on ``attempt``. That is not a micro-optimisation
+    # -- it is so the exhaustion message below can NAME the tolerance it gave up
+    # with. ``counts["spur_guard_bead_mm"]`` records the clamped bead, but
+    # ``counts`` only ever reaches a caller through the report, and this function
+    # RAISES before building one. So on the single occasion the number matters
+    # most -- a take that aborted at the cell -- it was computed and thrown away,
+    # leaving the operator unable to tell a genuine spur (leave the guard alone,
+    # the frame really is contaminated) from a tolerance that fell one pixel
+    # short. Both remedies are real and they are opposites, so the message has to
+    # carry enough to choose. The raw RGB-D is archived either way and the take
+    # can be reprocessed; what was missing was the evidence, not the data.
+    spur_limit = max(2, int(math.ceil(
+        1.5 * spur_bead_mm / config.raster_mm_per_pixel)))
+
     attempts: list[dict] = []
     ordered_pixels = None
     final_mask = final_skeleton = None
@@ -791,11 +810,6 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
         mask, candidate_lo, _ = _rasterize(
             points, config.raster_mm_per_pixel, recipe.bead_diameter_mm, attempt)
         skeleton = _thin(mask)
-        # The surface cloud already spans the bead width and raster dilation
-        # adds roughly another half-width.  Prune only twigs no longer than that
-        # combined footprint; longer arms remain safety-significant branches.
-        spur_limit = max(2, int(math.ceil(
-            1.5 * spur_bead_mm / config.raster_mm_per_pixel)))
         skeleton, pruned = _prune_short_spurs(skeleton, spur_limit)
         graph = _graph(skeleton)
         branches = sum(1 for links in graph.values() if len(links) > 2)
@@ -815,8 +829,13 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
                 record["warning"] = str(exc)
     if ordered_pixels is None or final_mask is None or lo is None:
         raise RuntimeError(
-            f"branch guard exhausted after {config.branch_guard_max_attempts} attempt(s): "
-            f"{attempts}")
+            f"branch guard exhausted after {config.branch_guard_max_attempts} attempt(s) "
+            f"with spur_limit {spur_limit} px "
+            f"(1.5 x {spur_bead_mm:.3f} mm bead / {config.raster_mm_per_pixel:g} mm per px; "
+            f"recipe bead {recipe.bead_diameter_mm:.3f} mm, "
+            f"this frame measured "
+            f"{'n/a' if measured_bead_mm is None else format(measured_bead_mm, '.3f') + ' mm'}"
+            f"): {attempts}")
 
     mark = time.perf_counter()
     ordered_xy = np.column_stack((ordered_pixels[:, 1], ordered_pixels[:, 0]))

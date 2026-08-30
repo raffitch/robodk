@@ -398,7 +398,7 @@ def test_corner_point_mm_returns_none_when_no_registered_depth_nearby():
     reg = ColorRegistered(
         pts_mm=np.zeros((0, 3)), uv=np.zeros((0, 2)), uv_depth=np.zeros((0, 2), int),
         color_size=(320, 240), depth_size=(160, 120), stride=1,
-        depth_K=np.eye(3), color_K_factory=np.eye(3))
+        depth_K=np.eye(3), color_K=np.eye(3))
     K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
     assert _corner_point_mm(reg, 200.0, 150.0, K, None, disc_px=6) is None
 

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import sys
 from pathlib import Path
 
@@ -393,6 +395,68 @@ def test_spur_guard_still_catches_real_contamination_regardless_of_recipe_bead()
                 color=color, depth=depth, geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
                 T_work_camera=T, K=syn.K_720P, dist=None, plan=plan, layer=plan.layers[0],
                 config=ExtrusionConfig())
+
+
+def test_branch_guard_exhaustion_names_the_tolerance_it_gave_up_with():
+    """An abort has to say WHICH tolerance it gave up with, and where it came from.
+
+    Since the spur tolerance was clamped to the frame's own measured bead
+    (``a0fabca``) there are two very different reasons this can raise, with
+    opposite remedies: a genuinely contaminated frame (leave the guard alone --
+    it is doing its job) or a clean ring whose measured bead came in narrow
+    enough to drop ``spur_limit`` a pixel below what this frame needed. The
+    number that separates them is ``spur_bead_mm``, and it was computed and then
+    thrown away: it is recorded in ``counts["spur_guard_bead_mm"]``, but
+    ``counts`` only reaches a caller through the report and this path raises
+    before a report exists. So on the one occasion the number decides what to do
+    next -- a take that aborted at the cell -- nobody could see it.
+
+    Guarded by a test because the message is the entire diagnostic: the raw
+    RGB-D is archived and the take can be reprocessed, so what an abort costs is
+    the operator's time working out which of the two cases they are in.
+    """
+    pytest.importorskip("open3d")
+    T = syn.inspection_camera_T([CENTER[0], CENTER[1], 6.0], 300.0)
+    ring = syn.RingSpec(40.0, 10.0, CENTER, height_fn=syn.flat(6.0))
+    r0 = 40.0 + 10.0 / 2.0 + 3.0
+    thetas = np.deg2rad(np.arange(0.0, 20.0, 0.5))
+    radii = np.arange(r0 - 2.5, r0 + 2.5, 0.5)
+    Th, R = np.meshgrid(thetas, radii, indexing="ij")
+    shelf = np.column_stack((
+        CENTER[0] + R.ravel() * np.cos(Th.ravel()),
+        CENTER[1] + R.ravel() * np.sin(Th.ravel()),
+        np.full(Th.size, 4.0)))
+    scene = np.vstack((syn.plane_points(center_xy_mm=CENTER), ring.surface_points(), shelf))
+    depth = syn.render_depth(scene, T, noise_mm=0.3)
+    color = np.zeros((720, 1280, 3), np.uint8)
+
+    # The recipe deliberately overstates the bead 3x, so the clamped value and the
+    # recipe value are far apart and the message cannot pass by quoting one twice.
+    plan = scene_plan(radius=40.0, bead=30.0, layer_height=6.0, center=CENTER)
+    cfg = ExtrusionConfig()
+    with pytest.raises(RuntimeError, match="branch guard exhausted") as excinfo:
+        process_observation(
+            color=color, depth=depth, geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
+            T_work_camera=T, K=syn.K_720P, dist=None, plan=plan, layer=plan.layers[0],
+            config=cfg)
+
+    message = str(excinfo.value)
+    limit = re.search(r"spur_limit (\d+) px", message)
+    assert limit, message
+    clamped = re.search(r"1\.5 x ([\d.]+) mm bead", message)
+    assert clamped, message
+
+    # The tolerance quoted must be the one actually applied -- the same formula the
+    # loop prunes with, on the CLAMPED bead, not the recipe's inflated 30 mm.
+    spur_bead_mm = float(clamped.group(1))
+    assert int(limit.group(1)) == max(2, int(math.ceil(
+        1.5 * spur_bead_mm / cfg.raster_mm_per_pixel)))
+    assert spur_bead_mm < 20.0, message           # clamped, not the recipe's 30 mm
+
+    # And the two inputs that decide which remedy applies are both named, so the
+    # reader can see the clamp fired rather than having to infer it.
+    assert "recipe bead 30.000 mm" in message, message
+    assert re.search(r"this frame measured [\d.]+ mm", message), message
 
 
 def test_chroma_gate_keeps_the_chromatic_bead_and_blanks_the_achromatic_board():
