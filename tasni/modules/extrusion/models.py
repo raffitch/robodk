@@ -149,6 +149,51 @@ class SideViewRecord(_Record):
     error: str | None = None
 
 
+class ViewRecord(_Record):
+    """One camera view of the ring inside a multi-view take.
+
+    Every field beyond the identity three is optional because a view can be
+    dropped at any stage -- unreachable pose, failed arrival gate, abstaining
+    colour gate, too little ring to fit -- and the record still has to say what
+    happened. ``dropped`` with a ``drop_reason`` is a normal outcome, not an
+    error: the take completes on the views that survived (spec section 8).
+    """
+
+    name: str
+    tilt_deg: float
+    azimuth_deg: float
+    roll_deg: float | None = None
+    T_work_camera: list[list[float]] | None = None
+    standoff_delta_mm: float | None = None
+    chroma_fraction: float | None = None
+    chroma_gated: bool | None = None
+    points_before_merge: int | None = None
+    fitted_center_mm: list[float] | None = None
+    solved_offset_mm: list[float] | None = None
+    residual_rms_mm: float | None = None
+    dropped: bool = False
+    drop_reason: str | None = None
+
+
+class CaptureRecord(_Record):
+    """How the take's cloud was acquired, and how much the views disagreed.
+
+    ``spread_before_mm`` is the raw scatter of the per-view fitted centres about
+    their mean BEFORE any correction -- the cell's hand-eye plus pose error read
+    at the ring. It is archived because it is the evidence that makes the merge
+    interpretable; ``residual_after_mm`` is what survived the joint solve.
+    """
+
+    style: str = "single"                      # "single" | "star"
+    views: list[ViewRecord] = Field(default_factory=list)
+    consensus_center_mm: list[float] | None = None
+    consensus_radius_mm: float | None = None
+    spread_before_mm: float | None = None
+    residual_after_mm: float | None = None
+    merged_points_file: str | None = None
+    timings_ms: dict[str, Any] = Field(default_factory=dict)
+
+
 class LayerManifest(_Record):
     schema_version: str = "1.0"
     trial_id: str
@@ -179,4 +224,7 @@ class LayerManifest(_Record):
     # The side photo belongs to the layer's capture as a whole, so only the last
     # take of a press carries one.
     side_view: SideViewRecord | None = None
+    # How this take's cloud was acquired. None on every take archived before
+    # multi-view existed, which is what keeps extra="forbid" safe here.
+    capture: CaptureRecord | None = None
     warnings: list[str] = Field(default_factory=list)

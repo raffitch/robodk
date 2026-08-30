@@ -862,6 +862,42 @@ class ExtrusionConfig(_Model):
     layer_floor_margin_mm: float = Field(default=2.0, ge=0, le=20)
     characterize_search_radius_mm: float = Field(default=150.0, gt=0, le=1000)
     characterize_max_height_mm: float = Field(default=40.0, gt=0, le=200)
+    # -- multi-view ring capture (modules/extrusion/multiview.py) ------------
+    # Opt-in. The single-view chain is the cell-validated one and every number
+    # in the PFH archive came from it; turning this on changes what a take IS.
+    multiview_enabled: bool = False
+    # The cell's own incidence sweep (characterization/characterization-20260813.json)
+    # measured board plane RMS 0.650 mm at 1 deg, 2.006 at 9.1, 4.969 at 19.6 and
+    # 7.430 at 29.4. The rings are 2.9-4.9 mm proud over much of their length, so
+    # 20 deg buys a noise floor comparable to the signal. 15 is the compromise;
+    # the on-cell A/B sweeps 10/15/20 offline from one capture session.
+    multiview_tilt_deg: float = Field(default=15.0, ge=0.0, le=45.0)
+    multiview_max_tilt_deg: float = Field(default=25.0, ge=0.0, le=45.0)
+    # Three azimuths is the minimum that puts every flank point within 60 deg of
+    # some camera. Measured in the WORK frame from +X -- the same axis the
+    # paired-detection offset is expressed along -- so a star is reproducible.
+    multiview_azimuths_deg: list[float] = Field(
+        default_factory=lambda: [0.0, 120.0, 240.0])
+    # depth_plane_check divides by cos(incidence); refuse a degenerate pose
+    # rather than divide by something near zero. 0.5 = 60 deg.
+    multiview_min_cos_incidence: float = Field(default=0.5, gt=0.0, le=1.0)
+    # The levelling annulus runs from the OUTER edge of the chain's radial ROI
+    # band (recipe.radius_mm + radial_roi_margin_mm) outward by this width. It
+    # must contain surface and never deposit: it is what defines z = 0.
+    multiview_level_annulus_width_mm: float = Field(default=60.0, gt=0, le=500)
+    multiview_level_min_points: int = Field(default=500, ge=50)
+    # A fitted surface further than this from z = 0 means the view is wrong, not
+    # tilted -- a bad pose, a wrong work frame -- so drop it rather than "level"
+    # the whole scene onto a fiction.
+    multiview_max_level_mm: float = Field(default=10.0, gt=0, le=200)
+    multiview_min_view_points: int = Field(default=200, ge=10)
+    # A view seeing less arc than this cannot constrain a centre: fitting a
+    # circle to a short arc trades centre against radius almost freely.
+    multiview_min_arc_deg: float = Field(default=90.0, gt=0, le=360)
+    # A solved offset beyond this is a failed registration, not a measurement.
+    multiview_max_offset_mm: float = Field(default=5.0, gt=0, le=100)
+    # Below this, "merging" is one cloud with extra steps: fall back to top-only.
+    multiview_min_views: int = Field(default=2, ge=2)
     # -- side photo for the paper ------------------------------------------
     # After a layer's capture completes, one RGB photo of the stack from the
     # side. TAUGHT targets, not a derived pose: the operator taught these around
