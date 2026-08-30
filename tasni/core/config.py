@@ -849,6 +849,12 @@ class ExtrusionConfig(_Model):
     measured_spline_points: int = Field(default=180, ge=24, le=4000)
 
     # -- ring-stack measure-only experiment (modules/extrusion/measure.py) ----
+    # One measurement is the per-pixel nonzero median of this many consecutive
+    # RGB-D frames while the arm is stationary. Five costs roughly 3-4 s more
+    # than the old single grab on the cell, but suppresses isolated D435 depth
+    # noise without mixing robot re-approach into the sensing result. The raw
+    # frames are archived beside the fused depth image for reproducibility.
+    measure_depth_fusion_frames: int = Field(default=5, ge=1, le=25)
     # Close-range measurement is opt-in per request and requires the operator to
     # confirm that the extrusion tool is detached or otherwise clear. It buys
     # nothing at the depth profile this cell streams: the D435i MinZ is ~280 mm at

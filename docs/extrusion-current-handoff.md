@@ -337,9 +337,11 @@ footprint). This is the successor to the original `PostExtrusionToolpath`
 `overlay.png` (alpha shape → skeletonize → matplotlib) whose 3-D companion was only
 ever `plt.show()`n.
 
-`RingMeasureJob` draws them after the manifest is written and OUTSIDE the camera
-hold; a drawing failure is logged and the measurement stands. Serving is
-render-if-missing, so takes archived before this existed still produce figures:
+As of 2026-08-30, `RingMeasureJob` does **not** draw them during a live robot job.
+The previous path spent 90–108 s per take in Matplotlib before returning the arm
+(`20260830-190622-925d7178`), against 7.6–8.6 s for the actual inspection. Serving is
+render-if-missing, so the first gallery/Word-draft request draws them robot-free and
+takes archived before this existed still produce figures:
 
 ```
 GET /api/modules/extrusion/trials/{id}/layers/{dir}/figures/{plan|heightmap|mesh|iso|profile|pipeline}.{png|pdf}
@@ -351,6 +353,28 @@ In the app, click a take in the measurement table to open its gallery; the
 bird's-eye now draws the measured centrelines (red) over the commanded ones (teal).
 Needs `pip install -e .[figures]` (matplotlib); without it measurements run
 unchanged and only the figures are skipped.
+
+### Top-view burst fusion and batch visibility (2026-08-30)
+
+Each ring observation is now the per-pixel **nonzero median of five consecutive
+RGB-D frames** while the arm is stationary (`extrusion.measure_depth_fusion_frames`,
+default 5). Zero is the D435 invalid sentinel and is excluded from the median. The
+archive keeps the fused `depth.npy`, the raw `depth-frames.npy`, the representative
+`color.png`, frame timestamps/method in `provenance.depth_fusion`, and charges the
+whole burst to `capture_ms`. This adds roughly 3–4 s over the old one-frame capture,
+not another robot excursion.
+
+Layer 1 enables the existing guarded ring-arc assembly because it is physically
+isolated; layers 2+ keep assembly off so a displaced ring cannot fuse with the exposed
+crescent below. The final completeness/angular-gap/branch gates are unchanged. Every
+archived take publishes a UI checkpoint immediately. An unattended excursion batch
+stops after an invalid take, returns home, and leaves the raw burst ready to reprocess.
+
+Measured limitation: pixel-median replay of the five old single-frame re-approaches in
+`20260830-190622-925d7178`, plus layer-1 arc assembly, still reaches only 68.5 %
+completeness (113.3 deg gap). Those frames contain a systematic missing/steep-crest
+sector, not merely independent temporal noise. The burst should reduce random waviness,
+but the next cell take is the proof; do not weaken the validity gates if it still fails.
 
 Two things the first real capture forced, both of which would silently corrupt a
 paper figure:

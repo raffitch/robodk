@@ -499,8 +499,21 @@ export default function Extrusion() {
         ? `Quick visual simulation passed for layer(s) ${event.payload.result.simulated_layer_indices.join(", ")}.`
         : name === "extrusion-dry-run"
           ? "Collision-validated dry run passed for this exact plan."
+          : event.payload.result?.kind === "ring_measure" && event.payload.result?.invalid_batch
+            ? event.payload.result?.stopped_early
+              ? "Measurement archived, but its validity gate failed. The unattended batch stopped early and the robot returned home."
+              : "Measurement archived, but its validity gate failed. The robot returned home without any extra side-photo motion."
           : "Print and layer archive completed.");
       refreshStatus();
+    } else if (event.type === "checkpoint" && event.payload?.kind === "extrusion_take") {
+      // A batch writes each take before it starts the next trip. Re-read that
+      // durable checkpoint immediately so the operator can see a failed gate
+      // while the job is still running, rather than after all five excursions.
+      api.get<{ session: MeasureSession | null }>("/measure/session")
+        .then((value) => setMeasureSession(value.session)).catch(() => {});
+      setMessage(event.payload.valid
+        ? `Layer ${event.payload.layer_index} take ${event.payload.take} archived and valid.`
+        : `Layer ${event.payload.layer_index} take ${event.payload.take} archived but INVALID — the batch will return home and stop.`);
     } else if (event.type === "error" && name?.startsWith("extrusion-")) {
       setBusy(false); setCancelling(false); setMessage(event.payload.message); setLogs((old) => [...old, `ERROR: ${event.payload.message}`]);
       refreshStatus();
@@ -675,8 +688,8 @@ export default function Extrusion() {
     } catch { /* module unavailable */ }
   }, []);
   useEffect(() => { refreshMeasure(); }, [refreshMeasure]);
-  // A take is only on disk once the job finishes, so re-read on every
-  // running -> idle edge rather than polling.
+  // Checkpoints above refresh each archived take while a batch is running. This
+  // idle-edge read remains the reconnect/final-timing fallback.
   useEffect(() => { if (status && !status.running) refreshMeasure(); },
             [status?.running, refreshMeasure]);
   /** What a press will archive as ground truth, in the operator's words. */
@@ -1115,7 +1128,7 @@ export default function Extrusion() {
           + `${characterization.bead_width_mm.toFixed(1)} mm · height `
           + `${characterization.top_z_min_mm.toFixed(1)}–${characterization.top_z_max_mm.toFixed(1)} mm. `
           + "This sets the recipe and the cylinder centre from the physical ring."
-        : "The robot moves the camera over the ring, takes one frame and returns.",
+        : "The robot moves the camera over the ring, fuses five depth frames and returns.",
     }),
     runStep({
       id: "noise", layer: 1, label: "Noise floor",

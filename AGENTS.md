@@ -101,13 +101,28 @@ only diagnostic frame.
 per-trial `stack` and `tube`, from the archive alone: no robot, no RoboDK, no camera.
 `mesh` (2026-08-29) is the surfaced view the old paper had — the frame meshed, from
 above and rotated — which used to exist only as an interactive Open3D window in
-`macros/3DScan.py` that wrote no file. Every take draws them
-automatically; serving is render-if-missing, so takes archived earlier — including
+`macros/3DScan.py` that wrote no file. Since 2026-08-30 they render on first view or
+Word-draft generation, so plotting cannot delay robot return; serving is
+render-if-missing, so takes archived earlier — including
 `20260828-192115-47fb78ea` — produce figures with zero cell time. Click a take in the
 measurement table to see them. Needs `pip install -e .[figures]`; without matplotlib the
 measurement is unchanged and only the figures are skipped. Details and the two
 correctness traps (deposit-band colour range; FITTED not averaged nominal centre) are in
 `docs/extrusion-current-handoff.md`.
+
+**2026-08-30 — top-view capture and live-job latency corrected.** A ring take now
+captures **five consecutive RGB-D frames at the stationary inspection pose** and
+processes their per-pixel nonzero depth median; the five raw depth frames are archived
+as `depth-frames.npy`, the fused observation remains `depth.npy`, and the full burst
+time is reported as `capture_ms`. Layer 1 now uses the same guarded ring-arc assembly as
+Characterize (only layer 1: there is no lower ring to fuse into it). Session
+`20260830-190622-925d7178` measured each trip in 7.6–8.6 s but then held the arm at the
+inspection pose for 90–108 s of Matplotlib work per take; figures are now on-demand.
+Each archived take appears in the UI immediately, and an invalid unattended take
+returns home and stops the remaining trips. Median replay of the five old single frames
+still reaches only 68.5 % completeness, so this is an evidence-backed improvement,
+**not yet a cell proof that a single top view can measure this thin reflective ring**.
+Restart the backend before the next take and check `/api/health` → `build.stale: false`.
 
 > **Picking this up? Read [docs/live-print-next-session.md](docs/live-print-next-session.md)**
 > — the continuation handoff: current state, the full decision tree for each bisect

@@ -943,6 +943,9 @@ def measure_env(tmp_path, monkeypatch, *, hardware_approved=False, side_photo=Fa
     # assertion about the MEASUREMENT path, which is not what they are about.
     # The tests that own it turn it back on.
     svc.config.extrusion.side_capture_enabled = side_photo
+    # Most orchestration tests count logical takes, not the depth-fusion burst.
+    # Dedicated tests below turn the production default back on.
+    svc.config.extrusion.measure_depth_fusion_frames = 1
     monkeypatch.setattr(measure_mod, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(measure_mod, "process_observation", fake_measure_processing)
     monkeypatch.setattr(measure_mod, "_git_commit", lambda: "abc123")
@@ -987,6 +990,41 @@ def test_measure_moves_only_the_camera_and_never_touches_the_valve(tmp_path, mon
     assert (layer_dir / "depth.npy").is_file() and (layer_dir / "color.png").is_file()
 
 
+def test_nonzero_depth_median_does_not_turn_missing_pixels_into_near_surfaces():
+    from tasni.modules.extrusion.measure import _nonzero_median_depth
+
+    burst = np.array([
+        [[0, 100, 100], [0, 100, 120]],
+        [[0, 110, 0], [200, 110, 110]],
+        [[0, 120, 120], [220, 120, 100]],
+    ], dtype=np.uint16)
+
+    assert _nonzero_median_depth(burst).tolist() == [
+        [0, 110, 110], [210, 110, 110]]
+
+
+def test_measure_fuses_five_top_frames_and_archives_the_raw_burst(tmp_path, monkeypatch):
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
+    svc.config.extrusion.measure_depth_fusion_frames = 5
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+    ctx = Ctx()
+
+    out = RingMeasureJob(svc, plan, session, 1, check_collisions=False)(ctx)
+
+    layer = Path(out["layer_dir"])
+    raw = np.load(layer / "depth-frames.npy", allow_pickle=False)
+    manifest = json.loads((layer / "manifest.json").read_text())
+    fusion = manifest["provenance"]["depth_fusion"]
+    assert camera.grabs == 6                         # readiness + five-frame burst
+    assert raw.shape == (5, 16, 16)
+    assert fusion["captured_frames"] == 5
+    assert fusion["method"] == "per-pixel nonzero median"
+    assert manifest["processing"]["depth_plane_check"]["fusion_frames"] == 5
+    assert ctx.checkpoints[-1][0] == "extrusion_take"
+    assert ctx.checkpoints[-1][1]["take"] == 1
+
+
 def test_repeat_takes_and_the_floor_from_the_previous_layer(tmp_path, monkeypatch):
     svc, rdk, camera = measure_env(tmp_path, monkeypatch)
     plan = auto_plan()
@@ -997,10 +1035,12 @@ def test_repeat_takes_and_the_floor_from_the_previous_layer(tmp_path, monkeypatc
                             check_collisions=True)(Ctx())
     assert Path(second["layer_dir"]).name == "layer-001-take02"
     assert fake_measure_processing.calls[-1].get("floor_profile") is None   # layer 1: build plane
+    assert fake_measure_processing.calls[-1]["assemble_arcs"] is True
     third = RingMeasureJob(svc, plan, session, 2, annotation={"introduced_offset_mm": [10, 0]},
                            check_collisions=True)(Ctx())
     floor = fake_measure_processing.calls[-1]["floor_profile"]
     assert floor is not None and np.asarray(floor).shape[1] == 3          # layer 2: ring 1's top
+    assert fake_measure_processing.calls[-1]["assemble_arcs"] is False
     assert json.loads((Path(third["layer_dir"]) / "manifest.json").read_text())["annotation"] == {"introduced_offset_mm": [10, 0]}
     # Session survives a restart.
     reloaded = MeasureSession.load(root, session.trial_id)
@@ -1457,31 +1497,16 @@ def test_measure_only_requests_default_to_collisions_off():
     assert MeasureLayerBody(fingerprint="f", layer_index=1).collision_check_enabled is False
 
 
-def test_a_measured_take_leaves_its_figures_next_to_the_frame(tmp_path, monkeypatch):
-    """The operator should not have to run a tool to see what was measured."""
+def test_live_measurement_defers_publication_figures(tmp_path, monkeypatch):
+    """Matplotlib must never hold the robot at the inspection pose for minutes."""
     svc, rdk, camera = measure_env(tmp_path, monkeypatch)
     plan = auto_plan()
     session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
 
     out = RingMeasureJob(svc, plan, session, 1, check_collisions=False)(Ctx())
 
-    figures = Path(out["layer_dir"]) / "figures"
-    assert figures.is_dir(), "the take archived no figures"
-    assert {p.name for p in figures.glob("*.png")} >= {"plan.png", "profile.png"}
-
-
-def test_a_figure_that_cannot_be_drawn_never_fails_the_measurement(tmp_path, monkeypatch):
-    """A drawing problem must not cost the operator a ring placement."""
-    svc, rdk, camera = measure_env(tmp_path, monkeypatch)
-    plan = auto_plan()
-    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
-    monkeypatch.setattr(measure_mod, "render_layer_figures",
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no matplotlib")))
-
-    out = RingMeasureJob(svc, plan, session, 1, check_collisions=False)(Ctx())
-
-    assert out["valid"] is True
-    assert Path(out["layer_dir"], "manifest.json").is_file()
+    assert not (Path(out["layer_dir"]) / "figures").exists()
+    assert rdk.events[-1] == ("move-joints", START_JOINTS)
 
 
 def archived_take(root, monkeypatch):
@@ -2543,6 +2568,36 @@ def test_excursions_repeat_the_whole_trip_unattended(tmp_path, monkeypatch):
     assert len(cycles) == 5 and all(c is not None for c in cycles)
 
 
+def test_unattended_excursions_stop_after_an_archived_invalid_take(tmp_path, monkeypatch):
+    """A failed gate must be visible and home before another robot trip starts."""
+    svc, rdk, camera = measure_env(tmp_path, monkeypatch, side_photo=True)
+    plan = auto_plan()
+    session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
+
+    def invalid(**kwargs):
+        result = fake_measure_processing(**kwargs)
+        result.metrics = result.metrics.model_copy(update={
+            "valid": False, "warnings": ["maximum angular gap 200 deg"]})
+        return result
+
+    monkeypatch.setattr(measure_mod, "process_observation", invalid)
+    ctx = Ctx()
+    out = RingMeasureJob(svc, plan, session, 1, annotation={"phase": "noise floor"},
+                         check_collisions=False, excursions=5)(ctx)
+
+    assert out["stopped_early"] is True
+    assert out["invalid_batch"] is True
+    assert out["side_view"] is None
+    assert camera.witness_grabs == 0
+    assert out["takes_recorded"] == [1]
+    assert len([e for e in rdk.events if e[0] == "start"]) == 1
+    assert rdk.events[-1] == ("move-joints", START_JOINTS)
+    assert ctx.checkpoints == [("extrusion_take", {
+        "trial_id": session.trial_id, "layer_index": 1, "take": 1,
+        "valid": False, "layer_name": "layer-001"})]
+    assert any("stopped before 4 remaining" in line for line in ctx.logs)
+
+
 def test_each_take_records_which_trip_it_came_from(tmp_path, monkeypatch):
     """Three frames of one trip and three re-approaches must be tellable apart.
 
@@ -2857,6 +2912,7 @@ def test_the_side_photo_is_part_of_the_protocol_by_default(tmp_path, monkeypatch
     from tasni.modules.extrusion.module import MeasureLayerBody
 
     config = AppConfig().extrusion
+    assert config.measure_depth_fusion_frames == 5
     assert config.side_capture_enabled is True
     assert config.side_capture_target == "SideCapture"
     assert config.side_capture_approach_target == "TowardsSideCapture"

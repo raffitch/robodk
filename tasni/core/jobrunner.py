@@ -48,6 +48,15 @@ class JobContext:
         b64 = base64.b64encode(jpeg_bytes).decode("ascii")
         self._bus.publish(JobEvent("frame", {"jpeg_b64": b64}))
 
+    def checkpoint(self, kind: str, payload: dict | None = None) -> None:
+        """Publish durable progress that callers may re-read while a job runs.
+
+        Unlike a terminal ``result``, a checkpoint says that one independently
+        useful artifact is already on disk. Long batched jobs use it to make
+        completed work visible without pretending the whole job has finished.
+        """
+        self._bus.publish(JobEvent("checkpoint", {"kind": kind, **(payload or {})}))
+
     @property
     def cancelled(self) -> bool:
         return self._cancel.is_set()

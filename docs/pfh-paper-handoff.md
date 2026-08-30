@@ -54,10 +54,10 @@ r 42.31, centre offset 1.28 mm, mean/RMS/max 1.51/1.85/3.91 mm, shape RMS 1.58,
 completeness 0.992. That is the first zero-offset baseline take. Continue in this
 session.
 
-**Figures are done** (`tasni/modules/extrusion/figures.py`, merged `ba8d2b3`). Four per
-take plus one per trial, 300 dpi PNG **and vector PDF**, rendered from the archive with
-no robot. They draw automatically on every take from now on, and older takes render on
-first view.
+**Figures are done** (`tasni/modules/extrusion/figures.py`, merged `ba8d2b3`). They are
+300 dpi PNG **and vector PDF**, rendered from the archive with no robot. Since 2026-08-30
+they render on first view/Word-draft instead of inside the live job; this removed
+90–108 s of plotting that previously held the arm at the inspection pose per take.
 
 | Figure | Use in the paper |
 |---|---|
@@ -112,7 +112,9 @@ Restart the backend first (it caches imported modules; check `/api/health` →
 4. **Noise floor** (phase `noise floor`): **one press**, five trips. The arm goes
    out and back five times on its own — stay out of the cell until it stops. This is
    the only step that re-approaches the ring for every take, which is what makes it
-   the floor: its spread contains the robot as well as the camera.
+   the floor: its spread contains the robot as well as the camera. Each trip fuses five
+   depth frames while parked. If a take is invalid, the batch returns home and stops;
+   inspect/reprocess it before pressing again for the remaining trips.
 5. **Placement repeatability** (phase `re-placed`): lift and re-place ring 1
    **three times**, measuring each. Still one press per take — your hand has to move
    between them, so they cannot be batched.
@@ -350,8 +352,8 @@ Constraints and expectations:
 
 ## 4. After the run
 
-- Figures for every take appear automatically; pick the ones the paper wants and use
-  the **PDF**. A take with an introduced offset also draws the **ground truth ring**
+- Click a take (or build the Word draft) to render its figures, then use the **PDF**.
+  A take with an introduced offset also draws the **ground truth ring**
   (nominal + that offset, teal dash-dot) in `plan` and in the trial `stack`, so the
   figure shows the extracted centreline landing on where the ring was actually moved
   to rather than merely displaced from nominal.

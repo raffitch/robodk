@@ -44,10 +44,13 @@ FAKE_CAMERA_T[:3, 3] = [0.0, 0.0, 506.0]
 
 
 class Ctx:
-    def __init__(self): self.logs = []; self.progresses = []; self.frames = []; self._cancelled = False
+    def __init__(self):
+        self.logs = []; self.progresses = []; self.frames = []; self.checkpoints = []
+        self._cancelled = False
     def progress(self, *args): self.progresses.append(args)
     def log(self, message): self.logs.append(message)
     def frame(self, payload): self.frames.append(payload)
+    def checkpoint(self, kind, payload=None): self.checkpoints.append((kind, payload or {}))
     @property
     def cancelled(self): return self._cancelled
     def check_cancel(self):

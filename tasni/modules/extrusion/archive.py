@@ -57,8 +57,8 @@ class ExtrusionArchive:
         return layer
 
     def write_layer(self, manifest: LayerManifest, *, nominal_xyz, commanded_xyz,
-                    measured_xyz=None, corrected_xyz=None, color=None, depth=None,
-                    pointcloud_xyz=None,
+                     measured_xyz=None, corrected_xyz=None, color=None, depth=None,
+                     depth_frames=None, pointcloud_xyz=None,
                     derived_images: dict[str, np.ndarray] | None = None,
                     report: dict | None = None) -> Path:
         trial = self.root / _segment(manifest.trial_id, "trial id")
@@ -78,6 +78,11 @@ class ExtrusionArchive:
                 raise OSError("failed to write color.png")
         if depth is not None:
             np.save(layer / "depth.npy", np.asarray(depth))
+        if depth_frames is not None:
+            frames = np.asarray(depth_frames)
+            if frames.ndim != 3 or frames.shape[0] < 1:
+                raise ValueError("archived depth burst must be NxHxW")
+            np.save(layer / "depth-frames.npy", frames)
         if pointcloud_xyz is not None:
             points = np.asarray(pointcloud_xyz, dtype=float)
             if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
@@ -124,7 +129,8 @@ class ExtrusionArchive:
         manifest_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return entry
 
-    def write_characterization(self, trial_id: str, index: int, *, color, depth, measured_xyz,
+    def write_characterization(self, trial_id: str, index: int, *, color, depth,
+                               depth_frames=None, measured_xyz,
                                derived_images: dict[str, np.ndarray], report: dict) -> Path:
         """Archive one ring characterization beside the trial's layers.
 
@@ -141,6 +147,11 @@ class ExtrusionArchive:
         if not cv2.imwrite(str(out / "color.png"), np.asarray(color)):
             raise OSError("failed to write color.png")
         np.save(out / "depth.npy", np.asarray(depth))
+        if depth_frames is not None:
+            frames = np.asarray(depth_frames)
+            if frames.ndim != 3 or frames.shape[0] < 1:
+                raise ValueError("archived depth burst must be NxHxW")
+            np.save(out / "depth-frames.npy", frames)
         self._json_path(out / "measured_path.json", measured_xyz)
         allowed = {"segmentation.png", "skeleton.png", "comparison.png"}
         for name, image in derived_images.items():

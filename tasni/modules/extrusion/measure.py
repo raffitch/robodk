@@ -2,7 +2,7 @@
 
 Nothing here prints. The operator places dried rings by hand; each press moves
 ONLY the camera (the same derived, collision-validated, wrist-gated inspection
-move the live print uses), takes one RGB-D frame, measures it and returns to
+move the live print uses), fuses a short RGB-D burst, measures it and returns to
 the start pose. No layer program, no AirOn/AirOff, no hardware-I/O gate.
 Trials are archived with ``mode = "MEASURE_ONLY"`` and never counted as prints.
 
@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import math
 import time
+import warnings
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -30,34 +32,11 @@ from ..calibration.service import _camera_hold, ensure_real_robot_link
 from .archive import ExtrusionArchive
 from .models import CylinderPlan, LayerManifest
 from .processing import characterize_ring, process_observation
-
-try:                                       # matplotlib is the `figures` extra
-    from .figures import render_layer_figures
-except Exception:                          # pragma: no cover - absent extra
-    render_layer_figures = None
 from .service import (_build_inspection_move, _git_commit, _program_name, _utcnow,
                       _wait_program, _warn_if_stale)
 from .toolpath import points_array
 
 MODE = "MEASURE_ONLY"
-
-
-def _draw_figures(ctx: JobContext, layer_dir) -> None:
-    """Render this take's figures. Never let a drawing problem cost a measurement.
-
-    The operator cannot re-place a ring exactly, so the archived frame is
-    irreplaceable and the figures are not: a failure here is logged and the
-    measurement stands. ``ensure_figure`` re-renders on demand at serve time.
-    """
-    if render_layer_figures is None:
-        ctx.log("figures skipped: matplotlib is absent (pip install -e .[figures])")
-        return
-    try:
-        drawn = render_layer_figures(layer_dir)
-    except Exception as exc:
-        ctx.log(f"figures could not be drawn (the measurement is unaffected): {exc}")
-        return
-    ctx.log(f"figures: {', '.join(sorted({p.stem for p in drawn}))}")
 
 
 def measure_station_requirements(rdk: RdkIO, plan: CylinderPlan, config) -> dict:
@@ -334,70 +313,98 @@ def _move_to_inspection(services, ctx: JobContext, plan: CylinderPlan, layer, *,
             "settle_ms": float(ecfg.settle_s) * 1000.0}
 
 
+def _nonzero_median_depth(depth_frames) -> np.ndarray:
+    """Per-pixel median of valid depth words; zero remains no measurement.
+
+    The D435 uses zero for an invalid depth sample. Including that sentinel in a
+    numeric median pulls thin or reflective surfaces toward the camera whenever
+    only part of a burst sees them, so invalid samples must be ignored rather
+    than averaged.
+    """
+    stack = np.asarray(depth_frames)
+    if stack.ndim != 3 or stack.shape[0] < 1:
+        raise ValueError("depth fusion needs an NxHxW burst")
+    if stack.shape[0] == 1:
+        return stack[0].copy()
+    samples = np.where(stack > 0, stack.astype(np.float32), np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        fused = np.nanmedian(samples, axis=0)
+    return np.rint(np.nan_to_num(fused, nan=0.0)).astype(stack.dtype)
+
+
 def _capture_at_pose(services, ctx: JobContext, T_work_camera) -> dict:
-    """Grab ONE validated RGB-D frame with the camera already at the pose."""
+    """Grab and median-fuse validated RGB-D frames at one stationary pose."""
     ecfg = services.config.extrusion
     started = time.perf_counter()
-    frame = services.camera.grab(with_depth=True, timeout=ecfg.grab_timeout_s)
-    capture_ms = (time.perf_counter() - started) * 1000.0
-    if frame.depth is None:
-        raise RuntimeError("RGB-D capture returned no depth")
-    # Checked right here, before the plane check ever reads frame.depth as
-    # millimetres: a missing greeting means the unit is unknown, and letting
-    # depth_plane_check default to 1.0 mm/word on a 0.1 mm-unit frame reads a
-    # true ~300 mm standoff as ~3000 mm -- a loud failure that blames the work
-    # frame or a frozen camera instead of naming the real cause.
-    if frame.geometry is None:
-        raise RuntimeError("depth frame arrived without a protocol-2 greeting")
-    # Throw away a depth frame that still describes the pose before the move.
-    # Each grab pulls a new frame through the Jetson's temporal filter, so a
-    # retry is what lets it converge on where the camera actually is now.
+    wanted = int(getattr(ecfg, "measure_depth_fusion_frames", 1))
     attempts = int(getattr(ecfg, "depth_stale_retries", 2))
-    check = depth_plane_check(frame.depth, T_work_camera, ecfg,
-                              unit_mm=frame.geometry.depth_unit_mm)
+    frames = []
     retries, frozen = 0, False
-    while not check["agrees"] and retries < attempts:
-        retries += 1
-        ctx.log(f"depth said {check['observed_depth_mm']:.0f} mm with the camera "
-                f"{check['camera_z_mm']:.0f} mm above the work plane - discarding it and "
-                f"grabbing again ({retries}/{attempts})")
-        previous = frame.depth
-        started = time.perf_counter()
+    previous = None
+    check = None
+    while len(frames) < wanted:
+        ctx.check_cancel()
         frame = services.camera.grab(with_depth=True, timeout=ecfg.grab_timeout_s)
-        capture_ms = (time.perf_counter() - started) * 1000.0
         if frame.depth is None:
             raise RuntimeError("RGB-D capture returned no depth")
+        # Checked before any depth word is interpreted as millimetres: a missing
+        # greeting on a 0.1 mm-unit frame would otherwise look ten times too far.
         if frame.geometry is None:
             raise RuntimeError("depth frame arrived without a protocol-2 greeting")
-        # A stalled stream hands back the SAME buffer every time. That is a
-        # different fault from a wrong one, and it has a different remedy, so it
-        # is worth telling apart rather than reporting as "still disagrees".
-        if np.array_equal(previous, frame.depth):
-            frozen = True
-        check = depth_plane_check(frame.depth, T_work_camera, ecfg,
-                                  unit_mm=frame.geometry.depth_unit_mm)
-    check["retries"] = retries
-    check["frozen_stream"] = frozen
-    if not check["agrees"]:
-        detail = (
-            "every grab returned a byte-identical depth buffer, so the camera's depth stream "
-            "is FROZEN - it keeps serving the last frame it managed to measure while colour "
-            "stays live. Restart it with `py -3.10 tools/jetson_deploy.py restart`, then "
-            "measure again."
-            if frozen else
-            "the depth is changing but does not match this pose. Check that the work frame "
-            "still sits on the physical surface, and that nothing has been placed under or "
-            "over the board.")
-        raise RuntimeError(
-            f"the depth frame does not describe this pose: median depth "
-            f"{check['observed_depth_mm']:.0f} mm with the camera "
-            f"{check['camera_z_mm']:.0f} mm above the work plane (expected "
-            f"{check['accepted_range_mm'][0]:.0f}-{check['accepted_range_mm'][1]:.0f} mm), "
-            f"after {retries} retry(s). " + detail)
+        if frames:
+            first = frames[0]
+            if (frame.depth.shape != first.depth.shape
+                    or frame.color.shape != first.color.shape
+                    or frame.geometry.to_dict() != first.geometry.to_dict()):
+                raise RuntimeError("camera geometry changed inside one depth-fusion burst")
+        candidate = depth_plane_check(frame.depth, T_work_camera, ecfg,
+                                      unit_mm=frame.geometry.depth_unit_mm)
+        if not candidate["agrees"]:
+            if previous is not None and np.array_equal(previous, frame.depth):
+                frozen = True
+            previous = frame.depth
+            if retries >= attempts:
+                check = candidate
+                detail = (
+                    "every grab returned a byte-identical depth buffer, so the camera's depth "
+                    "stream is FROZEN - restart it with `py -3.10 "
+                    "tools/jetson_deploy.py restart`, then measure again."
+                    if frozen else
+                    "the depth is changing but does not match this pose. Check that the work "
+                    "frame still sits on the physical surface.")
+                raise RuntimeError(
+                    f"the depth frame does not describe this pose: median depth "
+                    f"{check['observed_depth_mm']:.0f} mm with the camera "
+                    f"{check['camera_z_mm']:.0f} mm above the work plane (expected "
+                    f"{check['accepted_range_mm'][0]:.0f}-"
+                    f"{check['accepted_range_mm'][1]:.0f} mm), after {retries} retry(s). "
+                    + detail)
+            retries += 1
+            ctx.log(f"depth said {candidate['observed_depth_mm']:.0f} mm with the camera "
+                    f"{candidate['camera_z_mm']:.0f} mm above the work plane - discarding it "
+                    f"and grabbing again ({retries}/{attempts})")
+            continue
+        frames.append(frame)
+        previous = frame.depth
+
+    raw_depths = np.stack([np.asarray(item.depth) for item in frames])
+    fused_depth = _nonzero_median_depth(raw_depths)
+    representative = frames[len(frames) // 2]
+    frame = replace(representative, depth=fused_depth)
+    check = depth_plane_check(frame.depth, T_work_camera, ecfg,
+                              unit_mm=frame.geometry.depth_unit_mm)
+    check.update({"retries": retries, "frozen_stream": frozen,
+                  "fusion_frames": len(frames)})
+    capture_ms = (time.perf_counter() - started) * 1000.0
     ok, jpeg = cv2.imencode(".jpg", frame.color)
     if ok:
         ctx.frame(jpeg.tobytes())
-    return {"frame": frame, "capture_ms": capture_ms, "depth_plane_check": check}
+    fusion = {"method": "per-pixel nonzero median", "requested_frames": wanted,
+              "captured_frames": len(frames), "raw_file": "depth-frames.npy",
+              "timestamps": [float(item.timestamp) for item in frames]}
+    return {"frame": frame, "depth_frames": raw_depths, "depth_fusion": fusion,
+            "capture_ms": capture_ms, "depth_plane_check": check}
 
 
 def _inspect_and_capture(services, ctx: JobContext, plan: CylinderPlan, layer, *,
@@ -626,7 +633,23 @@ class RingMeasureJob:
             self._one_excursion(ctx, layer=layer, inspection_name=inspection_name,
                                 archive=archive, start_joints=start_joints,
                                 excursion=excursion, total=total)
-        side = self._side_photo(ctx, archive=archive, start_joints=start_joints)
+            # An invalid observation is useful evidence and is already archived,
+            # but five more robot trips cannot make that same processing result
+            # valid. Stop an unattended batch after the first failed gate so the
+            # operator can inspect/reprocess it instead of spending cell time on
+            # four more frames they cannot cite.
+            if self.results and not self.results[-1].get("valid", False):
+                remaining = self.excursions - excursion
+                if remaining:
+                    ctx.log(f"take {self.results[-1]['take']} is invalid; stopped before "
+                            f"{remaining} remaining robot trip(s)")
+                break
+        stopped_early = len(self.results) < total
+        invalid_batch = any(not item.get("valid", False) for item in self.results)
+        # An invalid measurement is not a paper take. Do not add another robot
+        # excursion merely to photograph a condition the validity gate rejected.
+        side = (None if invalid_batch else
+                self._side_photo(ctx, archive=archive, start_joints=start_joints))
         self.result = {"kind": "ring_measure", "mode": MODE,
                        "trial_id": self.session.trial_id,
                        "fingerprint": self.plan.fingerprint,
@@ -635,6 +658,8 @@ class RingMeasureJob:
                        # takes can tell five happened from the result alone.
                        "takes_recorded": [r["take"] for r in self.results],
                        "excursions": self.excursions, "repeats": self.repeats,
+                       "takes_requested": total, "stopped_early": stopped_early,
+                       "invalid_batch": invalid_batch,
                        "side_view": side}
         return self.result
 
@@ -714,11 +739,10 @@ class RingMeasureJob:
                     last_dir = self._one_take(ctx, layer=layer, archive=archive,
                                               moved=moved, excursion=excursion,
                                               repeat=repeat, total=total)
-            # Outside the camera hold: drawing needs no camera, and the Jetson
-            # lease should not be held while matplotlib works.
-            for record in self.results[-self.repeats:]:
-                ctx.progress(len(self.results), total, "drawing the figures")
-                _draw_figures(ctx, Path(record["layer_dir"]))
+            # Publication figures are deliberately NOT rendered in the live job.
+            # The existing figure endpoint renders a requested PNG/PDF from this
+            # archive on demand. Matplotlib took 90-108 s per take on the cell and,
+            # when called here, kept the robot parked over the ring for all of it.
             ctx.progress(len(self.results), total, "returning to the start pose")
         finally:
             if current_program:
@@ -759,7 +783,7 @@ class RingMeasureJob:
             except Exception:
                 pass
 
-    # -- one frame, processed and archived ----------------------------------
+    # -- one fused observation, processed and archived -----------------------
     def _one_take(self, ctx: JobContext, *, layer, archive: ExtrusionArchive,
                   moved: dict, excursion: int, repeat: int, total: int) -> Path:
         services = self.services
@@ -793,6 +817,7 @@ class RingMeasureJob:
                         "excursion_index": excursion,
                         "repeat_index": repeat,
                         "repeats_in_excursion": self.repeats,
+                        "depth_fusion": captured["depth_fusion"],
                         "T_work_camera": np.asarray(T_work_camera, dtype=float).tolist(),
                         # The frame's own greeting: native depth intrinsics and
                         # the depth->colour extrinsic. Without it a reprocess or
@@ -806,7 +831,11 @@ class RingMeasureJob:
             processed = process_observation(
                 color=frame.color, depth=frame.depth, geometry=frame.geometry,
                 T_work_camera=T_work_camera, K=camera_cfg.K, dist=camera_cfg.dist,
-                plan=self.plan, layer=layer, config=ecfg, floor_profile=floor)
+                plan=self.plan, layer=layer, config=ecfg, floor_profile=floor,
+                # Layer 1 is an isolated ring, just like Characterize: no lower
+                # layer exists for arc assembly to fuse into it. Higher layers
+                # retain the deliberately strict no-assembly path.
+                assemble_arcs=self.layer_index == 1)
         except Exception as exc:
             # A failed measurement still archives its raw RGB-D: the operator
             # cannot re-place the ring exactly, so the frame is the only thing
@@ -818,6 +847,7 @@ class RingMeasureJob:
             failed_dir = archive.write_layer(
                 manifest, nominal_xyz=nominal, commanded_xyz=nominal,
                 color=frame.color, depth=frame.depth,
+                depth_frames=captured["depth_frames"],
                 report={"valid": False, "error": str(exc)})
             # A failure the operator cannot see is a failure they cannot
             # reprocess -- and the raw frame that would rescue it is already
@@ -827,6 +857,9 @@ class RingMeasureJob:
                 pose=inspect["pose"],
                 summary=take_summary(failed_dir, manifest.model_dump(mode="json")))
             self.session.save()
+            ctx.checkpoint("extrusion_take", {
+                "trial_id": self.session.trial_id, "layer_index": self.layer_index,
+                "take": take, "valid": False, "layer_name": failed_dir.name})
             raise RuntimeError(
                 f"layer {self.layer_index} take {take} measurement invalid; "
                 f"raw RGB-D archived: {exc}") from exc
@@ -851,6 +884,7 @@ class RingMeasureJob:
             measured_xyz=processed.measured_xyz,
             pointcloud_xyz=processed.filtered_xyz,
             color=frame.color, depth=frame.depth,
+            depth_frames=captured["depth_frames"],
             derived_images={"segmentation.png": processed.segmentation,
                             "skeleton.png": processed.skeleton,
                             "comparison.png": processed.comparison},
@@ -872,6 +906,10 @@ class RingMeasureJob:
                                  pose=inspect["pose"], summary=summary)
         self.session.save()
         self.results.append(summary)
+        ctx.checkpoint("extrusion_take", {
+            "trial_id": self.session.trial_id, "layer_index": self.layer_index,
+            "take": take, "valid": bool(processed.metrics.valid),
+            "layer_name": layer_dir.name})
         ctx.log(f"layer {self.layer_index} take {take}: offset "
                 f"{processed.metrics.center_offset_norm_mm:.2f} mm, RMS "
                 f"{processed.metrics.rms_mm:.2f} mm, "
@@ -928,7 +966,8 @@ class RingCharacterizeJob:
                               # where the archived ring1_*.npz fixtures came from --
                               # records native, unaligned, 0.1 mm depth with nothing
                               # saying so (Task 9 review, Important 5).
-                              "camera_geometry": frame.geometry.to_dict()}
+                              "camera_geometry": frame.geometry.to_dict(),
+                              "depth_fusion": captured["depth_fusion"]}
                 camera_cfg = services.config.camera
                 try:
                     found = characterize_ring(
@@ -952,6 +991,7 @@ class RingCharacterizeJob:
                     }
                     capture_dir = archive.write_characterization(
                         self.session.trial_id, index, color=frame.color, depth=frame.depth,
+                        depth_frames=captured["depth_frames"],
                         measured_xyz=np.empty((0, 3)), derived_images={},
                         report=failed_report)
                     if captured["inspect"]["pose"]:
@@ -967,6 +1007,7 @@ class RingCharacterizeJob:
                                                 self.plan.setup.center_y_mm]}
                 capture_dir = archive.write_characterization(
                     self.session.trial_id, index, color=frame.color, depth=frame.depth,
+                    depth_frames=captured["depth_frames"],
                     measured_xyz=found.measured_xyz,
                     derived_images={"segmentation.png": found.segmentation,
                                     "skeleton.png": found.skeleton,
