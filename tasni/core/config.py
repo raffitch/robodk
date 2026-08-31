@@ -987,6 +987,14 @@ class ExtrusionConfig(_Model):
     # was the only schedule that fixed the failed cell frame AND both synthetic
     # board-lobe scenes without moving the frames that already worked.
     # Empty list disables the trim.
+    #
+    # The list is the TIGHTENING part only, not the whole filter: since
+    # 2026-08-31 `_radial_trim` then repeats the LAST band until the selection
+    # stops changing, because "the fit walks onto the ring as the bands tighten"
+    # was the schedule's premise and nothing checked it had finished walking. So
+    # do not lengthen this list to buy convergence -- that is already handled,
+    # and bounded, in `_RADIAL_TRIM_SETTLE_PASSES`. Only the band WIDTHS are
+    # tuning; the number of passes at the last one is not.
     radial_trim_schedule_mm: list[float] = Field(
         default_factory=lambda: [15.0, 12.0, 10.0])
 

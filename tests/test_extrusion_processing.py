@@ -108,6 +108,79 @@ def test_the_voxel_stays_fine_enough_for_0_1_mm_words_and_for_thin_deposits():
     assert ExtrusionConfig().voxel_size_m <= 0.001
 
 
+# ----------------------------------- the radial trim settles instead of running out
+
+def _ring_with_a_slab(*, radius=60.0, half_bead=4.0):
+    """A dense annulus plus a rectangular slab welded to its outer flank.
+
+    The board-bias failure with no camera, no Open3D and no renderer in the way:
+    the slab is 27% of the cloud, exactly the regime that drags the circle fit
+    off the ring. Everything is coplanar on purpose -- height cannot separate
+    these two populations, which is the premise the whole radial trim exists to
+    answer (see `_radial_trim`).
+    """
+    theta = np.linspace(0.0, 2 * np.pi, 720, endpoint=False)
+    offset = np.arange(-half_bead, half_bead + 0.01, 0.5)
+    T, D = np.meshgrid(theta, offset, indexing="ij")
+    R = radius + D
+    ring = np.column_stack((R.ravel() * np.cos(T.ravel()),
+                            R.ravel() * np.sin(T.ravel()), np.zeros(T.size)))
+    xs = np.arange(radius + 2.0, radius + 30.01, 0.5)
+    ys = np.arange(-14.0, 14.01, 0.5)
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+    slab = np.column_stack((X.ravel(), Y.ravel(), np.zeros(X.size)))
+    return ring, np.vstack((ring, slab))
+
+
+def test_radial_trim_settles_at_a_fixed_point_instead_of_where_the_schedule_ends():
+    """The band schedule's premise is that the fit walks onto the ring as the
+    bands tighten. Nothing used to check that it had ARRIVED before the list ran
+    out, and on a solid contamination patch it had not -- so the tightest band
+    selected against a circle still biased by the very thing it was removing.
+
+    Measured here, with no sensor model in the way (numbers are this fixture's,
+    2026-08-31): schedule-only keeps the raster out to r 73.7 mm on a 60 mm
+    ring; settling the last band reaches a fixed point after 4 passes at
+    r 71.7 mm. It is a genuine fixed point, not the cap -- 12 passes and 60
+    give bit-identical output.
+    """
+    from tasni.modules.extrusion.processing import _radial_trim
+    _ring, cloud = _ring_with_a_slab()
+    schedule = [15.0, 12.0, 10.0]
+
+    unsettled_counts, settled_counts, generous_counts = {}, {}, {}
+    unsettled = _radial_trim(cloud, schedule, unsettled_counts, settle_passes=0)
+    settled = _radial_trim(cloud, schedule, settled_counts)
+    generous = _radial_trim(cloud, schedule, generous_counts, settle_passes=60)
+
+    def reach(points):
+        return float(np.linalg.norm(points[:, :2], axis=1).max())
+
+    assert unsettled_counts["radial_trim_settle_passes"] == 0
+    assert settled_counts["radial_trim_settle_passes"] > 0
+    assert reach(settled) < reach(unsettled) - 1.0, (reach(settled), reach(unsettled))
+    # A FIXED POINT, not an iteration budget: more passes change nothing.
+    assert settled_counts["radial_trim_settle_passes"] == \
+        generous_counts["radial_trim_settle_passes"]
+    np.testing.assert_array_equal(settled, generous)
+
+
+def test_radial_trim_settling_leaves_an_uncontaminated_ring_completely_alone():
+    """The cost side of the same change: on a cloud whose fit had already
+    arrived, the extra passes must select exactly what the schedule's last pass
+    selected and stop immediately -- zero settle passes, not one point moved.
+    That is why this cannot quietly erode a real, thin bead."""
+    from tasni.modules.extrusion.processing import _radial_trim
+    ring, _cloud = _ring_with_a_slab()
+    counts = {}
+
+    kept = _radial_trim(ring, [15.0, 12.0, 10.0], counts)
+
+    assert counts["radial_trim_settle_passes"] == 0
+    assert counts["after_radial_trim"] == len(ring)
+    np.testing.assert_array_equal(kept, ring)
+
+
 # --------------------------------------------------- one seam for every caller (§3.7)
 
 def test_measure_take_derives_arc_assembly_from_the_layer_itself(monkeypatch):
