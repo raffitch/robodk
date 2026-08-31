@@ -380,18 +380,26 @@ def compactness_filter(points, *, mm_per_pixel: float, bead_mm: float,
     bead width, silently switching the filter's rejection power off exactly at
     the scale of the 2026-08-29 checker patch, which sat 12 mm outside the
     ring). ``math.floor`` (not ``round``) so this holds for every bead/pixel
-    recipe, not only ones that happen to round down. 8-connected labels,
-    per-component extent taken from ``cv2.minAreaRect``'s longer side -- the
-    true oriented (Feret) caliper, not a covariance-eigenvector projection
-    (review round 1: for a near-isotropic raster footprint the eigenvectors of
-    a covariance matrix with near-tied eigenvalues are numerically unstable,
-    so the "principal axis" the projection lands on -- and hence the measured
-    extent -- can swing by up to sqrt(2) depending purely on how the same
-    physical shape happens to sit on the pixel grid; a rotated bounding
-    rectangle has no such ambiguity, it searches all orientations and returns
-    the true minimum). FAIL-OPEN: if the survivors would be fewer than
-    ``min_points`` the cloud passes untouched and the bypass is recorded --
-    topology alone must never starve a thin real ring.
+    recipe, not only ones that happen to round down. 8-connected labels give
+    CONNECTIVITY only -- that raster's one job is answering "do these points
+    form one blob", nothing more. Per-component extent is then measured on
+    that component's own ORIGINAL float millimetre coordinates (looked up via
+    each point's own rasterized-pixel label), using ``cv2.minAreaRect``'s
+    longer side -- the true oriented (Feret) caliper, not a
+    covariance-eigenvector projection (review round 1: for a near-isotropic
+    footprint the eigenvectors of a covariance matrix with near-tied
+    eigenvalues are numerically unstable, so the "principal axis" the
+    projection lands on can swing by up to sqrt(2) depending purely on
+    orientation). Do NOT run the caliper on the rasterized pixel coordinates
+    (review round 2: doing so re-introduces exactly the grid-quantization the
+    caliper swap was meant to escape -- np.rint's rounding is itself
+    orientation-sensitive, and a perfect caliper computed on an
+    orientation-sensitive input set is still orientation-sensitive; measured
+    ~10% of rotations still flipping decision with the raster-coordinate
+    caliper, unmoved by the eigenvector-to-minAreaRect swap alone). FAIL-OPEN:
+    if the survivors would be fewer than ``min_points`` the cloud passes
+    untouched and the bypass is recorded -- topology alone must never starve a
+    thin real ring.
     """
     pts = np.asarray(points, dtype=float)
     if counts is None:
@@ -415,20 +423,29 @@ def compactness_filter(points, *, mm_per_pixel: float, bead_mm: float,
     closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     total, labels = cv2.connectedComponents(closed, connectivity=8)
     min_extent_mm = float(min_length_beads) * float(bead_mm)
+    # The raster answers ONLY "do these points form one blob" (that is what
+    # morphology/connected-components are for). Measuring extent on the raster
+    # itself re-introduces the exact grid-quantization the caliper swap was
+    # meant to escape -- np.rint's np.int rounding is orientation-sensitive in
+    # a way `cv2.minAreaRect` cannot see past, no matter how good the caliper
+    # is (review round 2: still ~10% of rotations flipped, unmoved by round
+    # 1's fix, because the INPUT to minAreaRect was still quantized). So the
+    # caliper below runs on each component's own ORIGINAL float millimetre
+    # coordinates -- looked up via `point_labels`, each original point's
+    # rasterized pixel's component label -- not on the pixel grid.
+    point_labels = labels[pixels[:, 1], pixels[:, 0]]
     keep_labels = []
     for label in range(1, total):
-        ys, xs = np.nonzero(labels == label)
-        coords = np.column_stack([xs, ys]).astype(np.float32)
-        if len(coords) < 2:
+        comp_xy = xy[point_labels == label].astype(np.float32)
+        if len(comp_xy) < 2:
             extent = 0.0
         else:
-            _, (w, h), _ = cv2.minAreaRect(coords)
-            extent = float(max(w, h)) * mm_per_pixel
+            _, (w, h), _ = cv2.minAreaRect(comp_xy)
+            extent = float(max(w, h))          # already in mm -- no pixel scale
         if extent >= min_extent_mm:
             keep_labels.append(label)
     counts["compactness_components"] = int(total - 1)
     counts["compactness_kept_components"] = len(keep_labels)
-    point_labels = labels[pixels[:, 1], pixels[:, 0]]
     keep = (np.isin(point_labels, keep_labels) if keep_labels
             else np.zeros(len(pts), bool))
     if int(keep.sum()) < int(min_points):

@@ -258,29 +258,50 @@ def _wide_arc_points(radius_mm, span_deg, width_mm, start_deg=0.0, per_deg=6,
     return np.column_stack([x, y, np.full(len(x), 3.0)])
 
 
-def test_six_identical_arcs_decide_consistently_regardless_of_grid_orientation():
-    """Review round 1, Required (promoted from Minor): six geometrically
-    identical 38-degree arcs (same radius/span/width, rotated only in start
-    angle -- so the raster footprint is the same physical shape, just at a
-    different orientation on the pixel grid) must reach the SAME keep/drop
-    decision. Measured before this fix: the eigenvector-projection extent
-    swung between the six rotations far enough (~10.8-12.2 mm) that a
-    threshold of 11.0 mm split them 3 kept / 3 dropped -- purely from grid
-    orientation, nothing physical changed. `cv2.minAreaRect`'s longer side
-    is the true oriented caliper (no eigenvalue-tie ambiguity to swing on);
-    at the same 11.0 mm threshold every rotation now measures inside a
-    tight, sub-mm band (~9.9-10.7 mm) and all six decide the same way."""
+def test_identical_arcs_decide_consistently_across_a_fine_orientation_sweep():
+    """Review round 1, Required (promoted from Minor) + review round 2
+    (the round 1 fix was incomplete): 72 geometrically identical 38-degree
+    arcs, swept at 5-degree resolution (same radius/span/width, rotated only
+    in start angle -- so the raster footprint is the same physical shape,
+    just at a different orientation on the pixel grid) must all reach the
+    SAME keep/drop decision. A coarse 6-angle sample of this same shape (0,
+    15, 30, 45, 60, 75 degrees) happened to land entirely outside the failure
+    band and passed even before round 2's fix -- a false pin, per review
+    round 2 -- so this sweeps every 5 degrees over the full circle instead of
+    a hand-picked few.
+
+    Round 1 (swapping the covariance-eigenvector projection for
+    `cv2.minAreaRect`) was not sufficient on its own: it was still measuring
+    the caliper on the RASTERIZED (`np.rint`-quantized) pixel coordinates,
+    which are themselves orientation-sensitive, so a perfect caliper on a
+    quantization-sensitive input is still quantization-sensitive. Measured at
+    5-degree resolution before round 2's fix: 7 of 72 rotations (105, 140,
+    190, 200, 205, 210, 230 degrees) flipped to `kept_components=1` against
+    threshold 11.0 mm while the other 65 decided 0 -- spread 4.000 mm,
+    worst-case ratio ~1.5 (~sqrt(2)), essentially unmoved by the round 1
+    caliper swap alone.
+
+    Round 2's fix measures the caliper on each component's own ORIGINAL float
+    millimetre coordinates (looked up via each point's rasterized-pixel
+    label), never on the quantized grid. Measured after: all 72 rotations
+    report the IDENTICAL extent (9.4415 mm, spread 0.0000 mm) -- rotating a
+    rigid shape's generating angle cannot change its own true caliper once
+    quantization is out of the measurement, so there is nothing left to flip
+    regardless of where the threshold sits."""
     radius_mm, span_deg, width_mm = 10.0, 38.0, 9.0
     mm_per_pixel = 2.0
     bead_mm = 11.0                # with min_length_beads=1.0 -> threshold 11.0 mm,
-    min_length_beads = 1.0        # inside the old eigen swing, outside the new one
+    min_length_beads = 1.0        # inside the round-1-only failure band
     kept_counts = []
-    for start_deg in (0, 15, 30, 45, 60, 75):
-        arc = _wide_arc_points(radius_mm, span_deg, width_mm, start_deg=start_deg)
+    for start_deg in np.arange(0.0, 360.0, 5.0):
+        arc = _wide_arc_points(radius_mm, span_deg, width_mm,
+                               start_deg=float(start_deg))
         counts = {}
         compactness_filter(arc, mm_per_pixel=mm_per_pixel, bead_mm=bead_mm,
                            min_length_beads=min_length_beads, min_points=0,
                            counts=counts)
         kept_counts.append(counts["compactness_kept_components"])
+    assert len(kept_counts) == 72
     assert len(set(kept_counts)) == 1, (
-        f"decision flipped across rotations purely on grid orientation: {kept_counts}")
+        f"decision flipped across the fine orientation sweep purely on grid "
+        f"orientation: {kept_counts}")
