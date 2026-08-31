@@ -58,9 +58,11 @@ def _tukey_one_sided_bias(c_positive: float, c_negative: float) -> float:
     E[w(Z - s) * (Z - s)] = 0 for a standard normal Z by bisection over a
     fixed, deterministic quadrature grid -- no RNG, no scipy, pure numpy.
     The result depends only on (c_positive, c_negative), so it is solved
-    once per distinct pair and cached; `fit()` adds `-shift * sigma_mm` to
-    the intercept once per call, which is cheap relative to the cached
-    lookup.
+    once per distinct pair and cached; `fit()` negates it into
+    `bias_correction_sigma` and multiplies by `sigma_mm` to get
+    `bias_correction_mm`, which it adds to the intercept -- both are kept on
+    the returned instance and surface in `to_report()` so the correction is
+    never an invisible constant.
     """
     z = np.linspace(-12.0, 12.0, 20_001)
     pdf = np.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
@@ -98,7 +100,10 @@ class PlaneSubstrate:
     NOT the true plane for clean data -- see `_tukey_one_sided_bias` for the
     closed-form correction `fit()` applies to the intercept. Do not remove it
     to "simplify" back to the textbook (biased, for this weight shape) IRLS
-    fixed point.
+    fixed point. The correction's effect on REAL cell data (not just the
+    synthetic Gaussian scenario proving it analytically) is checked by the
+    task 7 golden harness over 11 archived cell takes -- that is where its
+    real-world accuracy claim is verified, not here.
     """
     a: float
     b: float
@@ -106,6 +111,8 @@ class PlaneSubstrate:
     sigma_mm: float
     inlier_fraction: float
     clamp_mm: tuple[float, float]
+    bias_correction_mm: float
+    bias_correction_sigma: float
     source: str = "fitted_plane"
 
     @classmethod
@@ -134,9 +141,14 @@ class PlaneSubstrate:
         # The IRLS fixed point above is systematically offset from the true
         # plane by a known constant times sigma (see _tukey_one_sided_bias);
         # correct the intercept only -- x/y are ROI-centred, so the shift
-        # loads onto the constant term, not the slope.
+        # loads onto the constant term, not the slope. Keep both the applied
+        # mm shift and the dimensionless constant on the instance (spec §4:
+        # every frame reports its own health -- a correction that silently
+        # moves every measured height must not be invisible to the report).
+        bias_correction_sigma = -_tukey_one_sided_bias(c_positive, c_negative)
+        bias_correction_mm = bias_correction_sigma * sigma
         coeff = coeff.copy()
-        coeff[2] -= _tukey_one_sided_bias(c_positive, c_negative) * sigma
+        coeff[2] += bias_correction_mm
         residual = z - design @ coeff
         a, b, c = (float(v) for v in coeff)
         normal_z = 1.0 / math.sqrt(a * a + b * b + 1.0)
@@ -149,7 +161,9 @@ class PlaneSubstrate:
                 "and measuring against it would be silently wrong")
         inliers = float(np.mean(np.abs(residual) <= 3.0 * max(sigma, 1e-9)))
         return cls(a=a, b=b, c=c, sigma_mm=sigma, inlier_fraction=inliers,
-                   clamp_mm=(float(clamp_mm[0]), float(clamp_mm[1])))
+                   clamp_mm=(float(clamp_mm[0]), float(clamp_mm[1])),
+                   bias_correction_mm=bias_correction_mm,
+                   bias_correction_sigma=bias_correction_sigma)
 
     def plane_z(self, xy: np.ndarray) -> np.ndarray:
         xy = np.asarray(xy, dtype=float)
@@ -172,4 +186,10 @@ class PlaneSubstrate:
                 "sigma_mm": round(self.sigma_mm, 4),
                 "tilt_deg": round(self.tilt_deg(), 3),
                 "plane": [round(self.a, 6), round(self.b, 6), round(self.c, 4)],
-                "inlier_fraction": round(self.inlier_fraction, 4)}
+                "inlier_fraction": round(self.inlier_fraction, 4),
+                # audit trail for the Fisher-consistency correction applied to
+                # the intercept: the actual mm shift, and the dimensionless
+                # per-sigma constant it was derived from (bias_correction_mm
+                # == bias_correction_sigma * sigma_mm).
+                "bias_correction_mm": round(self.bias_correction_mm, 4),
+                "bias_correction_sigma": round(self.bias_correction_sigma, 5)}
