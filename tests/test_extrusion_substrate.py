@@ -95,3 +95,38 @@ def test_majority_deposit_is_refused_not_measured_as_perfect():
     pts, _ = _tilted_scene(bead_fraction=0.75)
     with pytest.raises(RuntimeError, match="substrate fit refused"):
         PlaneSubstrate.fit(pts)
+
+
+def test_healthy_low_point_count_frames_are_not_falsely_refused():
+    """Task 4 review round 3: the breakdown guard's clause (a) originally
+    used a FIXED 1% fraction, which false-fired on healthy, uncontaminated
+    frames at low n (measured up to 18% of trials at n=80 -- 1% of 50 points
+    is half a point, so a single unlucky point tripped it). This is a
+    supported input size (fit() explicitly accepts frames down to 50
+    points), not a pathological one. Pins the fix: the n-adaptive
+    (Poisson-tail) threshold must drive that rate to ~0 across n=50..500 --
+    30 trials per size, no bead at all, budget generous enough not to be
+    flaky (measured actual rate: 0-1% per size) but far below the ~10-18%
+    the fixed-fraction version showed."""
+    total_trials = 0
+    total_false_fires = 0
+    for n in (50, 60, 80, 100, 150, 200, 300, 500):
+        for seed in range(30):
+            pts, _ = _tilted_scene(n=n, bead_fraction=0.0, seed=1_000_000 + seed)
+            total_trials += 1
+            try:
+                PlaneSubstrate.fit(pts)
+            except RuntimeError:
+                total_false_fires += 1
+    assert total_false_fires <= max(3, round(0.05 * total_trials)), (
+        f"{total_false_fires}/{total_trials} healthy low-n frames were refused")
+
+
+def test_majority_deposit_is_refused_at_low_point_count_too():
+    """Task 4 review round 3: a bead-locked sparse frame is exactly as wrong
+    as a bead-locked dense one -- the n-adaptive threshold must not trade
+    low-n sensitivity for its fixed false-fire fix. n=100, 75% deposit
+    fraction (measured: caught 50/50 trials at this n)."""
+    pts, _ = _tilted_scene(n=100, bead_fraction=0.75, seed=11)
+    with pytest.raises(RuntimeError, match="substrate fit refused"):
+        PlaneSubstrate.fit(pts)

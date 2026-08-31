@@ -36,12 +36,35 @@ def _sigma_low(residual: np.ndarray) -> float:
     return float(np.median(residual) - np.percentile(residual, 15.87))
 
 
-def _breakdown_fraction(residual: np.ndarray, k: float = 3.0) -> float:
-    """Fraction of points sitting more than k robust-sigma BELOW the fitted
-    plane -- the physical-invariant check (spec §3.5-adjacent, task 4 review
-    Important 2): essentially nothing may sit far below the substrate, since
-    it is the surface everything rests on. A large fraction below means the
-    fit has locked onto the deposit's top instead of the table.
+#: P(Z < -3) for a standard normal -- the fraction of points a HEALTHY,
+#: uncontaminated fit is expected to show more than 3 sigma below the plane.
+#: Closed form (erfc), not a magic number: 0.5 * erfc(3/sqrt(2)).
+_P_TAIL_3SIGMA = 0.5 * math.erfc(3.0 / math.sqrt(2.0))
+
+#: Significance level for the breakdown count threshold below -- how often a
+#: genuinely healthy fit may be refused by chance. 1e-4 keeps that at roughly
+#: 1-in-10,000 while (measured, see task 4 report round 3) comfortably
+#: catching every realized-majority-deposit fit tried down to n=50.
+_BREAKDOWN_ALPHA = 1e-4
+
+#: Clause (b) in fit(): refuse if sigma_mm exceeds this multiple of
+#: clamp_mm[1]. 2.0x the default 2.0 mm ceiling = 4.0 mm, against a measured
+#: healthy sigma_mm ceiling of ~0.8 mm even at n=50 (5x margin) -- see the
+#: task 4 report for the full healthy-sigma sweep this was picked against.
+#: Lowered from round 2's 2.5x: at low n a partial (neither clean substrate
+#: nor clean deposit-top) lock can leave sigma_mm just under 2.5x while
+#: clause (a) also misses it because MAD is partly corrupted too -- 2.0x
+#: closes most of that gap and stays far above legitimate noise.
+_BREAKDOWN_SIGMA_MULT = 2.0
+
+
+def _breakdown_below_count(residual: np.ndarray, k: float = 3.0) -> tuple[int, float]:
+    """Count of points sitting more than k robust-sigma BELOW the fitted
+    plane, and the robust sigma used -- the physical-invariant check (spec
+    §3.5-adjacent, task 4 review Important 2): essentially nothing may sit
+    far below the substrate, since it is the surface everything rests on. A
+    large count below means the fit has locked onto the deposit's top
+    instead of the table.
 
     Deliberately NOT `sigma_mm`/`_sigma_low`: once the fit has actually
     locked onto the deposit (its majority now sits at/above the true
@@ -55,15 +78,56 @@ def _breakdown_fraction(residual: np.ndarray, k: float = 3.0) -> float:
     keeps its footing because it only needs the MAJORITY cluster's own
     spread, not the gap to the minority one -- robust up to just under 50%
     contamination, which is why this is one signal and not the only one
-    (clause (b) below covers the case this one measurably cannot: contamination
-    at or just past the exact 50/50 tie, where MAD sits at its own breakdown
-    point too).
+    (clause (b) in fit() covers the case this one measurably cannot:
+    contamination at or just past the exact 50/50 tie, where MAD sits at its
+    own breakdown point too).
+
+    Returns a raw COUNT, not a fraction: `fit()` compares it against an
+    n-adaptive threshold (`_poisson_upper_count`), not a fixed percentage --
+    a fixed 1% cutoff false-fired on healthy small-n frames (task 4 review
+    round 3: up to 18% of trials at n=80) because 1% of 50 points is half a
+    point, so a single unlucky point trips it.
+
+    If the MAD is degenerate (>=50% of residuals tied exactly at the
+    median), falls through to the ordinary (non-robust) standard deviation
+    rather than silently reporting a count of 0 -- a safety guard going
+    quietly blind in a degenerate case is the wrong default. Only when
+    THAT is also zero (every residual identical -- nothing to detect, by
+    construction) does this return 0.
     """
     centered = residual - np.median(residual)
     mad_sigma = float(np.median(np.abs(centered))) * 1.4826
     if mad_sigma <= 0.0:
-        return 0.0
-    return float(np.mean(residual < -k * mad_sigma))
+        mad_sigma = float(np.std(residual))
+    if mad_sigma <= 0.0:
+        return 0, 0.0
+    count = int(np.sum(residual < -k * mad_sigma))
+    return count, mad_sigma
+
+
+def _poisson_upper_count(lam: float, alpha: float = _BREAKDOWN_ALPHA) -> int:
+    """Smallest integer K such that P(Poisson(lam) > K) <= alpha, by direct
+    summation of the Poisson pmf -- pure math/numpy, deterministic, no scipy.
+
+    The count of points a healthy fit shows below -3*sigma is Binomial(n,
+    p=_P_TAIL_3SIGMA); Poisson(n*p) is an excellent approximation here
+    because p is tiny even when n is large (rare-event regime). This is what
+    makes the breakdown-count threshold SCALE with n instead of being a
+    fixed fraction or a fixed count -- exactly the fix task 4 review round 3
+    asked for over a hard-coded 1% cutoff.
+    """
+    if lam <= 0.0:
+        return 0
+    p = math.exp(-lam)
+    cdf = p
+    k = 0
+    while (1.0 - cdf) > alpha:
+        k += 1
+        p *= lam / k
+        cdf += p
+        if k > 10_000_000:      # safety valve; never reached for realistic n
+            break
+    return k
 
 
 @lru_cache(maxsize=None)
@@ -216,23 +280,30 @@ class PlaneSubstrate:
         # top is parallel to the substrate) and inlier_fraction, the number
         # an operator would trust, comes out 1.000 in exactly this failure.
         # Two independent checks, because the failure shows up differently
-        # depending on how far past the tipping point the contamination is:
-        breakdown_frac = _breakdown_fraction(residual)
-        if breakdown_frac > 0.01:
+        # depending on how far past the tipping point the contamination is.
+        # Clause (a)'s threshold is COUNT-based and n-adaptive (Poisson tail
+        # of the ~0.135% a healthy fit is expected to show below -3 sigma),
+        # not a fixed fraction: a fixed 1% cutoff false-fired on healthy
+        # small-n frames (measured up to 18% of trials at n=80, task 4
+        # review round 3) because 1% of 50 points is half a point.
+        breakdown_count, _breakdown_sigma = _breakdown_below_count(residual)
+        breakdown_threshold = _poisson_upper_count(len(pts) * _P_TAIL_3SIGMA)
+        if breakdown_count > breakdown_threshold:
             raise RuntimeError(
-                f"substrate fit refused: {breakdown_frac:.1%} of the fit region "
-                "sits more than 3 robust-sigma below the recovered plane -- "
-                "essentially nothing should sit far below the substrate that "
-                "everything else rests on, so the fit has almost certainly "
-                "locked onto the deposit's top instead of the table; widen or "
-                "reposition the fit region so the true substrate is the "
-                "majority of it")
-        if sigma > 2.5 * clamp_mm[1]:
+                f"substrate fit refused: {breakdown_count} of {len(pts)} points "
+                f"({breakdown_count / len(pts):.1%}) sit more than 3 robust-sigma "
+                f"below the recovered plane (expected at most {breakdown_threshold} "
+                "by chance on a clean fit this size) -- essentially nothing should "
+                "sit far below the substrate that everything else rests on, so the "
+                "fit has almost certainly locked onto the deposit's top instead of "
+                "the table; widen or reposition the fit region so the true "
+                "substrate is the majority of it")
+        if sigma > _BREAKDOWN_SIGMA_MULT * clamp_mm[1]:
             raise RuntimeError(
                 f"substrate fit refused: sigma_mm={sigma:.2f} is more than "
-                f"2.5x the floor ceiling ({clamp_mm[1]:g} mm) -- the clamp "
-                "ceiling exists precisely because k*sigma beyond it is "
-                "meaningless, so sigma this far above it means the fit region "
+                f"{_BREAKDOWN_SIGMA_MULT:g}x the floor ceiling ({clamp_mm[1]:g} mm) "
+                "-- the clamp ceiling exists precisely because k*sigma beyond it "
+                "is meaningless, so sigma this far above it means the fit region "
                 "is not describing a single substrate at all; widen or "
                 "reposition the fit region so the true substrate is the "
                 "majority of it")
