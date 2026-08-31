@@ -925,6 +925,29 @@ class ExtrusionConfig(_Model):
     # temporal depth filter, which is what lets it converge after a move.
     depth_stale_retries: int = Field(default=2, ge=0, le=10)
     bead_width_bins: int = Field(default=36, ge=4, le=360)
+    # -- substrate health, the gate on segmentation itself --------------------
+    # `separation_margin_mm` (deposit height p50 minus substrate p99) is spec
+    # section 4's one derived "is segmentation healthy here" number. It was
+    # computed and reported and read by NOTHING until 2026-08-31, when a cell
+    # take with a margin of -0.119 mm -- the deposit median UNDER the board's own
+    # p99 -- returned valid with no warnings and a bead 41% fatter than the same
+    # ring an hour before.
+    #
+    # A margin at or below this is not a marginal measurement, it is the absence
+    # of one: the two populations the chain separated are not separable, so the
+    # thing it called "deposit" has no claim to be the ring. Refuse, the way the
+    # branch guard refuses -- the raw frame is archived either way.
+    #
+    # 0.0 is a definition, not a tuned value. Every honest take in the 2026-08-30
+    # archive sits at 2.05-2.18 (layer 1) or 6.5-6.9 (layer 2), so the fault line
+    # has ~2 mm of headroom below the worst good take and 0.12 mm above the one
+    # bad one. Raising it turns a definition into a threshold; don't, without
+    # evidence from frames.
+    substrate_min_separation_mm: float = Field(default=0.0, ge=0.0, le=50.0)
+    # Above the fault line but below the archive's band: measure it, and say so.
+    substrate_warn_separation_mm: float = Field(default=1.5, ge=0.0, le=50.0)
+    # Archive band is 0.515-0.568; the bad take was 0.866.
+    substrate_warn_sigma_mm: float = Field(default=0.70, gt=0.0, le=10.0)
     # After the largest deposit cluster is chosen, keep only points within a band
     # of the circle FITTED to that cluster -- fit, trim, refit, one pass per band,
     # tightening. This is what separates the bead from the ChArUco board's own

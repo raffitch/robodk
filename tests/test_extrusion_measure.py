@@ -3107,3 +3107,105 @@ def test_the_side_photo_is_served_to_the_browser_and_listed(tmp_path, monkeypatc
     # A path that is not on the whitelist is still refused.
     assert client.get(f"/api/modules/extrusion/trials/{session.trial_id}"
                       "/layers/layer-001/files/depth.npy").status_code == 404
+
+
+# ------------------------------------------------- substrate health gating
+# `separation_margin_mm` -- spec section 4's one derived "is segmentation
+# healthy here" number -- was computed, written into the report, and read by
+# nothing. Measured 2026-08-31 on the cell: a take whose deposit median sat
+# BELOW the board's own p99 (margin -0.119 mm, sigma 0.866, floor pinned on its
+# 2.0 mm clamp) returned `valid: true` with `warnings: []`, and reported a bead
+# 41% fatter than the same ring measured an hour earlier. Every honest take in
+# the 2026-08-30 archive sits at margin 2.05-2.18 with sigma 0.515-0.568 and a
+# floor of 1.55-1.70, so there is ~2 mm of headroom on both sides of the fault
+# line; this is a gate, not a tuning parameter.
+
+from tasni.modules.extrusion.processing import substrate_health  # noqa: E402
+
+
+def _substrate(**over):
+    """One golden layer-1 take's substrate block (2026-08-30 archive, layer-001)."""
+    block = {"source": "fitted_plane", "sigma_mm": 0.5635, "floor_mm": 1.691,
+             "substrate_p99_mm": 1.364, "separation_margin_mm": 2.182}
+    block.update(over)
+    return block
+
+
+def test_substrate_health_passes_a_take_from_the_golden_archive():
+    fault, warnings = substrate_health(_substrate(), ExtrusionConfig())
+    assert fault is None
+    assert warnings == []
+
+
+def test_substrate_health_faults_when_the_deposit_sits_below_the_board():
+    """The 2026-08-31 17:12 cell take. A negative margin means the deposit's
+    median height is under the board's 99th percentile -- the two populations
+    are not separable, so whatever came out is not a measurement."""
+    fault, _ = substrate_health(
+        _substrate(separation_margin_mm=-0.119, sigma_mm=0.8657, floor_mm=2.0,
+                   substrate_p99_mm=3.535),
+        ExtrusionConfig())
+    assert fault is not None
+    assert "-0.119" in fault                    # names the number it refused on
+    assert "separation" in fault.lower()
+
+
+def test_substrate_health_warns_on_a_thin_margin_without_faulting():
+    """Above the fault line but below the golden band: report it, measure it."""
+    fault, warnings = substrate_health(
+        _substrate(separation_margin_mm=1.0), ExtrusionConfig())
+    assert fault is None
+    assert any("separation" in w.lower() for w in warnings), warnings
+
+
+def test_substrate_health_warns_when_the_derived_floor_is_pinned_on_its_clamp():
+    """A pinned floor means 3*sigma exceeded the clamp ceiling -- the surface is
+    noisier than the floor can express, so the floor is no longer derived from
+    this frame at all. Structural, and it fires on nothing in the archive."""
+    config = ExtrusionConfig()
+    ceiling = float(tuple(config.substrate_floor_clamp_mm)[1])
+    fault, warnings = substrate_health(_substrate(floor_mm=ceiling), config)
+    assert fault is None
+    assert any("clamp" in w.lower() for w in warnings), warnings
+
+
+def test_substrate_health_warns_on_a_substrate_noisier_than_the_archive():
+    fault, warnings = substrate_health(_substrate(sigma_mm=0.8657), ExtrusionConfig())
+    assert fault is None
+    assert any("sigma" in w.lower() for w in warnings), warnings
+
+
+def test_substrate_health_cannot_fault_on_a_margin_it_does_not_have():
+    """`separation_margin_mm` is None when the substrate had no p99 to subtract.
+    Absent evidence is not evidence of a fault."""
+    fault, warnings = substrate_health(
+        _substrate(separation_margin_mm=None, substrate_p99_mm=None),
+        ExtrusionConfig())
+    assert fault is None
+    assert not any("separation" in w.lower() for w in warnings), warnings
+
+
+def test_the_health_gate_is_wired_into_the_measurement_path():
+    """The pure function above is worthless if nothing calls it. A clean
+    synthetic ring measures fine on the shipped config and must REFUSE when the
+    fault line is raised above its own margin -- which can only happen if
+    process_observation consults the gate."""
+    pytest.importorskip("open3d")
+    T = syn.inspection_camera_T([CENTER[0], CENTER[1], 6.0], 300.0)
+    ring = syn.RingSpec(40.0, 10.0, CENTER, height_fn=syn.flat(6.0))
+    scene = np.vstack((syn.plane_points(center_xy_mm=CENTER), ring.surface_points()))
+    depth = syn.render_depth(scene, T, noise_mm=0.3)
+    plan = scene_plan(radius=40.0, bead=10.0, layer_height=6.0, center=CENTER)
+
+    def run(config):
+        return process_observation(depth=depth, geometry=syn.geometry(),
+                                   T_work_camera=T, plan=plan, layer=plan.layers[0],
+                                   config=config)
+
+    healthy = run(ExtrusionConfig())
+    assert healthy.report["valid"]
+    margin = healthy.report["substrate"]["separation_margin_mm"]
+    assert margin > 0.0
+
+    with pytest.raises(RuntimeError, match="separation"):
+        run(ExtrusionConfig(substrate_min_separation_mm=margin + 1.0))

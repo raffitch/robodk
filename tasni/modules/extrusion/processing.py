@@ -595,6 +595,68 @@ def plan_for_archived_take(manifest: dict, trial: dict, *,
     return generate_cylinder_plan(recipe, setup)
 
 
+def substrate_health(report: dict, config) -> tuple["str | None", list[str]]:
+    """Judge a frame's own segmentation from ``substrate_report``.
+
+    Returns ``(fault, warnings)``. A fault means the frame cannot yield a
+    measurement and the caller must refuse it; warnings mean measure it and say
+    what was odd.
+
+    The fault is the separation margin -- deposit height p50 minus substrate
+    p99, spec section 4's one derived health number. At or below
+    ``substrate_min_separation_mm`` (0.0 by default) the deposit's median height
+    sits under the board's own 99th percentile: the two populations the chain
+    just separated are not separable, so whatever it labelled "deposit" has no
+    claim to be the ring. That is a definition, not a threshold -- see the
+    config comment for why 0.0 is not tuned.
+
+    None is not a fault. ``separation_margin_mm`` is None when there was no
+    substrate p99 to subtract from, and absent evidence is not evidence.
+
+    The warnings are the softer tells, none of which fire on the 2026-08-30
+    archive: a margin above the fault line but below the archive's band, a
+    substrate noisier than the archive ever was, and a derived floor pinned on
+    its clamp ceiling -- that last meaning 3*sigma exceeded the clamp, so the
+    floor stopped being derived from this frame at all.
+    """
+    warnings: list[str] = []
+    fault: "str | None" = None
+
+    margin = report.get("separation_margin_mm")
+    if margin is not None:
+        margin = float(margin)
+        floor_line = float(config.substrate_min_separation_mm)
+        if margin <= floor_line:
+            fault = (
+                f"substrate separation collapsed: {margin:.3f} mm "
+                f"(deposit height p50 minus substrate p99) is at or below the "
+                f"{floor_line:.3f} mm fault line -- the deposit and the board are "
+                f"not separable in this frame, so nothing measured from it is a "
+                f"ring; substrate sigma {report.get('sigma_mm')} mm, floor "
+                f"{report.get('floor_mm')} mm, board p99 "
+                f"{report.get('substrate_p99_mm')} mm")
+        elif margin < float(config.substrate_warn_separation_mm):
+            warnings.append(
+                f"thin substrate separation: {margin:.3f} mm, under the "
+                f"{float(config.substrate_warn_separation_mm):.3f} mm the archive's "
+                f"takes clear comfortably")
+
+    sigma = report.get("sigma_mm")
+    if sigma is not None and float(sigma) > float(config.substrate_warn_sigma_mm):
+        warnings.append(
+            f"noisy substrate: sigma {float(sigma):.4f} mm, over "
+            f"{float(config.substrate_warn_sigma_mm):.2f} mm")
+
+    floor = report.get("floor_mm")
+    ceiling = float(tuple(config.substrate_floor_clamp_mm)[1])
+    if floor is not None and abs(float(floor) - ceiling) < 1e-6:
+        warnings.append(
+            f"the derived floor is pinned on its {ceiling:.2f} mm clamp ceiling, "
+            f"so it no longer follows this frame's own noise")
+
+    return fault, warnings
+
+
 def process_observation(*, depth: np.ndarray,
                         geometry: CameraGeometry, T_work_camera: np.ndarray,
                         plan: CylinderPlan, layer: LayerPath, config,
@@ -776,6 +838,14 @@ def process_observation(*, depth: np.ndarray,
     substrate_report["separation_margin_mm"] = (
         round(float(np.median(deposit_h)) - substrate_report["substrate_p99_mm"], 3)
         if substrate_report["substrate_p99_mm"] is not None else None)
+    # Refuse HERE, not at the end: this is the first moment the frame can be
+    # judged, and everything downstream (crest, raster, skeleton, spline, the
+    # metrics) would be measuring two populations that are not distinguishable.
+    # Raising matches the branch guard's contract -- the caller archives the raw
+    # RGB-D either way, so the take is reprocessable once the cause is fixed.
+    health_fault, health_warnings = substrate_health(substrate_report, config)
+    if health_fault:
+        raise RuntimeError(health_fault)
     points = _top_surface(deposit, config, counts)
     keep("top_surface", points)
     timings["filter_ms"] = (time.perf_counter() - mark) * 1000
@@ -915,7 +985,8 @@ def process_observation(*, depth: np.ndarray,
         "coordinate_frame": plan.setup.work_frame, "units": "mm",
         "closed": bool(closed),
         "measured_path_completeness": float(metrics.path_completeness),
-        "valid": metrics.valid, "warnings": metrics.warnings,
+        "valid": metrics.valid,
+        "warnings": list(metrics.warnings) + health_warnings,
     }
     return ProcessingResult(measured, corrected, metrics, final_mask,
                             final_skeleton * 255, overlay, report,
