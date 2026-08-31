@@ -86,11 +86,6 @@ class MeasureLayerBody(FingerprintBody):
     # SideCapture / TowardsSideCapture targets. None = follow the configured
     # default (on); pass false to skip it for a take that does not need one.
     side_photo: bool | None = None
-    # Escape hatch for a layer whose floor can never be measured (every take of
-    # the layer below failed). Deliberately not in the UI: the floor is
-    # load-bearing, and skipping it silently would produce a number the paper
-    # cannot use.
-    allow_missing_floor: bool = False
     confirm_close_range_tool_clear: bool = False
     collision_check_enabled: bool = False
 
@@ -751,9 +746,12 @@ class ExtrusionModule(WorkflowModule):
                 raise HTTPException(409, "toolpath changed; generate coordinates again")
             if body.layer_index > len(self._plan.layers):
                 raise HTTPException(400, f"layer_index must be 1..{len(self._plan.layers)}")
-            # Data-integrity gates BEFORE the motion gates: they are the two ways
-            # a cell run silently produces numbers the paper cannot use, and
-            # neither needs a robot to detect.
+            # Data-integrity gate BEFORE the motion gates: scoring a take against
+            # a plan the ring was never placed on silently produces a number the
+            # paper cannot use, and detecting it needs no robot. (The second gate
+            # here used to refuse layer N until layer N-1 had a measured top --
+            # deleted with `floor_profile`, which measured WORSE on the only
+            # stacked data there is; spec 2026-08-30 §2.4.)
             existing = self._session()
             applied = None if existing is None else existing.applied
             if applied and applied.get("fingerprint") != self._plan.fingerprint:
@@ -765,15 +763,6 @@ class ExtrusionModule(WorkflowModule):
                     "to measure against the characterized ring again — scoring a take "
                     "against a plan the ring was never placed on is the stale-plan "
                     "artifact (2026-08-28: a 15 mm centre offset that measured nothing).")
-            if (body.layer_index > 1 and existing is not None
-                    and not body.allow_missing_floor
-                    and existing.floor_profile(body.layer_index) is None):
-                raise HTTPException(
-                    409,
-                    f"measure layer {body.layer_index - 1} first: layer {body.layer_index}'s "
-                    f"measurement floor IS layer {body.layer_index - 1}'s latest measured "
-                    "take, and without it a stacked ring blends into the ring beneath it "
-                    "(the synthetic proof exhausts the branch guard outright).")
             _require_measure_ready(body.confirm_robot_motion)
             session = self._session(create=True)
             self._active_measure_job = RingMeasureJob(

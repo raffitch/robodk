@@ -80,15 +80,14 @@ def scene_plan(*, radius=60.0, bead=8.0, layers=1, layer_height=6.0, center=CENT
     return generate_cylinder_plan(recipe, setup)
 
 
-def observe(plan, layer_index, rings, *, config=None, floor_profile=None, seed=0,
-            stages=None):
+def observe(plan, layer_index, rings, *, config=None, seed=0, stages=None):
     """Render the rings from the derived inspection pose and process that frame."""
     layer = plan.layers[layer_index - 1]
     T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, layer_index), 300.0)
     depth = syn.render_scene(rings, T, plane_center_xy_mm=(plan.setup.center_x_mm,
                                                            plan.setup.center_y_mm), seed=seed)
     color = np.zeros((syn.SIZE_720P[1], syn.SIZE_720P[0], 3), np.uint8)
-    kwargs = {} if floor_profile is None else {"floor_profile": floor_profile}
+    kwargs = {}
     if stages is not None:
         kwargs["stages"] = stages
     return process_observation(color=color, depth=depth,
@@ -606,28 +605,13 @@ def test_characterize_records_what_the_search_cylinder_held_before_the_floor():
     assert coarse["search_cylinder_z_mm_p99"] > 4.0
 
 
-def test_floor_from_previous_layer_keeps_the_ring_below_out_of_the_measurement():
-    pytest.importorskip("open3d")
-    plan = scene_plan(layers=2, layer_height=6.0)
-    ring1 = syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.flat(6.0))
-    first = observe(plan, 1, [ring1])
-    assert first.metrics.valid and first.report["floor"]["source"] == "build_plane"
-
-    ring2 = syn.RingSpec(60.0, 8.0, (CENTER[0] + 10.0, CENTER[1]), z_base_mm=6.0,
-                         height_fn=syn.flat(6.0))
-    floored = observe(plan, 2, [ring1, ring2], floor_profile=first.measured_xyz)
-    assert floored.metrics.valid, floored.metrics.warnings
-    assert floored.report["floor"]["source"] == "previous_layer_measured"
-    assert floored.metrics.center_offset_norm_mm == pytest.approx(10.0, abs=1.5)
-
-    # Without the floor the exposed crescent of ring 1 contaminates the answer:
-    # either the branch guard rejects it, or the offset is pulled well under 10.
-    try:
-        blended = observe(plan, 2, [ring1, ring2])
-    except RuntimeError:
-        return
-    assert (abs(blended.metrics.center_offset_norm_mm - 10.0)
-            > abs(floored.metrics.center_offset_norm_mm - 10.0) + 1.0)
+def test_the_previous_layer_floor_is_gone_by_design():
+    """Spec §2.4: previous-layer referencing made the only stacked data WORSE
+    (0.62 -> 0.50). Layers are measured against the substrate; the ROI ceiling
+    accommodates the stack. Its return needs new evidence, not a revert."""
+    import inspect
+    from tasni.modules.extrusion.processing import process_observation
+    assert "floor_profile" not in inspect.signature(process_observation).parameters
 
 
 # ------------------------------------------------------ ring geometry (Task 5)
@@ -1043,7 +1027,7 @@ def test_measure_fuses_five_top_frames_and_archives_the_raw_burst(tmp_path, monk
     assert ctx.checkpoints[-1][1]["take"] == 1
 
 
-def test_repeat_takes_and_the_floor_from_the_previous_layer(tmp_path, monkeypatch):
+def test_repeat_takes_share_one_session(tmp_path, monkeypatch):
     svc, rdk, camera = measure_env(tmp_path, monkeypatch)
     plan = auto_plan()
     root = tmp_path / "runs" / "extrusion"
@@ -1052,12 +1036,9 @@ def test_repeat_takes_and_the_floor_from_the_previous_layer(tmp_path, monkeypatc
     second = RingMeasureJob(svc, plan, session, 1, annotation={"note": "re-placed"},
                             check_collisions=True)(Ctx())
     assert Path(second["layer_dir"]).name == "layer-001-take02"
-    assert fake_measure_processing.calls[-1].get("floor_profile") is None   # layer 1: build plane
     assert fake_measure_processing.calls[-1]["assemble_arcs"] is True
     third = RingMeasureJob(svc, plan, session, 2, annotation={"introduced_offset_mm": [10, 0]},
                            check_collisions=True)(Ctx())
-    floor = fake_measure_processing.calls[-1]["floor_profile"]
-    assert floor is not None and np.asarray(floor).shape[1] == 3          # layer 2: ring 1's top
     assert fake_measure_processing.calls[-1]["assemble_arcs"] is False
     assert json.loads((Path(third["layer_dir"]) / "manifest.json").read_text())["annotation"] == {"introduced_offset_mm": [10, 0]}
     # Session survives a restart.
@@ -1655,11 +1636,10 @@ def _archive_failed_take(root, session, plan, *, capture_ms=2874.0, layer_index=
 def test_reprocessing_an_archived_take_puts_it_back_into_the_session(tmp_path):
     """A take rescued offline must re-enter the session, not only its manifest.
 
-    session.json is what layer N+1's floor and the operator's table read. On the
+    session.json is what the operator's table and the stack view read. On the
     cell (2026-08-28) the paper trial's layer-001 was reprocessed to a valid
-    measurement while session.json still said records: [] and tops: {} -- so
-    layer 2 would have been measured against the build plane instead of ring 1's
-    measured top, the floor the spec proves is load-bearing.
+    measurement while session.json still said records: [] and tops: {} -- so a
+    rescued take was invisible everywhere except its own manifest.
     """
     pytest.importorskip("open3d")
     from tasni.modules.extrusion.service import reprocess_saved_layer
@@ -1677,7 +1657,7 @@ def test_reprocessing_an_archived_take_puts_it_back_into_the_session(tmp_path):
     assert reloaded.records[0]["valid"] is True
     assert reloaded.records[0]["reprocessed"] is True
     assert reloaded.records[0]["layer_name"] == "layer-001"     # the UI addresses figures by it
-    assert np.asarray(reloaded.tops[1]).shape[1] == 3           # layer 2 now has its floor
+    assert np.asarray(reloaded.tops[1]).shape[1] == 3           # the stack view can draw it
 
 
 def test_a_reprocessed_take_keeps_the_capture_time_it_was_measured_with(tmp_path):
@@ -1848,11 +1828,14 @@ def test_the_applied_plan_comes_back_after_a_restart(tmp_path, monkeypatch):
     assert plan["restored_from"] == MeasureSession.latest(tmp_path / "runs" / "extrusion").trial_id
 
 
-def test_measuring_layer_two_before_layer_one_has_a_measured_top_is_refused(tmp_path, monkeypatch):
-    """Layer N's ROI floor IS layer N-1's latest measured take.
+def test_measuring_layer_two_no_longer_needs_layer_one_measured_first(tmp_path, monkeypatch):
+    """The measure-layer-N-1-first gate went with ``floor_profile`` (spec §2.4).
 
-    Measured without it, a stacked ring blends with the ring beneath and the
-    synthetic proof shows the branch guard exhausting outright.
+    It existed only because layer N's ROI floor WAS layer N-1's measured top;
+    that referencing made the only stacked data worse (completeness 0.62 ->
+    0.50), so the data-integrity gate that enforced it is gone too. Layer 2 now
+    falls through to the ordinary robot-readiness gate -- still a 409 here (no
+    RoboDK in a test client), but no longer one about a missing floor.
     """
     monkeypatch.setattr(extrusion_module, "REPO_ROOT", tmp_path)
     client = TestClient(create_app(AppConfig()))
@@ -1864,7 +1847,9 @@ def test_measuring_layer_two_before_layer_one_has_a_measured_top_is_refused(tmp_
                                 "annotation": {}, "confirm_robot_motion": True})
 
     assert refused.status_code == 409
-    assert "layer 1" in refused.json()["detail"]
+    detail = refused.json()["detail"]
+    assert "measure layer 1 first" not in detail
+    assert "connect to RoboDK" in detail
 
 
 def test_a_failed_take_stays_visible_in_the_session(tmp_path, monkeypatch):
@@ -1889,7 +1874,7 @@ def test_a_failed_take_stays_visible_in_the_session(tmp_path, monkeypatch):
     assert record["valid"] is False and record["layer_name"] == "layer-001"
     assert "bad skeleton" in record["error"]
     assert record["annotation"] == {"phase": "noise floor"}
-    assert 1 not in reloaded.tops                       # a failure is not a floor
+    assert 1 not in reloaded.tops                       # a failure is not a measured top
 
 
 def test_apply_after_a_restart_rebuilds_from_the_sessions_own_trial(tmp_path, monkeypatch):
@@ -2770,8 +2755,6 @@ def test_a_ring_placed_displaced_is_paired_against_the_ring_it_sits_on(tmp_path,
         return out
 
     monkeypatch.setattr(processing_mod, "process_observation", at_position)
-    for layer in (1, 2, 3):
-        session.tops[layer] = [[0.0, 0.0, 0.0]]          # floors for the layer above
     RingMeasureJob(svc, plan, session, 3, annotation={"phase": "stacked true"},
                    check_collisions=False, repeats=3)(Ctx())
     RingMeasureJob(svc, plan, session, 4,

@@ -327,25 +327,25 @@ def bead_width_profile(cluster_xyz, center_xy, *, bins: int = 36,
             "max_mm": float(valid.max())}
 
 
-def ring_geometry(measured_xyz, cluster_xyz, center_xy, *, floor_profile=None,
+def ring_geometry(measured_xyz, cluster_xyz, center_xy, *, substrate=None,
                   build_plane_z_mm: float = 0.0, bins: int = 36) -> RingGeometry:
     """Height profile along the measured centreline plus the bead's footprint.
 
-    Height is measured against the previous ring's own measured top where one is
-    given, so a stacked ring reports ITS layer height rather than its absolute
-    elevation above the table.
+    ``substrate`` is the surface the deposit rests on (a
+    :class:`~tasni.modules.extrusion.substrate.SubstrateModel`); given one,
+    height is measured against the surface actually fitted in THIS frame rather
+    than the work frame's nominal build plane. The slot is dormant until the
+    front end is rebuilt on it -- every caller passes ``None`` today, which
+    keeps the build-plane reference unchanged.
     """
     measured = np.asarray(measured_xyz, dtype=float)
     top = measured[:, 2]
-    if floor_profile is None:
-        reference = np.full(len(top), float(build_plane_z_mm))
+    if substrate is None:
+        height = top - float(build_plane_z_mm)
         reference_name = "build_plane"
     else:
-        profile = np.asarray(floor_profile, dtype=float).reshape(-1, 3)
-        _, nearest = cKDTree(profile[:, :2]).query(measured[:, :2])
-        reference = profile[nearest, 2]
-        reference_name = "previous_layer_measured"
-    height = top - reference
+        height = substrate.height(measured)
+        reference_name = substrate.source
     width = bead_width_profile(cluster_xyz, center_xy, bins=bins)
     return RingGeometry(
         top_z_mean_mm=float(top.mean()), top_z_min_mm=float(top.min()),
@@ -667,7 +667,6 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
                         geometry: CameraGeometry, T_work_camera: np.ndarray,
                         K: np.ndarray, dist: np.ndarray | None,
                         plan: CylinderPlan, layer: LayerPath, config,
-                        floor_profile: np.ndarray | None = None,
                         stages: dict | None = None,
                         assemble_arcs: bool = False) -> ProcessingResult:
     """Reconstruct one layer from exactly one saved synchronized RGB-D frame.
@@ -679,12 +678,14 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     thing: projecting registered depth points into the colour image for the
     chroma gate (see :func:`chroma_gate_mask`).
 
-    ``floor_profile`` is the previous layer's measured centreline (Nx3, work
-    frame). Given it, the ROI floor becomes that surface's local height at the
-    nearest XY sample rather than a single build-plane number -- which is what
-    lets a DISPLACED ring be measured without the exposed crescent of the ring
-    beneath it being dragged into the same skeleton. Omitted, behaviour is
-    exactly as before.
+    Every layer is measured against the SAME reference -- the ROI's height
+    floor, and (Task 5's ``ring_geometry``) the substrate the deposit rests on.
+    Referencing layer N to layer N-1's own measured top was tried and deleted:
+    on the only stacked data that exists (the three 2026-08-30 layer-2 takes) it
+    made completeness WORSE, 0.62 -> 0.50, because ring 1's archived "measured
+    top" spans z 1.50-10.86 mm -- board recorded as crest -- and a margin added
+    on top of that noisy surface cut into ring 2 (spec 2026-08-30 §2.4). Its
+    return needs new evidence, not a revert.
 
     ``assemble_arcs`` rejoins ring arcs that the height floor or an occlusion
     split apart; see :func:`_filter_deposit` for why it is only safe on an
@@ -692,8 +693,8 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     :func:`measure_take`, the seam that derives it from the take.
 
     ``stages``, when a dict is passed, is filled with a copy of the cloud at
-    each step of the chain (backprojected, work_roi, above_floor,
-    deposit_cluster, radial_trimmed, top_surface). It exists so the method
+    each step of the chain (backprojected, work_roi, deposit_cluster,
+    radial_trimmed, top_surface). It exists so the method
     figure can draw what this function actually did instead of a second
     implementation of it that could drift. Collecting costs a few copies and
     changes nothing else.
@@ -749,15 +750,6 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     points = points[roi]
     keep("work_roi", points)
     floor = {"source": "build_plane", "margin_mm": 0.0, "mean_mm": float(min_z)}
-    if floor_profile is not None and len(points):
-        profile = np.asarray(floor_profile, dtype=float).reshape(-1, 3)
-        _, nearest = cKDTree(profile[:, :2]).query(points[:, :2])
-        local = profile[nearest, 2] + config.layer_floor_margin_mm
-        points = points[points[:, 2] >= local]
-        floor = {"source": "previous_layer_measured",
-                 "margin_mm": float(config.layer_floor_margin_mm),
-                 "mean_mm": float(local.mean())}
-        keep("above_floor", points)
     counts["after_work_roi"] = len(points)
     if len(points) < config.cluster_min_points:
         raise RuntimeError(
@@ -876,7 +868,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     metrics = compare_circle(measured, recipe.radius_mm,
                              nominal_center_mm=nominal_center)
     geometry = ring_geometry(measured, deposit, metrics.measured_center_mm,
-                             floor_profile=floor_profile,
+                             substrate=None,
                              build_plane_z_mm=setup.build_plane_z_mm,
                              bins=config.bead_width_bins)
     corrected = None
@@ -910,8 +902,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
 
 
 def measure_take(*, color, depth, geometry, T_work_camera, K, dist,
-                 plan, layer, config, floor_profile=None,
-                 stages=None) -> ProcessingResult:
+                 plan, layer, config, stages=None) -> ProcessingResult:
     """THE entry point for scoring one RGB-D take -- live, reprocess and figures.
 
     ``assemble_arcs`` is derived here, from the take itself: layer 1 is an
@@ -922,8 +913,7 @@ def measure_take(*, color, depth, geometry, T_work_camera, K, dist,
     """
     return process_observation(
         color=color, depth=depth, geometry=geometry, T_work_camera=T_work_camera,
-        K=K, dist=dist, plan=plan, layer=layer, config=config,
-        floor_profile=floor_profile, stages=stages,
+        K=K, dist=dist, plan=plan, layer=layer, config=config, stages=stages,
         assemble_arcs=int(layer.layer_index) == 1)
 
 

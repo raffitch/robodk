@@ -828,7 +828,7 @@ export default function Extrusion() {
         + `/reprocess?take=${take.take}`);
       setMessage(done.metrics.valid
         ? `Reprocessed: VALID, RMS ${done.metrics.rms_mm.toFixed(2)} mm. The take is back in `
-          + "the session and can serve as the floor for the layer above."
+          + "the session, in the table and in the stack view."
         : "Reprocessed, but the measurement is still invalid — see the take's figures.");
       refreshMeasure();
     } catch (e: any) { setMessage(e.message); } finally { setBusy(false); }
@@ -994,8 +994,6 @@ export default function Extrusion() {
   const characterization = measureSession?.characterizations?.length
     ? measureSession.characterizations[measureSession.characterizations.length - 1] : null;
   const planIsApplied = !applied || plan?.fingerprint === applied.fingerprint;
-  const floorReady = measureLayer <= 1
-    || Boolean(measureSession?.tops?.[String(measureLayer - 1)]);
 
   // -- the run as a sequence -------------------------------------------------
   // One thing to do at a time, in the order the protocol needs it. Each step
@@ -1162,8 +1160,8 @@ export default function Extrusion() {
       id: "ring2", label: "Ring 2", layer: 2, phase: "stacked true",
       title: "Ring 2 on the stack — three frames",
       hands: "Place ring 2 on top of ring 1, as true as you can, then keep clear.",
-      note: "Check the first take says VALID before continuing: where ring 2 sits low there is "
-        + "under a millimetre of floor margin and its low stretches can be clipped.",
+      note: "Check the first take says VALID before continuing: where ring 2 sits low it is "
+        + "hardest to tell from the ring beneath it, and its low stretches can be clipped.",
     }),
     parkedStep({
       id: "ring3", label: "Ring 3", layer: 3, phase: "stacked true",
@@ -1211,10 +1209,6 @@ export default function Extrusion() {
   useEffect(() => {
     if (pinnedDone && pinWasUnfinished.current) { pinWasUnfinished.current = false; setStepPin(null); }
   }, [pinnedDone]);
-  // The floor is the layer BELOW the one this step measures -- not the one the
-  // manual selector happens to be showing.
-  const stepFloorReady = !active.layer || active.layer <= 1
-    || Boolean(measureSession?.tops?.[String(active.layer - 1)]);
 
   return <div>
     <div className="page-head">
@@ -1503,7 +1497,7 @@ export default function Extrusion() {
             <input type="checkbox" checked={confirmMotion}
                    onChange={(e) => setConfirmMotion(e.target.checked)} />
             Hands clear — the robot may move the camera</label>}
-          <button className="go-btn" disabled={active.disabled || !stepFloorReady}
+          <button className="go-btn" disabled={active.disabled}
                   onClick={active.onRun}>{active.button}</button>
           {(busy || status?.running) && <button className="secondary" onClick={cancel}>Cancel</button>}
           {active.progress && <span className="step-progress">
@@ -1511,9 +1505,6 @@ export default function Extrusion() {
         </div>
 
         {active.blocked && <p className="hint warn-text">{active.blocked}</p>}
-        {!stepFloorReady && <p className="hint warn-text">
-          Measure layer {(active.layer ?? 1) - 1} first — it is the measurement floor for
-          layer {active.layer}.</p>}
         {active.note && <p className="hint">{active.note}</p>}
         {active.axisAck && <label className="axis-ack">
           <input type="checkbox" checked={axisKnown}
@@ -1555,7 +1546,7 @@ export default function Extrusion() {
           <label>Y <input type="number" step={1} value={offsetY}
             onChange={(e) => setOffsetY(Number(e.target.value))} /></label>
           <button className="secondary" disabled={!plan || !connected || !confirmMotion || busy
-                    || status?.running || !planIsApplied || !floorReady}
+                    || status?.running || !planIsApplied}
                   onClick={() => measure()}>Measure — {annotationLabel()}</button>
         </div>
       </div>}
@@ -1686,8 +1677,8 @@ export default function Extrusion() {
         <div className="io-note">
           <b>Bottom to top, and the error goes on last.</b> Rings 1, 2 and 3 are stacked and
           measured as true as a hand can place them — each layer must be measured as it goes
-          on, because layer N's measurement floor <i>is</i> layer N−1's measured top. Then ring
-          4 goes on <b>deliberately off-centre</b>: the controlled error the paper's claim
+          on, because once the ring above is placed the one beneath can no longer be seen.
+          Then ring 4 goes on <b>deliberately off-centre</b>: the controlled error the paper's claim
           rests on. Nothing is ever slid or lifted off, so no ring is disturbed after it has
           been measured.
         </div>

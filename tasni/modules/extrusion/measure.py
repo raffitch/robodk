@@ -131,17 +131,13 @@ class MeasureSession:
     def next_take(self, layer_index: int) -> int:
         return self.takes.get(layer_index, 0) + 1
 
-    def floor_profile(self, layer_index: int) -> np.ndarray | None:
-        """The ring BELOW this one, as MEASURED -- not as planned."""
-        below = self.tops.get(layer_index - 1)
-        return None if below is None else np.asarray(below, dtype=float)
-
     def record_take(self, *, layer_index: int, take: int, measured_xyz, pose: dict | None,
                     summary: dict) -> None:
-        """Record one take. ``measured_xyz`` None (a failure) leaves the floor alone.
+        """Record one take. ``measured_xyz`` None (a failure) leaves ``tops`` alone.
 
-        A ring that could not be measured is not a surface to stack the next
-        layer's ROI on, so a failed take must never become ``tops[layer]``.
+        ``tops`` is what the operator's stack view draws and what a future
+        previous-layer substrate provider would be built from, so a take that
+        could not be measured must never become ``tops[layer]``.
         """
         self.takes[layer_index] = max(take, self.takes.get(layer_index, 0))
         if measured_xyz is not None:
@@ -860,13 +856,12 @@ class RingMeasureJob:
                         # unaligned, 0.1 mm (protocol 2) rather than the legacy
                         # aligned 1 mm convention -- see figures.geometry_for_take.
                         "camera_geometry": frame.geometry.to_dict()})
-        floor = self.session.floor_profile(self.layer_index)
         camera_cfg = services.config.camera
         try:
             processed = measure_take(
                 color=frame.color, depth=frame.depth, geometry=frame.geometry,
                 T_work_camera=T_work_camera, K=camera_cfg.K, dist=camera_cfg.dist,
-                plan=self.plan, layer=layer, config=ecfg, floor_profile=floor)
+                plan=self.plan, layer=layer, config=ecfg)
         except Exception as exc:
             # A failed measurement still archives its raw RGB-D: the operator
             # cannot re-place the ring exactly, so the frame is the only thing

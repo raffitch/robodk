@@ -200,6 +200,37 @@ def test_measure_take_derives_arc_assembly_from_the_layer_itself(monkeypatch):
     assert seen[-1]["assemble_arcs"] is False
 
 
+def test_ring_geometry_measures_height_against_the_substrate_when_given_one():
+    """The `substrate=` slot that replaced `floor_profile` is DORMANT (every
+    caller passes None until Task 7 wires the fit in) -- so pin it here, or it
+    ships unexercised. Without a substrate the reference is the build plane;
+    with one, height is the substrate's own and the report names its source.
+    """
+    from tasni.modules.extrusion.processing import ring_geometry
+    from tasni.modules.extrusion.substrate import PlaneSubstrate
+
+    theta = np.linspace(0, 2 * np.pi, 240, endpoint=False)
+    ring = np.column_stack((40.0 * np.cos(theta), 40.0 * np.sin(theta),
+                            np.full_like(theta, 8.0)))
+    cluster = np.repeat(ring, 4, axis=0)
+    cluster[:, :2] *= np.linspace(0.95, 1.05, len(cluster))[:, None]
+
+    plain = ring_geometry(ring, cluster, (0.0, 0.0), bins=36)
+    assert plain.height_reference == "build_plane"
+    assert plain.height_mean_mm == pytest.approx(8.0)
+
+    # A plane 2 mm above z=0, tilted so the reference is genuinely per-point:
+    # a build-plane subtraction could not reproduce these heights.
+    plane = PlaneSubstrate(a=0.01, b=0.0, c=2.0, sigma_mm=0.3, inlier_fraction=1.0,
+                           clamp_mm=(1.0, 2.0), bias_correction_mm=0.0,
+                           bias_correction_sigma=0.0)
+    fitted = ring_geometry(ring, cluster, (0.0, 0.0), substrate=plane, bins=36)
+    assert fitted.height_reference == "fitted_plane"     # substrate.source, not a literal
+    assert fitted.top_z_mean_mm == pytest.approx(plain.top_z_mean_mm)   # top is unchanged
+    assert fitted.height_mean_mm == pytest.approx(6.0)                  # 8 - (0.01x + 2)
+    assert fitted.height_max_mm - fitted.height_min_mm == pytest.approx(0.8, abs=1e-6)
+
+
 def test_no_caller_bypasses_the_seam():
     """Grep guard: outside processing.py, nothing in the extrusion module may call
     process_observation directly (spec §3.7)."""
@@ -215,12 +246,28 @@ def test_no_caller_bypasses_the_seam():
 def test_archived_configs_with_retired_keys_still_validate():
     """extra='forbid' + archived processing_config payloads means a field can
     never be deleted without this shim (spec §3.6): retired keys are DROPPED,
-    never reinterpreted, and unknown keys still fail loudly."""
+    never reinterpreted, and unknown keys still fail loudly.
+
+    The three assertions below are load-bearing TOGETHER. While
+    RETIRED_EXTRUSION_CONFIG_KEYS was empty this test passed without exercising
+    the shim at all -- `with_retired` was just `payload`. So it now pins that
+    the set is non-empty, that every name in it is genuinely GONE from the
+    model (a live field listed as retired would be silently dropped from every
+    archive), and that plain validation actually REFUSES what from_archive
+    accepts -- otherwise the shim could be a no-op and nothing would say so.
+    """
     import pytest
     from tasni.core import config as cfg
+    retired = cfg.RETIRED_EXTRUSION_CONFIG_KEYS
+    assert retired, "nothing retired yet -- this test would not exercise the shim"
+    live = set(cfg.ExtrusionConfig.model_fields)
+    assert not (retired & live), f"retired but still a field: {sorted(retired & live)}"
+
     payload = cfg.ExtrusionConfig().model_dump()
     payload["deposit_min_saturation"] = 60          # will be retired by Task 7
-    with_retired = dict(payload, **{k: 1 for k in cfg.RETIRED_EXTRUSION_CONFIG_KEYS})
+    with_retired = dict(payload, **{k: 1 for k in retired})
     assert cfg.ExtrusionConfig.from_archive(with_retired) is not None
+    with pytest.raises(Exception):                  # the shim is doing real work
+        cfg.ExtrusionConfig.model_validate(with_retired)
     with pytest.raises(Exception):
         cfg.ExtrusionConfig.from_archive(dict(payload, not_a_field_ever=1))

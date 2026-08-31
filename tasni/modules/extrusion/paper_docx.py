@@ -194,8 +194,7 @@ def _system_rows(provenance: dict, robot_name: str | None = None) -> list[list[s
     if config:
         add("Segmentation",
             f"deposit floor {config.get('deposit_min_height_mm')} mm, radial band "
-            f"±{config.get('radial_roi_margin_mm')} mm about the nominal ring, per-layer floor "
-            f"margin {config.get('layer_floor_margin_mm')} mm")
+            f"±{config.get('radial_roi_margin_mm')} mm about the nominal ring")
         add("Centreline extraction",
             f"raster {config.get('raster_mm_per_pixel')} mm/px, thinned and pruned, "
             f"{config.get('measured_spline_points')} spline samples; bead footprint over "

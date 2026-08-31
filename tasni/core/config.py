@@ -714,7 +714,15 @@ class ScanConfig(_Model):
 # processing_config payloads (every archive dumps the full config per take).
 # from_archive() drops them so extra="forbid" keeps refusing genuinely unknown
 # keys without refusing history. Grown by the 2026-08-30 substrate change.
-RETIRED_EXTRUSION_CONFIG_KEYS: frozenset = frozenset()
+RETIRED_EXTRUSION_CONFIG_KEYS: frozenset = frozenset({
+    # Margin added on top of layer N-1's measured top when that surface was used
+    # as layer N's measurement floor. `floor_profile` and this margin were
+    # deleted together: on the only stacked data there is (the three 2026-08-30
+    # layer-2 takes) previous-layer referencing measured WORSE -- completeness
+    # 0.62 -> 0.50 -- because ring 1's archived "measured top" spans z
+    # 1.50-10.86 mm, so the margin cut into ring 2 (spec 2026-08-30 §2.4).
+    "layer_floor_margin_mm",
+})
 
 
 class ExtrusionConfig(_Model):
@@ -869,10 +877,6 @@ class ExtrusionConfig(_Model):
     # real headroom), so the clamp stays at the 300 mm inspection_min_mm floor.
     # Do not lower it without lowering server_unicast_syncronous.py's depth width.
     measure_close_range_min_mm: float = Field(default=300.0, gt=0, le=2000)
-    # Layer N keeps only points above the PREVIOUS layer's measured top at the
-    # nearest XY sample plus this margin, so a displaced ring cannot drag the
-    # exposed crescent of the ring beneath it into the skeleton.
-    layer_floor_margin_mm: float = Field(default=2.0, ge=0, le=20)
     characterize_search_radius_mm: float = Field(default=150.0, gt=0, le=1000)
     characterize_max_height_mm: float = Field(default=40.0, gt=0, le=200)
     # -- side photo for the paper ------------------------------------------
