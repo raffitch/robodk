@@ -678,8 +678,11 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     thing: projecting registered depth points into the colour image for the
     chroma gate (see :func:`chroma_gate_mask`).
 
-    Every layer is measured against the SAME reference -- the ROI's height
-    floor, and (Task 5's ``ring_geometry``) the substrate the deposit rests on.
+    Every layer is measured against the SAME reference, and today that reference
+    is the ``build_plane`` -- the work frame's Z=0, both for the ROI's height
+    floor and for :func:`ring_geometry`'s heights. (Its ``substrate=`` slot is
+    in place but DORMANT: this function passes ``None`` until the fitted
+    substrate replaces the build plane.)
     Referencing layer N to layer N-1's own measured top was tried and deleted:
     on the only stacked data that exists (the three 2026-08-30 layer-2 takes) it
     made completeness WORSE, 0.62 -> 0.50, because ring 1's archived "measured

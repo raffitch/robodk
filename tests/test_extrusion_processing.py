@@ -271,3 +271,41 @@ def test_archived_configs_with_retired_keys_still_validate():
         cfg.ExtrusionConfig.model_validate(with_retired)
     with pytest.raises(Exception):
         cfg.ExtrusionConfig.from_archive(dict(payload, not_a_field_ever=1))
+
+
+def test_a_users_config_file_survives_a_retired_extrusion_key(tmp_path, capsys):
+    """The ARCHIVE shim is not the whole story: a key an operator set in their
+    own tasni.config.json travels load_config -> _merge, which RAISES on an
+    unknown key. So retiring a field from RETIRED_EXTRUSION_CONFIG_KEYS alone
+    leaves a STARTUP CRASH behind -- `KeyError: Unknown config key` naming a key
+    that appears in no document the operator would reach for. (Live risk, not
+    hypothetical: docs/pfh-paper-handoff.md still tells the operator to lower
+    `extrusion.layer_floor_margin_mm`.) Every retired extrusion field must
+    therefore also be in LEGACY_CONFIG_KEYS, and be DROPPED with a note giving
+    its own reason -- not one borrowed from an unrelated removal.
+    """
+    import json
+    from tasni.core import config as cfg
+    legacy_extrusion = {key for section, key in cfg.LEGACY_CONFIG_KEYS
+                        if section == "extrusion"}
+    assert cfg.RETIRED_EXTRUSION_CONFIG_KEYS <= legacy_extrusion, (
+        "retired from archives but not from user configs -- these still crash "
+        f"startup: {sorted(cfg.RETIRED_EXTRUSION_CONFIG_KEYS - legacy_extrusion)}")
+
+    path = tmp_path / "tasni.config.json"
+    path.write_text(json.dumps({"extrusion": {
+        **{k: 1.0 for k in cfg.RETIRED_EXTRUSION_CONFIG_KEYS},
+        "radius_mm": 42.0,                      # a live key, set alongside
+    }}), encoding="utf-8")
+
+    loaded = cfg.load_config(path)              # must NOT raise
+
+    assert loaded.extrusion.radius_mm == 42.0   # the live override still applies
+    out = capsys.readouterr().out
+    for key in cfg.RETIRED_EXTRUSION_CONFIG_KEYS:
+        assert f"extrusion.{key}" in out        # the operator is told, not ignored
+    # ...and told the RIGHT reason: the message used to be hardcoded to the one
+    # removal it was written for, which would have blamed "camera protocol 2"
+    # for a segmentation change.
+    assert "camera protocol 2" not in out
+    assert "unknown config key" not in out.lower()

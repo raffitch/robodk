@@ -714,6 +714,12 @@ class ScanConfig(_Model):
 # processing_config payloads (every archive dumps the full config per take).
 # from_archive() drops them so extra="forbid" keeps refusing genuinely unknown
 # keys without refusing history. Grown by the 2026-08-30 substrate change.
+#
+# This covers ARCHIVES ONLY. A key an operator may have set in their own
+# tasni.config.json travels a different path (load_config -> _merge, which
+# RAISES on an unknown key), so a deleted field generally needs an entry in
+# LEGACY_CONFIG_KEYS below as well. Retiring it from one registry and not the
+# other leaves a startup crash behind.
 RETIRED_EXTRUSION_CONFIG_KEYS: frozenset = frozenset({
     # Margin added on top of layer N-1's measured top when that surface was used
     # as layer N's measurement floor. `floor_profile` and this margin were
@@ -989,7 +995,22 @@ def save_overrides(updates: dict[str, Any]) -> Path:
     return path
 
 
-LEGACY_CONFIG_KEYS = {("scan", "depth_scale")}   # removed with protocol 2; the greeting carries the unit
+# Keys deleted from the models but possibly still set in a user's
+# ``tasni.config.json``. ``load_config`` drops each with a note naming ITS OWN
+# reason -- an unknown key makes ``_merge`` raise, which is a startup crash, and
+# a key we ourselves removed must never brick the app for an operator following
+# a document written before the removal.
+#
+# This is the USER-OVERRIDE counterpart to ``RETIRED_EXTRUSION_CONFIG_KEYS``,
+# which shields ARCHIVED processing_config payloads. They are separate paths:
+# deleting a field from ``ExtrusionConfig`` generally needs an entry in BOTH.
+LEGACY_CONFIG_KEYS: dict[tuple[str, str], str] = {
+    ("scan", "depth_scale"):
+        "removed with camera protocol 2; the greeting carries the unit",
+    ("extrusion", "layer_floor_margin_mm"):
+        "removed with previous-layer referencing (2026-08-30): a layer is measured "
+        "against the substrate, so there is no previous-layer floor to add a margin to",
+}
 
 
 def migrate_camera_intrinsics(cam: CameraConfig) -> bool:
@@ -1030,10 +1051,10 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         path = candidate if candidate.exists() else None
     if path is not None:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        for section, key in LEGACY_CONFIG_KEYS:
+        for (section, key), reason in LEGACY_CONFIG_KEYS.items():
             if isinstance(data.get(section), dict) and key in data[section]:
                 data[section].pop(key)
-                print(f"config: dropped legacy key {section}.{key} (removed with camera protocol 2)")
+                print(f"config: dropped legacy key {section}.{key} ({reason})")
         _merge(cfg, data)
         if migrate_camera_intrinsics(cfg.camera):
             print("config: migrated calibrated 1280x720 intrinsics to 1920x1080 (x1.5)")
