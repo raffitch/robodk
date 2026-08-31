@@ -922,6 +922,38 @@ RS_VISUAL_PRESET = int(_env_number('RS_VISUAL_PRESET', -1))
 # power as an explicit experiment with its own before/after measurement.
 RS_LASER_POWER = _env_number('RS_LASER_POWER', -1.0)
 
+# -- spatial filter, for the crest-height A/B ---------------------------------
+# The chain runs the spatial filter in the DISPARITY domain with stock defaults
+# (magnitude 2, smooth_alpha 0.5, smooth_delta 20). smooth_delta is the
+# edge-preservation threshold -- steps larger than it survive, smaller ones are
+# smoothed across. At 300 mm with depth fx 637 and the D435i's ~50 mm baseline,
+# 1 mm of relief is only ~0.35 disparity px, so a 4-11 mm extrusion ring spans
+# 1.4-3.9: far under 20. The filter cannot tell the deposit from the board and
+# smooths across it, twice, at alpha 0.5.
+#
+# Measured 2026-08-31 against the operator's ruler at five clock positions on one
+# ring: the camera reproduces the ring's shape well (r = 0.97 on absolute height)
+# but reads ~1.5 mm LOW at every position, even taking each wedge's single
+# highest point. That shortfall eats most of a 1.78 mm deposit floor, which is
+# how a continuous ring came to be reported open.
+#
+# Both levers DEFAULT TO CURRENT BEHAVIOUR. Every number in the archive was
+# measured with the stock filter, and a silent change would invalidate all of
+# them -- the same invariant RS_LASER_POWER and RS_VISUAL_PRESET are kept under.
+# RS_SPATIAL=0 drops the filter entirely (the control arm);
+# RS_SPATIAL_SMOOTH_DELTA lowers the threshold so a millimetre-scale bead reads
+# as an edge instead of as texture.
+RS_SPATIAL = int(_env_number('RS_SPATIAL', 1))
+RS_SPATIAL_SMOOTH_DELTA = _env_number('RS_SPATIAL_SMOOTH_DELTA', -1.0)
+
+# Derived from the SAME constants the chain is built from, at module level, so
+# the greeting cannot describe a chain that did not run and no call ordering can
+# leave it stale. This list is archived as provenance on every take, and it is
+# the ONLY record of which arm of the A/B a take came from.
+DEPTH_FILTER_NAMES = (["threshold", "disparity"]
+                      + (["spatial"] if RS_SPATIAL else [])
+                      + ["temporal", "disparity_inv"])
+
 
 STATIC_GEOMETRY = None      # rs_geometry.StaticGeometry, set by openPipeline
 ACHIEVED_OPTIONS = {}       # read-back values, set by openPipeline
@@ -1142,7 +1174,7 @@ def make_greeting(snapshot: CameraSnapshot = None) -> dict:
     sensor = snap.pipeline.get_active_profile().get_device().first_depth_sensor()
     return rs_geometry.build_greeting(
         snap.geometry, depth_unit_mm=snap.depth_unit_mm,
-        filters=["threshold", "disparity", "spatial", "temporal", "disparity_inv"],
+        filters=list(DEPTH_FILTER_NAMES),
         temps=rs_config.read_temperatures(sensor, rs, log=_log),
         global_time_enabled=rs_config.read_global_time_enabled(sensor, rs, log=_log),
         achieved=snap.achieved, device=snap.device)
@@ -1635,8 +1667,14 @@ def setup_depth_filters():
     fabricated depth, and it was fabricated exactly where the metrology cares
     (surface edges). Threshold first so background is never smoothed into an edge."""
     threshold = rs.threshold_filter(RS_DEPTH_MIN_M, RS_DEPTH_MAX_M)
-    return [threshold, rs.disparity_transform(True), rs.spatial_filter(),
-            rs.temporal_filter(), rs.disparity_transform(False)]
+    chain = [threshold, rs.disparity_transform(True)]
+    if RS_SPATIAL:
+        spatial = rs.spatial_filter()
+        if RS_SPATIAL_SMOOTH_DELTA >= 0:
+            spatial.set_option(rs.option.filter_smooth_delta, RS_SPATIAL_SMOOTH_DELTA)
+        chain.append(spatial)
+    chain += [rs.temporal_filter(), rs.disparity_transform(False)]
+    return chain
 
 def _serve_client(conn, addr):
     """Run handle_client for one client and ALWAYS close its socket.
