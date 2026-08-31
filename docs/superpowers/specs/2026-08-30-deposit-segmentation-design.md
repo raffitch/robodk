@@ -349,7 +349,7 @@ extrusion tests plus an import check, and `npm run build` if any frontend touche
 | `tasni/modules/extrusion/service.py` | `reprocess_saved_layer` through the seam |
 | `tasni/modules/extrusion/figures.py` | stage renders through the seam; `_chroma_dist` and the K/dist plumbing die with the gate |
 | `tasni/modules/extrusion/module.py` | remove the measure-layer-N−1-first 409 guard + `allow_missing_floor` (obsolete with `floor_profile`) |
-| `tasni/modules/extrusion/paper_docx.py` | methods text stops describing the chroma gate / constant floor; renders `report["substrate"]` (legacy archives keep their `.get` fallbacks) |
+| `tasni/modules/extrusion/paper_docx.py` | methods text stops describing the chroma gate / constant floor (legacy archives keep their `.get` fallbacks); does **not** render `report["substrate"]` — see §13.3 |
 | `tasni/webui/src/pages/Extrusion.tsx` | drop the client-side previous-layer gate (`tops`-presence checks); keep the `tops` rendering |
 | `tasni/core/config.py` | remove 6 fields (`deposit_min_saturation`, `deposit_min_chroma_fraction`, `deposit_min_height_no_chroma_mm`, `plane_distance_threshold_m`, `deposit_min_height_mm`, `layer_floor_margin_mm`); add `substrate_sigma_k`, `substrate_floor_clamp_mm`, `substrate_fit_radius_mm`, `deposit_min_length_beads`; add `ExtrusionConfig.from_archive` (strips retired keys — `extra="forbid"` otherwise refuses every existing archive) |
 | `tests/test_extrusion_processing.py`, `tests/test_extrusion_measure.py` | ~9 gate tests replaced; the `ring1`/`ring2` fixture READMEs re-scoped |
@@ -487,3 +487,8 @@ Recorded as it happens, same discipline as §11:
    the assertion into a comparison of a value against itself — invisibly, since `runs/`
    is git-ignored. The baseline is now frozen as literals in the test, with the on-disk
    value demoted to a secondary drift check ordered after the primary assertion.
+3. **§6's `paper_docx.py` row narrowed to match what shipped.** It claimed the module
+   "renders `report["substrate"]`". It does not: the methods row (`paper_docx.py:195-203`)
+   is derived from `config` only, and the per-take substrate health block
+   (`report["substrate"]`) never reaches the docx. Adding that block is scope this design
+   does not take on — the row is corrected here rather than the feature being built.

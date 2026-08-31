@@ -1,5 +1,13 @@
 # Multi-view ring inspection + side photo — design (revamp)
 
+> **STALE — read before executing the companion plan.** The `deposit-segmentation`
+> work (`docs/superpowers/specs/2026-08-30-deposit-segmentation-design.md`) removed the
+> chroma gate, `floor_profile`, and the constant deposit floor this design is written
+> against — it extracts `observation_points` around `chroma_gate_mask`, threads
+> `chroma_gated`/`floor_profile` through `process_points`, and pins tests on "chroma
+> gate abstained". Those sections need rework against the geometry-only segmentation
+> chain before `docs/superpowers/plans/2026-08-30-multiview-inspection.md` is executed.
+
 **Status:** design agreed with the operator on 2026-08-30. **Supersedes**
 `docs/superpowers/specs/2026-08-29-multiview-inspection-design.md` (`a1cafa0`) and its
 plan `docs/superpowers/plans/2026-08-29-multiview-inspection.md` (`c31c720`), both of

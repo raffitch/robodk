@@ -377,6 +377,16 @@ class PlaneSubstrate:
                 "is not describing a single substrate at all; widen or "
                 "reposition the fit region so the true substrate is the "
                 "majority of it")
+        # `residual` here is POST bias-correction (recomputed at line 330 against
+        # the corrected `coeff`), but `sigma` is the PRE-correction robust scale
+        # (frozen at line 316, before `coeff[2] += bias_correction_mm`). The +-3
+        # sigma window is therefore centred on the corrected plane but sized from
+        # the uncorrected residual spread, leaving it asymmetric about the
+        # corrected plane by ~bias_correction_sigma (~0.35 sigma). This is
+        # deterministic, consistent across takes, and nothing downstream treats
+        # inlier_fraction as a guard -- do not "fix" it by swapping in a
+        # recomputed post-correction sigma, which would silently shift the
+        # baseline for every archived take.
         inliers = float(np.mean(np.abs(residual) <= 3.0 * max(sigma, 1e-9)))
         return cls(a=a, b=b, c=c, sigma_mm=sigma, inlier_fraction=inliers,
                    clamp_mm=(float(clamp_mm[0]), float(clamp_mm[1])),

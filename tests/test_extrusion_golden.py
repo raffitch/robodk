@@ -233,13 +233,17 @@ def test_substrate_report_is_present_and_sane_on_every_take():
         layer-002-take02     0.5153     1.546      0.813      6.548
         layer-002-take03     0.5190     1.557      0.805      6.705
 
-    sigma_mm spans 0.5153-0.5680 mm across all eleven takes -- inside §3.3's
-    0.55-0.61 mm band for the eight layer-1 takes; the three layer-2 takes
-    (a badly stacked ring, not a ground-truth frame) measure a bit lower,
-    which is the reconciliation itself, now on record rather than re-argued
-    from two summary ranges. floor_mm (k=3.0 x sigma_mm, clamped [1.0, 2.0])
-    spans 1.546-1.704 mm, matching the design's own 1.55-1.74 mm note (§3.4)
-    for layer-1.
+    sigma_mm spans 0.5153-0.5680 mm across all eleven takes. The eight
+    layer-1 takes span 0.5472-0.5680 mm, straddling the lower edge of
+    §3.3's 0.55-0.61 mm band: five sit inside it and the other three
+    (0.5497, 0.5472, 0.5498) sit below 0.55 mm by no more than 0.003 mm.
+    The three layer-2 takes (a badly stacked ring, not a ground-truth
+    frame) measure lower still, which is the reconciliation itself, now
+    on record rather than re-argued from two summary ranges. floor_mm
+    (k=3.0 x sigma_mm, clamped [1.0, 2.0]) spans 1.546-1.704 mm across
+    all eleven takes; the eight layer-1 takes alone span 1.642-1.704 mm,
+    matching the design's own 1.55-1.74 mm note (§3.4), which is scoped
+    to layer-1.
 
     tilt_deg spans 0.520-0.814 degrees -- comfortably inside the design's
     board measurement of 0.48-0.62 degrees (§2), so the single ceiling

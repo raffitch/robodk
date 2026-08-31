@@ -1017,7 +1017,15 @@ def characterize_ring(*, depth: np.ndarray, geometry: CameraGeometry,
     points = points[roi]
     counts["after_search_roi"] = len(points)
     if len(points) < config.cluster_min_points:
-        raise RuntimeError("no deposited geometry inside the characterization search region")
+        # Same lesson as the branch guard, the shape gate and the DBSCAN raise in
+        # `_deposit_clusters`: this RAISES, so the counts already gathered above
+        # (substrate_floor_mm, substrate_sigma_mm, search_cylinder_points,
+        # search_cylinder_above_floor_fraction, the height percentiles) die with
+        # it unless they ride along -- and those are exactly what separate "the
+        # substrate fit sat wrong" from "nothing is there".
+        raise RuntimeError(
+            "no deposited geometry inside the characterization search region: "
+            f"{json.dumps(dict(counts))}")
     clusters = _deposit_clusters(points, config, counts)
     deposit, selector = _select_ring_cluster(clusters, center, counts)
     coarse_center, coarse_radius = fit_circle_xy(deposit)

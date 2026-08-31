@@ -1,5 +1,13 @@
 # Multi-view ring inspection — Implementation Plan
 
+> **STALE — read before executing.** The `deposit-segmentation` work
+> (`docs/superpowers/specs/2026-08-30-deposit-segmentation-design.md`) removed the
+> chroma gate, `floor_profile`, and the constant deposit floor that this plan is written
+> against — it extracts `observation_points` around `chroma_gate_mask`, threads
+> `chroma_gated`/`floor_profile` through `process_points`, and pins tests on "chroma
+> gate abstained". Those sections need rework against the geometry-only segmentation
+> chain before this plan is executed.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let a Measure or Characterize press capture the ring from the top view plus three 15°-tilted views at 120° azimuths, level and register them against one shared circle, and measure the merged cloud — because the mock rings are thin (crest 2.9–4.9 mm over much of the ring) and one straight-down frame sees the flanks hardly at all. Opt-in, default OFF, so every archived single-view number stays exactly as it is.
