@@ -351,8 +351,21 @@ def _filter_deposit(points: np.ndarray, config, counts: dict, *,
     return points
 
 
+#: Extra passes at the schedule's TIGHTEST band, after the schedule itself has
+#: run, so the trim stops at a FIXED POINT of "fit on what is kept, select from
+#: everything" instead of wherever the band list happened to run out. See
+#: :func:`_radial_trim` for why that is not a tuning knob; this only bounds the
+#: iteration. Measured 2026-08-31: the solid-board-patch synthetic settles in 2-5
+#: passes (across both voxel sizes and three patch densities) and every one of
+#: the eleven archived 2026-08-30 cell takes settles in 0-1, so 12 is well over
+#: 2x the worst observed and exists only so a pathological cloud that oscillates
+#: between two selections cannot spin here.
+_RADIAL_TRIM_SETTLE_PASSES = 12
+
+
 def _radial_trim(points: np.ndarray, schedule_mm, counts: dict, *,
-                 minimum: int = 8) -> np.ndarray:
+                 minimum: int = 8,
+                 settle_passes: int = _RADIAL_TRIM_SETTLE_PASSES) -> np.ndarray:
     """Keep only points within a tightening band of the circle fitted to them.
 
     One pass per band in ``schedule_mm``: fit on what is kept, select from
@@ -362,21 +375,93 @@ def _radial_trim(points: np.ndarray, schedule_mm, counts: dict, *,
     and its upward normals, so this is the only filter in the chain that can see
     the difference.
 
+    The schedule alone is NOT the whole filter, and treating it as one was a real
+    hole (found and closed 2026-08-31). Its own premise is that the fit starts
+    biased by the contamination and walks onto the ring as the bands tighten --
+    so the answer depends on the fit having ARRIVED by the time the list runs
+    out, and nothing checked that it had. On a solid board patch fused to the
+    ring's outer flank it had not: the last band selected against a circle still
+    2.3 mm off centre and 0.4 mm large, admitting board out to r 72.8-73.4 mm on
+    a 60 mm ring (both voxel sizes), while the fit computed from that very
+    selection had already moved to 1.3 mm off centre. The remedy is not a
+    different schedule -- it is to keep going at the tightest band until the
+    selection stops changing, which is the fixed point the schedule was always
+    an approximation of. It settles at r 71.0-71.1 mm there, and moves the eleven
+    archived cell takes by at most 2 points in ~3100 (<= 0.07%; seven of the
+    eleven are bit-identical, the largest radius change is 0.010 mm), because on
+    a take whose fit had already arrived the extra passes select exactly what the
+    schedule's last pass selected and stop on the first one.
+
+    What this does NOT fix, so nobody re-derives it from scratch: contamination
+    large enough to move the FIXED POINT itself. Widen the same synthetic patch
+    from +/-14 mm to +/-30 mm (about 47 deg of arc, ~43% as much footprint as the
+    bead itself) and the iteration converges -- identically at 12 and at 60
+    passes, so this is the fixed point and not the cap -- onto a circle 2.2-2.4 mm
+    off centre at r 60.6-60.7, which a 10 mm band carries out to r 72.8-73.1 mm.
+    That is the trim's contract, not a bug in the convergence: a fixed band about
+    a fitted circle admits ``radius + band`` by construction, and the band cannot
+    be tied to the bead without cutting real deposit (the 2026-08-30 archive's
+    own radial deviation about its fitted circle runs to +/-8 mm p1-p99 on an
+    8.9 mm bead). Rejecting THAT needs a discriminator this function does not
+    have. The obvious candidate was measured and rejected on 2026-08-31: a
+    per-angular-bin radial-span rule does not separate the two populations --
+    max span / bead reaches 1.88 on honest archived takes and only 2.02-2.06 on
+    the leaking synthetic, a 7% gap across 17 clouds, i.e. a threshold that would
+    fire on real data long before it caught this.
+
+    Why iterate the LAST band rather than each band: the schedule's tightening is
+    what keeps a badly biased first fit from locking on, and settling band 15 to
+    a fixed point before band 10 ever runs would hand band 10 a set already
+    committed to whatever band 15's fixed point chose. Settling only after the
+    schedule has finished tightening leaves every pass it makes today unchanged
+    and adds the convergence at the one band that decides the result. (Measured:
+    settling every band gives bit-identical output on all sixteen clouds tried --
+    five synthetic, eleven archived -- so this is a safety argument, not a
+    measured difference.)
+
+    Convergence is judged on the selection MASK, not its size: two different sets
+    of equal size are not a fixed point, and this map is not monotone (it selects
+    from ``points`` every pass, so a set can grow again), which is also why
+    ``settle_passes`` bounds it -- a cloud that oscillates between two selections
+    stops on the cap rather than spinning.
+
     Never empties the set: a band that would leave fewer than ``minimum`` points
     is skipped and the previous set stands. ``after_radial_trim`` records what
-    survived.
+    survived, and ``radial_trim_settle_passes`` how many passes the schedule was
+    short by -- a take that consistently reports a non-zero count is telling you
+    its contamination is biasing the fit past what the schedule anticipates.
     """
+    schedule = [float(band) for band in (schedule_mm or ())]
     kept = points
-    for band in schedule_mm or ():
-        if len(kept) < minimum or float(band) <= 0:
+    kept_mask = np.ones(len(points), dtype=bool)
+    completed = bool(schedule)
+    for band in schedule:
+        if len(kept) < minimum or band <= 0:
+            completed = False
             break
         center, radius = fit_circle_xy(kept)
         distance = np.abs(np.linalg.norm(points[:, :2] - center, axis=1) - radius)
-        candidate = points[distance <= float(band)]
-        if len(candidate) < minimum:
+        mask = distance <= band
+        if int(mask.sum()) < minimum:
+            completed = False
             break
-        kept = candidate
+        kept, kept_mask = points[mask], mask
+    # Settle at the tightest band -- but only if the schedule actually ran to the
+    # end. A schedule that bailed early already fell back to "the previous set
+    # stands"; resuming from there at a band it never reached would be a second,
+    # different behaviour change hiding inside this one.
+    settled = 0
+    band = schedule[-1] if completed else 0.0
+    while band > 0 and settled < int(settle_passes) and len(kept) >= minimum:
+        center, radius = fit_circle_xy(kept)
+        distance = np.abs(np.linalg.norm(points[:, :2] - center, axis=1) - radius)
+        mask = distance <= band
+        if int(mask.sum()) < minimum or np.array_equal(mask, kept_mask):
+            break
+        kept, kept_mask = points[mask], mask
+        settled += 1
     counts["after_radial_trim"] = len(kept)
+    counts["radial_trim_settle_passes"] = settled
     return kept
 
 

@@ -125,13 +125,37 @@ def test_ring_shifted_10mm_reports_the_shift():
 
 
 def _board_bias_patch(center, *, r_from: float, r_to: float, half_height_mm: float,
-                      z_mm: float, step_mm: float = 1.0) -> np.ndarray:
+                      z_mm: float, step_mm: float = 0.25) -> np.ndarray:
     """A patch of the build plane reading a few mm HIGH, touching the ring's outer flank.
 
     What the D435i does to the ChArUco board at 300 mm: broad patches biased by
     2-5 mm (measured 2026-08-28: bare board z p50 0.8 / p99 4.8 mm, 22.7% above the
     2.5 mm deposit floor). Flat, so its normals face straight up, and fused to the
     ring, so it lands in the ring's DBSCAN cluster.
+
+    ``step_mm`` is the SOURCE-sample spacing, and it defaults to 0.25 mm to match
+    :meth:`extrusion_synthetic.RingSpec.surface_points` -- not a detail, a
+    faithfulness requirement. ``render_depth`` is a point splatter with no
+    surface interpolation: it can only fill the depth pixels a source sample
+    actually lands on, so a source grid coarser than the depth pixel pitch
+    renders a SIEVE. At these scenes' 300 mm standoff one colour pixel spans
+    304.5 / 889.87 = 0.342 mm on the patch, so the 1.0 mm spacing this defaulted
+    to until 2026-08-31 filled only 12.2% of the patch's own footprint in the
+    depth image (measured: 1131 source points -> 1131 of 9296 pixels; 0.5 mm ->
+    47.2%; 0.25 mm -> 9296 of 9296, 100.0%). Real board depth bias is solid, and
+    a holey patch is a materially EASIER adversary -- it voxel-downsamples to
+    fewer points, biases the trim's circle fit less, and dilates into a thinner
+    lobe. That is not a cosmetic difference: measured on the guard in
+    :func:`test_board_depth_bias_fused_to_the_ring_does_not_break_the_measurement`
+    (limit r 72.0 mm), the holey 1.0 mm patch kept the raster inside 70.6 mm and
+    passed, while the same scene rendered solid leaked board out to 72.4 mm
+    (0.5 mm sampling) and 72.8-73.4 mm (0.25 mm) -- i.e. the fixture was passing
+    because of its own sampling artefact, not because the chain rejected the
+    contamination.
+
+    So: do NOT raise this back toward (or past) the depth-pixel pitch. A fixture
+    that renders contamination the sensor could not produce cannot test the
+    chain's ability to reject the contamination it does produce.
     """
     xs = np.arange(center[0] + r_from, center[0] + r_to + step_mm, step_mm)
     ys = np.arange(center[1] - half_height_mm, center[1] + half_height_mm + step_mm, step_mm)
@@ -139,7 +163,43 @@ def _board_bias_patch(center, *, r_from: float, r_to: float, half_height_mm: flo
     return np.column_stack((X.ravel(), Y.ravel(), np.full(X.size, float(z_mm))))
 
 
-def observe_with_board_bias(plan, layer_index, rings, patch, *, seed=0):
+def test_the_board_bias_fixture_renders_a_solid_patch_not_a_sieve():
+    """The guard on the guard, and the reason it is a test and not a comment.
+
+    Every board-contamination assertion below is only worth what the fixture's
+    realism is worth, and that realism is invisible: ``_board_bias_patch``
+    returns a perfectly regular grid of points at any spacing, and the hole it
+    leaves at a coarse spacing appears only after ``render_depth`` splats it.
+    Until 2026-08-31 the default was 1.0 mm and the rendered patch was 12%
+    full -- and the r 72.0 mm guard below passed BECAUSE of that, not despite
+    it. So pin the property that matters directly: at the default sampling the
+    patch fills every depth pixel of its own footprint, the way real board depth
+    bias does. The second half pins the trap itself, so a future edit that
+    coarsens the spacing fails here, naming the reason, instead of quietly
+    turning the adversary back into a sieve.
+    """
+    T = syn.inspection_camera_T([CENTER[0], CENTER[1], 6.0], 300.0)
+
+    def fill_fraction(**kwargs):
+        patch = _board_bias_patch(CENTER, r_from=62.0, r_to=100.0,
+                                  half_height_mm=14.0, z_mm=3.5, **kwargs)
+        depth = syn.render_depth(patch, T, noise_mm=0.0)
+        rows, cols = np.nonzero(depth)
+        footprint = ((cols.max() - cols.min() + 1) * (rows.max() - rows.min() + 1))
+        return int(np.count_nonzero(depth)) / footprint
+
+    assert fill_fraction() >= 0.999, (
+        "the default board patch renders holey -- a sieve is an easier adversary "
+        "than the solid depth bias the real board produces (it downsamples to "
+        "fewer points, biases the trim's circle fit less, and dilates into a "
+        "thinner lobe), so every rejection assertion built on it is worth less "
+        "than it looks; see _board_bias_patch's docstring")
+    # One colour pixel spans 0.342 mm on this patch, so 1.0 mm source spacing
+    # cannot fill it -- measured 12.2%. This is the artefact, kept on record.
+    assert fill_fraction(step_mm=1.0) < 0.2
+
+
+def observe_with_board_bias(plan, layer_index, rings, patch, *, seed=0, config=None):
     layer = plan.layers[layer_index - 1]
     T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, layer_index), 300.0)
     centre = (plan.setup.center_x_mm, plan.setup.center_y_mm)
@@ -149,7 +209,8 @@ def observe_with_board_bias(plan, layer_index, rings, patch, *, seed=0):
     return process_observation(depth=depth,
                                geometry=syn.geometry(),
                                T_work_camera=T,
-                               plan=plan, layer=layer, config=ExtrusionConfig())
+                               plan=plan, layer=layer,
+                               config=config or ExtrusionConfig())
 
 
 def test_board_depth_bias_fused_to_the_ring_does_not_break_the_measurement():
@@ -175,6 +236,43 @@ def test_board_depth_bias_fused_to_the_ring_does_not_break_the_measurement():
     r = np.linalg.norm(np.asarray(out.filtered_xyz)[:, :2] - np.asarray(CENTER), axis=1)
     assert r.max() < 60.0 + 8.0 + 4.0, "board points beyond the bead must not reach the raster"
     assert out.report["counts"]["after_radial_trim"] < out.report["counts"]["after_largest_cluster"]
+
+
+@pytest.mark.parametrize("voxel_size_m", [0.001, 0.0005])
+def test_a_solid_board_patch_is_kept_out_of_the_raster_at_either_voxel(voxel_size_m):
+    """The guard above, held at BOTH voxel sizes the chain runs at.
+
+    The test above pins one (config, sampling) pair. This one pins the property
+    across the voxel size, because that default is not frozen -- it is 1.0 mm
+    today and moving to 0.5 mm -- and the leak this file was written to catch
+    was present at BOTH. Measured 2026-08-31 on the solid (0.25 mm) patch,
+    before the ``_radial_trim`` convergence fix:
+
+        voxel 1.0 mm -> r.max 72.821    voxel 0.5 mm -> r.max 73.378
+
+    against the same 72.0 mm limit, i.e. the contamination reached the raster
+    regardless of how finely the cloud was downsampled -- as it must, since the
+    leak is the trim's own circle fit still moving when the band schedule runs
+    out, and a voxel size cannot fix that. A fix that holds at one voxel and not
+    the other is therefore not a fix; it is a coincidence, and this test is what
+    stops one being mistaken for the other.
+    """
+    pytest.importorskip("open3d")
+    plan = scene_plan()
+    ring = syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.flat(6.0))
+    patch = _board_bias_patch(CENTER, r_from=62.0, r_to=100.0, half_height_mm=14.0, z_mm=3.5)
+
+    out = observe_with_board_bias(plan, 1, [ring], patch,
+                                  config=ExtrusionConfig(voxel_size_m=voxel_size_m))
+
+    m = out.metrics
+    assert m.valid, m.warnings
+    assert m.measured_radius_mm == pytest.approx(60.0, abs=1.0)
+    assert m.center_offset_norm_mm < 1.0
+    r = np.linalg.norm(np.asarray(out.filtered_xyz)[:, :2] - np.asarray(CENTER), axis=1)
+    assert r.max() < 60.0 + 8.0 + 4.0, (
+        f"voxel {voxel_size_m * 1000:g} mm: board points beyond the bead reached "
+        f"the raster (r.max {r.max():.3f} mm)")
 
 
 def test_radial_trim_follows_a_displaced_ring_not_the_nominal():
