@@ -802,8 +802,24 @@ def take_stages(take: TakeData) -> "dict | None":
     return stages
 
 
-def _compute_stages(take: TakeData) -> "dict | None":
-    from .processing import measure_take, plan_for_archived_take
+def reconstruct_take_inputs(take: TakeData, stages: "dict | None" = None) -> "dict | None":
+    """The inputs ``measure_take`` needs to reprocess ``take`` exactly as the
+    archived pass did: the plan and layer ``plan_for_archived_take`` rebuilds
+    from the manifest/trial, the config resolved from manifest-then-trial
+    provenance, and the lens model ``_chroma_dist`` chooses for the chroma
+    gate.
+
+    Returns ``None`` where the archive lacks what reprocessing needs: no
+    ``trial.json`` next to the layer, no ``processing_config`` in either
+    provenance, or a ``layer_index`` past the end of the rebuilt plan -- the
+    same conditions ``_compute_stages`` used to check inline before this was
+    pulled out, so it and the golden tests can never drift apart.
+
+    ``stages`` is optional and, when given, is MUTATED to collect any note
+    ``_chroma_dist`` has for the method figure caption. Callers with no
+    figure to annotate (the golden tests) can omit it.
+    """
+    from .processing import plan_for_archived_take
 
     trial_file = take.layer_dir.parent / "trial.json"
     if not trial_file.is_file():
@@ -818,7 +834,21 @@ def _compute_stages(take: TakeData) -> "dict | None":
     index = int(take.manifest.get("layer_index") or 1)
     if index > len(plan.layers):
         return None
+    return {
+        "plan": plan,
+        "layer": plan.layers[index - 1],
+        "config": ExtrusionConfig.model_validate(config_payload),
+        "dist": _chroma_dist(take, stages if stages is not None else {}),
+    }
+
+
+def _compute_stages(take: TakeData) -> "dict | None":
+    from .processing import measure_take
+
     stages: dict = {}
+    inputs = reconstruct_take_inputs(take, stages)
+    if inputs is None:
+        return None
     colour = take.layer_dir / (take.manifest.get("color_file") or "color.png")
     image = None
     if colour.is_file():
@@ -832,9 +862,8 @@ def _compute_stages(take: TakeData) -> "dict | None":
             T_work_camera=take.T_work_camera, K=take.K,
             # The lens model the MEASUREMENT gated with, not a second choice --
             # see TakeData.chroma_dist.
-            dist=_chroma_dist(take, stages), plan=plan,
-            layer=plan.layers[index - 1],
-            config=ExtrusionConfig.model_validate(config_payload), stages=stages)
+            dist=inputs["dist"], plan=inputs["plan"], layer=inputs["layer"],
+            config=inputs["config"], stages=stages)
     except Exception as exc:
         # A take that cannot be reconstructed still gets its other figures --
         # but the method figure is then partial, and has to be marked and logged.
