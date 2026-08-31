@@ -130,3 +130,25 @@ def test_majority_deposit_is_refused_at_low_point_count_too():
     pts, _ = _tilted_scene(n=100, bead_fraction=0.75, seed=11)
     with pytest.raises(RuntimeError, match="substrate fit refused"):
         PlaneSubstrate.fit(pts)
+
+
+def test_clause_b_margin_covers_noise_up_to_4mm():
+    """Task 4 review round 4: clause (b)'s sigma multiplier
+    (_BREAKDOWN_SIGMA_MULT) is a validated constant, not a round number --
+    round 3 briefly tightened it 2.5x -> 2.0x to close a low-n catch gap in
+    clause (a), which silently moved its false-fire cliff from noise_mm=5.0
+    down to noise_mm=4.0 (measured 48.3% false-fire there) because that
+    round only re-ran the sweep for the change it was making, not the sweep
+    that had validated clause (b) in the first place. Reverted to 2.5x
+    (controller ruling): real per-take sigma is 0.44-0.61mm, so 2.5x keeps
+    ~8-11x headroom, and clause (b) is a BACKSTOP behind clause (a) -- it
+    belongs far from any plausible operating point, not tuned flush against
+    the detector it backs up. Pins the margin directly (10 seeds at the
+    exact noise level round 3's tightening broke) so the next tightening
+    trips this test instead of needing a reviewer to catch it."""
+    n = 20_000
+    for seed in range(10):
+        pts, _ = _tilted_scene(n=n, noise_mm=4.0, bead_fraction=0.0,
+                                seed=900_000 + seed)
+        fit = PlaneSubstrate.fit(pts)   # must not raise
+        assert fit.sigma_mm > 0.0

@@ -48,14 +48,28 @@ _P_TAIL_3SIGMA = 0.5 * math.erfc(3.0 / math.sqrt(2.0))
 _BREAKDOWN_ALPHA = 1e-4
 
 #: Clause (b) in fit(): refuse if sigma_mm exceeds this multiple of
-#: clamp_mm[1]. 2.0x the default 2.0 mm ceiling = 4.0 mm, against a measured
-#: healthy sigma_mm ceiling of ~0.8 mm even at n=50 (5x margin) -- see the
-#: task 4 report for the full healthy-sigma sweep this was picked against.
-#: Lowered from round 2's 2.5x: at low n a partial (neither clean substrate
-#: nor clean deposit-top) lock can leave sigma_mm just under 2.5x while
-#: clause (a) also misses it because MAD is partly corrupted too -- 2.0x
-#: closes most of that gap and stays far above legitimate noise.
-_BREAKDOWN_SIGMA_MULT = 2.0
+#: clamp_mm[1]. MEASURED, not a round number picked by feel -- do not
+#: tighten this without re-running BOTH sweeps that pin it (task 4 report,
+#: round 4):
+#:   - noise-magnitude sweep (n=20,000, pure noise, no bead): at 2.5x
+#:     (5.0 mm) the false-fire cliff sits at noise_mm=5.0, with 0% fire
+#:     through noise_mm=4.8 -- real per-take sigma is 0.44-0.61 mm (spec),
+#:     so this keeps roughly 8-11x headroom. Round 3 briefly tried 2.0x
+#:     (4.0 mm) to close a low-n catch gap in clause (a); that moved the
+#:     cliff to noise_mm=4.0, i.e. onto a plausible-if-bad substrate reading
+#:     instead of nowhere near one -- reverted (round 4 controller ruling).
+#:   - low-n catch sweep for bead_frac 0.55/0.75: 2.5x measurably
+#:     under-catches 2.0x's coverage at n=50-80 for the 0.55 case (see the
+#:     round 4 report for the actual numbers) -- accepted, because clause
+#:     (b) is a BACKSTOP behind clause (a) (the primary, well-validated
+#:     detector), and a backstop belongs far from any plausible operating
+#:     point so it never argues with real data, not tuned flush against the
+#:     detector it backs up.
+#: The "just refuse an unusably-high sigma outright" alternative was
+#: considered and rejected: refusing whenever k*sigma saturates the clamp
+#: fires at sigma > 0.667 mm -- inside normal operation -- so it cannot be
+#: the criterion here.
+_BREAKDOWN_SIGMA_MULT = 2.5
 
 
 def _breakdown_below_count(residual: np.ndarray, k: float = 3.0) -> tuple[int, float]:
