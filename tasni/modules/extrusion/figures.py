@@ -815,6 +815,18 @@ def reconstruct_take_inputs(take: TakeData, stages: "dict | None" = None) -> "di
     same conditions ``_compute_stages`` used to check inline before this was
     pulled out, so it and the golden tests can never drift apart.
 
+    Anything else wrong with the archive -- malformed ``trial.json``,
+    ``plan_for_archived_take`` unable to rebuild a plan, a ``processing_config``
+    that fails ``ExtrusionConfig`` validation -- RAISES rather than returning
+    ``None``. That is deliberate: ``None`` here means "this take was never
+    meant to be reprocessable" (an expected, quiet shape), while a raise means
+    "this take's archive is broken in a way worth surfacing". Softening a
+    raise into ``None``/logging is the caller's job, not this function's --
+    ``_compute_stages`` does it via its ``try/except`` -> ``_incomplete`` so
+    one unrenderable take cannot kill a batch figure render; a caller that
+    wants the raise to propagate (e.g. a golden test, which should fail loudly
+    on a broken archive rather than silently skip it) gets that by default.
+
     ``stages`` is optional and, when given, is MUTATED to collect any note
     ``_chroma_dist`` has for the method figure caption. Callers with no
     figure to annotate (the golden tests) can omit it.
@@ -846,17 +858,17 @@ def _compute_stages(take: TakeData) -> "dict | None":
     from .processing import measure_take
 
     stages: dict = {}
-    inputs = reconstruct_take_inputs(take, stages)
-    if inputs is None:
-        return None
-    colour = take.layer_dir / (take.manifest.get("color_file") or "color.png")
-    image = None
-    if colour.is_file():
-        import cv2
-        image = cv2.imread(str(colour), cv2.IMREAD_COLOR)
-    if image is None:
-        image = np.zeros((*np.asarray(take.depth).shape[:2], 3), np.uint8)
     try:
+        inputs = reconstruct_take_inputs(take, stages)
+        if inputs is None:
+            return None
+        colour = take.layer_dir / (take.manifest.get("color_file") or "color.png")
+        image = None
+        if colour.is_file():
+            import cv2
+            image = cv2.imread(str(colour), cv2.IMREAD_COLOR)
+        if image is None:
+            image = np.zeros((*np.asarray(take.depth).shape[:2], 3), np.uint8)
         result = measure_take(
             color=image, depth=take.depth, geometry=take.geometry,
             T_work_camera=take.T_work_camera, K=take.K,
@@ -865,8 +877,17 @@ def _compute_stages(take: TakeData) -> "dict | None":
             dist=inputs["dist"], plan=inputs["plan"], layer=inputs["layer"],
             config=inputs["config"], stages=stages)
     except Exception as exc:
-        # A take that cannot be reconstructed still gets its other figures --
-        # but the method figure is then partial, and has to be marked and logged.
+        # A take that cannot be reconstructed -- a `reconstruct_take_inputs`
+        # raise (bad archive JSON, an unrebuildable plan, a config payload
+        # that fails validation) as much as a `measure_take` failure -- still
+        # gets its other figures; the method figure is then partial, and has
+        # to be marked and logged. This is WIDER than the pre-extraction
+        # split, where a `json.loads`/`plan_for_archived_take` error used to
+        # propagate uncaught while only the config-validation/dist-choice
+        # errors were caught here. Reconstruction is now fail-soft as a
+        # whole -- more coherent than being half-soft, and consistent with
+        # why `_incomplete` exists at all: one unrenderable take must not
+        # kill a batch figure render.
         return _incomplete(stages, take, exc)
     stages["result"] = result
     return stages
