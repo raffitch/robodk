@@ -15,6 +15,24 @@ interface ActiveRun {
               val_rms_px?: number | null; board_consistency_rms_mm?: number | null };
 }
 
+// Run folders are stamped `YYYYMMDD-HHMMSS[-suffix]`, which is sortable but not
+// readable at a glance. Parsed here rather than added to the API because the
+// stamp already carries it -- the backend has nothing extra to send. Anything
+// that does not match the pattern falls through to the raw stamp rather than
+// rendering "Invalid Date".
+const STAMP = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/;
+const fmtStamp = (stamp: string): string | null => {
+  const m = STAMP.exec(stamp);
+  if (!m) return null;
+  const [, y, mo, d, h, mi] = m;
+  const dt = new Date(+y, +mo - 1, +d, +h, +mi);
+  if (Number.isNaN(dt.getTime())) return null;
+  return dt.toLocaleString(undefined, {
+    day: "2-digit", month: "short", year: "numeric",
+    hour: "2-digit", minute: "2-digit",
+  });
+};
+
 const fmtSize = (b?: number) =>
   b == null ? "" : b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB`
     : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB`
@@ -22,7 +40,7 @@ const fmtSize = (b?: number) =>
 
 export default function Home() {
   const nav = useNavigate();
-  const health = useHealth();
+  const { health } = useHealth();
   const [modules, setModules] = useState<ModuleMeta[]>([]);
   const [runs, setRuns] = useState<Run[]>([]);
   const [calib, setCalib] = useState<ActiveRun | null>(null);
@@ -199,7 +217,9 @@ export default function Home() {
                 <input type="checkbox" checked={picked.has(r.path)}
                        disabled={deleting} onChange={() => toggle(r.path)} />
                 <span className="run-module">{r.module}</span>
-                <span className="mono run-stamp">{r.stamp}</span>
+                <span className="run-when" title={r.stamp}>
+                  {fmtStamp(r.stamp) ?? <span className="mono">{r.stamp}</span>}
+                </span>
                 {r.active && <span className="run-tag">applied</span>}
                 <span className="run-size">{fmtSize(r.bytes)}</span>
               </label>

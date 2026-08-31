@@ -19,6 +19,33 @@ def _segment(value: str, label: str) -> str:
     return value
 
 
+def _write_debug_raster(path, image) -> None:
+    """Write one debug raster MIRRORED IN X, so it reads the same way round as the
+    ``color.png`` sitting beside it in the same folder.
+
+    ``segmentation`` / ``skeleton`` / ``comparison`` are rasterised in WORK XY with
+    +X -> +column, but this cell's camera looks down with its +X axis along work
+    -X. Measured on runs/extrusion/20260831-190027-dd013e33: +40 mm of work X moved
+    the raster +40 columns and the photo -174 px in u, while +40 mm of work Y moved
+    BOTH down. So the disagreement is in X alone, and a horizontal flip is the whole
+    correction.
+
+    Flipping HERE and not at the source is deliberate. The in-memory arrays stay in
+    work coordinates, which is what ``_rasterize``'s ``lo`` origin and every
+    pixel->mm conversion built on it assume; and the web UI serves these FILES
+    (module.py's SERVED_FILES), so one flip fixes the archive and the UI together
+    rather than leaving them disagreeing.
+
+    Found by the operator comparing the two by eye. It had already misled the
+    assistant into naming the wrong side of a ring earlier in the same session,
+    which is the cost of leaving it: every defect discussed off these images was
+    left-right reversed against the photograph of the thing itself.
+    """
+    import cv2
+    if not cv2.imwrite(str(path), cv2.flip(np.asarray(image), 1)):
+        raise OSError(f"failed to write {path.name}")
+
+
 class ExtrusionArchive:
     def __init__(self, root: str | Path):
         self.root = Path(root)
@@ -94,8 +121,7 @@ class ExtrusionArchive:
             for name, image in derived_images.items():
                 if name not in allowed:
                     raise ValueError(f"unsupported derived image name: {name!r}")
-                if not cv2.imwrite(str(layer / name), np.asarray(image)):
-                    raise OSError(f"failed to write {name}")
+                _write_debug_raster(layer / name, image)
         if report is not None:
             (layer / "report.json").write_text(json.dumps(report, indent=2),
                                                 encoding="utf-8")
@@ -157,8 +183,7 @@ class ExtrusionArchive:
         for name, image in derived_images.items():
             if name not in allowed:
                 raise ValueError(f"unsupported derived image name: {name!r}")
-            if not cv2.imwrite(str(out / name), np.asarray(image)):
-                raise OSError(f"failed to write {name}")
+            _write_debug_raster(out / name, image)
         (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         return out
 
@@ -193,8 +218,7 @@ class ExtrusionArchive:
         if set(derived_images) - allowed:
             raise ValueError("unsupported derived image name")
         for name, image in derived_images.items():
-            if not cv2.imwrite(str(layer / name), np.asarray(image)):
-                raise OSError(f"failed to write {name}")
+            _write_debug_raster(layer / name, image)
         (layer / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         (layer / "manifest.json").write_text(
             manifest.model_dump_json(indent=2), encoding="utf-8")

@@ -3230,3 +3230,40 @@ def test_the_health_gate_is_wired_into_the_measurement_path():
 
     with pytest.raises(RuntimeError, match="separation"):
         run(ExtrusionConfig(substrate_min_separation_mm=margin + 1.0))
+
+
+# ------------------------------------------------- debug rasters match the photo
+def test_archived_debug_rasters_are_mirrored_to_match_the_colour_photo(tmp_path):
+    """segmentation/skeleton/comparison are built in WORK XY (+X -> +column), but
+    the camera's +X axis points along work -X, so the saved PNGs used to come out
+    left-right mirrored against color.png sitting beside them in the same folder.
+
+    Measured on runs/extrusion/20260831-190027-dd013e33 before the fix: moving
+    +40 mm in work X moved the raster +40 columns and the photo -174 pixels in u,
+    while +40 mm in work Y moved both DOWN. So the flip is in X only.
+
+    The operator caught this comparing the two by eye, and it had already misled
+    the assistant into naming the wrong side of a ring in the same session. The
+    web UI serves these FILES, so flipping at write time fixes the archive and the
+    UI together; the in-memory arrays stay in work coordinates, which is what the
+    raster maths and every ``lo``-based back-conversion assume.
+    """
+    import cv2
+    from tasni.modules.extrusion.archive import ExtrusionArchive
+
+    image = np.zeros((6, 8, 3), np.uint8)
+    image[1, 0] = (255, 255, 255)          # unmistakably on the +X-low side
+    archive = ExtrusionArchive(tmp_path)
+    archive.create_trial("trial-1", scene_plan())
+    out = archive.write_characterization(
+        "trial-1", 1, color=np.zeros((4, 4, 3), np.uint8),
+        depth=np.zeros((4, 4), np.uint16), measured_xyz=np.zeros((3, 3)),
+        report={"valid": True},
+        derived_images={"segmentation.png": image})
+
+    written = cv2.imread(str(out / "segmentation.png"), cv2.IMREAD_COLOR)
+    assert written is not None
+    assert np.array_equal(written, cv2.flip(image, 1)), (
+        "the archived raster must be mirrored in X so it reads the same way round "
+        "as color.png beside it")
+    assert not np.array_equal(written, image)

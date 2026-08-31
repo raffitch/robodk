@@ -128,6 +128,9 @@ table.metrics td.num { font-family: var(--mono); text-align: right; }
 .runs .run .mono { font-family: var(--mono); color: var(--muted); }
 .runs .run-module { flex: 0 0 auto; }
 .runs .run-stamp { flex: 1 1 auto; }
+/* Readable date/time for a run folder; the raw stamp stays in the title
+   attribute so it is still copyable and still identifies the folder. */
+.runs .run-when { flex: 1 1 auto; font-variant-numeric: tabular-nums; }
 .runs .run-tag { flex: 0 0 auto; font-size: 10.5px; font-weight: 700; letter-spacing: .5px;
   text-transform: uppercase; padding: 1px 6px; border-radius: 5px;
   background: rgba(63,185,80,.16); color: var(--ok); }

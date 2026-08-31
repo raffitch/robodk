@@ -11,6 +11,32 @@ Last updated: 2026-08-28. Active branch: `main` (`calibration-improvements` merg
 > [live-print-dispatch-handoff-2026-08-28.md](live-print-dispatch-handoff-2026-08-28.md).
 > New agents: start at [../AGENTS.md](../AGENTS.md).
 
+## Extrusion debug images are mirrored to match the photo (fixed 2026-08-31)
+
+`segmentation.png`, `skeleton.png` and `comparison.png` are rasterised in WORK XY
+(+X -> +column), but this cell's camera looks down with its +X axis along work -X.
+The saved PNGs therefore used to come out **left-right mirrored against the
+`color.png` sitting beside them in the same folder**. Vertical always agreed.
+
+Measured on `runs/extrusion/20260831-190027-dd013e33`: +40 mm of work X moved the
+raster +40 columns and the photo **-174 px** in u; +40 mm of work Y moved both DOWN.
+So the disagreement was in X alone.
+
+Fixed: `archive._write_debug_raster` flips horizontally at WRITE time. The in-memory
+arrays stay in work coordinates (which `_rasterize`'s `lo` origin and every
+pixel->mm conversion assume), and because the web UI serves these *files*
+(`module.py` `SERVED_FILES`), one flip fixes the archive and the UI together.
+
+> **Archives written BEFORE this fix are NOT flipped.** Any take captured earlier --
+> including the whole 2026-08-30 golden archive and everything from 2026-08-31
+> before 19:00 -- has un-mirrored debug PNGs. When comparing a historical take's
+> segmentation against its own `color.png`, mirror one of them yourself. The raw
+> `depth.npy` and every number in `report.json` are unaffected; this was only ever
+> a display convention.
+
+Found by the operator comparing the two by eye. It had already misled an assistant
+into naming the wrong side of a ring in the same session.
+
 ## Two-path workframe survey (2026-08-13)
 
 Implements `docs/scan-workframe-two-path-plan.md` (design) via
