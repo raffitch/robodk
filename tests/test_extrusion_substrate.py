@@ -27,7 +27,11 @@ def test_recovers_the_plane_under_one_sided_contamination():
     fit = PlaneSubstrate.fit(pts)
     assert fit.a == pytest.approx(slope, abs=0.002)      # tilt recovered
     assert fit.c == pytest.approx(-1.2, abs=0.15)        # offset recovered
-    assert fit.sigma_mm == pytest.approx(0.5, rel=0.25)  # sigma from the clean half
+    # sigma runs ~8-13% high under this scene's own 15% bead (measured across
+    # a 30-seed sweep); rel=0.20 leaves headroom for that while still catching
+    # a real magnitude regression -- sigma now multiplies the bias correction,
+    # so this bound is precisely what would notice one.
+    assert fit.sigma_mm == pytest.approx(0.5, rel=0.20)  # sigma from the clean half
     clean = ~(pts[:, 2] - (fit.a * pts[:, 0] + fit.b * pts[:, 1] + fit.c) > 4.0)
     heights = fit.height(pts[clean])
     assert abs(float(np.median(heights))) < 0.1          # substrate sits at height 0
@@ -63,3 +67,31 @@ def test_a_wall_is_refused_not_measured():
 def test_too_few_points_is_a_loud_error():
     with pytest.raises(RuntimeError, match="substrate fit needs"):
         PlaneSubstrate.fit(np.zeros((10, 3)))
+
+
+def test_bias_correction_is_audited_in_the_report():
+    """Task 4 review, Important 3: the correction that moves every measured
+    height must not be invisible to the frame's own report (spec §4). A
+    refactor that dropped both keys would still pass every other test here
+    without this one."""
+    pts, _ = _tilted_scene()
+    fit = PlaneSubstrate.fit(pts)
+    report = fit.to_report()
+    assert "bias_correction_mm" in report
+    assert "bias_correction_sigma" in report
+    assert fit.bias_correction_mm == pytest.approx(
+        fit.bias_correction_sigma * fit.sigma_mm)
+    # to_report() rounds (4dp / 5dp) for display -- compare with matching tolerance.
+    assert report["bias_correction_mm"] == pytest.approx(fit.bias_correction_mm, abs=1e-4)
+    assert report["bias_correction_sigma"] == pytest.approx(fit.bias_correction_sigma, abs=1e-5)
+
+
+def test_majority_deposit_is_refused_not_measured_as_perfect():
+    """Task 4 review, Important 2: past ~50% deposit in the fit region the
+    raw IRLS can converge onto the deposit's top instead of the table, and
+    (before this guard) reported inlier_fraction=1.000 -- the one number an
+    operator would trust -- while measuring height above the deposit, not
+    the substrate. 75% deposit fraction reproduces that breakdown."""
+    pts, _ = _tilted_scene(bead_fraction=0.75)
+    with pytest.raises(RuntimeError, match="substrate fit refused"):
+        PlaneSubstrate.fit(pts)
