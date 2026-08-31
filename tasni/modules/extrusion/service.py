@@ -1210,7 +1210,7 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
         # capture (Task 9 review, Important 4).
         dist=None if geometry.legacy else intrinsics.get("dist_coeffs"),
         plan=plan, layer=plan.layers[layer_index - 1],
-        config=ExtrusionConfig.model_validate(processing_payload))
+        config=ExtrusionConfig.from_archive(processing_payload))
     reprocessed_at = _utcnow()
     # Timing honesty. The capture is the same frame, so its capture_ms stays
     # true; the processing time is now a desktop measurement of a run that

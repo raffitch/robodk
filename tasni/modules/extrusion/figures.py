@@ -849,7 +849,7 @@ def reconstruct_take_inputs(take: TakeData, stages: "dict | None" = None) -> "di
     return {
         "plan": plan,
         "layer": plan.layers[index - 1],
-        "config": ExtrusionConfig.model_validate(config_payload),
+        "config": ExtrusionConfig.from_archive(config_payload),
         "dist": _chroma_dist(take, stages if stages is not None else {}),
     }
 
@@ -921,7 +921,7 @@ def _compute_characterization_stages(take: TakeData) -> "dict | None":
     trial_setup = trial.get("setup") or {}
     center = coarse.get("center_mm") or [0.0, 0.0]
     try:
-        config = ExtrusionConfig.model_validate(config_payload)
+        config = ExtrusionConfig.from_archive(config_payload)
         recipe = CylinderRecipe(
             radius_mm=float(np.clip(coarse["radius_mm"], 5.0, 500.0)), layer_count=1,
             layer_height_mm=float(np.clip(coarse["height_mm"], 0.5, 50.0)),

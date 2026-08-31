@@ -210,3 +210,17 @@ def test_no_caller_bypasses_the_seam():
                  if p.name != "processing.py"
                  and "process_observation(" in p.read_text(encoding="utf-8")]
     assert not offenders, f"route these through measure_take: {offenders}"
+
+
+def test_archived_configs_with_retired_keys_still_validate():
+    """extra='forbid' + archived processing_config payloads means a field can
+    never be deleted without this shim (spec §3.6): retired keys are DROPPED,
+    never reinterpreted, and unknown keys still fail loudly."""
+    import pytest
+    from tasni.core import config as cfg
+    payload = cfg.ExtrusionConfig().model_dump()
+    payload["deposit_min_saturation"] = 60          # will be retired by Task 7
+    with_retired = dict(payload, **{k: 1 for k in cfg.RETIRED_EXTRUSION_CONFIG_KEYS})
+    assert cfg.ExtrusionConfig.from_archive(with_retired) is not None
+    with pytest.raises(Exception):
+        cfg.ExtrusionConfig.from_archive(dict(payload, not_a_field_ever=1))

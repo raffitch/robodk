@@ -710,6 +710,13 @@ class ScanConfig(_Model):
     calibration_expiry_hard_fail: bool = False  # True: refuse the lock instead of warning
 
 
+# Config fields deleted from ExtrusionConfig but still present in archived
+# processing_config payloads (every archive dumps the full config per take).
+# from_archive() drops them so extra="forbid" keeps refusing genuinely unknown
+# keys without refusing history. Grown by the 2026-08-30 substrate change.
+RETIRED_EXTRUSION_CONFIG_KEYS: frozenset = frozenset()
+
+
 class ExtrusionConfig(_Model):
     """Cylinder-test defaults and verified extrusion-cell integration data.
 
@@ -913,6 +920,13 @@ class ExtrusionConfig(_Model):
     # Empty list disables the trim.
     radial_trim_schedule_mm: list[float] = Field(
         default_factory=lambda: [15.0, 12.0, 10.0])
+
+    @classmethod
+    def from_archive(cls, payload: dict) -> "ExtrusionConfig":
+        """Validate an ARCHIVED processing_config: retired keys are dropped
+        (never reinterpreted); anything else unknown still fails loudly."""
+        return cls.model_validate({k: v for k, v in dict(payload).items()
+                                   if k not in RETIRED_EXTRUSION_CONFIG_KEYS})
 
 
 class WebConfig(_Model):
