@@ -115,7 +115,16 @@ def load_take(take_dir: Path) -> dict:
     geom = CameraGeometry.from_greeting(prov["camera_geometry"])
     T = np.asarray(prov["T_work_camera"], float)
     depth = np.load(take_dir / "depth.npy")
-    search_c = np.asarray(report["search_center_mm"], float)
+    # A take that ABORTED carries search_center_mm at the top level; one that
+    # SUCCEEDED carries the coarse fit instead. Both name the same place well
+    # enough for this probe, which only needs a centre to fit the substrate
+    # around and to seed the ring selection.
+    if report.get("search_center_mm") is not None:
+        search_c = np.asarray(report["search_center_mm"], float)
+    elif (report.get("coarse") or {}).get("center_mm") is not None:
+        search_c = np.asarray(report["coarse"]["center_mm"], float)
+    else:
+        raise SystemExit(f"{take_dir}: no search centre or coarse fit in report.json")
 
     points, _ = depth_to_work_points(depth, geom, T)
     radial = np.linalg.norm(points[:, :2] - search_c, axis=1)
@@ -141,11 +150,19 @@ def load_take(take_dir: Path) -> dict:
     baseline_work = np.asarray(T, float)[:3, 0]
     baseline_deg = float(np.degrees(math.atan2(baseline_work[1], baseline_work[0])) % 180.0)
 
+    # inspection_pose is only written on the abort path, so roll/tilt come from
+    # the pose when it is there and are read back off T_work_camera when it is
+    # not. The baseline angle below never depends on it either way.
     pose = report.get("inspection_pose") or {}
+    axis = np.asarray(T, float)[:3, 2]
+    measured_tilt = float(np.degrees(math.acos(min(1.0, abs(float(axis[2]))))))
+    clamp_hi = float(tuple(config.substrate_floor_clamp_mm)[1])
     return {
         "dir": take_dir,
+        "clamp_hi": clamp_hi,
+        "floor_pinned": bool(abs(floor - clamp_hi) < 1e-6),
         "roll_deg": float(pose.get("roll_deg", float("nan"))),
-        "tilt_deg": float(pose.get("tilt_deg", float("nan"))),
+        "tilt_deg": float(pose.get("tilt_deg", measured_tilt)),
         "valid": bool(report.get("valid")),
         "points": points,
         "height": height,
@@ -236,7 +253,35 @@ def main() -> int:
     print(f"  work-frame disagreement       {work_gap:6.1f} deg")
     print(f"  baseline-relative disagreement{rel_gap:6.1f} deg")
 
+    # A verdict is only meaningful if the two captures are comparable. Measured
+    # 2026-08-31: rolling the camera 60 deg ALSO changed the depth quality --
+    # substrate sigma 0.591 -> 0.866 mm, board p99 1.66 -> 3.54, the floor driven
+    # onto its clamp ceiling, and the skirt pattern from two clean lobes to four
+    # at three times the amplitude. Rolling turns the IR projector's dot pattern
+    # against the printed board as well as the stereo baseline, so roll is NOT
+    # the single-variable change this probe was designed around. With the noise
+    # floor itself moving, the axial statistic is measuring general board wobble
+    # in one arm and a crisp artifact in the other, and comparing them says
+    # nothing. Refuse rather than print a confident wrong answer.
+    sigmas = [t["sigma"] for t in takes]
+    sigma_ratio = max(sigmas) / max(min(sigmas), 1e-9)
+    pinned = [t for t in takes if t["floor_pinned"]]
     print("=" * 78)
+    print(f"comparability: substrate sigma {sigmas[0]:.3f} vs {sigmas[1]:.3f} mm "
+          f"(ratio {sigma_ratio:.2f})"
+          + ("" if not pinned else
+             f"; floor PINNED at its {pinned[0]['clamp_hi']:.1f} mm clamp ceiling in "
+             + ", ".join('AB'[takes.index(t)] for t in pinned)))
+    if sigma_ratio > 1.25 or pinned:
+        print("=" * 78)
+        print("VERDICT: NOT A CONTROLLED COMPARISON. The two captures do not share a "
+              "noise floor, so neither 'baseline-locked' nor 'real geometry' can be "
+              "read off them. Re-run capture B until its substrate sigma is within "
+              "25% of capture A's and its floor is off the clamp, or change the "
+              "camera's baseline direction some other way. Do NOT read the axis "
+              "numbers below as an answer.")
+        print("=" * 78)
+        return 2
     if baseline_gap < 15.0:
         verdict = ("INCONCLUSIVE: the two captures' baselines are only "
                    f"{baseline_gap:.1f} deg apart. Check `rejected` in capture B's "
