@@ -947,6 +947,23 @@ class ExtrusionConfig(_Model):
     radial_trim_schedule_mm: list[float] = Field(
         default_factory=lambda: [15.0, 12.0, 10.0])
 
+    @field_validator("substrate_floor_clamp_mm")
+    @classmethod
+    def _clamp_is_ordered(cls, value: list[float]) -> list[float]:
+        """A reversed pair is silently catastrophic, not merely wrong:
+        ``np.clip(k * sigma, 2.0, 1.0)`` returns the UPPER bound unconditionally,
+        so the derived floor stops depending on the frame's noise at all and
+        every take is segmented at a constant 1.0 mm -- the exact failure this
+        design replaced, reintroduced by a typo that nothing else would catch."""
+        lo, hi = float(value[0]), float(value[1])
+        if not lo < hi:
+            raise ValueError(
+                f"substrate_floor_clamp_mm must be [low, high] with low < high, "
+                f"got [{lo:g}, {hi:g}] -- reversed, the clamp would pin the "
+                "derived deposit floor to a constant and ignore the substrate's "
+                "measured noise entirely")
+        return value
+
     @classmethod
     def from_archive(cls, payload: dict) -> "ExtrusionConfig":
         """Validate an ARCHIVED processing_config: retired keys are dropped

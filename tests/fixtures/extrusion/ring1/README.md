@@ -24,20 +24,48 @@ test reads it.
 
 From trial `20260828-171615-f088cf48/characterize-01`. This frame contains both
 the deposited ring and a larger above-plane residual on the ChArUco board. The
-old largest-cluster rule selected the board residual and reported a 51 mm bead.
-The fixture protects the ring-shape selection that rejects that residual.
+old largest-cluster rule selected the board residual and reported a 51 mm bead,
+and the fixture was written to protect the ring-shape selection that rejects it.
+
+The shape gate's own behaviour is unchanged -- the selected candidate's coarse
+circle still reads r 41.13 mm against 41.12 under the colour-gate chain -- but
+**the board no longer arrives as a competing candidate at all**: it now sits
+below the derived floor rather than above the old constant one, so there is a
+single candidate and `selected["points"] == largest["points"]`. "The ring is not
+the largest blob" is therefore no longer what this frame exercises; that stays
+pinned on the synthetic scene where the residual is placed on purpose
+(`test_characterize_selects_ring_instead_of_larger_raised_patch`).
+
+What this fixture pins now is the refined measurement on a real 1 mm-worded
+frame: r 40.39, centre (218.56, 150.18), bead 9.82, top z 6.78 (re-measured
+2026-08-31; previously 39.17 / (217.94, 150.44) / 13.26 / 6.14). Less board is
+fused into the footprint, so the bead narrows and the crest-read radius moves
+out to 0.74 mm inside the coarse circle where it used to sit 1.95 mm inside it.
+There is no ground truth for this ring in the archive, so what is asserted is
+self-consistency plus the unchanged selection.
 
 ## `ring1_low_relief_20260829.npz`
 
 From trial `20260829-151445-acb42814/characterize-01`. A hand-placed dried ring
 only 2-11 mm tall (median 2 mm) against a board whose own depth noise is +/-3 mm.
-Its two thinnest arcs fall under the ROI height floor, so ONE ring reached DBSCAN
-as two disconnected arcs: 48/72 angular bins and 25/72. Graded separately neither
-cleared the 0.70 coverage gate, so characterization aborted on a ring that was in
-fact captured all the way round -- the two arcs together cover 71/72.
+**Under the old constant 2.5 mm floor** its two thinnest arcs fell out, so ONE
+ring reached DBSCAN as two disconnected arcs: 48/72 angular bins and 25/72.
+Graded separately neither cleared the 0.70 coverage gate, so characterization
+aborted on a ring that was in fact captured all the way round -- the two arcs
+together cover 71/72. The fixture then protected arc assembly.
 
-The fixture protects arc assembly: completeness must be judged on the assembled
-ring, never on one connected component.
+**What it protects now is the datum.** The derived floor removes the
+fragmentation at its source: this capture's substrate fits at -1.81 mm with
+sigma 0.836 mm, so the floor lands 2.0 mm above THAT -- about 0.2 mm in
+work-frame Z, against 2.5 mm before. The thin arcs clear it and the ring arrives
+as ONE complete cluster covering 72/72 (measured 2026-08-31: r 42.11, against
+42.0 via assembly before). Measuring height above the surface the deposit rests
+on, rather than above a nominal plane the surface is not on, is worth ~2.3 mm
+here -- more than the ring's own thin arcs are tall.
+
+Arc assembly itself is still covered, on the synthetic scene whose dips are cut
+below the derived floor on purpose
+(`test_characterize_assembles_one_ring_from_arcs_the_height_floor_broke`).
 
 ## `ring1_take04_branchguard_20260829.npz`
 
@@ -64,18 +92,40 @@ silently wrong number, which is what the paired test asserts against.
 Measured 2026-08-31 running this frame through the fitted-substrate chain (task
 7 step 5a of the 2026-08-30 segmentation design):
 
-* **The patch is destroyed by SHAPE.** The compactness filter drops 5 of the 6
-  connected components in the work ROI, without its fail-open bypass firing.
-  Of the 1478 patch points that reach the ROI only **7** survive to the crest
-  (99.5% gone), and the radius bias falls from the +0.6-0.7 mm takes 1-3 carried
-  to +0.24 mm. With `deposit_min_length_beads = 0` the same frame reproduces the
-  original cell abort exactly -- so compactness is measurably doing the job the
-  saturation gate used to do.
+* **The patch is rejected with no colour input**, and the radius bias falls from
+  the +0.6-0.7 mm takes 1-3 carried to +0.24 mm: of the 1478 patch points
+  reaching the work ROI, 7 survive to the crest. **That cleaning is the
+  downstream chain's, not the compactness filter's** -- the two facts must not
+  be welded into one claim. With the filter ON and OFF (2026-08-31):
+
+  | stage | ON | OFF |
+  |---|---|---|
+  | work_roi | 22226 (patch 1478) | 22226 (patch 1478) |
+  | compactness | 21714 (patch 1386) | 22226 (patch 1478) |
+  | deposit_cluster | 1266 (patch 105) | 1277 (patch 116) |
+  | radial_trimmed | 1231 (patch **72**) | 1228 (patch **72**) |
+  | top_surface | 432 (patch **7**) | 436 (patch **6**) |
+
+  Compactness removes 92 of the 1471 patch points that go away -- 6%. DBSCAN,
+  the radial trim about the FITTED circle and the crest filter reach the same
+  endpoint either way.
+
+* **What compactness decides on this frame is the branch-guard outcome.** It
+  drops five compact components totalling 512 points, which changes the raster
+  topology; with `deposit_min_length_beads = 0` the frame reproduces the
+  original 2026-08-29 cell abort exactly. That role is real and load-bearing,
+  and the paired tests pin it -- it is simply a different mechanism from
+  "compactness cleans the patch off the crest". The filter's
+  contamination-rejection value is separately evidenced on the 2026-08-30
+  archive (spec 3.5).
 * **The take is reported INVALID, and that is the honest answer.** Completeness
   0.846, maximum angular gap 55.3 deg. This capture's 1 mm quantisation gives the
   substrate a sigma of 0.759 mm, so `3 * sigma` saturates the configured clamp at
-  2.0 mm -- about 2.54 mm in work-frame Z once the fitted plane's -1.32 mm offset
-  is added. That is essentially the old 2.5 mm floor, and it costs the same
+  2.0 mm -- about 2.54 mm in work-frame Z once the fitted plane's height AT THE
+  RING CENTRE is added (`plane_offset_at_center_mm` = 0.542; the plane's -1.32 mm
+  intercept is its value at the work-frame ORIGIN, and the 0.8 deg tilt carries
+  it up to +0.54 by the time it reaches the ring). That is essentially the old
+  2.5 mm floor, and it costs the same
   low-relief sector (crest 2.9-4.9 mm) it always did: at 2.5 mm this ring measured
   completeness 0.87 with a 46 deg gap. The metrics say so instead of returning a
   ring that was not there.
@@ -83,6 +133,7 @@ Measured 2026-08-31 running this frame through the fitted-substrate chain (task
   floor comes out at 1.65 mm and that sector is kept -- 8/8 valid at completeness
   0.992-0.993 across the 2026-08-30 archive (`tests/test_extrusion_golden.py`).
 
-The pair of tests on this fixture therefore pins: contamination rejected by
-geometry, and a frame whose own noise cannot support a low enough floor saying so
+The pair of tests on this fixture therefore pins: contamination rejected without
+colour, compactness's real (topological) role separated from the downstream
+chain's, and a frame whose own noise cannot support a low enough floor saying so
 rather than measuring a partial ring as a whole one.

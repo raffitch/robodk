@@ -42,15 +42,23 @@ SIZE_720P = (1280, 720)
 DEPTH_UNIT_MM = 0.1
 
 #: Per-pixel depth noise, in mm. NOT the substrate noise the chain then measures:
-#: this renderer splats many world points per pixel and z-buffers the nearest, and
-#: that min-over-samples widens the spread, so the fitted substrate's own sigma
-#: comes out ~1.4x this number. The cell measures sigma 0.52-0.57 mm per take
-#: (2026-08-30 archive), so 0.4 puts the synthetic substrate AT the cell's noise
-#: (sigma 0.50) where the previous 0.5 put it 27% above it (sigma 0.70).
-#: That difference is not cosmetic: at sigma 0.70 the derived floor 3*sigma =
-#: 2.09 mm is capped by `substrate_floor_clamp_mm`'s 2.0 mm ceiling, so the
-#: synthetic scenes were being segmented at 2.87 sigma while the cell runs at a
-#: true 3 sigma -- a regime the real hardware never enters.
+#: this renderer splats many world points per pixel and z-buffers the nearest,
+#: and that min-over-samples widens the spread, so the fitted substrate's own
+#: sigma comes out larger. Measured on the radius-60/bead-8 scene: noise 0.4 ->
+#: sigma 0.4989, noise 0.5 -> sigma 0.6014, i.e. a factor of 1.20-1.25 (it is
+#: scene-dependent, not a constant of the renderer). The cell measures sigma
+#: 0.52-0.57 mm per take (2026-08-30 archive), so 0.4 puts the synthetic
+#: substrate AT the cell's noise where 0.5 put it ~10-27% above it, depending on
+#: the scene.
+#:
+#: That is not cosmetic on the noisier scenes: where sigma reaches ~0.70,
+#: 3*sigma = 2.09 mm is capped by `substrate_floor_clamp_mm`'s 2.0 mm ceiling,
+#: so the scene is segmented at 2.87 sigma while the cell runs at a true 3
+#: sigma -- a regime the real hardware never enters. It does NOT apply
+#: everywhere: on the radius-40/bead-9 scene 3*sigma = 1.80 mm, comfortably
+#: inside the clamp either way. Note the direction, before assuming this made
+#: the tests easier: lowering the noise lowers the derived floor, so the
+#: synthetic scenes now admit MORE of the plane, not less.
 DEFAULT_NOISE_MM = 0.4
 
 

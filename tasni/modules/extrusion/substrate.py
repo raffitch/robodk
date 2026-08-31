@@ -83,9 +83,13 @@ _BREAKDOWN_ALPHA = 1e-4
 #: against the same statistic on a genuine breakdown, the >=50%-deposit fit
 #: that locks onto the bead top (synthetic sweep, n=100..300,000):
 #:     bead_frac 0.75  20.0% .. 34.0%      bead_frac 0.90  ~10.0%
-#: 5% therefore sits 2.7x above the worst healthy real frame and 4x below the
-#: weakest case the guard is REQUIRED to catch (the two majority-deposit tests
-#: below, both at bead_frac 0.75). Without this floor the guard refused 6 of
+#: 5% therefore sits 2.66x above the worst healthy real frame, and 4x below the
+#: two majority-deposit cases the tests below pin (both bead_frac 0.75). Note
+#: that 4x is the margin against those PINNED cases, not the guard's worst case:
+#: sweeping bead_frac further, the weakest breakdown that still locks onto the
+#: bead reads ~9.9% (bead_frac 0.90), i.e. 1.97x this floor. Still caught, with
+#: less room -- so treat 1.97x, not 4x, as the number to protect when touching
+#: this. Without this floor the guard refused 6 of
 #: the 11 golden takes and all 4 legacy fixtures -- i.e. it would have refused
 #: the very archive the design was validated on. Do not lower it without
 #: re-running BOTH: the healthy-real sweep above AND the low-n false-fire and

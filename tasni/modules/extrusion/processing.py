@@ -665,7 +665,22 @@ def process_observation(*, depth: np.ndarray,
                                    clamp_mm=tuple(config.substrate_floor_clamp_mm))
     heights = substrate.height(points)
     min_h = substrate.floor_mm(config.substrate_sigma_k)
-    max_h = layer.nominal_z_mm + recipe.bead_diameter_mm / 2 + config.deposit_height_margin_mm
+    # BOTH edges of the band live on the substrate, not just the floor.
+    # ``layer.nominal_z_mm`` is a COMMANDED work-frame Z (``build_plane_z_mm``
+    # plus the layer stack), so it has to be carried onto the same datum before
+    # it can bound a height above the fitted plane -- otherwise one edge of the
+    # band still sits on the work frame's Z=0, the datum this design exists to
+    # abolish, and the two edges answer to different surfaces. Harmless on this
+    # cell (the fitted plane passes within 0.13 mm of Z=0 at the ring centre,
+    # against a 15 mm margin -- measured across the 2026-08-30 archive, where
+    # this conversion moves ZERO points in the radial band on all 11 takes), but
+    # ``build_plane_z_mm`` is operator- and scan-settable: a work frame whose
+    # Z=0 sat more than the margin above the true surface would silently
+    # amputate the bead's top. Evaluated at the ring centre, where the ring is;
+    # the plane's tilt contributes ~0.36 mm across a 41 mm radius at the
+    # measured 0.5 deg, far inside the margin it is compared against.
+    max_h = (layer.nominal_z_mm - float(substrate.plane_z(center_xy))
+             + recipe.bead_diameter_mm / 2 + config.deposit_height_margin_mm)
     in_height = (heights >= min_h) & (heights <= max_h)
     r_lo = recipe.radius_mm - config.radial_roi_margin_mm
     r_hi = recipe.radius_mm + config.radial_roi_margin_mm
@@ -701,16 +716,29 @@ def process_observation(*, depth: np.ndarray,
     keep("work_roi", points)
     # Spec §4's per-frame health block: what surface was fitted, how noisy it
     # was, and what floor that bought. ``substrate_p99_mm`` is the top of the
-    # substrate's own height distribution -- the number the deposit has to
-    # clear -- so it is measured on the fit region, below the floor.
-    sub_heights = heights[near]
-    below = sub_heights[sub_heights < min_h]
+    # SUBSTRATE's own height distribution -- the number the deposit has to clear
+    # -- so it is measured on a population that cannot contain deposit by
+    # construction: the fit region minus the radial band the ring lives in.
+    #
+    # UNCENSORED, deliberately. It used to be the p99 of only those points
+    # already BELOW the floor, which made it arithmetically incapable of
+    # exceeding the floor and therefore blind to the one thing spec §4 most
+    # wants surfaced: a substrate whose own tail has climbed INTO the deposit
+    # band. It does exactly that on the archive -- layer-2 reads 1.92 mm against
+    # a 1.56-1.70 mm floor, where layer-1 reads 1.36-1.42 mm and stays clear.
+    # Taking p99 over the WHOLE fit region instead was measured and rejected:
+    # the deposit is ~3% of that region on layer-1 and ~6% on layer-2, so the
+    # top percentile lands inside the bead (4.5 mm on layer-1, 12.1 mm on
+    # layer-2 -- ring 2's own crest), which reports the deposit and collapses
+    # the separation margin below to nonsense.
+    substrate_only = heights[near & ~in_radial]
     substrate_report = {**substrate.to_report(),
                         "floor_mm": round(float(min_h), 3),
                         "plane_offset_at_center_mm": round(
                             float(substrate.plane_z(center_xy)), 3),
-                        "substrate_p99_mm": (round(float(np.percentile(below, 99)), 3)
-                                             if len(below) else None)}
+                        "substrate_p99_mm": (
+                            round(float(np.percentile(substrate_only, 99)), 3)
+                            if len(substrate_only) else None)}
     counts["after_work_roi"] = len(points)
     if len(points) < config.cluster_min_points:
         raise RuntimeError(

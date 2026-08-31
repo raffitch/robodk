@@ -284,10 +284,33 @@ def test_the_board_patch_dies_by_geometry_not_colour():
         metrics say so instead of returning a ring that was not there.
         Protocol-2 captures (0.1 mm words, sigma ~0.55) derive a 1.65 mm floor
         and keep that sector -- see tests/test_extrusion_golden.py.
-      * The patch is destroyed by GEOMETRY: compactness drops 5 of the 6
-        components in the ROI, and of the 1478 patch points that reach the work
-        ROI only 7 survive to the crest -- a 99.5% reduction, with the radius
-        bias down from the +0.6-0.7 mm takes 1-3 carried to +0.24 mm.
+      * Of the 1478 patch points reaching the work ROI, 7 survive to the crest,
+        and the radius bias is down from the +0.6-0.7 mm takes 1-3 carried to
+        +0.24 mm. **That cleaning is NOT compactness's doing**, and the two
+        facts must not be welded into one claim. Run with the filter ON and OFF
+        (measured 2026-08-31):
+
+            stage            ON              OFF
+            work_roi         n=22226 p=1478  n=22226 p=1478
+            compactness      n=21714 p=1386  n=22226 p=1478
+            deposit_cluster  n= 1266 p= 105  n= 1277 p= 116
+            radial_trimmed   n= 1231 p=  72  n= 1228 p=  72
+            top_surface      n=  432 p=   7  n=  436 p=   6
+
+        Compactness removes 92 of the 1471 patch points that go away -- 6% --
+        and the pre-existing downstream chain (DBSCAN, the radial trim about the
+        fitted circle, the crest filter) reaches the same endpoint either way:
+        identically 72 after the trim, 6 crest points without the filter against
+        7 with it.
+      * What compactness actually does here is drop five compact components
+        totalling 512 points, which changes the RASTER TOPOLOGY -- and that is
+        what decides the branch-guard outcome. Without it this frame reproduces
+        the 2026-08-29 cell abort, which is what the twin below pins. That role
+        is real and load-bearing; it is simply a different mechanism from
+        "compactness cleans the patch off the crest". The filter's
+        contamination-rejection value is separately evidenced on the archive
+        (spec §3.5: layer-001 keeps 1 of 1 component, layer-002 keeps 2 of 4 and
+        1 of 9, the rejected ones being exactly the compact patches).
 
     The one outcome the design could not accept -- a VALID measurement that
     still includes the patch, i.e. a silently wrong radius -- is not what this
@@ -312,8 +335,10 @@ def test_the_board_patch_dies_by_geometry_not_colour():
     # ... and the fitted plane is the BOARD, 1.3 mm below work Z=0 (spec §1).
     assert sub["plane"][2] == pytest.approx(-1.32, abs=0.2)
 
-    # Compactness is where the patch dies -- 5 of 6 components dropped, and the
-    # fail-open bypass did NOT fire (this is a real rejection, not a starvation).
+    # Five of six components dropped, and the fail-open bypass did NOT fire
+    # (a real rejection, not a starvation). This is what changes the raster
+    # topology; the crest cleaning is the downstream chain's -- see the
+    # ON/OFF table in the docstring.
     assert sub["compactness"]["compactness_components"] == 6
     assert sub["compactness"]["compactness_kept_components"] == 1
     assert sub["compactness"]["compactness_bypassed"] == 0
@@ -331,12 +356,18 @@ def test_the_board_patch_dies_by_geometry_not_colour():
 def test_the_same_frame_reproduces_the_cell_crash_with_compactness_disabled():
     """Locks the CAUSE, exactly as the colour-gate pair used to.
 
-    With ``deposit_min_length_beads = 0`` the compact patch survives into the
-    raster, dilates into the skeleton arms of 2026-08-29 and exhausts the branch
-    guard -- the original cell abort, reproduced (measured 2026-08-31: branch
-    pixels 1, 1, 2 across the three attempts against a 15 px spur limit). So
-    compactness is doing the load-bearing work the saturation gate used to do,
-    and that stays measured rather than asserted.
+    With ``deposit_min_length_beads = 0`` the five compact components the filter
+    would have dropped (512 points) stay in the cloud, and the raster topology
+    they produce exhausts the branch guard -- the original cell abort,
+    reproduced (measured 2026-08-31: branch pixels 1, 1, 2 across the three
+    attempts against a 15 px spur limit).
+
+    Note what this does and does not show. It is NOT that those points reach the
+    crest and are measured as bead: the crest is cleaned to 6-7 patch points
+    either way (see the ON/OFF table in the test above). It is that their
+    presence changes which skeleton the thinning produces, and the guard refuses
+    the branched one. That is the load-bearing role compactness inherited from
+    the saturation gate, and it stays measured rather than asserted.
 
     Guards against 'fixing' this by loosening the branch guard instead: the
     guard was right, and takes 1-3 carried the same contamination into radii
@@ -585,7 +616,12 @@ def test_the_substrate_block_reports_everything_a_frame_must_say_about_itself():
     # synthetic plane has metres of headroom; what is pinned is that it is
     # POSITIVE and derived, not that it hits a particular value.
     assert sub["separation_margin_mm"] > 1.0
-    assert sub["substrate_p99_mm"] < sub["floor_mm"]
+    # substrate_p99_mm is NOT asserted below the floor: it is measured on the
+    # substrate uncensored, precisely so it CAN report a tail that has climbed
+    # into the deposit band (it does, on the archive's layer-2 takes). Asserting
+    # it below the floor is what the old censored form guaranteed by
+    # construction, which is why that assertion said nothing.
+    assert sub["substrate_p99_mm"] > 0.0
     # The old chain's `report["floor"]` block is gone, not renamed alongside.
     assert "floor" not in out.report
 
