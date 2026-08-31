@@ -856,12 +856,12 @@ class RingMeasureJob:
                         # unaligned, 0.1 mm (protocol 2) rather than the legacy
                         # aligned 1 mm convention -- see figures.geometry_for_take.
                         "camera_geometry": frame.geometry.to_dict()})
-        camera_cfg = services.config.camera
         try:
+            # The colour frame is still captured and archived below (evidence
+            # and figure material); segmentation is geometric and never reads it.
             processed = measure_take(
-                color=frame.color, depth=frame.depth, geometry=frame.geometry,
-                T_work_camera=T_work_camera, K=camera_cfg.K, dist=camera_cfg.dist,
-                plan=self.plan, layer=layer, config=ecfg)
+                depth=frame.depth, geometry=frame.geometry,
+                T_work_camera=T_work_camera, plan=self.plan, layer=layer, config=ecfg)
         except Exception as exc:
             # A failed measurement still archives its raw RGB-D: the operator
             # cannot re-place the ring exactly, so the frame is the only thing
@@ -994,12 +994,10 @@ class RingCharacterizeJob:
                               # saying so (Task 9 review, Important 5).
                               "camera_geometry": frame.geometry.to_dict(),
                               "depth_fusion": captured["depth_fusion"]}
-                camera_cfg = services.config.camera
                 try:
                     found = characterize_ring(
-                        color=frame.color, depth=frame.depth, geometry=frame.geometry,
-                        T_work_camera=captured["T_work_camera"], K=camera_cfg.K,
-                        dist=camera_cfg.dist,
+                        depth=frame.depth, geometry=frame.geometry,
+                        T_work_camera=captured["T_work_camera"],
                         search_center_mm=(float(self.plan.setup.center_x_mm),
                                           float(self.plan.setup.center_y_mm)),
                         work_frame=self.plan.setup.work_frame, config=ecfg,

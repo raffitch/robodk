@@ -246,7 +246,8 @@ class CameraClient:
         (say 1280x720 left over while the server streams 1920x1080) therefore does
         not fail — it silently squashes every registered point into the top-left
         ~44% of the colour canvas, so polygon/centre-patch tests select the wrong
-        pixels and the chroma gate reads the wrong colours. Measured on a synthetic
+        pixels and every colour read off a registered point is the wrong one.
+        Measured on a synthetic
         full-frame plane at 450 mm: u spans -186..2148 with the correct K and
         -124..1432 with the stale one, and the centre-patch population changes 2.3x.
 

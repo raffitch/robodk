@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import extrusion_synthetic as syn  # noqa: E402
 import geometry_fixtures as gf  # noqa: E402
 from tasni.modules.extrusion.processing import (_graph, _ordered_skeleton,  # noqa: E402
                                                  _prune_short_spurs, _rasterize,
@@ -67,102 +66,24 @@ def test_short_raster_spurs_are_pruned_but_real_branch_is_rejected():
         _ordered_skeleton(cleaned_tee)
 
 
-# --------------------------------------- chroma gate on registered points (Task 9)
+# --------------------------------- segmentation reads no colour at all (spec §3.6)
 
-def test_chroma_gate_masks_points_by_their_colour_projection_not_depth_pixel():
-    """Depth is not aligned to colour any more: a bead point must be kept because the
-    colour pixel it PROJECTS TO is saturated, even though the depth pixel with the
-    same (v, u) index looks at something else."""
-    from tasni.core.config import ExtrusionConfig
-    from tasni.core.depth_geometry import ColorRegistered
-    from tasni.modules.extrusion.processing import chroma_gate_mask
-    K_c = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
-    geom = gf.offset(color_K=K_c, color_size=(320, 240), depth_size=(160, 120))
-    # two colour-frame points at z=400: one lands on the saturated blob, one on grey
-    pts = np.array([[0.0, 0.0, 400.0], [-80.0, 0.0, 400.0]])
-    depth = gf.render_depth_in_depth_camera(pts, geom)
-    color = np.full((240, 320, 3), 128, np.uint8)               # achromatic everywhere ...
-    color[100:140, 140:180] = (20, 40, 220)                    # ... except a chromatic blob at the reticle
-    reg = ColorRegistered.build(depth, geom, K_c, None)
-    cfg = ExtrusionConfig(deposit_min_chroma_fraction=0.001)
-    keep, applied = chroma_gate_mask(color, reg, cfg)
-    assert applied and keep.shape == (len(reg),)
-    on_blob = np.linalg.norm(reg.pts_mm - pts[0], axis=1) < 3.5
-    assert keep[on_blob].all() and not keep[~on_blob].any()
+def test_the_seam_takes_no_colour_input_at_all():
+    """The colour frame is still captured and archived; it takes no part in any
+    decision. A signature that still ACCEPTED colour would let a caller quietly
+    reintroduce it, so the absence is pinned here rather than left to review.
 
-
-def test_chroma_gate_at_production_resolution_drops_outside_points_and_scales_the_close_kernel():
-    """1920x1080 colour / 1280x720 depth -- the shapes this port exists for.
-
-    Task 9 review, Important 3: every other chroma-gate test here uses
-    identity-aligned same-size frames or gf.offset at 320x240/160x120. Neither
-    exercises a colour FOV narrower than depth's (most points project outside
-    and are dropped -- the review measured 456,026 of 921,600 real-capture
-    points, 49%, doing exactly this) nor the close kernel scaling to width
-    (k=8 at 1920 wide, not the 720p-tuned 5).
+    Spec §1: the saturation gate's premise inverted (bead median S 25, printed
+    board 28), and colour auto-exposure runs free on the Jetson, so a fixed
+    threshold on saturation was never a calibrated quantity.
     """
-    from tasni.core.config import ExtrusionConfig
-    from tasni.core.depth_geometry import ColorRegistered
-    from tasni.modules.extrusion.processing import chroma_gate_mask
-    depth_K = syn.K_720P
-    # A much narrower FOV than the depth camera's, on purpose: most of a full
-    # depth frame reprojects outside a 1920x1080 image at this focal length.
-    color_K = np.array([[3000.0, 0, 960.0], [0, 3000.0, 540.0], [0, 0, 1.0]])
-    geom = gf.offset(color_K=color_K, color_size=(1920, 1080),
-                     depth_K=depth_K, depth_size=(1280, 720),
-                     rot_deg=(0.0, 0.0, 0.0), t_mm=(0.0, 0.0, 0.0))
-    # A flat plane filling the WHOLE depth frame: 1280 x 720 = 921,600 points,
-    # the review's own real-capture point count.
-    depth = np.full((720, 1280), 4000, np.uint16)          # 4000 * 0.1 mm = 400 mm
-    color = np.full((1080, 1920, 3), 128, np.uint8)        # achromatic background
-    # Two chromatic bars either side of the optical axis (colour pixel ~960,540,
-    # where the depth camera's own principal point reprojects with this zero
-    # rotation/translation), separated by a 6 px achromatic gap: wider than the
-    # OLD 720p-tuned 5x5 close can bridge, narrower than the correct k=8 at
-    # 1920 px wide -- only the right kernel keeps the axis point.
-    color[520:560, 900:957] = (20, 40, 220)
-    color[520:560, 963:1020] = (20, 40, 220)
-
-    reg = ColorRegistered.build(depth, geom, color_K, None)
-    counts: dict = {}
-    keep, applied = chroma_gate_mask(
-        color, reg, ExtrusionConfig(deposit_min_chroma_fraction=0.001), counts)
-
-    assert applied and keep.shape == (len(reg),)
-    u, v = reg.uv[:, 0], reg.uv[:, 1]
-    inside = (u >= 0) & (u < 1920) & (v >= 0) & (v < 1080)
-    assert counts["chroma_gate_outside_colour"] == int((~inside).sum())
-    # A substantial, not edge-case, fraction drops -- this is the shape the
-    # review measured on a real capture, not a corner case.
-    assert (~inside).sum() > 0.5 * len(reg)
-
-    def nearest(target_u, target_v, *, only=None):
-        d = np.hypot(u - target_u, v - target_v)
-        if only is not None:
-            d = np.where(only, d, np.inf)
-        return int(np.argmin(d))
-
-    axis = nearest(960.0, 540.0)                      # sits in the achromatic gap
-    assert keep[axis], "the axis point sits in the achromatic gap; only k=8 bridges it"
-    on_bar = nearest(920.0, 540.0)                     # squarely on the left chromatic bar
-    assert keep[on_bar]
-    background = nearest(960.0, 900.0, only=inside)    # achromatic, inside the frame
-    assert not keep[background]
-
-
-def test_chroma_gate_abstains_on_an_achromatic_frame_or_size_mismatch():
-    from tasni.core.config import ExtrusionConfig
-    from tasni.core.depth_geometry import ColorRegistered
-    from tasni.modules.extrusion.processing import chroma_gate_mask, deposit_floor_mm
-    K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
-    depth = np.full((240, 320), 4000, np.uint16)
-    reg = ColorRegistered.build(depth, gf.aligned(K, (320, 240), depth_unit_mm=0.1), K, None)
-    cfg = ExtrusionConfig()
-    keep, applied = chroma_gate_mask(np.full((240, 320, 3), 128, np.uint8), reg, cfg)
-    assert not applied and keep.all()
-    assert deposit_floor_mm(cfg, applied) == 2.5
-    keep, applied = chroma_gate_mask(np.zeros((100, 100, 3), np.uint8), reg, cfg)   # wrong size
-    assert not applied and keep.all()
+    import inspect
+    from tasni.modules.extrusion import processing
+    for name in ("process_observation", "measure_take", "characterize_ring"):
+        params = set(inspect.signature(getattr(processing, name)).parameters)
+        assert not params & {"color", "K", "dist"}, (name, sorted(params))
+    assert not hasattr(processing, "chroma_gate_mask")
+    assert not hasattr(processing, "deposit_floor_mm")
 
 
 # ------------------------------------------------------- 1 mm voxel default (Task 9)
@@ -192,32 +113,34 @@ def test_measure_take_derives_arc_assembly_from_the_layer_itself(monkeypatch):
                       inspection_tool="Realsense", inspection_auto=True,
                       center_x_mm=0.0, center_y_mm=0.0))
     # (construction idiom copied from scene_plan() in tests/test_extrusion_measure.py:73)
-    common = dict(color=None, depth=None, geometry=None, T_work_camera=None,
-                  K=None, dist=None, plan=plan, config=ExtrusionConfig())
+    common = dict(depth=None, geometry=None, T_work_camera=None,
+                  plan=plan, config=ExtrusionConfig())
     assert processing.measure_take(layer=plan.layers[0], **common) == "sentinel"
     assert seen[-1]["assemble_arcs"] is True
     processing.measure_take(layer=plan.layers[1], **common)
     assert seen[-1]["assemble_arcs"] is False
 
 
-def test_ring_geometry_measures_height_against_the_substrate_when_given_one():
-    """The `substrate=` slot that replaced `floor_profile` is DORMANT (every
-    caller passes None until Task 7 wires the fit in) -- so pin it here, or it
-    ships unexercised. Without a substrate the reference is the build plane;
-    with one, height is the substrate's own and the report names its source.
+def test_ring_geometry_measures_height_against_the_substrate_it_is_given():
+    """Height is measured against the surface FITTED IN THIS FRAME, and the
+    substrate is required -- there is no build-plane fallback to slip back to.
+    The work frame's Z=0 was measured to be the wrong datum (the board sits
+    1.2 mm below it, tilted ~0.5 deg), so a reference that is not the substrate
+    is a silent ~2 mm error, not a convenience.
     """
+    import inspect
     from tasni.modules.extrusion.processing import ring_geometry
     from tasni.modules.extrusion.substrate import PlaneSubstrate
+
+    signature = inspect.signature(ring_geometry)
+    assert "build_plane_z_mm" not in signature.parameters
+    assert signature.parameters["substrate"].default is inspect.Parameter.empty
 
     theta = np.linspace(0, 2 * np.pi, 240, endpoint=False)
     ring = np.column_stack((40.0 * np.cos(theta), 40.0 * np.sin(theta),
                             np.full_like(theta, 8.0)))
     cluster = np.repeat(ring, 4, axis=0)
     cluster[:, :2] *= np.linspace(0.95, 1.05, len(cluster))[:, None]
-
-    plain = ring_geometry(ring, cluster, (0.0, 0.0), bins=36)
-    assert plain.height_reference == "build_plane"
-    assert plain.height_mean_mm == pytest.approx(8.0)
 
     # A plane 2 mm above z=0, tilted so the reference is genuinely per-point:
     # a build-plane subtraction could not reproduce these heights.
@@ -226,7 +149,7 @@ def test_ring_geometry_measures_height_against_the_substrate_when_given_one():
                            bias_correction_sigma=0.0)
     fitted = ring_geometry(ring, cluster, (0.0, 0.0), substrate=plane, bins=36)
     assert fitted.height_reference == "fitted_plane"     # substrate.source, not a literal
-    assert fitted.top_z_mean_mm == pytest.approx(plain.top_z_mean_mm)   # top is unchanged
+    assert fitted.top_z_mean_mm == pytest.approx(8.0)    # top is raw work-frame Z
     assert fitted.height_mean_mm == pytest.approx(6.0)                  # 8 - (0.01x + 2)
     assert fitted.height_max_mm - fitted.height_min_mm == pytest.approx(0.8, abs=1e-6)
 
@@ -264,7 +187,6 @@ def test_archived_configs_with_retired_keys_still_validate():
     assert not (retired & live), f"retired but still a field: {sorted(retired & live)}"
 
     payload = cfg.ExtrusionConfig().model_dump()
-    payload["deposit_min_saturation"] = 60          # will be retired by Task 7
     with_retired = dict(payload, **{k: 1 for k in retired})
     assert cfg.ExtrusionConfig.from_archive(with_retired) is not None
     with pytest.raises(Exception):                  # the shim is doing real work

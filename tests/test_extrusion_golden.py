@@ -63,15 +63,13 @@ LAYER2_BASELINE_COMPLETENESS = {
 
 
 def _measure(name):
-    import cv2
     from tasni.modules.extrusion import figures, processing
     take = figures.load_take(ARCHIVE / name)
     inputs = figures.reconstruct_take_inputs(take)
     assert inputs is not None, f"{name}: archive lacks reprocess provenance"
-    color = cv2.imread(str(ARCHIVE / name / "color.png"), cv2.IMREAD_COLOR)
     return processing.measure_take(
-        color=color, depth=take.depth, geometry=take.geometry,
-        T_work_camera=take.T_work_camera, K=take.K, dist=inputs["dist"],
+        depth=take.depth, geometry=take.geometry,
+        T_work_camera=take.T_work_camera,
         plan=inputs["plan"], layer=inputs["layer"], config=inputs["config"])
 
 

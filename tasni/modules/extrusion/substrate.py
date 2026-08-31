@@ -38,7 +38,24 @@ def _sigma_low(residual: np.ndarray) -> float:
     """One-sided scale: median minus p15.87. Deposit contaminates only the
     positive side, so the lower half of the residuals is pure sensor noise;
     for a Gaussian this equals sigma exactly, where a two-sided MAD is
-    inflated by the bead (spec §3.3)."""
+    inflated by the bead (spec §3.3).
+
+    This CAN return 0.0, on residuals so coarsely quantised that the median and
+    p15.87 land on the same lattice level -- depth words as wide as the noise,
+    read square-on to a flat surface, put ~68% of the residuals on one value.
+    That is deliberately left as 0.0 rather than patched with a fallback
+    estimator. Measured 2026-08-31 (task 7): on such a lattice there is no
+    scale to recover -- a -2 sigma quantile lands on the same level, and an
+    averaged (quantisation-immune) fallback returned 0.002, which is worse than
+    zero because a tiny non-zero scale lets the IRLS loop iterate on nonsense
+    (the recovered intercept drifted 0.13 mm and inlier_fraction fell to 0.000,
+    where breaking out at zero keeps the sound least-squares seed). Zero
+    propagates to `floor_mm`, which clamps -- the documented behaviour for a
+    pathological fit. The real cell cannot produce this: protocol-2 depth is
+    0.1 mm-worded, and even the 1 mm-worded pre-protocol-2 fixtures in
+    tests/fixtures/extrusion measure sigma 0.76-0.86 mm because a real surface
+    is never exactly square to the camera.
+    """
     return float(np.median(residual) - np.percentile(residual, 15.87))
 
 
@@ -52,6 +69,28 @@ _P_TAIL_3SIGMA = 0.5 * math.erfc(3.0 / math.sqrt(2.0))
 #: 1-in-10,000 while (measured, see task 4 report round 3) comfortably
 #: catching every realized-majority-deposit fit tried down to n=50.
 _BREAKDOWN_ALPHA = 1e-4
+
+#: FLOOR under clause (a)'s count threshold, as a fraction of n. The Poisson
+#: tail above answers "how many points would a GAUSSIAN population put more
+#: than 3 sigma below the plane" -- and real depth residuals are not Gaussian.
+#: They carry a genuine low tail (quantisation lattice, dropout edges, the mat
+#: the board rests on), so at large n the Poisson threshold converges on the
+#: 0.135% Gaussian tail while healthy real frames sit well above it and every
+#: one of them is refused. MEASURED 2026-08-31 on every real frame this repo
+#: has -- 11 protocol-2 golden takes (0.1 mm depth words) and the 4 legacy
+#: fixtures (1 mm words), all of which the chain measures correctly:
+#:     healthy real below-fraction  0.069% .. 1.880%   (worst: layer-002)
+#: against the same statistic on a genuine breakdown, the >=50%-deposit fit
+#: that locks onto the bead top (synthetic sweep, n=100..300,000):
+#:     bead_frac 0.75  20.0% .. 34.0%      bead_frac 0.90  ~10.0%
+#: 5% therefore sits 2.7x above the worst healthy real frame and 4x below the
+#: weakest case the guard is REQUIRED to catch (the two majority-deposit tests
+#: below, both at bead_frac 0.75). Without this floor the guard refused 6 of
+#: the 11 golden takes and all 4 legacy fixtures -- i.e. it would have refused
+#: the very archive the design was validated on. Do not lower it without
+#: re-running BOTH: the healthy-real sweep above AND the low-n false-fire and
+#: majority-deposit tests in tests/test_extrusion_substrate.py.
+_BREAKDOWN_MIN_FRACTION = 0.05
 
 #: Clause (b) in fit(): refuse if sigma_mm exceeds this multiple of
 #: clamp_mm[1]. MEASURED, not a round number picked by feel -- do not
@@ -301,19 +340,26 @@ class PlaneSubstrate:
         # an operator would trust, comes out 1.000 in exactly this failure.
         # Two independent checks, because the failure shows up differently
         # depending on how far past the tipping point the contamination is.
-        # Clause (a)'s threshold is COUNT-based and n-adaptive (Poisson tail
-        # of the ~0.135% a healthy fit is expected to show below -3 sigma),
-        # not a fixed fraction: a fixed 1% cutoff false-fired on healthy
-        # small-n frames (measured up to 18% of trials at n=80, task 4
-        # review round 3) because 1% of 50 points is half a point.
+        # Clause (a)'s threshold is COUNT-based and takes whichever of two
+        # bounds is LOOSER, because each fixes the other's failure. The
+        # n-adaptive Poisson tail (of the ~0.135% a Gaussian shows below
+        # -3 sigma) keeps small n honest: a fixed 1% cutoff false-fired on
+        # healthy small-n frames (measured up to 18% of trials at n=80, task 4
+        # review round 3) because 1% of 50 points is half a point. The
+        # measured fraction floor (_BREAKDOWN_MIN_FRACTION) keeps LARGE n
+        # honest: real depth residuals are not Gaussian, so at n ~ 300,000 the
+        # Poisson bound lands under every real frame's own low tail and refuses
+        # all of them (measured 2026-08-31 -- see that constant).
         breakdown_count, _breakdown_sigma = _breakdown_below_count(residual)
-        breakdown_threshold = _poisson_upper_count(len(pts) * _P_TAIL_3SIGMA)
+        breakdown_threshold = max(
+            _poisson_upper_count(len(pts) * _P_TAIL_3SIGMA),
+            math.ceil(_BREAKDOWN_MIN_FRACTION * len(pts)))
         if breakdown_count > breakdown_threshold:
             raise RuntimeError(
                 f"substrate fit refused: {breakdown_count} of {len(pts)} points "
                 f"({breakdown_count / len(pts):.1%}) sit more than 3 robust-sigma "
-                f"below the recovered plane (expected at most {breakdown_threshold} "
-                "by chance on a clean fit this size) -- essentially nothing should "
+                f"below the recovered plane (at most {breakdown_threshold} is "
+                "normal for a clean fit this size) -- essentially nothing should "
                 "sit far below the substrate that everything else rests on, so the "
                 "fit has almost certainly locked onto the deposit's top instead of "
                 "the table; widen or reposition the fit region so the true "

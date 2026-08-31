@@ -23,7 +23,7 @@ def test_renderer_puts_a_ring_where_it_says_at_the_height_it_says():
     depth = syn.render_scene([syn.RingSpec(60.0, 8.0, center, height_fn=syn.flat(6.0))], T,
                              plane_center_xy_mm=center, noise_mm=0.0)
     assert depth.dtype == np.uint16 and depth.shape == (720, 1280)
-    points, raw = depth_to_work_points(depth, gf.aligned(syn.K_720P, syn.SIZE_720P), T)
+    points, raw = depth_to_work_points(depth, syn.geometry(), T)
     assert raw > 100_000                                  # plane + ring both rendered
     ring = points[points[:, 2] > 3.0]
     radii = np.linalg.norm(ring[:, :2] - np.array(center), axis=1)
@@ -86,13 +86,12 @@ def observe(plan, layer_index, rings, *, config=None, seed=0, stages=None):
     T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, layer_index), 300.0)
     depth = syn.render_scene(rings, T, plane_center_xy_mm=(plan.setup.center_x_mm,
                                                            plan.setup.center_y_mm), seed=seed)
-    color = np.zeros((syn.SIZE_720P[1], syn.SIZE_720P[0], 3), np.uint8)
     kwargs = {}
     if stages is not None:
         kwargs["stages"] = stages
-    return process_observation(color=color, depth=depth,
-                               geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
-                               T_work_camera=T, K=syn.K_720P, dist=None,
+    return process_observation(depth=depth,
+                               geometry=syn.geometry(),
+                               T_work_camera=T,
                                plan=plan, layer=layer, config=config or ExtrusionConfig(),
                                **kwargs)
 
@@ -147,10 +146,9 @@ def observe_with_board_bias(plan, layer_index, rings, patch, *, seed=0):
     parts = [syn.plane_points(center_xy_mm=centre), patch]
     parts += [ring.surface_points() for ring in rings]
     depth = syn.render_depth(np.vstack(parts), T, seed=seed)
-    color = np.zeros((syn.SIZE_720P[1], syn.SIZE_720P[0], 3), np.uint8)
-    return process_observation(color=color, depth=depth,
-                               geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
-                               T_work_camera=T, K=syn.K_720P, dist=None,
+    return process_observation(depth=depth,
+                               geometry=syn.geometry(),
+                               T_work_camera=T,
                                plan=plan, layer=layer, config=ExtrusionConfig())
 
 
@@ -206,12 +204,11 @@ def test_real_frame_with_board_noise_measures_the_applied_ring():
                       layer_height=float(fixture["recipe_layer_height_mm"]),
                       center=centre)
     depth = fixture["depth"]
-    color = np.zeros((*depth.shape, 3), np.uint8)
 
     out = process_observation(
-        color=color, depth=depth,
+        depth=depth,
         geometry=gf.aligned(fixture["K"], (depth.shape[1], depth.shape[0])),
-        T_work_camera=fixture["T_work_camera"], K=fixture["K"], dist=None,
+        T_work_camera=fixture["T_work_camera"],
         plan=plan, layer=plan.layers[0], config=ExtrusionConfig())
 
     m = out.metrics
@@ -225,24 +222,25 @@ def test_real_frame_with_board_noise_measures_the_applied_ring():
     assert not (r > 55.0).any(), "the board lobe at r 55-72 mm must be gone (was 21% of points)"
 
 
-# ------------------------------------------- chroma gate: bead vs board by colour
-
-from tasni.core.depth_geometry import ColorRegistered
-from tasni.modules.extrusion.processing import chroma_gate_mask, deposit_floor_mm
+# ------------------------- the board patch dies in GEOMETRY, where colour used to
 
 RING1_TAKE04 = (Path(__file__).parent / "fixtures" / "extrusion" / "ring1"
                 / "ring1_take04_branchguard_20260829.npz")
 
 
 def _ring1_take04() -> dict:
-    """Cell trial 20260829-165938, layer 1 take 4: the frame that crashed."""
-    import cv2
+    """Cell trial 20260829-165938, layer 1 take 4: the frame that crashed.
+
+    The archive still carries this take's colour frame (``color_jpeg``); the
+    chain no longer reads it, and neither do these tests. It stays as evidence:
+    it is the frame the 20:1 saturation separation was measured on, and the one
+    that shows the separation had inverted a day later.
+    """
     fixture = np.load(RING1_TAKE04)
     centre = tuple(float(v) for v in fixture["nominal_center_mm"])
     return {
         "depth": fixture["depth"], "K": fixture["K"],
         "T_work_camera": fixture["T_work_camera"], "centre": centre,
-        "color": cv2.imdecode(fixture["color_jpeg"], cv2.IMREAD_COLOR),
         "plan": scene_plan(radius=float(fixture["recipe_radius_mm"]),
                            bead=float(fixture["recipe_bead_mm"]),
                            layer_height=float(fixture["recipe_layer_height_mm"]),
@@ -250,68 +248,103 @@ def _ring1_take04() -> dict:
     }
 
 
-def test_chroma_gate_clears_the_board_lobe_that_exhausted_the_branch_guard():
-    """The 2026-08-29 13:03 cell frame. Board patch welded to the ring's +X flank."""
-    pytest.importorskip("open3d")
+def _measure_ring1_take04(**overrides):
     f = _ring1_take04()
-
     # This fixture is a pre-protocol-2 capture with 1 mm depth WORDS, so it is
-    # processed at the 2 mm voxel it was captured under. The new 1 mm default
-    # (spec 4.4) sits at this archive's quantisation floor, where it merges
-    # nothing and lets noise through -- it flips this frame's branch-guard
-    # outcome in BOTH directions across the two archived takes. On protocol-2
-    # depth (0.1 mm words) 1 mm spans ten quantisation steps, which is the point.
-    # Pinned here too (Ruling R23): this is the gate-ENABLED half of the pair
-    # below (test_the_same_frame_still_fails_with_the_chroma_gate_disabled) --
-    # the pair's whole claim, "crashes with the gate off, survives with it on",
-    # only holds if both halves measure the SAME frame at the SAME voxel.
-    out = process_observation(color=f["color"], depth=f["depth"],
-                              geometry=gf.aligned(f["K"], (1280, 720)), K=f["K"], dist=None,
-                              T_work_camera=f["T_work_camera"], plan=f["plan"],
-                              layer=f["plan"].layers[0],
-                              config=ExtrusionConfig(voxel_size_m=0.002))
-
-    m = out.metrics
-    assert m.valid, m.warnings
-    assert out.report["counts"]["chroma_gate_applied"] == 1
-    # Takes 1-3 of the same trial measured this ring as an arc with a 41-46 deg
-    # hole; with the board gone and the floor it earns, the ring closes.
-    assert out.report["closed"]
-    assert m.path_completeness >= 0.98
-    assert m.maximum_angular_gap_deg < 5.0
-    # Characterization of this ring, minutes earlier: r 42.2 mm.
-    assert m.measured_radius_mm == pytest.approx(42.2, abs=1.0)
-    cluster = np.asarray(out.filtered_xyz)
-    r = np.linalg.norm(cluster[:, :2] - np.asarray(f["centre"]), axis=1)
-    # The patch sat on the ring's +X flank at r 50-54 mm (raw, out to r 71 mm);
-    # 285 of its points reached the deposit cluster and 22 the crest, where they
-    # dilated into the 17 and 22 px skeleton arms the guard refused.
-    assert not ((cluster[:, 0] > 254.0) & (r > 47.0)).any(), "the +X board patch must be gone"
-    assert r.max() < 54.0, "nothing may survive past the bead's own outer flank"
+    # processed at the 2 mm voxel it was captured under. The 1 mm default sits
+    # at this archive's quantisation floor, where it merges nothing and lets
+    # noise through -- it flips this frame's branch-guard outcome in BOTH
+    # directions across the two archived takes. On protocol-2 depth (0.1 mm
+    # words) 1 mm spans ten quantisation steps, which is the point. Shared by
+    # both halves of the pair below: their whole claim, "the patch dies in
+    # geometry", only holds if both measure the SAME frame at the SAME voxel.
+    return f, process_observation(
+        depth=f["depth"], geometry=gf.aligned(f["K"], (1280, 720)),
+        T_work_camera=f["T_work_camera"], plan=f["plan"], layer=f["plan"].layers[0],
+        config=ExtrusionConfig(voxel_size_m=0.002, **overrides))
 
 
-def test_the_same_frame_still_fails_with_the_chroma_gate_disabled():
-    """Locks the CAUSE. Without colour the frame reproduces the cell crash exactly.
+def test_the_board_patch_dies_by_geometry_not_colour():
+    """The 2026-08-29 13:03 cell frame, through the chain that reads no colour.
 
-    Guards against 'fixing' this by loosening the branch guard instead: the guard
-    was right, and takes 1-3 carried the same contamination into radii biased
-    0.6-0.7 mm large precisely because their topology let them through.
+    A 22-point patch of bare black checker, 12 mm outside the ring's +X flank,
+    welded to the bead. The colour gate used to remove it; nothing reads colour
+    now, so the removal has to come from shape and from a floor derived from the
+    frame's own substrate noise. MEASURED 2026-08-31 running this fixture through
+    the new chain (task 7 step 5a) -- every number below is that measurement, not
+    a target:
+
+      * The frame is MEASURED, not refused, and reported **INVALID**: path
+        completeness 0.846, maximum angular gap 55.3 deg. That is the honest
+        outcome. This is a 1 mm-quantised capture, so the substrate's own sigma
+        is 0.759 mm and 3*sigma saturates the clamp at 2.0 mm -- which lands at
+        ~2.54 mm in work-frame Z, reproducing what the old 2.5 mm floor did to
+        this ring (fixture README: completeness 0.87, 46 deg gap). The
+        low-relief sector whose crest reads 2.9-4.9 mm falls out, and the
+        metrics say so instead of returning a ring that was not there.
+        Protocol-2 captures (0.1 mm words, sigma ~0.55) derive a 1.65 mm floor
+        and keep that sector -- see tests/test_extrusion_golden.py.
+      * The patch is destroyed by GEOMETRY: compactness drops 5 of the 6
+        components in the ROI, and of the 1478 patch points that reach the work
+        ROI only 7 survive to the crest -- a 99.5% reduction, with the radius
+        bias down from the +0.6-0.7 mm takes 1-3 carried to +0.24 mm.
+
+    The one outcome the design could not accept -- a VALID measurement that
+    still includes the patch, i.e. a silently wrong radius -- is not what this
+    frame produces, and ``assert not m.valid`` is what pins that.
     """
     pytest.importorskip("open3d")
-    f = _ring1_take04()
-    # This fixture is a pre-protocol-2 capture with 1 mm depth WORDS, so it is
-    # processed at the 2 mm voxel it was captured under. The new 1 mm default
-    # (spec 4.4) sits at this archive's quantisation floor, where it merges
-    # nothing and lets noise through -- it flips this frame's branch-guard
-    # outcome in BOTH directions across the two archived takes. On protocol-2
-    # depth (0.1 mm words) 1 mm spans ten quantisation steps, which is the point.
+    f, out = _measure_ring1_take04()
+
+    m = out.metrics
+    # Honest refusal-by-metric: no wrong number is presented as a good one.
+    assert not m.valid
+    assert m.path_completeness == pytest.approx(0.846, abs=0.03)
+    assert m.maximum_angular_gap_deg > 30.0
+    assert any("completeness" in w or "angular gap" in w for w in m.warnings), m.warnings
+
+    sub = out.report["substrate"]
+    assert sub["source"] == "fitted_plane"
+    assert sub["sigma_mm"] == pytest.approx(0.759, abs=0.05)
+    # 3 * 0.759 = 2.28 -> clamped. The clamp is what stops a noisy frame opening
+    # the floor to everything; here it also costs the low-relief sector.
+    assert sub["floor_mm"] == 2.0
+    # ... and the fitted plane is the BOARD, 1.3 mm below work Z=0 (spec §1).
+    assert sub["plane"][2] == pytest.approx(-1.32, abs=0.2)
+
+    # Compactness is where the patch dies -- 5 of 6 components dropped, and the
+    # fail-open bypass did NOT fire (this is a real rejection, not a starvation).
+    assert sub["compactness"]["compactness_components"] == 6
+    assert sub["compactness"]["compactness_kept_components"] == 1
+    assert sub["compactness"]["compactness_bypassed"] == 0
+
+    cluster = np.asarray(out.filtered_xyz)
+    r = np.linalg.norm(cluster[:, :2] - np.asarray(f["centre"]), axis=1)
+    # The patch sat on the ring's +X flank at r 50-54 mm (raw, out to r 71 mm).
+    patch = (cluster[:, 0] > 254.0) & (r > 47.0)
+    assert int(patch.sum()) <= 12, "the +X board patch must be all but gone"
+    assert r.max() < 54.0, "nothing may survive past the bead's own outer flank"
+    # Characterization of this ring, minutes earlier: r 42.2 mm.
+    assert m.measured_radius_mm == pytest.approx(42.2, abs=1.0)
+
+
+def test_the_same_frame_reproduces_the_cell_crash_with_compactness_disabled():
+    """Locks the CAUSE, exactly as the colour-gate pair used to.
+
+    With ``deposit_min_length_beads = 0`` the compact patch survives into the
+    raster, dilates into the skeleton arms of 2026-08-29 and exhausts the branch
+    guard -- the original cell abort, reproduced (measured 2026-08-31: branch
+    pixels 1, 1, 2 across the three attempts against a 15 px spur limit). So
+    compactness is doing the load-bearing work the saturation gate used to do,
+    and that stays measured rather than asserted.
+
+    Guards against 'fixing' this by loosening the branch guard instead: the
+    guard was right, and takes 1-3 carried the same contamination into radii
+    biased 0.6-0.7 mm large precisely because their topology let them through.
+    """
+    pytest.importorskip("open3d")
     with pytest.raises(RuntimeError, match="branch guard exhausted"):
-        process_observation(color=f["color"], depth=f["depth"],
-                            geometry=gf.aligned(f["K"], (1280, 720)), K=f["K"], dist=None,
-                            T_work_camera=f["T_work_camera"], plan=f["plan"],
-                            layer=f["plan"].layers[0],
-                            config=ExtrusionConfig(deposit_min_saturation=0,
-                                                   voxel_size_m=0.002))
+        _measure_ring1_take04(deposit_min_length_beads=0.0)
 
 
 # ------------------------------- branch-guard spur limit: measured, not nominal
@@ -333,13 +366,12 @@ def test_spur_guard_uses_the_deposits_own_footprint_not_an_inflated_recipe_bead(
     ring = syn.RingSpec(40.0, 10.0, CENTER, height_fn=syn.flat(6.0))
     scene = np.vstack((syn.plane_points(center_xy_mm=CENTER), ring.surface_points()))
     depth = syn.render_depth(scene, T, noise_mm=0.3)
-    color = np.zeros((720, 1280, 3), np.uint8)
 
     def run(bead_mm):
         plan = scene_plan(radius=40.0, bead=bead_mm, layer_height=6.0, center=CENTER)
         return process_observation(
-            color=color, depth=depth, geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
-            T_work_camera=T, K=syn.K_720P, dist=None, plan=plan, layer=plan.layers[0],
+            depth=depth, geometry=syn.geometry(),
+            T_work_camera=T, plan=plan, layer=plan.layers[0],
             config=ExtrusionConfig())
 
     true_bead = run(10.0)          # recipe already matches the physical ring
@@ -373,8 +405,60 @@ def test_spur_guard_still_catches_real_contamination_regardless_of_recipe_bead()
     T = syn.inspection_camera_T([CENTER[0], CENTER[1], 6.0], 300.0)
     ring = syn.RingSpec(40.0, 10.0, CENTER, height_fn=syn.flat(6.0))
     # A tangential shelf just proud of the ring's own outer edge, spanning a
-    # 20 degree arc -- long enough that neither an accurate nor a doubled+
+    # 28 degree arc -- long enough that neither an accurate nor a doubled+
     # dilation/spur tolerance can absorb it into the clean loop.
+    #
+    # 28, not the original 20: once the synthetic fixtures moved to protocol-2
+    # depth words the crest resolves cleanly enough that a 20 degree shelf
+    # (16.8 mm of arc, against a 15-16 px spur limit) sits ON the guard's
+    # threshold -- it refused at a 10 mm recipe bead and was absorbed at 30 mm,
+    # differing by a single pixel of tolerance. Measured 2026-08-31 across
+    # spans 20/25/28/30/32/35 deg at recipe beads 10/20/30 mm: 25-30 deg
+    # refuses at EVERY recipe bead (a plateau, not an edge), 20 deg is
+    # marginal, and 32 deg and beyond is a concentric arc the radial trim
+    # removes cleanly (measured r 39.96-40.00 for a 40 mm ring). 28 deg sits
+    # mid-plateau, so this pins the guard rather than a rounding.
+    r0 = 40.0 + 10.0 / 2.0 + 3.0
+    thetas = np.deg2rad(np.arange(0.0, 28.0, 0.5))
+    radii = np.arange(r0 - 2.5, r0 + 2.5, 0.5)
+    Th, R = np.meshgrid(thetas, radii, indexing="ij")
+    shelf = np.column_stack((
+        CENTER[0] + R.ravel() * np.cos(Th.ravel()),
+        CENTER[1] + R.ravel() * np.sin(Th.ravel()),
+        np.full(Th.size, 4.0)))
+    scene = np.vstack((syn.plane_points(center_xy_mm=CENTER), ring.surface_points(), shelf))
+    depth = syn.render_depth(scene, T, noise_mm=0.3)
+
+    for bead_mm in (10.0, 20.0):
+        plan = scene_plan(radius=40.0, bead=bead_mm, layer_height=6.0, center=CENTER)
+        with pytest.raises(RuntimeError, match="branch guard exhausted"):
+            process_observation(
+                depth=depth, geometry=syn.geometry(),
+                T_work_camera=T, plan=plan, layer=plan.layers[0],
+                config=ExtrusionConfig())
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "KNOWN DEFECT, pinned deliberately: a 3x overstated recipe bead inflates "
+    "_rasterize's DILATION (radius = bead/2), which fattens the ring and the "
+    "shelf into one lobe whose thinned skeleton has no junction left, so the "
+    "branch guard cannot see the contamination it is there to catch. Measured "
+    "2026-08-31: r 39.04-39.14 for a 40.0 mm ring, VALID, across shelf spans "
+    "20-32 deg -- a confident number ~0.9 mm wrong. The spur TOLERANCE is "
+    "already clamped to the frame's own measured footprint (`a0fabca`) for "
+    "exactly this reason; the raster's dilation is not. Feeding it the same "
+    "clamped bead was tried and reverted: it fixes this (39.87) but regresses "
+    "the real 2026-08-28 ring2 frame, where the tighter dilation stops "
+    "absorbing the ChArUco board lobe and exhausts the guard on a take that "
+    "measures correctly today. Closing this needs its own evidence on real "
+    "frames. When it is closed this test XPASSes and strict=True fails the "
+    "suite -- delete the marker then. Latent before the synthetic fixtures "
+    "moved to protocol-2 depth words: a coarser, noisier crest happened to "
+    "leave a branch behind, so the guard fired for the wrong reason."))
+def test_an_overstated_recipe_bead_defeats_the_branch_guard_through_the_raster():
+    pytest.importorskip("open3d")
+    T = syn.inspection_camera_T([CENTER[0], CENTER[1], 6.0], 300.0)
+    ring = syn.RingSpec(40.0, 10.0, CENTER, height_fn=syn.flat(6.0))
     r0 = 40.0 + 10.0 / 2.0 + 3.0
     thetas = np.deg2rad(np.arange(0.0, 20.0, 0.5))
     radii = np.arange(r0 - 2.5, r0 + 2.5, 0.5)
@@ -385,15 +469,10 @@ def test_spur_guard_still_catches_real_contamination_regardless_of_recipe_bead()
         np.full(Th.size, 4.0)))
     scene = np.vstack((syn.plane_points(center_xy_mm=CENTER), ring.surface_points(), shelf))
     depth = syn.render_depth(scene, T, noise_mm=0.3)
-    color = np.zeros((720, 1280, 3), np.uint8)
-
-    for bead_mm in (10.0, 30.0):
-        plan = scene_plan(radius=40.0, bead=bead_mm, layer_height=6.0, center=CENTER)
-        with pytest.raises(RuntimeError, match="branch guard exhausted"):
-            process_observation(
-                color=color, depth=depth, geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
-                T_work_camera=T, K=syn.K_720P, dist=None, plan=plan, layer=plan.layers[0],
-                config=ExtrusionConfig())
+    plan = scene_plan(radius=40.0, bead=30.0, layer_height=6.0, center=CENTER)
+    with pytest.raises(RuntimeError, match="branch guard exhausted"):
+        process_observation(depth=depth, geometry=syn.geometry(), T_work_camera=T,
+                            plan=plan, layer=plan.layers[0], config=ExtrusionConfig())
 
 
 def test_branch_guard_exhaustion_names_the_tolerance_it_gave_up_with():
@@ -417,8 +496,11 @@ def test_branch_guard_exhaustion_names_the_tolerance_it_gave_up_with():
     pytest.importorskip("open3d")
     T = syn.inspection_camera_T([CENTER[0], CENTER[1], 6.0], 300.0)
     ring = syn.RingSpec(40.0, 10.0, CENTER, height_fn=syn.flat(6.0))
+    # 28 degrees: see test_spur_guard_still_catches_real_contamination... for
+    # the span sweep that measured 25-30 deg as the plateau where this shelf
+    # refuses at every recipe bead.
     r0 = 40.0 + 10.0 / 2.0 + 3.0
-    thetas = np.deg2rad(np.arange(0.0, 20.0, 0.5))
+    thetas = np.deg2rad(np.arange(0.0, 28.0, 0.5))
     radii = np.arange(r0 - 2.5, r0 + 2.5, 0.5)
     Th, R = np.meshgrid(thetas, radii, indexing="ij")
     shelf = np.column_stack((
@@ -427,16 +509,18 @@ def test_branch_guard_exhaustion_names_the_tolerance_it_gave_up_with():
         np.full(Th.size, 4.0)))
     scene = np.vstack((syn.plane_points(center_xy_mm=CENTER), ring.surface_points(), shelf))
     depth = syn.render_depth(scene, T, noise_mm=0.3)
-    color = np.zeros((720, 1280, 3), np.uint8)
 
-    # The recipe deliberately overstates the bead 3x, so the clamped value and the
+    # The recipe deliberately overstates the bead 2x, so the clamped value and the
     # recipe value are far apart and the message cannot pass by quoting one twice.
-    plan = scene_plan(radius=40.0, bead=30.0, layer_height=6.0, center=CENTER)
+    # (2x, not 3x: at 3x the raster's dilation absorbs the contamination and the
+    # guard never fires at all -- see
+    # test_an_overstated_recipe_bead_defeats_the_branch_guard_through_the_raster.)
+    plan = scene_plan(radius=40.0, bead=20.0, layer_height=6.0, center=CENTER)
     cfg = ExtrusionConfig()
     with pytest.raises(RuntimeError, match="branch guard exhausted") as excinfo:
         process_observation(
-            color=color, depth=depth, geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
-            T_work_camera=T, K=syn.K_720P, dist=None, plan=plan, layer=plan.layers[0],
+            depth=depth, geometry=syn.geometry(),
+            T_work_camera=T, plan=plan, layer=plan.layers[0],
             config=cfg)
 
     message = str(excinfo.value)
@@ -454,103 +538,73 @@ def test_branch_guard_exhaustion_names_the_tolerance_it_gave_up_with():
 
     # And the two inputs that decide which remedy applies are both named, so the
     # reader can see the clamp fired rather than having to infer it.
-    assert "recipe bead 30.000 mm" in message, message
+    assert "recipe bead 20.000 mm" in message, message
     assert re.search(r"this frame measured [\d.]+ mm", message), message
 
 
-def test_chroma_gate_keeps_the_chromatic_bead_and_blanks_the_achromatic_board():
-    K = np.array([[400.0, 0, 20.0], [0, 400.0, 20.0], [0, 0, 1.0]])
-    depth = np.full((40, 40), 300, np.uint16)
-    color = np.dstack([np.full((40, 40), 40, np.uint8)] * 3)      # black checker
-    color[10:30, 10:30] = (40, 110, 190)                          # tan clay
-    reg = ColorRegistered.build(depth, gf.aligned(K, (40, 40)), K, None)
-
-    keep, applied = chroma_gate_mask(color, reg, ExtrusionConfig())
-
-    assert applied and keep.shape == (len(reg),)
-    # Aligned/identity registration: uv_depth (the depth pixel that made the
-    # point) and its projected colour pixel are the same (v, u) -- the region
-    # selectors below are just the pixel test's crops, restated on points.
-    on_clay = ((reg.uv_depth[:, 1] >= 15) & (reg.uv_depth[:, 1] < 25)
-              & (reg.uv_depth[:, 0] >= 15) & (reg.uv_depth[:, 0] < 25))
-    off_clay = (reg.uv_depth[:, 1] < 5) & (reg.uv_depth[:, 0] < 5)
-    assert keep[on_clay].all()
-    assert not keep[off_clay].any()
+def test_the_derived_floor_lands_where_the_constant_used_to():
+    """clamp(k * sigma) must land in the old constant's neighbourhood on the
+    synthetic plane (spec §3.4: 1.55-1.74 mm measured on the cell archive), and
+    the report must carry the §4 health block."""
+    pytest.importorskip("open3d")
+    plan = scene_plan(radius=40.0, bead=9.0, layer_height=6.0)
+    out = observe(plan, 1, [syn.RingSpec(40.0, 9.0, CENTER, height_fn=syn.flat(6.0))])
+    sub = out.report["substrate"]
+    assert sub["source"] == "fitted_plane"
+    assert sub["sigma_mm"] > 0.0
+    assert 1.0 <= sub["floor_mm"] <= 2.0
+    assert out.metrics.valid
 
 
-def test_chroma_gate_abstains_on_an_achromatic_frame_and_restores_the_floor():
-    """An RGB dropout must not erase the deposit, nor drop the floor it earned."""
-    config = ExtrusionConfig()
-    K = np.array([[400.0, 0, 4.0], [0, 400.0, 4.0], [0, 0, 1.0]])
-    depth = np.full((8, 8), 300, np.uint16)
-    reg = ColorRegistered.build(depth, gf.aligned(K, (8, 8)), K, None)
+def test_the_substrate_block_reports_everything_a_frame_must_say_about_itself():
+    """Spec §4: one health block per take, or a degrading setup shows up only as
+    a low completeness that reads like a placement fault.
 
-    keep, applied = chroma_gate_mask(np.zeros((8, 8, 3), np.uint8), reg, config)
-    assert not applied and keep.all()
-    assert deposit_floor_mm(config, False) == pytest.approx(2.5)
-
-    saturated = np.zeros((8, 8, 3), np.uint8)
-    saturated[:, :, 2] = 200
-    keep, applied = chroma_gate_mask(saturated, reg, config)
-    assert applied and keep.all()
-    assert deposit_floor_mm(config, True) == pytest.approx(1.5)
-
-
-def test_chroma_gate_reports_the_fraction_of_the_frame_it_kept():
-    """The one number that says whether the gate is still telling bead from board.
-
-    Every other chroma-gate test here paints the board a PERFECTLY NEUTRAL grey,
-    where saturation is 0 by construction and the gate cannot fail. Real black
-    print is not neutral: on the 2026-08-30 16:35 cell frame it measured BGR
-    (17.5, 20.3, 24.4) -- a ~7-count warm channel offset -- and saturation is
-    (max - min) / max, so at max = 24 that reads S = 72, over the threshold of 60.
-    The gate kept 26% of that frame against 9% on the 2026-08-29 frames it was
-    tuned on, the board arrived with the ring, and the ring characterization died
-    at the shape gate with an eighteen-candidate JSON dump that named none of it.
-
-    This pins the DIAGNOSTIC, not a decision: the gate's behaviour on a warm-cast
-    near-black background is unchanged and is asserted here so the hazard is
-    visible, because tightening it (a value floor, an absolute-chroma criterion)
-    also shaves the bead's own dim flanks -- measured on the 2026-08-29 fixture it
-    moves the reported bead width 9.48 mm -> 5.1-6.9 mm, which is a paper number.
+    ``compactness_kept_components`` vs ``compactness_components`` is load-bearing
+    on its own: the filter's fail-open is a STARVATION guard, not a partial-ring
+    guard, so a real ring fragmented into arcs can lose most of its fragments
+    with ``compactness_bypassed = 0`` and NOTHING else in the report would say
+    so (measured on layer-002-take03 of the 2026-08-30 archive: 6 components in,
+    1 kept).
     """
-    K = np.array([[400.0, 0, 20.0], [0, 400.0, 20.0], [0, 0, 1.0]])
-    depth = np.full((40, 40), 300, np.uint16)
-    reg = ColorRegistered.build(depth, gf.aligned(K, (40, 40)), K, None)
-    clay = (40, 110, 190)
-
-    neutral = np.dstack([np.full((40, 40), 24, np.uint8)] * 3)   # S = 0 by construction
-    neutral[10:30, 10:30] = clay
-    counts: dict = {}
-    keep, applied = chroma_gate_mask(neutral, reg, ExtrusionConfig(), counts)
-    assert applied and keep.any()
-    assert counts["chroma_gate_kept_fraction"] < 0.45, counts
-
-    warm = np.zeros((40, 40, 3), np.uint8)                       # real black print
-    warm[:, :] = (17, 20, 24)
-    warm[10:30, 10:30] = clay
-    warm_counts: dict = {}
-    keep_warm, applied_warm = chroma_gate_mask(warm, reg, ExtrusionConfig(), warm_counts)
-
-    assert applied_warm
-    # Unchanged behaviour: the warm-cast board still passes a gate built on a ratio.
-    assert keep_warm.mean() > 0.9, "the leak this number exists to expose"
-    # ... and now the count says so, in a form that does not need the frame size.
-    assert warm_counts["chroma_gate_kept_fraction"] > 0.9
-    assert (warm_counts["chroma_gate_kept_fraction"]
-            > 2 * counts["chroma_gate_kept_fraction"])
+    pytest.importorskip("open3d")
+    plan = scene_plan(radius=40.0, bead=9.0, layer_height=6.0)
+    out = observe(plan, 1, [syn.RingSpec(40.0, 9.0, CENTER, height_fn=syn.flat(6.0))])
+    sub = out.report["substrate"]
+    assert set(sub) >= {"source", "sigma_mm", "tilt_deg", "plane", "inlier_fraction",
+                        "bias_correction_mm", "bias_correction_sigma", "floor_mm",
+                        "plane_offset_at_center_mm", "substrate_p99_mm",
+                        "separation_margin_mm", "compactness"}
+    assert set(sub["compactness"]) == {"compactness_components",
+                                       "compactness_kept_components",
+                                       "compactness_bypassed"}
+    assert sub["compactness"]["compactness_kept_components"] >= 1
+    assert sub["compactness"]["compactness_bypassed"] == 0
+    assert len(sub["plane"]) == 3
+    # Separation margin = bead p50 - substrate p99. A 6 mm ring on a quiet
+    # synthetic plane has metres of headroom; what is pinned is that it is
+    # POSITIVE and derived, not that it hits a particular value.
+    assert sub["separation_margin_mm"] > 1.0
+    assert sub["substrate_p99_mm"] < sub["floor_mm"]
+    # The old chain's `report["floor"]` block is gone, not renamed alongside.
+    assert "floor" not in out.report
 
 
 def test_the_shape_gate_rejection_names_the_capture_that_produced_the_blobs():
-    """A rejection has to distinguish a leaking gate from a genuinely low ring.
+    """A rejection has to distinguish a leaking front end from a genuinely low ring.
 
     2026-08-30 16:35, cell: candidate 1 was 5489 points at r 51.6 mm with a 79 mm
-    radial span -- a disc, around a physical ring that a colour-only fit put at
-    r 42.3 mm. The message listed all eighteen blobs and their failed criteria and
-    said nothing about where they came from, so the two opposite remedies (fix the
-    capture / re-place the ring) were indistinguishable from it. Same defect the
-    branch guard's message had until `da5f7a4`, same fix: this function RAISES, so
-    the counts the capture already measured die with it unless they ride along.
+    radial span -- a disc, around a physical ring measured at r 42.3 mm. The
+    message listed all eighteen blobs and their failed criteria and said nothing
+    about where they came from, so the two opposite remedies (fix the capture /
+    re-place the ring) were indistinguishable from it. Same defect the branch
+    guard's message had until `da5f7a4`, same fix: this function RAISES, so the
+    counts the capture already measured die with it unless they ride along.
+
+    The counts that carry that diagnosis are the SEGMENTATION's own now -- the
+    derived floor and the substrate sigma it came from -- where they used to be
+    the colour gate's kept-fraction. Both answer the same question: did the front
+    end admit far more of the frame than the ring?
     """
     from tasni.modules.extrusion.processing import _select_ring_cluster
 
@@ -560,8 +614,8 @@ def test_the_shape_gate_rejection_names_the_capture_that_produced_the_blobs():
     disc = np.column_stack((250.0 + radius * np.cos(theta),
                             140.0 + radius * np.sin(theta),
                             rng.random(4000) * 3.0))       # filled: span ratio ~1.5
-    counts = {"chroma_gate_kept_fraction": 0.2982, "chroma_gate_applied": 1,
-              "deposit_floor_mm": 1.5, "search_cylinder_above_floor_fraction": 0.1871}
+    counts = {"substrate_floor_mm": 1.5, "substrate_sigma_mm": 0.5,
+              "search_cylinder_above_floor_fraction": 0.1871}
 
     with pytest.raises(RuntimeError, match="shape gate") as excinfo:
         _select_ring_cluster([disc], np.array([212.1, 149.7]), counts)
@@ -569,40 +623,45 @@ def test_the_shape_gate_rejection_names_the_capture_that_produced_the_blobs():
     message = str(excinfo.value)
     payload = json.loads(message[message.index("{"):])
     assert payload["candidates"][0]["radial_span_ratio"] > 0.8      # the gate was right
-    assert payload["capture"]["chroma_gate_kept_fraction"] == pytest.approx(0.2982)
+    assert payload["capture"]["substrate_sigma_mm"] == pytest.approx(0.5)
     assert payload["capture"]["search_cylinder_above_floor_fraction"] == pytest.approx(0.1871)
-    assert payload["capture"]["deposit_floor_mm"] == pytest.approx(1.5)
+    assert payload["capture"]["substrate_floor_mm"] == pytest.approx(1.5)
 
 
 def test_characterize_records_what_the_search_cylinder_held_before_the_floor():
-    """The deposit floor is fixed; the noise it has to beat is a fact of the frame.
+    """The floor is derived; the noise it has to beat is a fact of the frame.
 
-    1.5 mm above the work plane against a plane whose own measured noise at the
-    300 mm inspection standoff is ~1.1 mm is ~1.4 sigma, and on 2026-08-30 18.7%
-    of the search cylinder cleared it. Whether that tail is a nuisance or the whole
-    story cannot be read from ``after_search_roi`` alone, so the frame states it.
+    Characterization fits the same substrate the layer measurements do -- it
+    defines the recipe they are judged against, so the two must see the same
+    cloud. The floor it derives, and the fraction of the search cylinder that
+    clears it, cannot be read from ``after_search_roi`` alone (on 2026-08-30
+    18.7% of the cylinder cleared the old fixed 1.5 mm), so the frame states
+    both.
     """
     pytest.importorskip("open3d")
     plan = scene_plan(radius=60.0, bead=8.0, layer_height=5.0)
     T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, 1), 300.0)
     depth = syn.render_scene([syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.flat(6.0))],
                              T, plane_center_xy_mm=CENTER)
-    found = characterize_ring(color=np.zeros((720, 1280, 3), np.uint8), depth=depth,
-                              geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
-                              T_work_camera=T, K=syn.K_720P, dist=None,
+    found = characterize_ring(depth=depth,
+                              geometry=syn.geometry(),
+                              T_work_camera=T,
                               search_center_mm=CENTER, work_frame="Tasni Work Frame",
                               config=ExtrusionConfig())
 
     coarse = found.report["counts_coarse"]
-    # A depth-only frame: the gate abstains, so the conservative floor applies.
-    assert coarse["deposit_floor_mm"] == pytest.approx(2.5)
+    # Derived from THIS frame's substrate noise, inside the configured clamp --
+    # never the 1.5/2.5 mm constants the colour gate used to pick between.
+    assert 1.0 <= coarse["substrate_floor_mm"] <= 2.0
+    assert coarse["substrate_sigma_mm"] > 0.0
     assert coarse["search_cylinder_points"] > coarse["after_search_roi"]
     assert 0.0 < coarse["search_cylinder_above_floor_fraction"] < 1.0
     # The statistic describes the WHOLE cylinder, not the deposit the ROI kept:
-    # its median is the build plane and only its tail is the ring's 6 mm crest.
-    # That is what makes 0.187-at-1.5 mm readable as "the board is in here too".
-    assert coarse["search_cylinder_z_mm_p50"] == pytest.approx(0.0, abs=1.0)
-    assert coarse["search_cylinder_z_mm_p99"] > 4.0
+    # its median is the substrate and only its tail is the ring's 6 mm crest.
+    # That is what makes it readable as "the board is in here too". Heights, not
+    # work-frame Z: the band above is applied to heights.
+    assert coarse["search_cylinder_height_mm_p50"] == pytest.approx(0.0, abs=1.0)
+    assert coarse["search_cylinder_height_mm_p99"] > 4.0
 
 
 def test_the_previous_layer_floor_is_gone_by_design():
@@ -621,7 +680,8 @@ def test_wavy_ring_height_profile_is_measured():
     plan = scene_plan(layer_height=7.5)
     out = observe(plan, 1, [syn.RingSpec(60.0, 8.0, CENTER, height_fn=syn.wavy(7.5, 2.5, lobes=2))])
     g = out.geometry
-    assert g is not None and g.height_reference == "build_plane"
+    # The datum is the surface FITTED IN THIS FRAME, never the work frame's Z=0.
+    assert g is not None and g.height_reference == "fitted_plane"
     assert g.top_z_min_mm == pytest.approx(5.0, abs=1.5)
     assert g.top_z_max_mm == pytest.approx(10.0, abs=1.5)
     assert g.top_z_std_mm > 1.0
@@ -662,10 +722,9 @@ def test_characterize_recovers_a_ring_the_recipe_got_wrong():
     T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, 1), 300.0)
     depth = syn.render_scene([syn.RingSpec(60.0, 8.0, true_center, height_fn=syn.flat(6.0))], T,
                              plane_center_xy_mm=CENTER)
-    color = np.zeros((720, 1280, 3), np.uint8)
-    found = characterize_ring(color=color, depth=depth,
-                              geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
-                              T_work_camera=T, K=syn.K_720P, dist=None,
+    found = characterize_ring(depth=depth,
+                              geometry=syn.geometry(),
+                              T_work_camera=T,
                               search_center_mm=CENTER, work_frame="Tasni Work Frame",
                               config=ExtrusionConfig())
     assert found.radius_mm == pytest.approx(60.0, abs=1.0)
@@ -691,11 +750,9 @@ def test_characterize_selects_ring_instead_of_larger_raised_patch():
     scene = np.vstack((
         syn.plane_points(center_xy_mm=CENTER), ring.surface_points(), patch))
     depth = syn.render_depth(scene, T)
-    color = np.zeros((720, 1280, 3), np.uint8)
-
     found = characterize_ring(
-        color=color, depth=depth, geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
-        T_work_camera=T, K=syn.K_720P, dist=None,
+        depth=depth, geometry=syn.geometry(),
+        T_work_camera=T,
         search_center_mm=CENTER, work_frame="Tasni Work Frame",
         config=ExtrusionConfig())
 
@@ -709,12 +766,32 @@ def test_characterize_selects_ring_instead_of_larger_raised_patch():
 
 
 def test_characterize_real_checkerboard_capture_selects_the_visible_ring():
+    """trial 20260828-171615-f088cf48/characterize-01: ring plus board residual.
+
+    The protected behaviour is the SELECTION -- the ring-shape gate must pick
+    the ring and not the larger above-plane board residual the old
+    largest-cluster rule chose (it reported a 51 mm bead). That is unmoved:
+    the selected candidate's coarse circle still reads r 41.13 mm, against
+    41.12 under the colour-gate chain.
+
+    The refined numbers below DID move, and were re-measured 2026-08-31 rather
+    than carried over. This is a 1 mm-worded pre-protocol-2 frame whose
+    substrate fits at -1.36 mm with sigma 0.805, so the derived floor sits
+    2.0 mm above THAT -- roughly 0.64 mm in work-frame Z where the old constant
+    sat at 2.5 mm. Less of the ring's own low flank is cut away and the board
+    no longer arrives as a second large candidate, so the measured bead
+    footprint narrows (13.26 -> 9.82 mm) and the crest-read radius moves out
+    from 39.17 to 40.39 -- 0.74 mm inside the coarse circle where it used to sit
+    1.95 mm inside it. Both moves are the same fact: the old footprint had
+    board fused into it, which widened the bead and dragged the crest inward.
+    There is no ground truth for this ring in the archive, so what is asserted
+    is self-consistency (refined radius near the coarse fit, bead near the
+    ring's own width) plus the selection that has not changed.
+    """
     pytest.importorskip("open3d")
     fixture = np.load(Path(__file__).parent / "fixtures" / "extrusion" / "ring1"
                       / "ring1_checkerboard_20260828.npz")
     depth = fixture["depth"]
-    color = np.zeros((*depth.shape, 3), np.uint8)
-
     # This fixture is a pre-protocol-2 capture with 1 mm depth WORDS, so it is
     # processed at the 2 mm voxel it was captured under. The new 1 mm default
     # (spec 4.4) sits at this archive's quantisation floor, where it merges
@@ -722,32 +799,49 @@ def test_characterize_real_checkerboard_capture_selects_the_visible_ring():
     # outcome in BOTH directions across the two archived takes. On protocol-2
     # depth (0.1 mm words) 1 mm spans ten quantisation steps, which is the point.
     found = characterize_ring(
-        color=color, depth=depth,
+        depth=depth,
         geometry=gf.aligned(fixture["K"], (depth.shape[1], depth.shape[0])),
-        T_work_camera=fixture["T_work_camera"], K=fixture["K"], dist=None,
+        T_work_camera=fixture["T_work_camera"],
         search_center_mm=fixture["search_center_mm"],
         work_frame="Tasni Work Frame", config=ExtrusionConfig(voxel_size_m=0.002))
 
-    assert found.radius_mm == pytest.approx(39.17, abs=0.5)
-    assert found.center_mm == pytest.approx((217.94, 150.44), abs=0.5)
-    assert found.bead_width_mm == pytest.approx(13.26, abs=0.75)
-    assert found.top_z_mean_mm == pytest.approx(6.14, abs=0.75)
+    assert found.radius_mm == pytest.approx(40.39, abs=0.5)
+    assert found.center_mm == pytest.approx((218.56, 150.18), abs=0.5)
+    assert found.bead_width_mm == pytest.approx(9.82, abs=0.75)
+    assert found.top_z_mean_mm == pytest.approx(6.78, abs=0.75)
     selector = found.report["ring_selector"]
     selected = next(candidate for candidate in selector["candidates"]
                     if candidate.get("selected"))
-    largest = max(selector["candidates"], key=lambda candidate: candidate["points"])
-    assert selected["points"] < largest["points"]
+    # The selection itself is the protected behaviour, and it is UNCHANGED:
+    # the coarse circle through the chosen footprint still reads 41.12/41.13 mm.
     assert selected["radius_mm"] == pytest.approx(41.12, abs=0.5)
     assert selected["angular_coverage"] >= 0.95
-    assert not largest["eligible"]
+    assert selected["radial_span_ratio"] <= 0.8
+    # The board no longer arrives as a separate, larger candidate at all -- it
+    # is below the derived floor rather than above the old constant one -- so
+    # "the ring is not the largest blob" is no longer the thing under test here.
+    # It stays pinned on the synthetic scene, where the residual is placed on
+    # purpose: test_characterize_selects_ring_instead_of_larger_raised_patch.
+    largest = max(selector["candidates"], key=lambda candidate: candidate["points"])
+    assert selected["points"] == largest["points"]
 
 
-def _thin_at(mean_mm: float, dips_deg, width_deg: float = 12.0, floor_mm: float = 1.0):
+def _thin_at(mean_mm: float, dips_deg, width_deg: float = 12.0, floor_mm: float = 0.5):
     """A ring that all but vanishes at ``dips_deg`` -- the real low-relief failure.
 
     The 2026-08-29 capture had a hand-placed dried ring 2-11 mm tall whose two
     thinnest arcs fell under the ROI height floor, so one loop reached DBSCAN as
     two disconnected arcs and the per-cluster shape gate rejected both.
+
+    ``floor_mm`` is the dip's own crest height, and it has to sit under the
+    ROI floor for the scene to reproduce that failure at all. It was 1.0,
+    chosen against the old CONSTANT 2.5 mm floor; the derived floor on this
+    synthetic plane measures 1.50 mm, and 1.0 mm of dip lands just above it
+    once the substrate fit's bias correction is applied -- the ring arrives
+    whole and there is nothing to assemble. Measured 2026-08-31 at dips
+    1.0/0.5/0.2 mm: 1.0 gives one cluster at coverage 1.000, while 0.5 and 0.2
+    both give the two arcs (best single 0.611, assembled 0.889) this fixture is
+    about. 0.5 it is.
     """
     def height(theta):
         h = np.full_like(theta, float(mean_mm), dtype=float)
@@ -768,11 +862,9 @@ def test_characterize_assembles_one_ring_from_arcs_the_height_floor_broke():
     ring = syn.RingSpec(40.0, 10.0, center,
                         height_fn=_thin_at(7.0, (125.0, 245.0)))
     depth = syn.render_scene([ring], T, plane_center_xy_mm=CENTER)
-    color = np.zeros((720, 1280, 3), np.uint8)
-
     found = characterize_ring(
-        color=color, depth=depth, geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
-        T_work_camera=T, K=syn.K_720P, dist=None,
+        depth=depth, geometry=syn.geometry(),
+        T_work_camera=T,
         search_center_mm=CENTER, work_frame="Tasni Work Frame",
         config=ExtrusionConfig())
 
@@ -780,7 +872,7 @@ def test_characterize_assembles_one_ring_from_arcs_the_height_floor_broke():
     selected = next(c for c in selector["candidates"] if c.get("selected"))
     # The winner must be the ASSEMBLED ring, not either arc on its own.
     assert selected["cluster_count"] >= 2
-    # 2 x 24 deg of the ring is genuinely erased, so ~0.87 is the honest ceiling;
+    # 2 x 24 deg of the ring is genuinely erased, so ~0.89 is the honest ceiling;
     # what matters is that it clears the 0.70 gate no single arc could.
     assert selected["angular_coverage"] >= 0.85
     assert max(c["angular_coverage"] for c in selector["candidates"]
@@ -790,27 +882,41 @@ def test_characterize_assembles_one_ring_from_arcs_the_height_floor_broke():
 
 
 def test_characterize_real_low_relief_capture_is_not_rejected():
+    """trial 20260829-151445-acb42814/characterize-01: a 2-11 mm dried ring.
+
+    Under the old CONSTANT 2.5 mm floor its two thinnest arcs fell out, so one
+    physical loop reached DBSCAN as two disconnected arcs (48/72 and 25/72
+    bins), every cluster failed the per-cluster shape gate on its own, and only
+    arc assembly rescued the frame.
+
+    The derived floor removes the fragmentation at its source. This capture's
+    substrate fits at -1.81 mm with sigma 0.836 mm (a 1 mm-worded pre-protocol-2
+    frame), so the floor lands 2.0 mm above THAT -- about 0.2 mm in work-frame Z,
+    against 2.5 mm before. The thin arcs clear it, and the ring arrives as ONE
+    complete cluster covering 72/72 (measured 2026-08-31: r 42.11, previously
+    42.0 via assembly). That is the point of measuring height above the surface
+    the deposit rests on rather than above a nominal plane the surface is not on.
+    Arc assembly itself stays covered by
+    test_characterize_assembles_one_ring_from_arcs_the_height_floor_broke, whose
+    synthetic dips are cut below the derived floor on purpose.
+    """
     pytest.importorskip("open3d")
-    # trial 20260829-151445-acb42814/characterize-01: a 2-11 mm dried ring whose
-    # thin arcs fell under the floor. Every cluster failed the old per-cluster
-    # gate (best 48/72 bins = 0.667) though together they cover 71/72.
     fixture = np.load(Path(__file__).parent / "fixtures" / "extrusion" / "ring1"
                       / "ring1_low_relief_20260829.npz")
     depth = fixture["depth"]
-    color = np.zeros((*depth.shape, 3), np.uint8)
-
     found = characterize_ring(
-        color=color, depth=depth,
+        depth=depth,
         geometry=gf.aligned(fixture["K"], (depth.shape[1], depth.shape[0])),
-        T_work_camera=fixture["T_work_camera"], K=fixture["K"], dist=None,
+        T_work_camera=fixture["T_work_camera"],
         search_center_mm=fixture["search_center_mm"],
         work_frame="Tasni Work Frame", config=ExtrusionConfig())
 
     assert found.radius_mm == pytest.approx(42.0, abs=2.0)
     selected = next(c for c in found.report["ring_selector"]["candidates"]
                     if c.get("selected"))
-    assert selected["cluster_count"] == 2
-    assert selected["angular_coverage"] >= 0.90
+    # No longer assembled, and no longer NEEDS to be: one whole ring, all round.
+    assert selected["cluster_count"] == 1
+    assert selected["angular_coverage"] == pytest.approx(1.0, abs=0.02)
 
 
 def test_a_ring_measured_only_in_part_is_not_closed_into_a_full_one():
@@ -822,11 +928,9 @@ def test_a_ring_measured_only_in_part_is_not_closed_into_a_full_one():
     T = syn.inspection_camera_T(aim_point_mm(plan.recipe, plan.setup, 1), 300.0)
     ring = syn.RingSpec(40.0, 10.0, center, height_fn=_thin_at(7.0, (200.0,), width_deg=35.0))
     depth = syn.render_scene([ring], T, plane_center_xy_mm=CENTER)
-    color = np.zeros((720, 1280, 3), np.uint8)
-
-    result = process_observation(color=color, depth=depth,
-                                 geometry=gf.aligned(syn.K_720P, syn.SIZE_720P),
-                                 T_work_camera=T, K=syn.K_720P, dist=None,
+    result = process_observation(depth=depth,
+                                 geometry=syn.geometry(),
+                                 T_work_camera=T,
                                  plan=plan, layer=plan.layers[0],
                                  config=ExtrusionConfig())
 
@@ -1268,6 +1372,11 @@ def test_reprocessing_uses_the_recipe_and_centre_the_take_was_measured_against(t
         processing={"valid": False, "error": "branch guard exhausted"},
         provenance={"T_work_camera": np.asarray(T, dtype=float).tolist(),
                     "camera_intrinsics": {"K": syn.K_720P.tolist()},
+                    # The frame's own greeting, exactly as the measure job
+                    # records it. Without it the reprocess path falls back to
+                    # the legacy 1 mm depth convention and reads this take's
+                    # 0.1 mm words 10x too far away.
+                    "camera_geometry": syn.geometry_dict(),
                     "processing_config": ExtrusionConfig().model_dump(mode="json")})
     nominal = points_array(layer)
     archive.write_layer(manifest, nominal_xyz=nominal, commanded_xyz=nominal,
@@ -1482,7 +1591,14 @@ def test_empty_roi_error_reports_which_band_rejected_the_points():
     with pytest.raises(RuntimeError) as excinfo:
         observe(plan, 1, [syn.RingSpec(60.0, 8.0, far, height_fn=syn.flat(6.0))])
     msg = str(excinfo.value)
-    assert "not enough deposited-geometry points" in msg
+    # WHICH stage refuses is not the point and is allowed to move: a few
+    # scattered substrate specks can clear the derived floor, so the ROI is
+    # rarely literally empty and the refusal now usually comes one stage later,
+    # at DBSCAN. What must never move is the diagnosis reaching the operator --
+    # the per-band tallies that separate a wrong centre from a wrong height
+    # reference. Both messages carry them.
+    assert ("not enough deposited-geometry points" in msg
+            or "no deposited cluster survived" in msg), msg
     assert "height" in msg and "radial" in msg          # both bands named
     assert "in_height_band" in msg and "in_radial_band" in msg
 
@@ -1624,6 +1740,11 @@ def _archive_failed_take(root, session, plan, *, capture_ms=2874.0, layer_index=
                     "timings_ms": {"capture_ms": capture_ms}},
         provenance={"T_work_camera": np.asarray(T, dtype=float).tolist(),
                     "camera_intrinsics": {"K": syn.K_720P.tolist()},
+                    # The frame's own greeting, exactly as the measure job
+                    # records it. Without it the reprocess path falls back to
+                    # the legacy 1 mm depth convention and reads this take's
+                    # 0.1 mm words 10x too far away.
+                    "camera_geometry": syn.geometry_dict(),
                     "processing_config": ExtrusionConfig().model_dump(mode="json")})
     nominal = points_array(layer)
     ExtrusionArchive(root).write_layer(

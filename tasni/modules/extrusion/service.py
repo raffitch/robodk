@@ -1047,10 +1047,9 @@ class CylinderPrintJob:
                         base_manifest["provenance"]["standoff"] = standoff
                         if arrival_fault:
                             raise RuntimeError(arrival_fault)
-                        camera_cfg = services.config.camera
                         processed = measure_take(
-                            color=frame.color, depth=frame.depth, geometry=frame.geometry,
-                            T_work_camera=T_work_camera, K=camera_cfg.K, dist=camera_cfg.dist,
+                            depth=frame.depth, geometry=frame.geometry,
+                            T_work_camera=T_work_camera,
                             plan=self.plan, layer=layer, config=ecfg)
                     except Exception as exc:
                         manifest = LayerManifest(**base_manifest,
@@ -1155,13 +1154,11 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
         raise RuntimeError(
             "archive predates reproducible reprocessing provenance "
             "(processing config, intrinsics, or camera pose is missing)")
-    color_path, depth_path = layer_dir / "color.png", layer_dir / "depth.npy"
-    if not color_path.is_file() or not depth_path.is_file():
-        raise RuntimeError("archived raw color/depth observation is incomplete")
-    import cv2
-    color = cv2.imread(str(color_path), cv2.IMREAD_COLOR)
-    if color is None:
-        raise RuntimeError("archived color image could not be decoded")
+    # Depth alone: segmentation is geometric, so a missing or undecodable
+    # color.png costs the archive a photograph, never a re-measurement.
+    depth_path = layer_dir / "depth.npy"
+    if not depth_path.is_file():
+        raise RuntimeError("archived raw depth observation is missing")
     depth = np.load(depth_path, allow_pickle=False)
     geom_dict = provenance.get("camera_geometry")
     if geom_dict is not None and not geom_dict.get("legacy_aligned"):
@@ -1195,20 +1192,8 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
     if layer_index > len(plan.layers):
         raise RuntimeError("archived layer index exceeds the stored recipe")
     processed = measure_take(
-        color=color, depth=depth, geometry=geometry,
+        depth=depth, geometry=geometry,
         T_work_camera=np.asarray(transform, dtype=float),
-        K=np.asarray(intrinsics["K"], dtype=float),
-        # A legacy archive's registration is the IDENTITY (depth K == colour K,
-        # zero extrinsic -- see CameraGeometry.legacy_aligned). Handing
-        # project_to_color the CALIBRATED distortion anyway breaks that: it
-        # re-projects through the distortion map, so uv != (u, v) and the gate
-        # is sampled off-pixel (this checkout's k1=0.1148/k2=-0.2386 moves it a
-        # few px at the ring's radius, tens near the frame edge) -- and
-        # figures._compute_stages already passes dist=None for the same take,
-        # so the reprocess button and the figure would gate it differently.
-        # Protocol-2 takes keep the calibrated distortion, same as a live
-        # capture (Task 9 review, Important 4).
-        dist=None if geometry.legacy else intrinsics.get("dist_coeffs"),
         plan=plan, layer=plan.layers[layer_index - 1],
         config=ExtrusionConfig.from_archive(processing_payload))
     reprocessed_at = _utcnow()

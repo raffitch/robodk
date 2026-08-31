@@ -16,11 +16,12 @@ import numpy as np
 from scipy.interpolate import splprep, splev
 from scipy.spatial import cKDTree
 
-from ...core.depth_geometry import CameraGeometry, ColorRegistered, backproject
+from ...core.depth_geometry import CameraGeometry, backproject
 from ...core.geometry import transform_points
 from .comparison import compare_circle, corrected_circle, fit_circle_xy
 from .models import (CylinderPlan, CylinderRecipe, CylinderSetup, DeviationMetrics,
                      LayerPath, RingGeometry)
+from .substrate import PlaneSubstrate, compactness_filter
 from .toolpath import generate_cylinder_plan
 
 
@@ -43,88 +44,6 @@ def depth_to_work_points(depth: np.ndarray, geometry: CameraGeometry,
     (the hand-eye); ``backproject`` already returns colour-frame points."""
     camera, _uv = backproject(depth, geometry)
     return transform_points(T_work_camera, camera), int(len(camera))
-
-
-def deposit_floor_mm(config, chroma_gated: bool) -> float:
-    """Lowest height above the work plane a point may have and still be deposit.
-
-    Coupled to the colour gate on purpose: the low floor is EARNED by it. With
-    the board removed by chroma, 1.5 mm stops amputating the bead; without it,
-    1.5 mm lets the board flood in and every take exhausts the branch guard
-    (measured on all four cell frames of 2026-08-29). So an abstaining gate --
-    an RGB dropout, a depth-only fixture -- also restores the conservative floor
-    rather than handing the chain a cloud it cannot survive.
-    """
-    floor = max(config.deposit_min_height_mm, config.plane_distance_threshold_m * 1000.0)
-    if chroma_gated:
-        return float(floor)
-    return float(max(floor, getattr(config, "deposit_min_height_no_chroma_mm", 0.0)))
-
-
-def chroma_gate_mask(color: np.ndarray | None, registered: ColorRegistered, config,
-                     counts: dict | None = None) -> tuple[np.ndarray, bool]:
-    """Per REGISTERED POINT: True where the colour frame says "bead", not "board".
-
-    Depth is native and not aligned to colour any more (camera protocol 2), so
-    the gate cannot blank depth pixels in place; each depth point is projected
-    into the calibrated colour model (``registered.uv``) and the saturation mask
-    is read there. Everything else is the 2026-08-29 gate unchanged (`041ad1b`):
-    height cannot tell bead from board (the bare ChArUco board reads 1-3 LSB
-    above the work plane, so every floor a real bead clears passes board with
-    it -- cell 2026-08-29 take 4: a 22-point patch of black checker 12 mm
-    outside the ring survived the radial trim, dilated into a 17-22 px arm and
-    exhausted the branch guard). Saturation separates the two ~20:1 (the clay is
-    chromatic, the printed board is not): saturation > threshold, a
-    chroma-fraction abstention for RGB dropouts and depth-only fixtures, and a
-    closing so speckle inside the bead does not punch holes. Points that project
-    OUTSIDE the colour image (the depth field is wider than colour) have no
-    colour evidence and are dropped while the gate applies -- they are far
-    outside any ring ROI anyway. Abstains as ``(all True, False)``, which
-    ``deposit_floor_mm`` turns into the 2.5 mm floor.
-    """
-    def note(key: str, value: float) -> None:
-        if counts is not None:
-            counts[key] = value
-
-    n = len(registered)
-    threshold = int(getattr(config, "deposit_min_saturation", 0) or 0)
-    if threshold <= 0 or color is None:
-        note("chroma_gate_applied", 0)
-        return np.ones(n, bool), False
-    image = np.asarray(color)
-    w, h = registered.color_size
-    if image.ndim != 3 or image.shape[2] != 3 or image.shape[:2] != (h, w):
-        note("chroma_gate_applied", 0)
-        return np.ones(n, bool), False
-    saturation = cv2.cvtColor(image.astype(np.uint8), cv2.COLOR_BGR2HSV)[:, :, 1]
-    keep = (saturation > threshold).astype(np.uint8)
-    note("chroma_gate_kept_pixels", int(keep.sum()))
-    if float(keep.mean()) < float(getattr(config, "deposit_min_chroma_fraction", 0.0)):
-        note("chroma_gate_applied", 0)
-        return np.ones(n, bool), False
-    # Speckle inside the bead would otherwise punch holes through it. The close
-    # kernel was tuned at 720p; scale it with the colour frame's own width so a
-    # 1920x1080 colour image (protocol 2) closes the same physical gap.
-    k = max(3, int(round(5 * w / 1280.0)))
-    keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
-    # The fraction of the colour frame this gate actually admits, AFTER the close
-    # -- the one number that says whether it is still discriminating. The absolute
-    # ``chroma_gate_kept_pixels`` above cannot: 534247 means nothing without the
-    # frame size, and the frame size changed with protocol 2. A ring at the
-    # inspection standoff covers ~1.5% of the frame, and the 2026-08-29 cell frames
-    # this gate was tuned on kept 9%; the 2026-08-30 16:35 frame kept 26% -- the
-    # board's near-black print reading S 72-85 because saturation is (max-min)/max
-    # and a ~7-count warm channel offset is most of ``max`` when ``max`` is 24.
-    # That single ratio is the whole diagnosis, and it was computed and discarded.
-    note("chroma_gate_kept_fraction", round(float(keep.mean()), 4))
-    u = np.rint(registered.uv[:, 0]).astype(int)
-    v = np.rint(registered.uv[:, 1]).astype(int)
-    inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-    mask = np.zeros(n, bool)
-    mask[inside] = keep[v[inside], u[inside]] > 0
-    note("chroma_gate_applied", 1)
-    note("chroma_gate_outside_colour", int((~inside).sum()))
-    return mask, True
 
 
 def _largest_label(points: np.ndarray, labels: np.ndarray) -> np.ndarray:
@@ -327,25 +246,23 @@ def bead_width_profile(cluster_xyz, center_xy, *, bins: int = 36,
             "max_mm": float(valid.max())}
 
 
-def ring_geometry(measured_xyz, cluster_xyz, center_xy, *, substrate=None,
-                  build_plane_z_mm: float = 0.0, bins: int = 36) -> RingGeometry:
+def ring_geometry(measured_xyz, cluster_xyz, center_xy, *, substrate,
+                  bins: int = 36) -> RingGeometry:
     """Height profile along the measured centreline plus the bead's footprint.
 
     ``substrate`` is the surface the deposit rests on (a
-    :class:`~tasni.modules.extrusion.substrate.SubstrateModel`); given one,
-    height is measured against the surface actually fitted in THIS frame rather
-    than the work frame's nominal build plane. The slot is dormant until the
-    front end is rebuilt on it -- every caller passes ``None`` today, which
-    keeps the build-plane reference unchanged.
+    :class:`~tasni.modules.extrusion.substrate.SubstrateModel`), and it is
+    REQUIRED: height is measured against the surface actually fitted in THIS
+    frame. The work frame's nominal build plane used to serve instead, and was
+    measured to be the wrong datum -- the board sits 1.2 mm below work-frame
+    Z = 0 and tilted 0.48-0.62 deg, worth +/-0.75 mm across the ROI band
+    (spec 2026-08-30 §1). ``height_reference`` names the provider, so a report
+    always says what the number was measured against.
     """
     measured = np.asarray(measured_xyz, dtype=float)
     top = measured[:, 2]
-    if substrate is None:
-        height = top - float(build_plane_z_mm)
-        reference_name = "build_plane"
-    else:
-        height = substrate.height(measured)
-        reference_name = substrate.source
+    height = substrate.height(measured)
+    reference_name = substrate.source
     width = bead_width_profile(cluster_xyz, center_xy, bins=bins)
     return RingGeometry(
         top_z_mean_mm=float(top.mean()), top_z_min_mm=float(top.min()),
@@ -372,7 +289,9 @@ def _deposit_clusters(points: np.ndarray, config, counts: dict) -> list[np.ndarr
         nb_points=config.radius_neighbors, radius=config.radius_m * 1000.0)
     counts["after_radius"] = len(cloud.points)
     if len(cloud.points) < config.cluster_min_points:
-        raise RuntimeError("deposited cloud was removed by outlier filtering")
+        raise RuntimeError(
+            "deposited cloud was removed by outlier filtering: "
+            f"{json.dumps(dict(counts))}")
     labels = np.asarray(cloud.cluster_dbscan(
         eps=config.cluster_eps_m * 1000.0, min_points=config.cluster_min_points,
         print_progress=False))
@@ -381,7 +300,18 @@ def _deposit_clusters(points: np.ndarray, config, counts: dict) -> list[np.ndarr
     clusters.sort(key=len, reverse=True)
     counts["dbscan_cluster_count"] = len(clusters)
     if not clusters:
-        raise RuntimeError("no deposited cluster survived DBSCAN filtering")
+        # Same lesson as the branch guard (`da5f7a4`) and the shape gate: this
+        # RAISES, so every count the ROI already measured dies with it unless it
+        # rides along. It is the ROI's band tallies that separate the two
+        # opposite remedies here -- a wrong centre (in_radial_band near zero) from
+        # a wrong height reference (in_height_band near zero) from a genuinely
+        # absent deposit (both healthy, nothing coherent inside them). A handful
+        # of scattered substrate specks can clear the derived floor and get this
+        # far, so "the ROI was not empty" is no longer the same as "the ROI held
+        # a deposit".
+        raise RuntimeError(
+            "no deposited cluster survived DBSCAN filtering: "
+            f"{json.dumps(dict(counts))}")
     return clusters
 
 
@@ -599,14 +529,16 @@ def _select_ring_cluster(clusters: list[np.ndarray], search_center_xy: np.ndarra
     if not eligible:
         # The candidate table says WHICH criterion each blob failed; it never says
         # why there were eighteen blobs. On 2026-08-30 the answer was upstream and
-        # numeric -- the chroma gate admitted 26% of the colour frame instead of
-        # 9%, so the board arrived with the ring and DBSCAN fused the two into one
-        # disc (r 51.6 mm, radial span 79 mm about a real 42 mm ring). This
-        # function RAISES, so, exactly as with the branch guard (`da5f7a4`), every
-        # count the capture already measured was computed and thrown away on the
-        # one occasion it mattered. They ride along now: a leaking colour gate and
-        # a genuinely low-relief ring produce the same shape-gate message and
-        # opposite remedies, so the message has to carry enough to tell them apart.
+        # numeric -- the segmentation admitted far more of the frame than it
+        # should have, so the board arrived with the ring and DBSCAN fused the two
+        # into one disc (r 51.6 mm, radial span 79 mm about a real 42 mm ring).
+        # This function RAISES, so, exactly as with the branch guard (`da5f7a4`),
+        # every count the capture already measured was computed and thrown away on
+        # the one occasion it mattered. They ride along now: a leaking front end
+        # (today: a substrate fit sitting too low, its floor and sigma both in
+        # ``counts``) and a genuinely low-relief ring produce the same shape-gate
+        # message and opposite remedies, so it has to carry enough to tell them
+        # apart.
         raise RuntimeError(
             "deposited geometry was found, but no complete ring-like cluster passed "
             f"the characterization shape gate: {json.dumps({**selector, 'capture': dict(counts)})}")
@@ -663,26 +595,33 @@ def plan_for_archived_take(manifest: dict, trial: dict, *,
     return generate_cylinder_plan(recipe, setup)
 
 
-def process_observation(*, color: np.ndarray, depth: np.ndarray,
+def process_observation(*, depth: np.ndarray,
                         geometry: CameraGeometry, T_work_camera: np.ndarray,
-                        K: np.ndarray, dist: np.ndarray | None,
                         plan: CylinderPlan, layer: LayerPath, config,
                         stages: dict | None = None,
                         assemble_arcs: bool = False) -> ProcessingResult:
-    """Reconstruct one layer from exactly one saved synchronized RGB-D frame.
+    """Reconstruct one layer from exactly one saved synchronized depth frame.
 
     ``geometry`` is the frame's own greeting (native depth intrinsics + the
-    depth->colour extrinsic; Task 7's ``CameraGeometry``); ``T_work_camera`` is
-    the COLOUR camera's hand-eye pose, which is what its colour-frame points
-    need. ``K``/``dist`` are the CALIBRATED colour model, used for exactly one
-    thing: projecting registered depth points into the colour image for the
-    chroma gate (see :func:`chroma_gate_mask`).
+    depth->colour extrinsic; ``CameraGeometry``); ``T_work_camera`` is the
+    COLOUR camera's hand-eye pose, which is what ``backproject``'s colour-frame
+    points need. **No colour image is read.** The frame's RGB is still captured
+    and archived as evidence and as figure material, but it takes no part in any
+    decision: the saturation gate it fed was measured on 2026-08-30 to have
+    INVERTED (bead median S 25, printed board 28), and free-running colour
+    auto-exposure on the Jetson meant a fixed saturation threshold was never a
+    calibrated quantity (spec 2026-08-30 §1).
 
-    Every layer is measured against the SAME reference, and today that reference
-    is the ``build_plane`` -- the work frame's Z=0, both for the ROI's height
-    floor and for :func:`ring_geometry`'s heights. (Its ``substrate=`` slot is
-    in place but DORMANT: this function passes ``None`` until the fitted
-    substrate replaces the build plane.)
+    Segmentation is geometric, and its datum is measured rather than assumed:
+    :class:`~tasni.modules.extrusion.substrate.PlaneSubstrate` fits the surface
+    the deposit rests on in THIS frame, the height floor is derived from that
+    fit's own residual scale, and
+    :func:`~tasni.modules.extrusion.substrate.compactness_filter` takes over the
+    gate's one defensible job -- rejecting contamination on shape. The work
+    frame supplies only the up-axis and the search band; its Z = 0 is not the
+    build surface (measured: the board sits 1.2 mm below it and tilted
+    0.48-0.62 deg, worth +/-0.75 mm across the ROI band).
+
     Referencing layer N to layer N-1's own measured top was tried and deleted:
     on the only stacked data that exists (the three 2026-08-30 layer-2 takes) it
     made completeness WORSE, 0.62 -> 0.50, because ring 1's archived "measured
@@ -696,8 +635,8 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     :func:`measure_take`, the seam that derives it from the take.
 
     ``stages``, when a dict is passed, is filled with a copy of the cloud at
-    each step of the chain (backprojected, work_roi, deposit_cluster,
-    radial_trimmed, top_surface). It exists so the method
+    each step of the chain (backprojected, work_roi, compactness,
+    deposit_cluster, radial_trimmed, top_surface). It exists so the method
     figure can draw what this function actually did instead of a second
     implementation of it that could drift. Collecting costs a few copies and
     changes nothing else.
@@ -710,28 +649,33 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     counts: dict[str, int] = {}
 
     mark = time.perf_counter()
-    reg = ColorRegistered.build(depth, geometry, K, dist)
-    keep_mask, chroma_gated = chroma_gate_mask(color, reg, config, counts)
-    points = transform_points(T_work_camera, reg.pts_mm[keep_mask])
-    counts["raw_depth_pixels"] = int(keep_mask.sum())
+    points, valid_depth = depth_to_work_points(depth, geometry, T_work_camera)
+    counts["raw_depth_pixels"] = int(valid_depth)
     timings["backproject_ms"] = (time.perf_counter() - mark) * 1000
     keep("backprojected", points)
     setup, recipe = plan.setup, plan.recipe
-    radius = np.linalg.norm(points[:, :2] - np.array([setup.center_x_mm, setup.center_y_mm]), axis=1)
-    max_z = layer.nominal_z_mm + recipe.bead_diameter_mm / 2 + config.deposit_height_margin_mm
-    # The selected work frame defines the build plane at Z=0, so deterministic
-    # height subtraction is more reproducible than fitting a new plane per frame.
-    min_z = deposit_floor_mm(config, chroma_gated)
-    in_height = (points[:, 2] >= min_z) & (points[:, 2] <= max_z)
+    center_xy = np.array([setup.center_x_mm, setup.center_y_mm])
+    radius = np.linalg.norm(points[:, :2] - center_xy, axis=1)
+    # The substrate is refitted EVERY frame: a reused fit was measured to carry
+    # pose-dependent depth bias straight into the numbers (radius sigma 0.107 ->
+    # 0.234 mm; spec §3.4). The work frame supplies only the up-axis and the
+    # search band -- the surface itself is measured, never assumed at Z=0.
+    near = radius <= config.substrate_fit_radius_mm
+    substrate = PlaneSubstrate.fit(points[near],
+                                   clamp_mm=tuple(config.substrate_floor_clamp_mm))
+    heights = substrate.height(points)
+    min_h = substrate.floor_mm(config.substrate_sigma_k)
+    max_h = layer.nominal_z_mm + recipe.bead_diameter_mm / 2 + config.deposit_height_margin_mm
+    in_height = (heights >= min_h) & (heights <= max_h)
     r_lo = recipe.radius_mm - config.radial_roi_margin_mm
     r_hi = recipe.radius_mm + config.radial_roi_margin_mm
     in_radial = (radius >= r_lo) & (radius <= r_hi)
     roi = in_height & in_radial
     # Keep the per-band tallies: when the ROI comes back empty the operator needs
-    # to know WHICH band rejected the geometry (a wrong build plane and a wrong
+    # to know WHICH band rejected the geometry (a wrong substrate and a wrong
     # centre look identical from the point count alone).
     roi_diag = {
-        "height_band_mm": [round(float(min_z), 2), round(float(max_z), 2)],
+        "height_band_mm": [round(float(min_h), 2), round(float(max_h), 2)],
         "radial_band_mm": [round(float(r_lo), 2), round(float(r_hi), 2)],
         "center_xy_mm": [round(float(setup.center_x_mm), 2),
                          round(float(setup.center_y_mm), 2)],
@@ -742,32 +686,68 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     }
     if len(points):
         pct = lambda a, q: round(float(np.percentile(a, q)), 1)  # noqa: E731
-        roi_diag["observed_z_mm"] = [pct(points[:, 2], 1), pct(points[:, 2], 50),
-                                     pct(points[:, 2], 99)]
+        # Heights above the FITTED substrate, not raw work-frame Z -- the band
+        # above is applied to these, so a diagnostic quoting Z would not be
+        # comparable with the limits it is meant to explain.
+        roi_diag["observed_height_mm"] = [pct(heights, 1), pct(heights, 50),
+                                          pct(heights, 99)]
         roi_diag["observed_radius_mm"] = [pct(radius, 1), pct(radius, 50),
                                           pct(radius, 99)]
         if in_radial.any():     # what heights show up where the ring should be
-            zr = points[in_radial][:, 2]
-            roi_diag["z_within_radial_band_mm"] = [pct(zr, 1), pct(zr, 50), pct(zr, 99)]
+            hr = heights[in_radial]
+            roi_diag["height_within_radial_band_mm"] = [pct(hr, 1), pct(hr, 50), pct(hr, 99)]
     counts.update({k: v for k, v in roi_diag.items() if isinstance(v, int)})
     points = points[roi]
     keep("work_roi", points)
-    floor = {"source": "build_plane", "margin_mm": 0.0, "mean_mm": float(min_z)}
+    # Spec §4's per-frame health block: what surface was fitted, how noisy it
+    # was, and what floor that bought. ``substrate_p99_mm`` is the top of the
+    # substrate's own height distribution -- the number the deposit has to
+    # clear -- so it is measured on the fit region, below the floor.
+    sub_heights = heights[near]
+    below = sub_heights[sub_heights < min_h]
+    substrate_report = {**substrate.to_report(),
+                        "floor_mm": round(float(min_h), 3),
+                        "plane_offset_at_center_mm": round(
+                            float(substrate.plane_z(center_xy)), 3),
+                        "substrate_p99_mm": (round(float(np.percentile(below, 99)), 3)
+                                             if len(below) else None)}
     counts["after_work_roi"] = len(points)
     if len(points) < config.cluster_min_points:
         raise RuntimeError(
             "not enough deposited-geometry points inside the configured work ROI "
             f"(need {config.cluster_min_points}); {json.dumps(roi_diag)}")
+    # Shape, not colour, is what tells a bead from contamination that cleared
+    # the floor: a deposit is a long connected curve, a checker patch is a blob.
+    kept = compactness_filter(points, mm_per_pixel=config.raster_mm_per_pixel,
+                              bead_mm=recipe.bead_diameter_mm,
+                              min_length_beads=config.deposit_min_length_beads,
+                              min_points=config.cluster_min_points, counts=counts)
+    keep("compactness", kept)
+    points = kept
+    # The filter FAILS OPEN on starvation, not on partial rings: a real ring
+    # broken into arcs can lose most of its fragments with bypassed = 0, and
+    # kept-vs-total components is the only place that shows.
+    substrate_report["compactness"] = {
+        key: counts.get(key) for key in
+        ("compactness_components", "compactness_kept_components",
+         "compactness_bypassed")}
 
     mark = time.perf_counter()
     deposit = _filter_deposit(points, config, counts, assemble_arcs=assemble_arcs,
-                              search_center_xy=np.array([setup.center_x_mm,
-                                                         setup.center_y_mm]))
+                              search_center_xy=center_xy)
     keep("deposit_cluster", deposit)
     # Before the crest is picked and before the bead width is read from the
     # flanks: both must see the bead alone, not the board fused to it.
     deposit = _radial_trim(deposit, getattr(config, "radial_trim_schedule_mm", ()), counts)
     keep("radial_trimmed", deposit)
+    # Spec §4's one derived number: bead p50 minus substrate p99, the
+    # surface- and material-agnostic answer to "is segmentation healthy here".
+    # A take whose margin collapses says so, instead of quietly returning a low
+    # completeness that reads like a placement fault.
+    deposit_h = substrate.height(deposit)
+    substrate_report["separation_margin_mm"] = (
+        round(float(np.median(deposit_h)) - substrate_report["substrate_p99_mm"], 3)
+        if substrate_report["substrate_p99_mm"] is not None else None)
     points = _top_surface(deposit, config, counts)
     keep("top_surface", points)
     timings["filter_ms"] = (time.perf_counter() - mark) * 1000
@@ -798,6 +778,18 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     if measured_bead_mm is not None and measured_bead_mm > 0:
         spur_bead_mm = min(spur_bead_mm, measured_bead_mm)
     counts["spur_guard_bead_mm"] = round(float(spur_bead_mm), 3)
+    # NOT the raster's dilation, deliberately -- the clamp above bounds the SPUR
+    # tolerance only. Feeding the clamped bead to `_rasterize` as well was tried
+    # (2026-08-31) and reverted on measurement: it is a real improvement on one
+    # synthetic scene (a 3x overstated recipe bead welds a tangential shelf into
+    # the ring and returns r 39.04 for a 40.0 mm ring, VALID and 0.96 mm small,
+    # with the guard silent -- the clamped raster takes that to 39.87) and a
+    # regression on real data, where the tighter dilation stopped absorbing the
+    # ChArUco board lobe on the 2026-08-28 ring2 frame and exhausted the branch
+    # guard on a take that measures correctly today. An overstated recipe bead
+    # inflating the raster IS a live hole -- it is how contamination becomes a
+    # confident wrong number -- but closing it needs its own evidence on real
+    # frames, not a change smuggled into a segmentation swap.
 
     # The surface cloud already spans the bead width and raster dilation adds
     # roughly another half-width.  Prune only twigs no longer than that combined
@@ -871,9 +863,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     metrics = compare_circle(measured, recipe.radius_mm,
                              nominal_center_mm=nominal_center)
     geometry = ring_geometry(measured, deposit, metrics.measured_center_mm,
-                             substrate=None,
-                             build_plane_z_mm=setup.build_plane_z_mm,
-                             bins=config.bead_width_bins)
+                             substrate=substrate, bins=config.bead_width_bins)
     corrected = None
     if recipe.correction_enabled and metrics.valid and closed:
         corrected = corrected_circle(
@@ -893,7 +883,7 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     timings["total_ms"] = (time.perf_counter() - started) * 1000
     report = {
         "counts": counts, "timings_ms": timings, "branch_guard_attempts": attempts,
-        "floor": floor, "geometry": geometry.model_dump(mode="json"),
+        "substrate": substrate_report, "geometry": geometry.model_dump(mode="json"),
         "coordinate_frame": plan.setup.work_frame, "units": "mm",
         "closed": bool(closed),
         "measured_path_completeness": float(metrics.path_completeness),
@@ -904,9 +894,9 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
                             filtered_xyz=points.copy(), geometry=geometry)
 
 
-def measure_take(*, color, depth, geometry, T_work_camera, K, dist,
+def measure_take(*, depth, geometry, T_work_camera,
                  plan, layer, config, stages=None) -> ProcessingResult:
-    """THE entry point for scoring one RGB-D take -- live, reprocess and figures.
+    """THE entry point for scoring one take -- live, reprocess and figures.
 
     ``assemble_arcs`` is derived here, from the take itself: layer 1 is an
     isolated ring (no lower layer for assembly to fuse into), every higher layer
@@ -915,8 +905,8 @@ def measure_take(*, color, depth, geometry, T_work_camera, K, dist,
     reprocess button and in its method figure (2026-08-30 handoff §6).
     """
     return process_observation(
-        color=color, depth=depth, geometry=geometry, T_work_camera=T_work_camera,
-        K=K, dist=dist, plan=plan, layer=layer, config=config, stages=stages,
+        depth=depth, geometry=geometry, T_work_camera=T_work_camera,
+        plan=plan, layer=layer, config=config, stages=stages,
         assemble_arcs=int(layer.layer_index) == 1)
 
 
@@ -944,52 +934,58 @@ class CharacterizationResult:
             "bead_width_max_mm", "top_z_mean_mm", "top_z_min_mm", "top_z_max_mm")}
 
 
-def characterize_ring(*, color: np.ndarray, depth: np.ndarray, geometry: CameraGeometry,
-                      T_work_camera: np.ndarray, K: np.ndarray, dist: np.ndarray | None,
+def characterize_ring(*, depth: np.ndarray, geometry: CameraGeometry,
+                      T_work_camera: np.ndarray,
                       search_center_mm, work_frame: str, config,
                       inspection_tool: str = "Realsense",
                       print_tool: str = "LongCalibTool") -> CharacterizationResult:
     """Measure a ring with NO recipe assumption: coarse fit, then the normal pipeline.
 
-    Pass 1 takes everything above the build plane inside a search cylinder around
-    ``search_center_mm``, filters it like a deposit, and fits a circle to get a
-    coarse centre/radius/bead. Pass 2 hands those to ``measure_take`` as a
+    Pass 1 takes everything above the FITTED SUBSTRATE inside a search cylinder
+    around ``search_center_mm``, filters it like a deposit, and fits a circle to
+    get a coarse centre/radius/bead. Pass 2 hands those to ``measure_take`` as a
     throwaway recipe so the refined centreline, radius and height profile come out
     of the same code the layer measurements use -- one pipeline, one set of
     numbers, no second implementation to keep honest.
 
-    ``geometry`` is the frame's own greeting; ``K``/``dist`` are the CALIBRATED
-    colour model used only to register depth points into the colour image for
-    the chroma gate -- see :func:`process_observation`.
+    ``geometry`` is the frame's own greeting. No colour is read here either:
+    characterization defines the recipe the layers are then judged against, so
+    the two must see the same cloud, segmented the same way -- see
+    :func:`process_observation`.
     """
     started = time.perf_counter()
     counts: dict[str, float] = {}
-    # The same gate as the layer measurements: characterization defines the
-    # recipe they are then judged against, so the two must see the same cloud.
-    reg = ColorRegistered.build(depth, geometry, K, dist)
-    keep_mask, chroma_gated = chroma_gate_mask(color, reg, config, counts)
-    points = transform_points(T_work_camera, reg.pts_mm[keep_mask])
-    counts["raw_depth_pixels"] = int(keep_mask.sum())
+    # The same segmentation as the layer measurements: characterization defines
+    # the recipe they are then judged against, so the two must see the same
+    # cloud -- the substrate is fitted here exactly as it is there.
+    points, valid_depth = depth_to_work_points(depth, geometry, T_work_camera)
+    counts["raw_depth_pixels"] = int(valid_depth)
     center = np.asarray(search_center_mm, dtype=float)
-    min_z = deposit_floor_mm(config, chroma_gated)
     radial = np.linalg.norm(points[:, :2] - center, axis=1)
-    roi = ((points[:, 2] >= min_z) & (points[:, 2] <= config.characterize_max_height_mm)
+    substrate = PlaneSubstrate.fit(points[radial <= config.substrate_fit_radius_mm],
+                                   clamp_mm=tuple(config.substrate_floor_clamp_mm))
+    heights = substrate.height(points)
+    min_h = substrate.floor_mm(config.substrate_sigma_k)
+    roi = ((heights >= min_h) & (heights <= config.characterize_max_height_mm)
            & (radial <= config.characterize_search_radius_mm))
-    # What the search cylinder looks like BEFORE the height floor cuts it, mirroring
-    # ``process_observation``'s ``observed_z_mm``. ``deposit_floor_mm`` is a fixed
-    # 1.5 mm above the work plane while the plane's own measured noise at the 300 mm
-    # inspection standoff is ~1.1 mm (2026-08-30: 18.6% of board points cleared
-    # 1.5 mm, 3.8% cleared 2.5 mm). Whether that tail is a nuisance or the whole
-    # story is a property of the frame, not of the code, so the frame has to say it.
-    in_cylinder = points[radial <= config.characterize_search_radius_mm]
-    if len(in_cylinder):
-        counts["search_cylinder_points"] = int(len(in_cylinder))
+    # What the search cylinder looks like BEFORE the height floor cuts it,
+    # mirroring ``process_observation``'s ``observed_height_mm``. The floor is
+    # derived from this frame's own substrate noise, so the fraction it admits
+    # is the one number that says whether the surface under this ring is quiet
+    # enough to segment on (2026-08-30: 18.6% of board points cleared the old
+    # fixed 1.5 mm, 3.8% cleared 2.5 mm). Whether that tail is a nuisance or the
+    # whole story is a property of the frame, so the frame has to say it.
+    in_cylinder = radial <= config.characterize_search_radius_mm
+    if in_cylinder.any():
+        cylinder_h = heights[in_cylinder]
+        counts["search_cylinder_points"] = int(in_cylinder.sum())
         counts["search_cylinder_above_floor_fraction"] = round(
-            float(np.mean(in_cylinder[:, 2] >= min_z)), 4)
-        counts["search_cylinder_z_mm_p50"] = round(float(np.median(in_cylinder[:, 2])), 2)
-        counts["search_cylinder_z_mm_p99"] = round(
-            float(np.percentile(in_cylinder[:, 2], 99)), 2)
-    counts["deposit_floor_mm"] = round(float(min_z), 3)
+            float(np.mean(cylinder_h >= min_h)), 4)
+        counts["search_cylinder_height_mm_p50"] = round(float(np.median(cylinder_h)), 2)
+        counts["search_cylinder_height_mm_p99"] = round(
+            float(np.percentile(cylinder_h, 99)), 2)
+    counts["substrate_floor_mm"] = round(float(min_h), 3)
+    counts["substrate_sigma_mm"] = round(float(substrate.sigma_mm), 4)
     points = points[roi]
     counts["after_search_roi"] = len(points)
     if len(points) < config.cluster_min_points:
@@ -999,7 +995,11 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, geometry: CameraG
     coarse_center, coarse_radius = fit_circle_xy(deposit)
     width = bead_width_profile(deposit, coarse_center, bins=config.bead_width_bins)
     top = _top_surface(deposit, config, counts)
-    coarse_height = float(np.percentile(top[:, 2], 90))
+    # Height above the SUBSTRATE, not work-frame Z: this number becomes the
+    # throwaway recipe's ``layer_height_mm``, and pass 2 compares it against
+    # heights measured from the same fitted plane. Quoting Z here would put the
+    # ROI ceiling off by the plane's own offset (1.2 mm on the cell).
+    coarse_height = float(np.percentile(substrate.height(top), 90))
     coarse = {"center_mm": [float(coarse_center[0]), float(coarse_center[1])],
               "radius_mm": float(coarse_radius), "bead_width_mm": width["mean_mm"],
               "height_mm": coarse_height, "time_ms": (time.perf_counter() - started) * 1000}
@@ -1015,8 +1015,8 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, geometry: CameraG
         inspection_auto=True, center_x_mm=float(coarse_center[0]),
         center_y_mm=float(coarse_center[1]))
     plan = generate_cylinder_plan(recipe, setup)
-    refined = measure_take(color=color, depth=depth, geometry=geometry,
-                           T_work_camera=T_work_camera, K=K, dist=dist,
+    refined = measure_take(depth=depth, geometry=geometry,
+                           T_work_camera=T_work_camera,
                            plan=plan, layer=plan.layers[0], config=config)
     geometry = refined.geometry
     report = {**refined.report, "coarse": coarse, "counts_coarse": counts,

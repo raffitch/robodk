@@ -728,6 +728,32 @@ RETIRED_EXTRUSION_CONFIG_KEYS: frozenset = frozenset({
     # 0.62 -> 0.50 -- because ring 1's archived "measured top" spans z
     # 1.50-10.86 mm, so the margin cut into ring 2 (spec 2026-08-30 §2.4).
     "layer_floor_margin_mm",
+    # The colour gate's saturation threshold. Retired with the gate itself
+    # (2026-08-30): measured on the cell, the bead's median S is 25 and the
+    # printed board's black squares 28 -- the board is MORE chromatic than the
+    # deposit, so the separation the threshold was built on has inverted. Not a
+    # drift to re-tune: colour auto-exposure runs free on the Jetson and the
+    # per-frame exposure is never recorded, so a fixed saturation cut was never a
+    # calibrated quantity. Segmentation is geometric now (spec §1, §3.6).
+    "deposit_min_saturation",
+    # The colour gate's abstention threshold -- the chromatic fraction below
+    # which the frame was treated as carrying no usable chroma. Nothing abstains
+    # any more because nothing reads colour (spec §3.6).
+    "deposit_min_chroma_fraction",
+    # The conservative floor the colour gate fell back to when it abstained. The
+    # floor is DERIVED per frame now -- clamp(k * sigma) from the substrate fit's
+    # own residual scale -- so there is no constant to fall back to
+    # (substrate_sigma_k / substrate_floor_clamp_mm replace it; spec §3.4).
+    "deposit_min_height_no_chroma_mm",
+    # The two halves of the old constant deposit floor
+    # (`max(deposit_min_height_mm, plane_distance_threshold_m * 1000)`). Both
+    # assumed the substrate sits at work-frame Z=0; measured 2026-08-30 it sits
+    # 1.2 mm below and tilted 0.48-0.62 deg, worth +/-0.75 mm across the ROI band
+    # -- about 2 mm of systematic error against a 1.5 mm threshold. The surface
+    # is fitted per frame now and the floor comes from its own noise (spec §1,
+    # §3.4).
+    "deposit_min_height_mm",
+    "plane_distance_threshold_m",
 })
 
 
@@ -826,16 +852,6 @@ class ExtrusionConfig(_Model):
     hardware_io_test_approved: bool = False
 
     # Legacy single-frame processing defaults (metres where suffixed ``_m``).
-    # Doubles as the deposit floor (``max`` with deposit_min_height_mm). It was
-    # 2.5 mm only to outrun bare-board depth noise; ``deposit_min_saturation``
-    # now removes the board by COLOUR, so the floor can drop to where it stops
-    # amputating the bead. Cell 2026-08-29, ring 1: at 2.5 mm a 45 deg sector
-    # whose crest reads 2.9-4.9 mm fell out of the deposit cluster entirely
-    # (completeness 0.87, angular gap 46 deg, every take invalid); at 1.5 mm all
-    # four takes close at 0.992 with a 2.7-2.9 deg gap. Lowering this WITHOUT the
-    # colour gate is catastrophic -- the mask doubles to ~8000 px and all four
-    # takes exhaust the branch guard.
-    plane_distance_threshold_m: float = Field(default=0.0015, gt=0)
     voxel_size_m: float = Field(default=0.001, gt=0)
     statistical_neighbors: int = Field(default=20, ge=3)
     statistical_std_ratio: float = Field(default=2.0, gt=0)
@@ -846,24 +862,24 @@ class ExtrusionConfig(_Model):
     upwards_normal_z: float = Field(default=0.92, ge=-1, le=1)
     normal_cluster_eps_m: float = Field(default=0.02, gt=0)
     branch_guard_max_attempts: int = Field(default=3, ge=1, le=20)
-    deposit_min_height_mm: float = Field(default=0.5, ge=0, le=100)
-    # Bead-vs-board discriminator. Height cannot do it: depth is quantised at
-    # 1 mm and the bare ChArUco board reads 1-3 LSB above the work plane, so no
-    # floor a real bead clears excludes the board too. Saturation separates them
-    # ~20:1 -- the clay is chromatic, the printed board is not. Measured over the
-    # four cell frames of 2026-08-29: bead S median 106-114 (0.74-0.80 above 60),
-    # off-ring contamination S median 15-16 (0.04 above 60), bare board S median
-    # 5-25 with 0.00 above 60. 0 disables the gate.
-    deposit_min_saturation: int = Field(default=60, ge=0, le=255)
-    # Below this chromatic fraction the colour frame is treated as carrying no
-    # usable chroma (RGB dropout, or a depth-only synthetic fixture) and the gate
-    # abstains rather than erasing the deposit. Real cell frames sit at 0.086-0.091.
-    deposit_min_chroma_fraction: float = Field(default=0.005, ge=0, le=1)
-    # The floor to fall back to when the gate abstains. The low floor above is
-    # EARNED by the colour gate; without it 1.5 mm floods the chain with board
-    # and every take exhausts the branch guard, so an abstention must restore
-    # the pre-2026-08-29 conservative value rather than crash.
-    deposit_min_height_no_chroma_mm: float = Field(default=2.5, ge=0, le=100)
+    # -- fitted-substrate segmentation (2026-08-30 design; modules/extrusion/substrate.py)
+    # The deposit floor is DERIVED per frame: clamp(k * sigma, lo, hi) where sigma
+    # is the substrate fit's own one-sided residual scale. k=3 reproduced the old
+    # 1.5 mm constant on the 2026-08-30 archive (floors 1.55-1.74 mm); k=4 was
+    # measured to fall off a cliff (completeness 0.358), hence the bound.
+    substrate_sigma_k: float = Field(default=3.0, ge=1.0, le=3.5)
+    # Clamp on the derived floor: ceiling under the measured k=4 cliff at 2.25 mm,
+    # lower bound above raw sensor noise. A pathological fit can neither open the
+    # floor to everything nor close it to nothing.
+    substrate_floor_clamp_mm: list[float] = Field(
+        default_factory=lambda: [1.0, 2.0], min_length=2, max_length=2)
+    # Neighbourhood the plane is fitted in, about the plan centre. Spec §8: a wide
+    # print that fills this disc starves the fit -- widen it rather than edit code.
+    substrate_fit_radius_mm: float = Field(default=150.0, gt=0, le=1000)
+    # Compactness filter: a surviving component must be at least this many bead
+    # widths long along its principal axis. The 22-point checker patch of
+    # 2026-08-29 dies here, in geometry, where the colour gate used to catch it.
+    deposit_min_length_beads: float = Field(default=3.0, ge=0, le=50)
     deposit_height_margin_mm: float = Field(default=15.0, gt=0, le=100)
     radial_roi_margin_mm: float = Field(default=30.0, gt=0, le=200)
     raster_mm_per_pixel: float = Field(default=1.0, gt=0, le=10)
@@ -1010,6 +1026,26 @@ LEGACY_CONFIG_KEYS: dict[tuple[str, str], str] = {
     ("extrusion", "layer_floor_margin_mm"):
         "removed with previous-layer referencing (2026-08-30): a layer is measured "
         "against the substrate, so there is no previous-layer floor to add a margin to",
+    ("extrusion", "deposit_min_saturation"):
+        "removed with the colour gate (2026-08-30): the bead now measures LESS "
+        "chromatic than the printed board (S 25 vs 28), and free-running colour "
+        "auto-exposure never made a fixed saturation cut a calibrated quantity; "
+        "segmentation is geometric",
+    ("extrusion", "deposit_min_chroma_fraction"):
+        "removed with the colour gate (2026-08-30): nothing reads the colour frame "
+        "any more, so there is no chroma abstention to threshold",
+    ("extrusion", "deposit_min_height_no_chroma_mm"):
+        "removed with the colour gate (2026-08-30): the deposit floor is derived "
+        "per frame from the fitted substrate's own noise, so there is no constant "
+        "to fall back to -- see substrate_sigma_k and substrate_floor_clamp_mm",
+    ("extrusion", "deposit_min_height_mm"):
+        "removed with the constant deposit floor (2026-08-30): it measured height "
+        "from work-frame Z=0, which the board misses by 1.2 mm and 0.5 deg of tilt; "
+        "the substrate is fitted per frame -- see substrate_sigma_k",
+    ("extrusion", "plane_distance_threshold_m"):
+        "removed with the constant deposit floor (2026-08-30): it was the other "
+        "half of max(deposit_min_height_mm, plane_distance_threshold_m * 1000) and "
+        "had no other consumer -- see substrate_sigma_k",
 }
 
 

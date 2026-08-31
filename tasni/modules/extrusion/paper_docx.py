@@ -192,9 +192,24 @@ def _system_rows(provenance: dict, robot_name: str | None = None) -> list[list[s
             f"board consistency {float(quality.get('board_consistency_rms_mm', 0)):.2f} mm "
             f"(run {calibration.get('run_id', 'n/a')})")
     if config:
-        add("Segmentation",
-            f"deposit floor {config.get('deposit_min_height_mm')} mm, radial band "
-            f"±{config.get('radial_roi_margin_mm')} mm about the nominal ring")
+        if config.get("substrate_sigma_k") is not None:
+            clamp = config.get("substrate_floor_clamp_mm") or [None, None]
+            add("Segmentation",
+                f"deposit floor derived per frame as {config['substrate_sigma_k']}× the "
+                "fitted substrate's own residual scale"
+                + (f", clamped to {clamp[0]}–{clamp[1]} mm" if len(clamp) == 2 else "")
+                + f"; plane fitted within {config.get('substrate_fit_radius_mm')} mm of the "
+                f"ring centre; components shorter than {config.get('deposit_min_length_beads')} "
+                "bead widths rejected; radial band "
+                f"±{config.get('radial_roi_margin_mm')} mm about the nominal ring")
+        else:
+            # A take measured before 2026-08-30 used a CONSTANT floor above
+            # work-frame Z=0 plus a colour gate. A draft built from that archive
+            # has to state what THAT take used, not today's recipe.
+            add("Segmentation",
+                f"deposit floor {config.get('deposit_min_height_mm')} mm above the work "
+                "plane (fixed; pre-2026-08-30 chain), radial band "
+                f"±{config.get('radial_roi_margin_mm')} mm about the nominal ring")
         add("Centreline extraction",
             f"raster {config.get('raster_mm_per_pixel')} mm/px, thinned and pruned, "
             f"{config.get('measured_spline_points')} spline samples; bead footprint over "

@@ -51,7 +51,7 @@ DPI = 300
 # The clouds ``process_observation`` hands back through its ``stages`` collector,
 # in the order it holds them. Used to tell "the chain produced nothing" from
 # "the chain stopped part-way" -- see ``_incomplete``.
-STAGE_KEYS = ("backprojected", "work_roi", "above_floor", "deposit_cluster",
+STAGE_KEYS = ("backprojected", "work_roi", "compactness", "deposit_cluster",
               "radial_trimmed", "top_surface")
 
 # A 3-D box flatter than this reads as a pancake rather than a surface. The
@@ -128,32 +128,6 @@ class TakeData:
     K: np.ndarray | None
     T_work_camera: np.ndarray | None
     geometry: CameraGeometry | None = None
-    dist_coeffs: np.ndarray | None = None
-
-    @property
-    def chroma_dist(self) -> "np.ndarray | None":
-        """The colour lens model the MEASUREMENT sampled the chroma gate through.
-
-        The chain projects registered depth points into the colour image and
-        reads the bead/board gate at those pixels, so this choice decides which
-        pixels are read -- a method figure that re-runs with a different model
-        can show a DIFFERENT segmentation from the number it is captioned with
-        (on the cell's protocol-2 characterization take 2.7% of registered
-        points flip class, moving the fitted centre 0.27 mm and the RMS 0.12 mm).
-
-        The rule is the measurement's, not the figure's, and both the live
-        capture and offline reprocessing already follow it (see
-        ``service.reprocess_layer``): a protocol-2 take registers native,
-        unaligned depth into colour through the CALIBRATED model, so the gate is
-        read at distorted pixels; a legacy (pre-protocol-2) take arrived already
-        aligned, its registration is the identity (depth K == colour K, zero
-        extrinsic), and pushing distortion through it would sample the gate
-        off-pixel. ``None`` for a legacy take is therefore the model it used,
-        not an omission.
-        """
-        if self.geometry is None or self.geometry.legacy:
-            return None
-        return self.dist_coeffs
 
     @property
     def _nominal_circle(self) -> tuple[tuple[float, float], float] | None:
@@ -252,13 +226,15 @@ def expected_ring(take: TakeData) -> np.ndarray | None:
     return moved
 
 
-def _camera_model(manifest: dict, layer_dir: Path
-                  ) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """The archived colour model (K, dist_coeffs) for this take.
+def _camera_model(manifest: dict, layer_dir: Path) -> "np.ndarray | None":
+    """The archived colour camera matrix for this take.
 
     The take's own ``camera_intrinsics`` block first, the trial's as the
-    fallback -- the same order (and the same block, never K from one and the
-    distortion from the other) that ``service.reprocess_layer`` reads them in.
+    fallback -- the same order ``service.reprocess_layer`` reads them in. Only
+    ``K`` is returned: it is what ``geometry_for_take`` needs to rebuild a
+    legacy aligned geometry. The archived ``dist_coeffs`` served the colour gate
+    alone and has no consumer now that segmentation reads depth only (it is
+    still recorded in provenance, and the paper draft still reports it).
     """
     blocks = [(manifest.get("provenance") or {}).get("camera_intrinsics") or {}]
     trial_file = layer_dir.parent / "trial.json"
@@ -267,9 +243,7 @@ def _camera_model(manifest: dict, layer_dir: Path
         blocks.append((trial.get("provenance") or {}).get("camera_intrinsics") or {})
     block = next((b for b in blocks if b.get("K") is not None), {})
     K = block.get("K")
-    dist = block.get("dist_coeffs")
-    return (None if K is None else np.asarray(K, dtype=float),
-            None if dist is None else np.asarray(dist, dtype=float))
+    return None if K is None else np.asarray(K, dtype=float)
 
 
 def geometry_for_take(manifest: dict, K: np.ndarray | None,
@@ -342,14 +316,14 @@ def load_take(layer_dir: Path) -> TakeData:
         cloud = None                                   # a height map, not a cloud
     transform = (manifest.get("provenance") or {}).get("T_work_camera")
     depth = np.load(depth_file) if depth_file.is_file() else None
-    K, dist = _camera_model(manifest, layer_dir)
+    K = _camera_model(manifest, layer_dir)
     return TakeData(
         layer_dir=layer_dir, manifest=manifest,
         nominal=_points(layer_dir / "nominal_path.json"),
         measured=_points(layer_dir / "measured_path.json"),
         cloud=cloud, depth=depth, K=K,
         T_work_camera=None if transform is None else np.asarray(transform, dtype=float),
-        geometry=geometry_for_take(manifest, K, depth), dist_coeffs=dist)
+        geometry=geometry_for_take(manifest, K, depth))
 
 
 # -- shared drawing helpers --------------------------------------------------
@@ -469,11 +443,6 @@ def _true_box(ax, *, dx: float, dy: float, z_lo: float, z_hi: float,
         pass
 
 
-def _note(stages: dict, message: str) -> None:
-    """Something a reader of the method figure has to be told, on the figure."""
-    stages.setdefault("notes", []).append(message)
-
-
 def _incomplete(stages: dict, take: "TakeData", exc: BaseException) -> "dict | None":
     """A re-run that failed must never render as a finished method figure.
 
@@ -488,24 +457,6 @@ def _incomplete(stages: dict, take: "TakeData", exc: BaseException) -> "dict | N
         return None
     stages["error"] = f"{type(exc).__name__}: {exc}"
     return stages
-
-
-def _chroma_dist(take: "TakeData", stages: dict) -> "np.ndarray | None":
-    """The lens model to re-run this take's chroma gate through -- see
-    ``TakeData.chroma_dist``. A protocol-2 take whose archive never recorded the
-    coefficients cannot be reproduced exactly; it falls back to the undistorted
-    model (what ``service.reprocess_layer`` also does with a missing
-    ``dist_coeffs``, so the figure and the reprocess button still agree), and
-    says so on the figure rather than passing the guess off as the measurement.
-    """
-    dist = take.chroma_dist
-    if dist is None and take.geometry is not None and not take.geometry.legacy:
-        message = ("colour distortion not recorded for this take: the chroma gate "
-                   "was re-sampled through an undistorted lens model, so this "
-                   "segmentation may differ from the archived measurement")
-        _note(stages, message)
-        log.warning("method figure: %s: %s", take.layer_dir, message)
-    return dist
 
 
 # -- the four layer figures --------------------------------------------------
@@ -802,12 +753,13 @@ def take_stages(take: TakeData) -> "dict | None":
     return stages
 
 
-def reconstruct_take_inputs(take: TakeData, stages: "dict | None" = None) -> "dict | None":
+def reconstruct_take_inputs(take: TakeData) -> "dict | None":
     """The inputs ``measure_take`` needs to reprocess ``take`` exactly as the
     archived pass did: the plan and layer ``plan_for_archived_take`` rebuilds
-    from the manifest/trial, the config resolved from manifest-then-trial
-    provenance, and the lens model ``_chroma_dist`` chooses for the chroma
-    gate.
+    from the manifest/trial, and the config resolved from manifest-then-trial
+    provenance. (There is no lens-model choice to make any more: segmentation
+    reads depth only, so a take reprocesses the same way whatever its archive
+    recorded about the colour camera.)
 
     Returns ``None`` where the archive lacks what reprocessing needs: no
     ``trial.json`` next to the layer, no ``processing_config`` in either
@@ -826,10 +778,6 @@ def reconstruct_take_inputs(take: TakeData, stages: "dict | None" = None) -> "di
     one unrenderable take cannot kill a batch figure render; a caller that
     wants the raise to propagate (e.g. a golden test, which should fail loudly
     on a broken archive rather than silently skip it) gets that by default.
-
-    ``stages`` is optional and, when given, is MUTATED to collect any note
-    ``_chroma_dist`` has for the method figure caption. Callers with no
-    figure to annotate (the golden tests) can omit it.
     """
     from .processing import plan_for_archived_take
 
@@ -850,7 +798,6 @@ def reconstruct_take_inputs(take: TakeData, stages: "dict | None" = None) -> "di
         "plan": plan,
         "layer": plan.layers[index - 1],
         "config": ExtrusionConfig.from_archive(config_payload),
-        "dist": _chroma_dist(take, stages if stages is not None else {}),
     }
 
 
@@ -859,22 +806,13 @@ def _compute_stages(take: TakeData) -> "dict | None":
 
     stages: dict = {}
     try:
-        inputs = reconstruct_take_inputs(take, stages)
+        inputs = reconstruct_take_inputs(take)
         if inputs is None:
             return None
-        colour = take.layer_dir / (take.manifest.get("color_file") or "color.png")
-        image = None
-        if colour.is_file():
-            import cv2
-            image = cv2.imread(str(colour), cv2.IMREAD_COLOR)
-        if image is None:
-            image = np.zeros((*np.asarray(take.depth).shape[:2], 3), np.uint8)
         result = measure_take(
-            color=image, depth=take.depth, geometry=take.geometry,
-            T_work_camera=take.T_work_camera, K=take.K,
-            # The lens model the MEASUREMENT gated with, not a second choice --
-            # see TakeData.chroma_dist.
-            dist=inputs["dist"], plan=inputs["plan"], layer=inputs["layer"],
+            depth=take.depth, geometry=take.geometry,
+            T_work_camera=take.T_work_camera,
+            plan=inputs["plan"], layer=inputs["layer"],
             config=inputs["config"], stages=stages)
     except Exception as exc:
         # A take that cannot be reconstructed -- a `reconstruct_take_inputs`
@@ -941,24 +879,11 @@ def _compute_characterization_stages(take: TakeData) -> "dict | None":
                     take.layer_dir, exc, exc_info=True)
         return None
     stages: dict = {}
-    colour = take.layer_dir / (take.manifest.get("color_file") or "color.png")
-    image = None
-    if colour.is_file():
-        import cv2
-        image = cv2.imread(str(colour), cv2.IMREAD_COLOR)
-    if image is None:
-        image = np.zeros((*np.asarray(take.depth).shape[:2], 3), np.uint8)
     from .processing import measure_take
     try:
         result = measure_take(
-            color=image, depth=take.depth, geometry=take.geometry,
-            T_work_camera=take.T_work_camera, K=take.K,
-            # ``characterize_ring`` gated this take through the CALIBRATED
-            # colour model; re-running the figure with a different one samples
-            # the gate at different pixels and can segment the ring differently
-            # from the number the figure is captioned with -- see
-            # TakeData.chroma_dist.
-            dist=_chroma_dist(take, stages), plan=plan,
+            depth=take.depth, geometry=take.geometry,
+            T_work_camera=take.T_work_camera, plan=plan,
             layer=plan.layers[0], config=config, stages=stages)
     except Exception as exc:
         return _incomplete(stages, take, exc)
@@ -1018,7 +943,10 @@ def _figure_pipeline(plt, take: TakeData):
         return None
     result = stages.get("result")
     radius = take._nominal_circle[1] if take._nominal_circle is not None else take.radius
-    roi = stages.get("above_floor")
+    # The compactness stage is the ROI as the chain finally held it (the work
+    # ROI minus components too short to be a bead); it is what panel 3 should
+    # show. Fall back to the work ROI on a run that stopped before it.
+    roi = stages.get("compactness")
     if roi is None or not len(roi):
         roi = stages.get("work_roi")
     window = _work_window(roi if roi is not None and len(roi) else raw, radius)
@@ -1066,11 +994,12 @@ def _figure_pipeline(plt, take: TakeData):
     ax.set_xlabel("X (mm)", fontsize=7)
     ax.set_ylabel("Y (mm)", fontsize=7)
 
-    # 3 -- the work ROI: height band, radial band, previous layer's top.
+    # 3 -- the work ROI (height above the FITTED substrate, radial band), then
+    # the compactness filter: components too short to be a bead are dropped.
     ax = fig.add_subplot(grid[0, 2])
     _panel_cloud(ax, near, colour="#dbe1e8", size=.5)
     _panel_cloud(ax, roi, colour=CLOUD, size=1.2)
-    ax.set_title("3 · kept by the work ROI", fontsize=10)
+    ax.set_title("3 · kept by the work ROI + compactness", fontsize=10)
     _square(ax, None, window)
 
     # 4 -- the deposit itself: largest cluster, then trimmed to the fitted ring.
@@ -1126,9 +1055,6 @@ def _figure_pipeline(plt, take: TakeData):
         fig.text(.5, .965, banner, ha="center", va="top", fontsize=8,
                  color=MEASURED, weight="bold", linespacing=1.25)
     caption = take.caption
-    notes = stages.get("notes") or []
-    if notes:
-        caption = " · ".join([caption, *notes]) if caption else " · ".join(notes)
     fig.text(.5, .012, wrap_caption(caption, width=150), ha="center", va="bottom",
              fontsize=7.5, color="#4b5563")
     return fig

@@ -55,8 +55,17 @@ def _cloud_xyz(*, radius=RADIUS, center=CENTER, z=6.0, bead=8.0, seed=0):
 
 def write_take(root, *, trial_id="t1", layer_index=1, take=1, measured=None,
                cloud=None, depth=True, mode="MEASURE_ONLY", annotation=None,
-               geometry=None, metrics=None):
-    """One archived take, written exactly the way the measure job writes it."""
+               geometry=None, metrics=None, legacy_depth=False):
+    """One archived take, written exactly the way the measure job writes it.
+
+    ``legacy_depth`` writes a PRE-protocol-2 take instead: 1 mm depth words and
+    no ``camera_geometry`` in provenance, which is what an archive from before
+    2026-08 looks like and what ``figures.geometry_for_take``'s legacy fallback
+    exists for. Everything else records the 0.1 mm words the renderer (and the
+    real cell) actually produce -- without that the archive would be read back
+    through the 1 mm fallback and every reconstructed point would be 10x too
+    far away.
+    """
     plan = _plan(layers=max(layer_index, 1))
     archive = ExtrusionArchive(root)
     if not (root / trial_id / "trial.json").is_file():
@@ -71,7 +80,8 @@ def write_take(root, *, trial_id="t1", layer_index=1, take=1, measured=None,
     frame = None
     if depth:
         frame = syn.render_scene([syn.RingSpec(RADIUS, 8.0, CENTER, height_fn=syn.flat(6.0))],
-                                 T, plane_center_xy_mm=CENTER, seed=1)
+                                 T, plane_center_xy_mm=CENTER, seed=1,
+                                 depth_unit_mm=1.0 if legacy_depth else syn.DEPTH_UNIT_MM)
     manifest = LayerManifest(
         trial_id=trial_id, layer_index=layer_index, take=take, mode=mode,
         recipe=plan.recipe, toolpath_fingerprint=plan.fingerprint,
@@ -98,7 +108,9 @@ def write_take(root, *, trial_id="t1", layer_index=1, take=1, measured=None,
                     # The method figure re-runs the chain from the frame, and
                     # the chain is reproducible only with the config it used.
                     "processing_config": ExtrusionConfig().model_dump(mode="json"),
-                    "work_frame": "Tasni Work Frame"})
+                    "work_frame": "Tasni Work Frame",
+                    **({} if legacy_depth
+                       else {"camera_geometry": syn.geometry_dict()})})
     return archive.write_layer(manifest, nominal_xyz=nominal, commanded_xyz=nominal,
                                measured_xyz=measured, pointcloud_xyz=cloud, depth=frame)
 
@@ -115,19 +127,20 @@ def write_characterization(root, *, trial_id="c1", index=1, radius=RADIUS, cente
     if not (root / trial_id / "trial.json").is_file():
         archive.create_trial(trial_id, plan, mode="MEASURE_ONLY")
     T = syn.inspection_camera_T((center[0], center[1], height), 300.0)
-    geometry = gf.aligned(syn.K_720P, syn.SIZE_720P)
+    geometry = syn.geometry()
     depth = syn.render_scene([syn.RingSpec(radius, bead, center, height_fn=syn.flat(height))],
                              T, plane_center_xy_mm=center, seed=seed)
     color = np.zeros((syn.SIZE_720P[1], syn.SIZE_720P[0], 3), np.uint8)
     config = ExtrusionConfig()
     found = characterize_ring(
-        color=color, depth=depth, geometry=geometry, T_work_camera=T,
-        K=syn.K_720P, dist=None, search_center_mm=center,
+        depth=depth, geometry=geometry, T_work_camera=T,
+        search_center_mm=center,
         work_frame="Tasni Work Frame", config=config,
         inspection_tool="Realsense", print_tool="LongCalibTool")
     report = {**found.report, "summary": {**found.summary(), "index": index},
              "provenance": {"T_work_camera": np.asarray(T, dtype=float).tolist(),
                             "camera_intrinsics": {"K": syn.K_720P.tolist()},
+                            "camera_geometry": syn.geometry_dict(),
                             "processing_config": config.model_dump(mode="json")}}
     return archive.write_characterization(
         trial_id, index, color=color, depth=depth, measured_xyz=found.measured_xyz,
@@ -584,7 +597,7 @@ def test_a_frame_with_nothing_near_the_work_plane_gets_no_scene_panel(tmp_path):
 
 def test_a_take_without_camera_geometry_renders_as_legacy_aligned(tmp_path):
     from tasni.modules.extrusion import figures
-    layer_dir = write_take(tmp_path)                       # write_take records no camera_geometry
+    layer_dir = write_take(tmp_path, legacy_depth=True)    # a pre-protocol-2 archive
     take = figures.load_take(layer_dir)
     assert take.geometry is not None and take.geometry.legacy
     assert take.geometry.depth_size == (1280, 720)
@@ -741,171 +754,6 @@ def test_a_characterizations_pipeline_figure_reruns_its_own_coarse_plan(tmp_path
     assert stages and "result" in stages
     assert len(stages["backprojected"]) > len(stages["work_roi"]) > 0
     assert stages["result"].measured_xyz is not None
-
-
-# ------------------------------- the lens model the method figure re-gates with
-
-# Real coefficients from this cell's calibrated colour model: what a protocol-2
-# take's provenance actually records, and what the measurement gated through.
-CALIBRATED_DIST = [0.11480838161001118, -0.23856355593822276,
-                   -0.0018212469331017086, 0.0004210400812176703, 0.0]
-
-
-def _patch_provenance(layer_dir, **fields):
-    """Rewrite one archived take's provenance -- the archive is the contract."""
-    manifest_file = Path(layer_dir) / "manifest.json"
-    report_file = Path(layer_dir) / "report.json"
-    target = manifest_file if manifest_file.is_file() else report_file
-    payload = json.loads(target.read_text(encoding="utf-8"))
-    provenance = payload.setdefault("provenance", {})
-    for key, value in fields.items():
-        if value is None:
-            provenance.pop(key, None)
-        else:
-            provenance[key] = value
-    target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return Path(layer_dir)
-
-
-def _protocol_2(K=None, size=None):
-    """A protocol-2 greeting whose registration is numerically the identity.
-
-    The synthetic depth these fixtures archive is rendered in the legacy
-    convention (aligned, 1 mm), so the greeting keeps that geometry and changes
-    only what is under test: the take is no longer ``legacy``, which is what
-    decides whether the chroma gate is re-sampled through the calibrated lens.
-    """
-    K = syn.K_720P if K is None else K
-    size = syn.SIZE_720P if size is None else size
-    return gf.offset(color_K=K, color_size=size, depth_K=K, depth_size=size,
-                     depth_unit_mm=1.0, rot_deg=(0.0, 0.0, 0.0),
-                     t_mm=(0.0, 0.0, 0.0)).to_dict()
-
-
-def _spy_on_the_chain(monkeypatch):
-    """Capture the kwargs the method figure hands ``process_observation``."""
-    from tasni.modules.extrusion import processing
-
-    seen: dict = {}
-    real = processing.process_observation
-
-    def spy(**kwargs):
-        seen.update(kwargs)
-        return real(**kwargs)
-
-    monkeypatch.setattr(processing, "process_observation", spy)
-    return seen
-
-
-def test_the_method_figure_gates_through_the_lens_model_the_measurement_used(
-        tmp_path, monkeypatch):
-    """A protocol-2 take was measured through the CALIBRATED colour model.
-
-    The chroma gate is read at the pixels the registration projects to, so
-    re-running the method figure through a different lens model samples it
-    somewhere else: on the cell's own protocol-2 characterization that is
-    2.7% of registered points flipping bead/board, the fitted centre moving
-    0.27 mm and the RMS moving 0.12 mm. A published method figure that
-    disagrees with the number it is captioned with is the failure that matters.
-    """
-    pytest.importorskip("open3d")
-    from tasni.modules.extrusion import figures
-
-    layer_dir = _patch_provenance(
-        write_take(tmp_path, trial_id="t-v2"),
-        camera_geometry=_protocol_2(),
-        camera_intrinsics={"K": syn.K_720P.tolist(), "dist_coeffs": CALIBRATED_DIST})
-    seen = _spy_on_the_chain(monkeypatch)
-    figures._STAGE_CACHE.clear()
-
-    take = figures.load_take(layer_dir)
-    assert take.geometry.legacy is False, "fixture must be a protocol-2 take"
-    stages = figures.take_stages(take)
-
-    assert stages is not None and "result" in stages
-    assert seen["dist"] is not None, "the figure re-gated with a different lens model"
-    assert np.allclose(np.asarray(seen["dist"], float), CALIBRATED_DIST)
-    assert not (stages.get("notes") or []), "nothing to warn about: the model is recorded"
-
-
-def test_a_legacy_take_is_re_run_with_the_identity_registration_it_was_measured_with(
-        tmp_path, monkeypatch):
-    """The mirror image, and the reason the fix is not "always pass dist".
-
-    A pre-protocol-2 take arrived already aligned to colour; its registration is
-    the identity, so pushing the calibrated distortion through it would sample
-    the gate off-pixel. ``service.reprocess_layer`` drops it for exactly this
-    case and the figure has to agree, recorded coefficients or not.
-    """
-    pytest.importorskip("open3d")
-    from tasni.modules.extrusion import figures
-
-    layer_dir = _patch_provenance(
-        write_take(tmp_path, trial_id="t-legacy"),
-        camera_intrinsics={"K": syn.K_720P.tolist(), "dist_coeffs": CALIBRATED_DIST})
-    seen = _spy_on_the_chain(monkeypatch)
-    figures._STAGE_CACHE.clear()
-
-    take = figures.load_take(layer_dir)
-    assert take.geometry.legacy is True, "fixture must be a legacy take"
-    assert take.dist_coeffs is not None, "the archive DOES record coefficients"
-    assert figures.take_stages(take) is not None
-
-    assert seen["dist"] is None
-
-
-def test_a_protocol_2_take_with_no_recorded_distortion_says_so_on_the_figure(
-        tmp_path, monkeypatch, caplog):
-    """What cannot be known must not be guessed silently.
-
-    Nothing in the archive says which coefficients were applied, so the figure
-    falls back to the undistorted model -- the same fallback the reprocess path
-    takes -- and prints the caveat instead of passing it off as the measurement.
-    """
-    pytest.importorskip("open3d")
-    import logging
-    from tasni.modules.extrusion import figures
-
-    layer_dir = _patch_provenance(
-        write_take(tmp_path, trial_id="t-v2-nodist"),
-        camera_geometry=_protocol_2(),
-        camera_intrinsics={"K": syn.K_720P.tolist()})
-    seen = _spy_on_the_chain(monkeypatch)
-    figures._STAGE_CACHE.clear()
-
-    take = figures.load_take(layer_dir)
-    with caplog.at_level(logging.WARNING):
-        stages = figures.take_stages(take)
-
-    assert seen["dist"] is None
-    assert any("distortion not recorded" in note for note in stages.get("notes") or [])
-    assert "distortion not recorded" in caplog.text
-
-    fig = figures._figure_pipeline(figures._pyplot(), take)
-    try:
-        assert "distortion not recorded" in " ".join(t.get_text() for t in fig.texts)
-    finally:
-        figures._pyplot().close(fig)
-
-
-def test_a_characterizations_method_figure_uses_its_own_recorded_lens_model(
-        tmp_path, monkeypatch):
-    """Ring 1 is a characterization, so the paper's method figure comes through
-    this path -- it must gate the same way ``characterize_ring`` did."""
-    pytest.importorskip("open3d")
-    from tasni.modules.extrusion import figures
-
-    char_dir = _patch_provenance(
-        write_characterization(tmp_path, trial_id="c-v2"),
-        camera_geometry=_protocol_2(),
-        camera_intrinsics={"K": syn.K_720P.tolist(), "dist_coeffs": CALIBRATED_DIST})
-    seen = _spy_on_the_chain(monkeypatch)
-    figures._STAGE_CACHE.clear()
-
-    stages = figures.take_stages(figures.load_take(char_dir))
-
-    assert stages is not None and "result" in stages
-    assert np.allclose(np.asarray(seen["dist"], float), CALIBRATED_DIST)
 
 
 # ---------------------------------------------- a failed re-run is not a figure
