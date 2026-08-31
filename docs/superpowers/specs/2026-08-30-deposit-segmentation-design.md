@@ -149,6 +149,20 @@ N−1's measured top); **none ships in this change** — see §11.
 negative (`c⁻ = 4.685`), because the deposit is the only thing that can sit above the
 surface. Seeded with plain least squares, 12 iterations, no randomness.
 
+**A Fisher-consistency correction is part of the estimator, not an optimisation.**
+Asymmetric redescending weights are biased on a symmetric population: solving the
+converged M-estimator's estimating equation in closed form for `c⁺ = 2.0, c⁻ = 4.685`
+gives a fixed point at **−0.34882 σ**, i.e. the raw fit sits that far *below* the true
+surface, inflating every height by ~0.17 mm at the cell's measured σ ≈ 0.55 mm. The
+implementation therefore applies a one-off `−0.34882 σ` shift to the intercept after the
+loop converges, leaving `c⁺`/`c⁻` and the iteration untouched. This was derived during
+implementation (2026-08-31) and confirmed empirically with contamination removed, across
+30 seeds and iteration counts 1–80; the prose above originally omitted it, but the
+§3.2 accuracy figure (0.064 mm) is unreachable without it, so the validated prototype
+must have carried it or an equivalent. The applied shift is reported per take
+(`bias_correction_mm`, §4) so it can never move a number silently. **Do not strip it as
+unnecessary complexity** — an asymmetric weight is never bias-free without one.
+
 **RANSAC was tried first and rejected on measurement, not taste.** It is the textbook
 primitive (`Open3D segment_plane`), and it fails two requirements:
 
@@ -290,8 +304,8 @@ offline validation in §5 proves nothing.
 ## 4. What gets reported
 
 Per take, in `report["substrate"]`: source, `sigma_mm`, derived floor, plane tilt versus
-work Z, plane offset at the ring centre, inlier fraction, and the component tally from
-§3.5.
+work Z, plane offset at the ring centre, inlier fraction, the applied
+`bias_correction_mm` (§3.2), and the component tally from §3.5.
 
 Plus one derived number, **separation margin** = bead p50 − substrate p99. It is the
 surface- and material-agnostic answer to "is segmentation healthy on this setup" — 3.0 mm
@@ -370,8 +384,21 @@ extrusion tests plus an import check, and `npm run build` if any frontend touche
   before it refuses. A low-order surface provider is the escalation, and it plugs into
   the same interface.
 - **A deposit that covers most of the ROI.** IRLS assumes the substrate is the majority.
-  For a dense raster or a wide print this inverts. Mitigation: the fit region is a
-  neighbourhood, not the ROI, and can be widened; `inlier_fraction` is reported.
+  For a dense raster or a wide print this inverts. **Measured 2026-08-31: past ~50%
+  deposit in the fit region the estimator locks onto the bead top and reports
+  `inlier_fraction = 1.000`** — the best possible health number — while the tilt guard
+  stays blind (the bead top is parallel to the substrate) and the clamp hides the absurd
+  σ. So the mitigation originally written here (*"`inlier_fraction` is reported"*) was
+  worse than useless: in the failure case that number is actively reassuring. Two
+  refusal guards replace it, chosen because they fail differently: **nothing may sit far
+  below the substrate** (it is the surface everything rests on, so a non-trivial fraction
+  more than 3σ below the plane means the plane is not the substrate), and **σ far above
+  the clamp ceiling** means the fit is not describing a substrate at all. The fit region
+  remains a widenable neighbourhood (`substrate_fit_radius_mm`).
+  A related measured envelope: the §3.2 bias correction is a net win across the realistic
+  regime (35× better on clean substrate, 3× better at 15% deposit) but crosses over to
+  net-harmful at roughly **27% deposit fraction in the fit region**, through σ inflation.
+  Keep the fit region's deposit fraction well under a quarter.
 - **The 2026-08-29 crash frame is unvalidated.** The offline run used the 2026-08-30
   archive; the branch-guard fixture
   (`tests/fixtures/extrusion/ring1/ring1_take04_branchguard_20260829.npz`) — a
@@ -442,3 +469,21 @@ direction:
    `process_observation` callers plus `characterize_ring`'s internal pass, not three
    (§3.7); and `ExtrusionConfig` is `extra="forbid"`, so field retirement without a
    `from_archive` key-stripper breaks every archived take's reprocess (§3.6, §6).
+
+---
+
+## 13. What implementation changed in this design (2026-08-31)
+
+Recorded as it happens, same discipline as §11:
+
+1. **The estimator needs a Fisher-consistency correction** (§3.2). The one-sided Tukey
+   fit as described in prose is asymptotically biased low by 0.34882 σ on symmetric
+   noise — derived in closed form and confirmed empirically during implementation. The
+   §3.2 accuracy claim is unreachable without a correction, so the prose, not the
+   measurement, was incomplete. The shift is now reported per take.
+2. **The golden layer-2 baseline cannot live in `runs/`** (§5). `report.json` is
+   rewritten by every offline reprocess (`service.py:1252`), so reading the expected
+   value from disk at test time would let one reprocess during this work silently turn
+   the assertion into a comparison of a value against itself — invisibly, since `runs/`
+   is git-ignored. The baseline is now frozen as literals in the test, with the on-disk
+   value demoted to a secondary drift check ordered after the primary assertion.
