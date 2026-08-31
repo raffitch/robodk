@@ -852,7 +852,27 @@ class ExtrusionConfig(_Model):
     hardware_io_test_approved: bool = False
 
     # Legacy single-frame processing defaults (metres where suffixed ``_m``).
-    voxel_size_m: float = Field(default=0.001, gt=0)
+    # 0.5 mm, halved from 1.0 on 2026-08-31. The voxel downsample bounds compute;
+    # at 1 mm it was also DELETING marginal deposits. The cell take at 17:35 had a
+    # thin arc the operator ruled at 4 mm and confirmed by eye as unbroken, of
+    # which only 13% of the band cleared the deposit floor -- and merging those
+    # sparse survivors at 1 mm cost the raster its connectivity:
+    #     1.0 mm -> completeness 0.8752, closed False   (reported a whole ring open)
+    #     0.5 mm -> completeness 0.9925, closed True
+    # with nothing about the camera changed between those lines.
+    #
+    # What this is NOT: a quality lever. Measured across the 2026-08-30 archive,
+    # the eight valid layer-1 takes move by at most 0.0006 completeness, in both
+    # directions -- neutral. The three partial layer-2 takes get consistently
+    # WORSE (0.6252->0.5964, 0.6361->0.6325, 0.6137->0.5860); they stay invalid
+    # either way, and the likeliest reading is that a 1 mm voxel was bridging
+    # their genuine gaps, so the finer grid is the more honest of the two. That
+    # reading is inference on n=3, so it is recorded rather than relied on.
+    # Crest height is untouched (max moves <0.15 mm at 1.0/0.5/0.25), which is
+    # what rules the voxel OUT as an explanation of the ~1.5 mm height shortfall
+    # measured against the operator's ruler -- see [[crest-height-shortfall]].
+    # Cost: +0.5 s per take (2.78 -> 3.32 s), after_voxel 3814 -> 10096 points.
+    voxel_size_m: float = Field(default=0.0005, gt=0)
     statistical_neighbors: int = Field(default=20, ge=3)
     statistical_std_ratio: float = Field(default=2.0, gt=0)
     radius_neighbors: int = Field(default=16, ge=2)

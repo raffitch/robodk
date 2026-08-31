@@ -88,9 +88,24 @@ def test_the_seam_takes_no_colour_input_at_all():
 
 # ------------------------------------------------------- 1 mm voxel default (Task 9)
 
-def test_default_voxel_is_1_mm_so_0_1_mm_depth_words_reach_the_ring_numbers():
+def test_the_voxel_stays_fine_enough_for_0_1_mm_words_and_for_thin_deposits():
+    """Pinned at 0.5 mm, and the direction of travel is one-way: 2 mm -> 1 mm when
+    protocol 2 brought 0.1 mm depth words (f662dae, so the finer words could reach
+    the ring numbers), 1 mm -> 0.5 mm on 2026-08-31 because 1 mm was also DELETING
+    marginal deposits -- a ring the operator confirmed unbroken came back open at
+    completeness 0.875, and closed at 0.9925 with no camera change
+    (test_extrusion_golden.test_a_marginal_deposit_survives_the_voxel_downsample
+    holds that end).
+
+    Both moves are the same argument, so this asserts the BOUND rather than the
+    value: coarsening is what has ever been shown to hurt. If a future change
+    wants a coarser grid it has to beat this test deliberately and say why, which
+    is the point -- the equality pin this replaces would have blocked the 2026-08-31
+    fix without ever stating what it was protecting.
+    """
     from tasni.core.config import ExtrusionConfig
-    assert ExtrusionConfig().voxel_size_m == 0.001
+    assert ExtrusionConfig().voxel_size_m == 0.0005
+    assert ExtrusionConfig().voxel_size_m <= 0.001
 
 
 # --------------------------------------------------- one seam for every caller (§3.7)

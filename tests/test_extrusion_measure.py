@@ -174,7 +174,15 @@ def test_board_depth_bias_fused_to_the_ring_does_not_break_the_measurement():
     assert m.path_completeness >= 0.95
     r = np.linalg.norm(np.asarray(out.filtered_xyz)[:, :2] - np.asarray(CENTER), axis=1)
     assert r.max() < 60.0 + 8.0 + 4.0, "board points beyond the bead must not reach the raster"
-    assert out.report["counts"]["after_radial_trim"] < out.report["counts"]["after_largest_cluster"]
+    # The patch must be REMOVED, but this deliberately does not name the stage.
+    # It used to assert after_radial_trim < after_largest_cluster, i.e. "the radial
+    # trim is what removed it". Halving the voxel on 2026-08-31 made that false
+    # while making the outcome BETTER: with a denser cloud the patch is rejected
+    # earlier, so the trim has nothing left to take (r.max improved 70.56 -> 62.71
+    # on this fixture). An assertion that pins WHICH filter does the work fails when
+    # an earlier one starts doing it better, which is backwards.
+    counts = out.report["counts"]
+    assert counts["after_radial_trim"] < counts["after_work_roi"], counts
 
 
 def test_radial_trim_follows_a_displaced_ring_not_the_nominal():
@@ -469,23 +477,22 @@ def test_spur_guard_still_catches_real_contamination_regardless_of_recipe_bead()
                 config=ExtrusionConfig())
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "KNOWN DEFECT, pinned deliberately: a 3x overstated recipe bead inflates "
-    "_rasterize's DILATION (radius = bead/2), which fattens the ring and the "
-    "shelf into one lobe whose thinned skeleton has no junction left, so the "
-    "branch guard cannot see the contamination it is there to catch. Measured "
-    "2026-08-31: r 39.04-39.14 for a 40.0 mm ring, VALID, across shelf spans "
-    "20-32 deg -- a confident number ~0.9 mm wrong. The spur TOLERANCE is "
-    "already clamped to the frame's own measured footprint (`a0fabca`) for "
-    "exactly this reason; the raster's dilation is not. Feeding it the same "
-    "clamped bead was tried and reverted: it fixes this (39.87) but regresses "
-    "the real 2026-08-28 ring2 frame, where the tighter dilation stops "
-    "absorbing the ChArUco board lobe and exhausts the guard on a take that "
-    "measures correctly today. Closing this needs its own evidence on real "
-    "frames. When it is closed this test XPASSes and strict=True fails the "
-    "suite -- delete the marker then. Latent before the synthetic fixtures "
-    "moved to protocol-2 depth words: a coarser, noisier crest happened to "
-    "leave a branch behind, so the guard fired for the wrong reason."))
+# CLOSED 2026-08-31 by halving the voxel (1.0 -> 0.5 mm). This carried a strict
+# xfail: a 3x overstated recipe bead inflated _rasterize's DILATION until the ring
+# and the shelf fused into one lobe whose thinned skeleton had no junction left, so
+# the branch guard could not see the contamination it exists to catch -- r 39.04 for
+# a 40.0 mm ring, VALID, ~0.9 mm wrong with nothing complaining.
+#
+# A denser cloud keeps the junction, so the guard fires and the frame is refused.
+# The fix is therefore NOT the one previously tried and reverted (clamping the
+# raster's dilation to the measured bead, which regressed the real 2026-08-28 ring2
+# frame); the dilation is untouched. Removing the marker per its own instruction.
+#
+# Caveat, recorded rather than hidden: this was closed as a SIDE EFFECT of a change
+# made for a different reason, and it is evidenced on one synthetic scene. It is a
+# topology guard, so it stays sensitive to point density -- if the voxel is ever
+# coarsened again, expect this to reopen, which is what the bound in
+# test_extrusion_processing's voxel test exists to make deliberate.
 def test_an_overstated_recipe_bead_defeats_the_branch_guard_through_the_raster():
     pytest.importorskip("open3d")
     T = syn.inspection_camera_T([CENTER[0], CENTER[1], 6.0], 300.0)
@@ -796,9 +803,23 @@ def test_characterize_selects_ring_instead_of_larger_raised_patch():
     assert found.center_mm == pytest.approx(true_center, abs=1.5)
     candidates = found.report["ring_selector"]["candidates"]
     selected = next(candidate for candidate in candidates if candidate.get("selected"))
-    assert selected["points"] < max(candidate["points"] for candidate in candidates)
+    # The patch must be REJECTED ON SHAPE, which is the rule under test. This used
+    # to assert the ring was not the largest candidate -- an adversarial PRECONDITION
+    # of the fixture rather than a property of the chain, and one that was tied to
+    # the voxel size by accident: the patch is sampled at 1 mm and saturates the
+    # voxel grid, while RingSpec samples at 0.25 mm and keeps gaining, so halving
+    # the voxel on 2026-08-31 flipped which one was bigger (ring 8531 -> 24106,
+    # patch 11462 -> 11622) without changing a thing about the selection. Assert the
+    # shape gate instead: the patch is still there, still bigger-radius, still refused.
     assert selected["angular_coverage"] >= 0.95
     assert selected["radial_span_ratio"] < 0.8
+    rejected = [c for c in candidates if not c.get("selected")]
+    assert rejected, candidates
+    patch_candidate = max(rejected, key=lambda c: c["radius_mm"])
+    assert not patch_candidate["eligible"], patch_candidate
+    assert patch_candidate["radius_mm"] > 50.0, patch_candidate
+    assert (patch_candidate["radial_span_ratio"] >= 0.8
+            or patch_candidate["angular_coverage"] < 0.7), patch_candidate
 
 
 def test_characterize_real_checkerboard_capture_selects_the_visible_ring():

@@ -285,3 +285,64 @@ def test_substrate_report_is_present_and_sane_on_every_take():
 
         assert sub["separation_margin_mm"] is None or sub["separation_margin_mm"] > 1.0, (
             name, sub)
+
+
+# --------------------------------------------------- the 1 mm voxel and margins
+MARGINAL = (Path(__file__).resolve().parents[1] / "runs" / "extrusion"
+            / "20260831-173544-24d21bab" / "characterize-01")
+
+
+@pytest.mark.skipif(not MARGINAL.is_dir(),
+                    reason="the 2026-08-31 marginal take is not on this machine")
+def test_a_marginal_deposit_survives_the_voxel_downsample():
+    """The cell take that reported a CONTINUOUS ring as open.
+
+    2026-08-31 17:35. The operator ruled the ring at five clock positions and
+    confirmed by eye that the arc the chain called a 44.9 deg gap is thin but
+    unbroken -- 4 mm where the rest of the ring runs 7-11. Only 13% of that
+    arc's band cleared the deposit floor, and at a 1 mm voxel the downsample
+    merged the sparse survivors until the raster lost connectivity:
+
+        voxel 1.00 mm -> completeness 0.8752, closed False   (the live failure)
+        voxel 0.50 mm -> completeness 0.9925, closed True
+
+    Nothing about the camera changed between those two lines. The ring-open
+    report was host-side.
+
+    This reads the archive for its DEPTH and pose but builds the config from
+    SHIPPED DEFAULTS rather than `from_archive`, because the question it asks is
+    "would the chain we ship today measure this take", not "what did the chain
+    that captured it do" -- the archived payload carries the 1 mm voxel that
+    caused the failure, so reading it back would pin the bug in place.
+    """
+    from tasni.core.config import ExtrusionConfig
+    from tasni.core.depth_geometry import CameraGeometry
+    from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup
+    from tasni.modules.extrusion.processing import measure_take
+    from tasni.modules.extrusion.toolpath import generate_cylinder_plan
+
+    report = json.loads((MARGINAL / "report.json").read_text(encoding="utf-8"))
+    coarse = report["coarse"]
+    provenance = report["provenance"]
+    config = ExtrusionConfig()          # shipped defaults, deliberately
+    recipe = CylinderRecipe(
+        radius_mm=float(coarse["radius_mm"]), layer_count=1,
+        layer_height_mm=float(coarse["height_mm"]),
+        bead_diameter_mm=float(coarse["bead_width_mm"]),
+        robot_speed_mm_s=75.0, extrusion_rate_pct=0.0,
+        points_per_circle=config.measured_spline_points)
+    setup = CylinderSetup(
+        print_tool="LongCalibTool", work_frame="wf", inspection_tool="Realsense",
+        inspection_auto=True, center_x_mm=float(coarse["center_mm"][0]),
+        center_y_mm=float(coarse["center_mm"][1]))
+    plan = generate_cylinder_plan(recipe, setup)
+    result = measure_take(
+        depth=np.load(MARGINAL / "depth.npy"),
+        geometry=CameraGeometry.from_greeting(provenance["camera_geometry"]),
+        T_work_camera=np.asarray(provenance["T_work_camera"], float),
+        plan=plan, layer=plan.layers[0], config=config)
+
+    assert result.report["closed"], result.report["measured_path_completeness"]
+    assert result.report["measured_path_completeness"] > 0.95, (
+        "a ring the operator confirmed unbroken must not be reported open: "
+        f"{result.report['measured_path_completeness']}")
