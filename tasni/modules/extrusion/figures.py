@@ -781,7 +781,7 @@ _STAGE_CACHE: dict[tuple[str, int], "dict | None"] = {}
 def take_stages(take: TakeData) -> "dict | None":
     """Re-run the archived frame through the real chain, keeping every stage.
 
-    Nothing is re-implemented here: this calls ``process_observation`` with a
+    Nothing is re-implemented here: this calls ``measure_take`` with a
     collector, so the panels show the arrays the pipeline actually held. Needs
     the scan extra (Open3D); without it the method figure is skipped like any
     other figure that cannot be drawn.
@@ -803,7 +803,7 @@ def take_stages(take: TakeData) -> "dict | None":
 
 
 def _compute_stages(take: TakeData) -> "dict | None":
-    from .processing import plan_for_archived_take, process_observation
+    from .processing import measure_take, plan_for_archived_take
 
     trial_file = take.layer_dir.parent / "trial.json"
     if not trial_file.is_file():
@@ -827,7 +827,7 @@ def _compute_stages(take: TakeData) -> "dict | None":
     if image is None:
         image = np.zeros((*np.asarray(take.depth).shape[:2], 3), np.uint8)
     try:
-        result = process_observation(
+        result = measure_take(
             color=image, depth=take.depth, geometry=take.geometry,
             T_work_camera=take.T_work_camera, K=take.K,
             # The lens model the MEASUREMENT gated with, not a second choice --
@@ -848,7 +848,7 @@ def _compute_characterization_stages(take: TakeData) -> "dict | None":
 
     ``characterize_ring`` fits a coarse circle from the frame itself, builds a
     one-layer plan from it (radius/height/bead clipped exactly the way it
-    does), and re-runs ``process_observation`` on that plan -- but the coarse
+    does), and re-runs ``measure_take`` on that plan -- but the coarse
     plan is never written to disk, only the numbers it was built from
     (``report['coarse']``, stashed on the manifest by
     ``_characterization_manifest``). Rebuilding it here, the same way, lets
@@ -898,9 +898,9 @@ def _compute_characterization_stages(take: TakeData) -> "dict | None":
         image = cv2.imread(str(colour), cv2.IMREAD_COLOR)
     if image is None:
         image = np.zeros((*np.asarray(take.depth).shape[:2], 3), np.uint8)
-    from .processing import process_observation
+    from .processing import measure_take
     try:
-        result = process_observation(
+        result = measure_take(
             color=image, depth=take.depth, geometry=take.geometry,
             T_work_camera=take.T_work_camera, K=take.K,
             # ``characterize_ring`` gated this take through the CALIBRATED
@@ -909,7 +909,7 @@ def _compute_characterization_stages(take: TakeData) -> "dict | None":
             # from the number the figure is captioned with -- see
             # TakeData.chroma_dist.
             dist=_chroma_dist(take, stages), plan=plan,
-            layer=plan.layers[0], config=config, stages=stages, assemble_arcs=True)
+            layer=plan.layers[0], config=config, stages=stages)
     except Exception as exc:
         return _incomplete(stages, take, exc)
     stages["result"] = result

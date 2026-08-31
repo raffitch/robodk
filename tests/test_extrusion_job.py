@@ -19,6 +19,7 @@ from tasni.core.camera_lease import CameraLease  # noqa: E402
 from tasni.core.config import AppConfig  # noqa: E402
 from tasni.modules.extrusion.models import (CylinderRecipe, CylinderSetup,  # noqa: E402
                                             DeviationMetrics)
+from tasni.modules.extrusion import processing as processing_mod  # noqa: E402
 from tasni.modules.extrusion.processing import ProcessingResult  # noqa: E402
 from tasni.modules.extrusion import service as service_mod  # noqa: E402
 from tasni.modules.extrusion.service import (CylinderDryRunJob, CylinderPrintJob,  # noqa: E402
@@ -352,7 +353,7 @@ def _mkdir(path: Path) -> Path:
 def test_live_print_forces_off_captures_once_and_archives(tmp_path, monkeypatch):
     svc, rdk, camera = services(tmp_path)
     monkeypatch.setattr(service_mod, "REPO_ROOT", tmp_path)
-    monkeypatch.setattr(service_mod, "process_observation", fake_processing)
+    monkeypatch.setattr(processing_mod, "process_observation", fake_processing)
     monkeypatch.setattr(service_mod, "_git_commit", lambda: "abc123")
     monkeypatch.setattr(service_mod.time, "sleep", lambda _: None)
     monkeypatch.setattr(service_mod.runs, "read_active", lambda module: {"run_id": "cal-1"})
@@ -393,7 +394,7 @@ def test_live_print_forces_off_after_processing_fault(tmp_path, monkeypatch):
     monkeypatch.setattr(service_mod, "_git_commit", lambda: "abc123")
     monkeypatch.setattr(service_mod.time, "sleep", lambda _: None)
     monkeypatch.setattr(service_mod.runs, "read_active", lambda module: None)
-    monkeypatch.setattr(service_mod, "process_observation",
+    monkeypatch.setattr(processing_mod, "process_observation",
                         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("bad skeleton")))
     with pytest.raises(RuntimeError, match="raw RGB-D archived"):
         CylinderPrintJob(svc, plan(layers=1))(Ctx())
@@ -426,7 +427,7 @@ def test_failed_final_valve_off_inhibits_return_motion(tmp_path, monkeypatch):
     monkeypatch.setattr(service_mod, "_git_commit", lambda: "abc123")
     monkeypatch.setattr(service_mod.time, "sleep", lambda _: None)
     monkeypatch.setattr(service_mod.runs, "read_active", lambda module: None)
-    monkeypatch.setattr(service_mod, "process_observation",
+    monkeypatch.setattr(processing_mod, "process_observation",
                         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("bad skeleton")))
     ctx = Ctx()
     with pytest.raises(RuntimeError, match="raw RGB-D archived"):
@@ -494,7 +495,7 @@ def test_live_print_archives_the_derived_viewpoint_it_actually_measured_from(
     monkeypatch.setattr(service_mod, "_git_commit", lambda: "abc123")
     monkeypatch.setattr(service_mod.time, "sleep", lambda _: None)
     monkeypatch.setattr(service_mod.runs, "read_active", lambda module: None)
-    monkeypatch.setattr(service_mod, "process_observation", fake_processing)
+    monkeypatch.setattr(processing_mod, "process_observation", fake_processing)
     monkeypatch.setattr(service_mod, "ensure_real_robot_link", lambda *a, **k: None)
     output = CylinderPrintJob(svc, plan(layers=1, auto_inspection=True))(Ctx())
     manifest = json.loads((Path(output["trial_dir"]) / "layer-001" / "manifest.json")
@@ -582,7 +583,7 @@ def test_an_inspection_path_that_flips_mid_move_rejects_that_candidate(
 def test_live_print_deletes_its_robodk_artifacts_by_default(tmp_path, monkeypatch):
     svc, rdk, camera = services(tmp_path)
     monkeypatch.setattr(service_mod, "REPO_ROOT", tmp_path)
-    monkeypatch.setattr(service_mod, "process_observation", fake_processing)
+    monkeypatch.setattr(processing_mod, "process_observation", fake_processing)
     monkeypatch.setattr(service_mod, "_git_commit", lambda: "abc123")
     monkeypatch.setattr(service_mod.time, "sleep", lambda _: None)
     monkeypatch.setattr(service_mod.runs, "read_active", lambda module: {"run_id": "cal-1"})
@@ -597,7 +598,7 @@ def test_live_print_can_keep_its_robodk_artifacts(tmp_path, monkeypatch):
     """
     svc, rdk, camera = services(tmp_path)
     monkeypatch.setattr(service_mod, "REPO_ROOT", tmp_path)
-    monkeypatch.setattr(service_mod, "process_observation", fake_processing)
+    monkeypatch.setattr(processing_mod, "process_observation", fake_processing)
     monkeypatch.setattr(service_mod, "_git_commit", lambda: "abc123")
     monkeypatch.setattr(service_mod.time, "sleep", lambda _: None)
     monkeypatch.setattr(service_mod.runs, "read_active", lambda module: {"run_id": "cal-1"})

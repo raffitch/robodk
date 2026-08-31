@@ -907,6 +907,7 @@ from test_extrusion_job import (Ctx, FakeCamera, FakeRdk, START_JOINTS,  # noqa:
                                 SIDE_APPROACH_JOINTS, SIDE_JOINTS,
                                 services)
 from tasni.modules.extrusion import measure as measure_mod
+from tasni.modules.extrusion import processing as processing_mod
 from tasni.modules.extrusion.measure import MeasureSession, RingMeasureJob
 from tasni.modules.extrusion.models import DeviationMetrics, RingGeometry
 from tasni.modules.extrusion.processing import ProcessingResult
@@ -947,7 +948,7 @@ def measure_env(tmp_path, monkeypatch, *, hardware_approved=False, side_photo=Fa
     # Dedicated tests below turn the production default back on.
     svc.config.extrusion.measure_depth_fusion_frames = 1
     monkeypatch.setattr(measure_mod, "REPO_ROOT", tmp_path)
-    monkeypatch.setattr(measure_mod, "process_observation", fake_measure_processing)
+    monkeypatch.setattr(processing_mod, "process_observation", fake_measure_processing)
     monkeypatch.setattr(measure_mod, "_git_commit", lambda: "abc123")
     monkeypatch.setattr(measure_mod.time, "sleep", lambda _: None)
     monkeypatch.setattr(measure_mod.runs, "read_active", lambda module: {"run_id": "cal-1"})
@@ -1068,7 +1069,7 @@ def test_repeat_takes_and_the_floor_from_the_previous_layer(tmp_path, monkeypatc
 
 def test_measure_archives_the_raw_frame_when_processing_fails(tmp_path, monkeypatch):
     svc, rdk, _ = measure_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(measure_mod, "process_observation",
+    monkeypatch.setattr(processing_mod, "process_observation",
                         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("bad skeleton")))
     plan = auto_plan()
     session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
@@ -1873,7 +1874,7 @@ def test_a_failed_take_stays_visible_in_the_session(tmp_path, monkeypatch):
     session shows it happened.
     """
     svc, rdk, _ = measure_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(measure_mod, "process_observation",
+    monkeypatch.setattr(processing_mod, "process_observation",
                         lambda **kwargs: (_ for _ in ()).throw(RuntimeError("bad skeleton")))
     plan = auto_plan()
     session = MeasureSession.create(tmp_path / "runs" / "extrusion", plan)
@@ -2604,7 +2605,7 @@ def test_unattended_excursions_stop_after_an_archived_invalid_take(tmp_path, mon
             "valid": False, "warnings": ["maximum angular gap 200 deg"]})
         return result
 
-    monkeypatch.setattr(measure_mod, "process_observation", invalid)
+    monkeypatch.setattr(processing_mod, "process_observation", invalid)
     ctx = Ctx()
     out = RingMeasureJob(svc, plan, session, 1, annotation={"phase": "noise floor"},
                          check_collisions=False, excursions=5)(ctx)
@@ -2660,7 +2661,7 @@ def test_a_batch_keeps_the_takes_it_already_measured(tmp_path, monkeypatch):
             raise RuntimeError("branch guard exhausted")
         return fake_measure_processing(**kwargs)
 
-    monkeypatch.setattr(measure_mod, "process_observation", fail_on_the_third)
+    monkeypatch.setattr(processing_mod, "process_observation", fail_on_the_third)
     with pytest.raises(RuntimeError, match="measurement invalid"):
         RingMeasureJob(svc, plan, session, 1, check_collisions=False, excursions=5)(Ctx())
 
@@ -2708,7 +2709,7 @@ def test_the_summary_separates_the_camera_s_repeatability_from_the_robot_s(tmp_p
         out.metrics.measured_center_mm = next(centres)
         return out
 
-    monkeypatch.setattr(measure_mod, "process_observation", wander)
+    monkeypatch.setattr(processing_mod, "process_observation", wander)
     RingMeasureJob(svc, plan, session, 1, annotation={"phase": "noise floor"},
                    check_collisions=False, excursions=3)(Ctx())
     RingMeasureJob(svc, plan, session, 1, annotation={"phase": "re-placed"},
@@ -2768,7 +2769,7 @@ def test_a_ring_placed_displaced_is_paired_against_the_ring_it_sits_on(tmp_path,
         out.metrics.center_offset_mm = (centre[0] - 200.0, centre[1] - 150.0)
         return out
 
-    monkeypatch.setattr(measure_mod, "process_observation", at_position)
+    monkeypatch.setattr(processing_mod, "process_observation", at_position)
     for layer in (1, 2, 3):
         session.tops[layer] = [[0.0, 0.0, 0.0]]          # floors for the layer above
     RingMeasureJob(svc, plan, session, 3, annotation={"phase": "stacked true"},

@@ -170,3 +170,43 @@ def test_chroma_gate_abstains_on_an_achromatic_frame_or_size_mismatch():
 def test_default_voxel_is_1_mm_so_0_1_mm_depth_words_reach_the_ring_numbers():
     from tasni.core.config import ExtrusionConfig
     assert ExtrusionConfig().voxel_size_m == 0.001
+
+
+# --------------------------------------------------- one seam for every caller (§3.7)
+
+def test_measure_take_derives_arc_assembly_from_the_layer_itself(monkeypatch):
+    """assemble_arcs is a property of the take (isolated first layer), not of the
+    caller -- the live/reprocess/figure divergence was the defect."""
+    from tasni.modules.extrusion import processing
+    seen = []
+    monkeypatch.setattr(processing, "process_observation",
+                        lambda **kw: seen.append(kw) or "sentinel")
+    from tasni.core.config import ExtrusionConfig
+    from tasni.modules.extrusion.models import CylinderRecipe, CylinderSetup
+    from tasni.modules.extrusion.toolpath import generate_cylinder_plan
+    plan = generate_cylinder_plan(
+        CylinderRecipe(radius_mm=40.0, layer_count=2, layer_height_mm=5.0,
+                       bead_diameter_mm=9.0, robot_speed_mm_s=75.0,
+                       extrusion_rate_pct=0.0, points_per_circle=180),
+        CylinderSetup(print_tool="LongCalibTool", work_frame="Tasni Work Frame",
+                      inspection_tool="Realsense", inspection_auto=True,
+                      center_x_mm=0.0, center_y_mm=0.0))
+    # (construction idiom copied from scene_plan() in tests/test_extrusion_measure.py:73)
+    common = dict(color=None, depth=None, geometry=None, T_work_camera=None,
+                  K=None, dist=None, plan=plan, config=ExtrusionConfig())
+    assert processing.measure_take(layer=plan.layers[0], **common) == "sentinel"
+    assert seen[-1]["assemble_arcs"] is True
+    processing.measure_take(layer=plan.layers[1], **common)
+    assert seen[-1]["assemble_arcs"] is False
+
+
+def test_no_caller_bypasses_the_seam():
+    """Grep guard: outside processing.py, nothing in the extrusion module may call
+    process_observation directly (spec §3.7)."""
+    from pathlib import Path
+    import tasni.modules.extrusion as ext
+    root = Path(ext.__file__).parent
+    offenders = [p.name for p in root.glob("*.py")
+                 if p.name != "processing.py"
+                 and "process_observation(" in p.read_text(encoding="utf-8")]
+    assert not offenders, f"route these through measure_take: {offenders}"

@@ -395,10 +395,11 @@ def _filter_deposit(points: np.ndarray, config, counts: dict, *,
     width has to be measured before that selection throws the flanks away.
 
     ``assemble_arcs`` rejoins clusters that are arcs of one ring, for the single
-    isolated ring a characterization looks at. It stays OFF for layer
-    measurement: there the ROI deliberately spans the ring beneath, and fusing a
-    displaced ring to the crescent of its neighbour would destroy the very
-    displacement the measurement exists to report.
+    isolated ring a characterization -- or layer 1 of a stack -- looks at,
+    neither of which has a ring beneath to protect. It stays OFF above layer 1:
+    there the ROI deliberately spans the ring beneath, and fusing a displaced
+    ring to the crescent of its neighbour would destroy the very displacement
+    the measurement exists to report.
     """
     clusters = _deposit_clusters(points, config, counts)
     if assemble_arcs and len(clusters) > 1 and search_center_xy is not None:
@@ -686,8 +687,9 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
     exactly as before.
 
     ``assemble_arcs`` rejoins ring arcs that the height floor or an occlusion
-    split apart; see :func:`_filter_deposit` for why only a characterization
-    turns it on.
+    split apart; see :func:`_filter_deposit` for why it is only safe on an
+    isolated ring. Callers should not choose this themselves -- see
+    :func:`measure_take`, the seam that derives it from the take.
 
     ``stages``, when a dict is passed, is filled with a copy of the cloud at
     each step of the chain (backprojected, work_roi, above_floor,
@@ -907,6 +909,24 @@ def process_observation(*, color: np.ndarray, depth: np.ndarray,
                             filtered_xyz=points.copy(), geometry=geometry)
 
 
+def measure_take(*, color, depth, geometry, T_work_camera, K, dist,
+                 plan, layer, config, floor_profile=None,
+                 stages=None) -> ProcessingResult:
+    """THE entry point for scoring one RGB-D take -- live, reprocess and figures.
+
+    ``assemble_arcs`` is derived here, from the take itself: layer 1 is an
+    isolated ring (no lower layer for assembly to fuse into), every higher layer
+    keeps the deliberately strict no-assembly path. Callers choosing it
+    independently is how the same archived take scored differently live, on the
+    reprocess button and in its method figure (2026-08-30 handoff §6).
+    """
+    return process_observation(
+        color=color, depth=depth, geometry=geometry, T_work_camera=T_work_camera,
+        K=K, dist=dist, plan=plan, layer=layer, config=config,
+        floor_profile=floor_profile, stages=stages,
+        assemble_arcs=int(layer.layer_index) == 1)
+
+
 @dataclass
 class CharacterizationResult:
     """What a physical ring actually IS, measured with no recipe assumption."""
@@ -940,7 +960,7 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, geometry: CameraG
 
     Pass 1 takes everything above the build plane inside a search cylinder around
     ``search_center_mm``, filters it like a deposit, and fits a circle to get a
-    coarse centre/radius/bead. Pass 2 hands those to ``process_observation`` as a
+    coarse centre/radius/bead. Pass 2 hands those to ``measure_take`` as a
     throwaway recipe so the refined centreline, radius and height profile come out
     of the same code the layer measurements use -- one pipeline, one set of
     numbers, no second implementation to keep honest.
@@ -1002,10 +1022,9 @@ def characterize_ring(*, color: np.ndarray, depth: np.ndarray, geometry: CameraG
         inspection_auto=True, center_x_mm=float(coarse_center[0]),
         center_y_mm=float(coarse_center[1]))
     plan = generate_cylinder_plan(recipe, setup)
-    refined = process_observation(color=color, depth=depth, geometry=geometry,
-                                  T_work_camera=T_work_camera, K=K, dist=dist,
-                                  plan=plan, layer=plan.layers[0], config=config,
-                                  assemble_arcs=True)
+    refined = measure_take(color=color, depth=depth, geometry=geometry,
+                           T_work_camera=T_work_camera, K=K, dist=dist,
+                           plan=plan, layer=plan.layers[0], config=config)
     geometry = refined.geometry
     report = {**refined.report, "coarse": coarse, "counts_coarse": counts,
               "ring_selector": selector,

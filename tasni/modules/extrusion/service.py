@@ -26,7 +26,7 @@ from .inspection import (aim_point_mm, cylinder_diameter_mm, framing_standoff,
                          pose_candidates, standoff_fault,
                          standoff_report)
 from .models import CylinderPlan, CylinderRecipe, CylinderSetup, LayerManifest
-from .processing import process_observation
+from .processing import measure_take
 from .surface import surface_check
 from .toolpath import generate_cylinder_plan, points_array
 from .valve import instructions_match
@@ -1048,7 +1048,7 @@ class CylinderPrintJob:
                         if arrival_fault:
                             raise RuntimeError(arrival_fault)
                         camera_cfg = services.config.camera
-                        processed = process_observation(
+                        processed = measure_take(
                             color=frame.color, depth=frame.depth, geometry=frame.geometry,
                             T_work_camera=T_work_camera, K=camera_cfg.K, dist=camera_cfg.dist,
                             plan=self.plan, layer=layer, config=ecfg)
@@ -1194,7 +1194,7 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
     plan = generate_cylinder_plan(recipe, setup)
     if layer_index > len(plan.layers):
         raise RuntimeError("archived layer index exceeds the stored recipe")
-    processed = process_observation(
+    processed = measure_take(
         color=color, depth=depth, geometry=geometry,
         T_work_camera=np.asarray(transform, dtype=float),
         K=np.asarray(intrinsics["K"], dtype=float),

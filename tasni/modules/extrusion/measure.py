@@ -31,7 +31,7 @@ from ...core.rdk_io import RdkIO
 from ..calibration.service import _camera_hold, ensure_real_robot_link
 from .archive import ExtrusionArchive
 from .models import CylinderPlan, LayerManifest
-from .processing import characterize_ring, process_observation
+from .processing import characterize_ring, measure_take
 from .service import (_build_inspection_move, _git_commit, _program_name, _utcnow,
                       _wait_program, _warn_if_stale)
 from .toolpath import points_array
@@ -863,14 +863,10 @@ class RingMeasureJob:
         floor = self.session.floor_profile(self.layer_index)
         camera_cfg = services.config.camera
         try:
-            processed = process_observation(
+            processed = measure_take(
                 color=frame.color, depth=frame.depth, geometry=frame.geometry,
                 T_work_camera=T_work_camera, K=camera_cfg.K, dist=camera_cfg.dist,
-                plan=self.plan, layer=layer, config=ecfg, floor_profile=floor,
-                # Layer 1 is an isolated ring, just like Characterize: no lower
-                # layer exists for arc assembly to fuse into it. Higher layers
-                # retain the deliberately strict no-assembly path.
-                assemble_arcs=self.layer_index == 1)
+                plan=self.plan, layer=layer, config=ecfg, floor_profile=floor)
         except Exception as exc:
             # A failed measurement still archives its raw RGB-D: the operator
             # cannot re-place the ring exactly, so the frame is the only thing
