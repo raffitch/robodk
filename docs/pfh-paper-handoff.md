@@ -248,12 +248,13 @@ introduced offset at ~18 mm). If a take still fails, its raw RGB-D is archived a
 
 ### Why displacements go on the top ring, and why three takes
 
-- **Top ring only.** Layer N's ROI floor is the *latest take* of layer N−1
-  (`MeasureSession.floor_profile`). Displacing a ring that something else is
-  measured on top of corrupts that floor for every take above it. Displace the
-  highest ring in the stack and nothing downstream is affected. Physically it is
-  also the only one that *can* be displaced: a buried ring cannot be slid or lifted
-  without disturbing everything resting on it.
+- **Top ring only.** Physically, a buried ring cannot be slid or lifted without
+  disturbing everything resting on it — displace the highest ring in the stack and
+  nothing else in the print is touched. (The algorithmic version of this reason —
+  that layer N's ROI floor was the *latest take* of layer N−1, via
+  `MeasureSession.floor_profile` — no longer applies: that mechanism was deleted
+  end to end 2026-08-30/31, see "Watch this on layer 2's first take" below. The
+  physical reason stands on its own regardless.)
 - **So the offset ring goes on LAST and is never moved again** (2026-08-29). Rather
   than stack three and then slide the top one, the run stacks three true and places a
   **fourth already off-centre**. Nothing is ever slid or lifted, so no ring is
@@ -323,14 +324,35 @@ line before every press.
 
 ### Watch this on layer 2's first take
 
-Layer N keeps only points above the measured top of layer N−1 plus
-`layer_floor_margin_mm` (2.0). These rings run **2.9–11.0 mm** tall, so where ring 2
-sits only ~3 mm above ring 1 there is under 1 mm of margin and its low stretches can
-be clipped — showing up as reduced `path_completeness` or an angular gap, i.e.
-`valid: false`. The synthetic proof used a *uniform* ring, so this case is untested
-on real geometry. **Check completeness on L2 take 1 before continuing.** If it
-clips, lower `extrusion.layer_floor_margin_mm` and press **Reprocess** — every take
-archives its raw RGB-D, so no cell time is lost.
+There is no longer a floor that references layer N−1's measured top —
+`extrusion.layer_floor_margin_mm` and `MeasureSession.floor_profile` were both
+deleted end to end (2026-08-30/31, see
+`docs/superpowers/specs/2026-08-30-deposit-segmentation-design.md`): on the only
+stacked data that existed, referencing layer N−1 made completeness WORSE, 0.62 →
+0.50, because ring 1's archived "measured top" spans z 1.50–10.86 mm — board noise
+read as crest — and a margin added on top of that noisy surface cut into ring 2.
+Every layer's height floor is now derived from **that frame's own fitted
+substrate** (`tasni/modules/extrusion/substrate.py`: `PlaneSubstrate`) — a plane
+fit to whatever surface sits within `extrusion.substrate_fit_radius_mm` (150 mm)
+of the ring centre, robust to the deposit itself — then
+`floor = clamp(extrusion.substrate_sigma_k × sigma_mm, extrusion.substrate_floor_clamp_mm)`
+(defaults 3.0, [1.0, 2.0] mm). On the archive this floor sits ~1.5–1.7 mm above the
+flat board on layer-1 **and** layer-2 takes alike — it does not climb onto ring 1's
+crest — so the specific clipping this section used to warn about does not
+reproduce the same way any more.
+
+If layer 2's first take still shows reduced `path_completeness` or `valid: false`,
+**read `report["substrate"]` before touching any config** (`sigma_mm`, `floor_mm`,
+`separation_margin_mm`, the `compactness` component tally) — it tells you whether
+segmentation is unhealthy or the ring is genuinely thin/gapped there. The three
+real 2026-08-30 layer-2 takes measured completeness 0.61–0.64 and were correctly
+invalid: every 10° sector carried plenty of valid depth (nothing unsensed), and the
+crest height swung 2–16 mm around the circumference — a badly stacked physical
+ring, not a segmentation artifact. Only an unhealthy substrate report (inflated
+`sigma_mm`, `floor_mm` pinned at the clamp ceiling, a collapsed
+`separation_margin_mm`) makes `extrusion.substrate_sigma_k` or
+`extrusion.substrate_floor_clamp_mm` worth touching — every take archives its raw
+RGB-D, so **Reprocess** costs no cell time.
 
 Constraints and expectations:
 
