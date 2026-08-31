@@ -152,3 +152,47 @@ def test_clause_b_margin_covers_noise_up_to_4mm():
                                 seed=900_000 + seed)
         fit = PlaneSubstrate.fit(pts)   # must not raise
         assert fit.sigma_mm > 0.0
+
+
+# ------------------------------------------ compactness: the gate's one real job
+
+from tasni.modules.extrusion.substrate import compactness_filter
+
+
+def _arc_points(radius_mm=41.0, span_deg=180.0, per_deg=6):
+    angles = np.radians(np.linspace(0.0, span_deg, int(span_deg * per_deg)))
+    return np.column_stack([radius_mm * np.cos(angles),
+                            radius_mm * np.sin(angles),
+                            np.full(len(angles), 3.0)])
+
+
+def _patch_points(n, center=(60.0, 0.0)):
+    rng = np.random.default_rng(11)
+    xy = rng.uniform(-4.0, 4.0, size=(n, 2)) + np.asarray(center)
+    return np.column_stack([xy, np.full(n, 3.0)])
+
+
+def test_rejects_the_compact_patch_and_keeps_an_arc_of_equal_count():
+    """The 22-point checker patch that exhausted the branch guard was COMPACT,
+    not colourful -- an arc of the same pixel count is long and survives."""
+    arc = _arc_points()
+    patch = _patch_points(len(arc), center=(80.0, 0.0))
+    counts = {}
+    kept = compactness_filter(np.vstack([arc, patch]), mm_per_pixel=1.0,
+                              bead_mm=9.0, min_length_beads=3.0,
+                              min_points=10, counts=counts)
+    assert counts["compactness_components"] == 2
+    assert counts["compactness_kept_components"] == 1
+    assert len(kept) == len(arc)
+    assert np.allclose(np.sort(kept[:, 0]), np.sort(arc[:, 0]))
+
+
+def test_fail_open_when_the_filter_would_starve_the_chain():
+    """A thin or fragmented real ring must never be zeroed by topology alone:
+    below min_points the cloud passes through untouched, recorded as bypassed."""
+    patch = _patch_points(40)
+    counts = {}
+    kept = compactness_filter(patch, mm_per_pixel=1.0, bead_mm=9.0,
+                              min_length_beads=3.0, min_points=10, counts=counts)
+    assert counts["compactness_bypassed"] == 1
+    assert len(kept) == len(patch)

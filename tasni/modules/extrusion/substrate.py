@@ -8,6 +8,11 @@ contract answers it for every consumer; the fitted plane is the one provider
 that ships. Further providers (a captured empty-plate reference, layer N-1's
 measured top) plug into the same interface WHEN evidence demands them --
 building them now was measured to be speculative (spec §11).
+
+This module also carries `compactness_filter`, the topology gate that takes
+over the colour gate's one real job: distinguishing a deposit (a long
+connected curve) from contamination that clears the height floor (a blob) --
+by shape, not by an uncalibrated auto-exposed colour (spec §3.5).
 """
 from __future__ import annotations
 
@@ -16,6 +21,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Protocol
 
+import cv2
 import numpy as np
 
 
@@ -355,3 +361,61 @@ class PlaneSubstrate:
                 # == bias_correction_sigma * sigma_mm).
                 "bias_correction_mm": round(self.bias_correction_mm, 4),
                 "bias_correction_sigma": round(self.bias_correction_sigma, 5)}
+
+
+def compactness_filter(points, *, mm_per_pixel: float, bead_mm: float,
+                       min_length_beads: float, min_points: int,
+                       counts: dict | None = None) -> np.ndarray:
+    """Drop connected components whose principal-axis extent is shorter than
+    ``min_length_beads`` bead widths (spec §3.5).
+
+    A deposit is a curve; contamination that clears the height floor (a speckle
+    patch, a fixture corner, the 2026-08-29 checker patch) is compact. Occupancy
+    raster at the chain's own pixel size, closed at half a bead width so one
+    bead cannot self-fragment, 8-connected labels, per-component extent along
+    the largest covariance eigenvector. FAIL-OPEN: if the survivors would be
+    fewer than ``min_points`` the cloud passes untouched and the bypass is
+    recorded -- topology alone must never starve a thin real ring.
+    """
+    pts = np.asarray(points, dtype=float)
+    if counts is None:
+        counts = {}
+    if not len(pts):
+        return pts
+    xy = pts[:, :2]
+    lo = xy.min(axis=0) - bead_mm
+    size = np.ceil((xy.max(axis=0) + bead_mm - lo) / mm_per_pixel).astype(int) + 1
+    if np.any(size > 4096):
+        raise RuntimeError(f"compactness raster too large: {size[0]}x{size[1]}")
+    pixels = np.rint((xy - lo) / mm_per_pixel).astype(int)
+    mask = np.zeros((int(size[1]), int(size[0])), np.uint8)
+    mask[pixels[:, 1], pixels[:, 0]] = 255
+    close_px = max(1, int(round(bead_mm / (2.0 * mm_per_pixel))))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * close_px + 1, 2 * close_px + 1))
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    total, labels = cv2.connectedComponents(closed, connectivity=8)
+    min_extent_mm = float(min_length_beads) * float(bead_mm)
+    keep_labels = []
+    for label in range(1, total):
+        ys, xs = np.nonzero(labels == label)
+        coords = np.column_stack([xs, ys]).astype(float)
+        coords -= coords.mean(axis=0)
+        if len(coords) < 2:
+            extent = 0.0
+        else:
+            _, vectors = np.linalg.eigh(np.cov(coords.T))
+            projected = coords @ vectors[:, -1]
+            extent = float(projected.max() - projected.min()) * mm_per_pixel
+        if extent >= min_extent_mm:
+            keep_labels.append(label)
+    counts["compactness_components"] = int(total - 1)
+    counts["compactness_kept_components"] = len(keep_labels)
+    point_labels = labels[pixels[:, 1], pixels[:, 0]]
+    keep = (np.isin(point_labels, keep_labels) if keep_labels
+            else np.zeros(len(pts), bool))
+    if int(keep.sum()) < int(min_points):
+        counts["compactness_bypassed"] = 1
+        return pts
+    counts["compactness_bypassed"] = 0
+    return pts[keep]
