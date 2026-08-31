@@ -371,16 +371,35 @@ def compactness_filter(points, *, mm_per_pixel: float, bead_mm: float,
 
     A deposit is a curve; contamination that clears the height floor (a speckle
     patch, a fixture corner, the 2026-08-29 checker patch) is compact. Occupancy
-    raster at the chain's own pixel size, closed at half a bead width so one
-    bead cannot self-fragment, 8-connected labels, per-component extent along
-    the largest covariance eigenvector. FAIL-OPEN: if the survivors would be
-    fewer than ``min_points`` the cloud passes untouched and the bypass is
-    recorded -- topology alone must never starve a thin real ring.
+    raster at the chain's own pixel size, closed at a QUARTER bead width so the
+    closing operation's own bridged-gap reach (a morphological close bridges up
+    to roughly TWICE the structuring element's radius, not the radius itself)
+    lands at about half a bead width -- sub-bead-scale speckle inside a real
+    bead still closes, but two components separated by most of a bead width do
+    not weld into one (review round 1: a half-bead RADIUS bridged up to a FULL
+    bead width, silently switching the filter's rejection power off exactly at
+    the scale of the 2026-08-29 checker patch, which sat 12 mm outside the
+    ring). ``math.floor`` (not ``round``) so this holds for every bead/pixel
+    recipe, not only ones that happen to round down. 8-connected labels,
+    per-component extent taken from ``cv2.minAreaRect``'s longer side -- the
+    true oriented (Feret) caliper, not a covariance-eigenvector projection
+    (review round 1: for a near-isotropic raster footprint the eigenvectors of
+    a covariance matrix with near-tied eigenvalues are numerically unstable,
+    so the "principal axis" the projection lands on -- and hence the measured
+    extent -- can swing by up to sqrt(2) depending purely on how the same
+    physical shape happens to sit on the pixel grid; a rotated bounding
+    rectangle has no such ambiguity, it searches all orientations and returns
+    the true minimum). FAIL-OPEN: if the survivors would be fewer than
+    ``min_points`` the cloud passes untouched and the bypass is recorded --
+    topology alone must never starve a thin real ring.
     """
     pts = np.asarray(points, dtype=float)
     if counts is None:
         counts = {}
     if not len(pts):
+        counts["compactness_components"] = 0
+        counts["compactness_kept_components"] = 0
+        counts["compactness_bypassed"] = 0
         return pts
     xy = pts[:, :2]
     lo = xy.min(axis=0) - bead_mm
@@ -390,7 +409,7 @@ def compactness_filter(points, *, mm_per_pixel: float, bead_mm: float,
     pixels = np.rint((xy - lo) / mm_per_pixel).astype(int)
     mask = np.zeros((int(size[1]), int(size[0])), np.uint8)
     mask[pixels[:, 1], pixels[:, 0]] = 255
-    close_px = max(1, int(round(bead_mm / (2.0 * mm_per_pixel))))
+    close_px = max(1, math.floor(bead_mm / (4.0 * mm_per_pixel)))
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (2 * close_px + 1, 2 * close_px + 1))
     closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -399,14 +418,12 @@ def compactness_filter(points, *, mm_per_pixel: float, bead_mm: float,
     keep_labels = []
     for label in range(1, total):
         ys, xs = np.nonzero(labels == label)
-        coords = np.column_stack([xs, ys]).astype(float)
-        coords -= coords.mean(axis=0)
+        coords = np.column_stack([xs, ys]).astype(np.float32)
         if len(coords) < 2:
             extent = 0.0
         else:
-            _, vectors = np.linalg.eigh(np.cov(coords.T))
-            projected = coords @ vectors[:, -1]
-            extent = float(projected.max() - projected.min()) * mm_per_pixel
+            _, (w, h), _ = cv2.minAreaRect(coords)
+            extent = float(max(w, h)) * mm_per_pixel
         if extent >= min_extent_mm:
             keep_labels.append(label)
     counts["compactness_components"] = int(total - 1)

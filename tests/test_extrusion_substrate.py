@@ -196,3 +196,91 @@ def test_fail_open_when_the_filter_would_starve_the_chain():
                               min_length_beads=3.0, min_points=10, counts=counts)
     assert counts["compactness_bypassed"] == 1
     assert len(kept) == len(patch)
+
+
+def _bead_strip(x0, x1, width_mm, z=3.0, step=0.5):
+    """A filled rectangle x in [x0, x1], y in [-width/2, width/2] -- mimics a
+    real deposit's raster footprint, which has WIDTH (a mathematically 1px-wide
+    line is degenerate for morphological closing: the erosion half of a close
+    can never restore a bridge that thin, so it cannot exercise the weld
+    reach at all)."""
+    xs = np.arange(x0, x1 + step / 2, step)
+    ys = np.arange(-width_mm / 2, width_mm / 2 + step / 2, step)
+    xx, yy = np.meshgrid(xs, ys)
+    return np.column_stack([xx.ravel(), yy.ravel(), np.full(xx.size, z)])
+
+
+def test_weld_reach_is_about_half_a_bead_not_a_full_one():
+    """Review round 1, Important 1: the first cut's close radius was a
+    half-bead RADIUS, which a morphological close bridges at roughly TWICE
+    ITS RADIUS -- i.e. a FULL bead width, silently switching the filter's
+    rejection power off exactly at the scale of the 2026-08-29 checker patch
+    (12 mm outside the ring -- close to a 0.6-bead gap here). Pins the fix
+    (close radius = bead_mm / (4*mm_per_pixel), floor) against two
+    bead-length, bead-width strips (bead_mm=20, mm_per_pixel=1.0), measured
+    directly against `compactness_filter`'s own component count: a 2 mm
+    sub-bead-scale gap (speckle-inside-a-bead scale) must still weld into
+    one component, and a 0.6-bead (12 mm) gap -- the scale that mattered on
+    2026-08-29 -- must not."""
+    bead_mm, mm_per_pixel = 20.0, 1.0
+    seg1 = _bead_strip(0.0, bead_mm, bead_mm)
+
+    small_gap = _bead_strip(bead_mm + 2.0, bead_mm + 2.0 + bead_mm, bead_mm)
+    counts = {}
+    compactness_filter(np.vstack([seg1, small_gap]), mm_per_pixel=mm_per_pixel,
+                       bead_mm=bead_mm, min_length_beads=100.0, min_points=1,
+                       counts=counts)
+    assert counts["compactness_components"] == 1        # 2 mm: still welds
+
+    wide_gap = _bead_strip(bead_mm + 0.6 * bead_mm,
+                           bead_mm + 0.6 * bead_mm + bead_mm, bead_mm)
+    counts = {}
+    compactness_filter(np.vstack([seg1, wide_gap]), mm_per_pixel=mm_per_pixel,
+                       bead_mm=bead_mm, min_length_beads=100.0, min_points=1,
+                       counts=counts)
+    assert counts["compactness_components"] == 2         # 0.6 bead: separate
+
+
+def _wide_arc_points(radius_mm, span_deg, width_mm, start_deg=0.0, per_deg=6,
+                     per_width=2):
+    """A deposit-width annular segment (unlike `_arc_points`, which is a bare
+    1px-wide curve) -- the near-isotropic raster footprint that exposed the
+    orientation bug: at a short span/radius its covariance eigenvalues sit
+    close enough together that the eigenvector projection's "principal axis"
+    became numerically unstable."""
+    n = max(2, int(round(span_deg * per_deg)))
+    angles = np.radians(np.linspace(start_deg, start_deg + span_deg, n))
+    m = max(1, int(round(width_mm * per_width)))
+    radii = np.linspace(radius_mm - width_mm / 2, radius_mm + width_mm / 2, m)
+    aa, rr = np.meshgrid(angles, radii)
+    x = rr.ravel() * np.cos(aa.ravel())
+    y = rr.ravel() * np.sin(aa.ravel())
+    return np.column_stack([x, y, np.full(len(x), 3.0)])
+
+
+def test_six_identical_arcs_decide_consistently_regardless_of_grid_orientation():
+    """Review round 1, Required (promoted from Minor): six geometrically
+    identical 38-degree arcs (same radius/span/width, rotated only in start
+    angle -- so the raster footprint is the same physical shape, just at a
+    different orientation on the pixel grid) must reach the SAME keep/drop
+    decision. Measured before this fix: the eigenvector-projection extent
+    swung between the six rotations far enough (~10.8-12.2 mm) that a
+    threshold of 11.0 mm split them 3 kept / 3 dropped -- purely from grid
+    orientation, nothing physical changed. `cv2.minAreaRect`'s longer side
+    is the true oriented caliper (no eigenvalue-tie ambiguity to swing on);
+    at the same 11.0 mm threshold every rotation now measures inside a
+    tight, sub-mm band (~9.9-10.7 mm) and all six decide the same way."""
+    radius_mm, span_deg, width_mm = 10.0, 38.0, 9.0
+    mm_per_pixel = 2.0
+    bead_mm = 11.0                # with min_length_beads=1.0 -> threshold 11.0 mm,
+    min_length_beads = 1.0        # inside the old eigen swing, outside the new one
+    kept_counts = []
+    for start_deg in (0, 15, 30, 45, 60, 75):
+        arc = _wide_arc_points(radius_mm, span_deg, width_mm, start_deg=start_deg)
+        counts = {}
+        compactness_filter(arc, mm_per_pixel=mm_per_pixel, bead_mm=bead_mm,
+                           min_length_beads=min_length_beads, min_points=0,
+                           counts=counts)
+        kept_counts.append(counts["compactness_kept_components"])
+    assert len(set(kept_counts)) == 1, (
+        f"decision flipped across rotations purely on grid orientation: {kept_counts}")
