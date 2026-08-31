@@ -86,14 +86,43 @@ pytestmark = pytest.mark.skipif(
 LAYER1 = ["layer-001"] + [f"layer-001-take{i:02d}" for i in range(2, 9)]
 LAYER2 = ["layer-002", "layer-002-take02", "layer-002-take03"]
 
-# Frozen 2026-08-31 baseline, NEW (fitted-substrate) chain -- see the module
-# docstring for the re-baselining and its evidence. Do NOT read these from
-# report.json at test time; that file is overwritten by every offline reprocess
-# (service.py's archive.rewrite_processing).
+# Frozen 2026-08-31 baseline, NEW (fitted-substrate + layer-floor) chain -- see
+# the module docstring for the FIRST re-baselining and its evidence. Do NOT read
+# these from report.json at test time; that file is overwritten by every offline
+# reprocess (service.py's archive.rewrite_processing).
+#
+# RE-BASED A SECOND TIME, 2026-08-31, for the deposit floor under layer N
+# (processing.py, after the compactness filter). Previous values and deltas:
+#
+#     layer-002          0.6252 -> 0.5044   (-0.121)
+#     layer-002-take02   0.6361 -> 0.5482   (-0.088)
+#     layer-002-take03   0.6137 -> 0.5213   (-0.092)
+#
+# The movement is DOWNWARD and that is the whole point of the change. Layer N's
+# ROI spans the ring beneath it, and until now nothing took that ring back out
+# again before the chain fitted a circle -- so where ring 2 was thin or absent,
+# ring 1's crest was measured and reported as ring 2's, padding these three
+# takes with circumference belonging to the layer below. The floor puts the
+# population back to layer 2 alone, and ~0.10 of completeness goes with it.
+#
+# Two independent readings say the smaller number is the truer one. The fitted
+# radius on these takes lands at 41.00 / 40.35 / 40.74 mm against layer 1's own
+# 41.02 / 40.93 measured from the same archive, where before the change it
+# carried the mixture of both rings. And on the 2026-08-31 cell archive -- the
+# stack this change was actually diagnosed on, where fragmentation was severe
+# enough that only a 110 deg arc survived -- the same code moves completeness
+# the OTHER way, 0.294 -> 0.515, and collapses the fitted radius spread across
+# three repeat takes of one physical ring from 7.24 mm to 0.29 mm. One chain,
+# two archives, both now reporting ring 2 and only ring 2, and both landing
+# near 0.5 instead of one at 0.6 and one at 0.3.
+#
+# What did NOT move, and must not: every take here is still INVALID, and still
+# far below ``LAYER2_MAX_COMPLETENESS``. This re-base only widens nothing --
+# it recentres a drift guard on a chain change made deliberately.
 LAYER2_BASELINE_COMPLETENESS = {
-    "layer-002": 0.6251582106816579,
-    "layer-002-take02": 0.6360546777518749,
-    "layer-002-take03": 0.6137140438066724,
+    "layer-002": 0.5044306975515656,
+    "layer-002-take02": 0.5481795735507635,
+    "layer-002-take03": 0.5213493858283733,
 }
 
 # What the archive's report.json holds ON DISK: the OLD colour-gate chain's

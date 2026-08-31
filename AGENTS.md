@@ -260,8 +260,63 @@ now background history at `docs/deposit-segmentation-handoff-2026-08-30.md`. Val
 offline on the full 2026-08-30 archive (`tests/test_extrusion_golden.py`): 8/8 layer-1 takes
 valid, radius mean 40.980 mm / sigma 0.074 mm (better than the design prototype's own 0.107),
 completeness 0.9923-0.9928, with no colour input at all; the 3 layer-2 takes remain correctly
-invalid (a badly stacked physical ring, not a segmentation artifact). Merge to `main` is a
-separate decision, still pending.
+invalid. Merge to `main` is a separate decision, still pending.
+
+**Layer >= 2 was ALSO a segmentation artifact, fixed 2026-08-31 (deposit floor under
+layer N).** The line above used to add "a badly stacked physical ring, not a segmentation
+artifact" about the layer-2 takes. That was half right and the wrong half was load-bearing.
+Layer 2 had never once been measured validly -- **0 of 6 takes** across both cell sessions --
+and replaying the 2026-08-31 archive stage by stage put the loss in one place: the ring
+reaches DBSCAN whole (36/36 angular bins in the work ROI) and leaves it as 5-7 arcs, because
+a hand-placed ring 2's crest swings ~10 mm around the circumference and the 3D neighbourhood
+breaks where it steps. Layer 1 fragments the same way and was rescued by arc assembly;
+above layer 1 assembly was off, so the **largest arc alone -- 110 deg of it -- became the
+ring**. Completeness 0.294 was never a statement about that ring.
+
+The fix is a **deposit floor under layer N at the top of layer N-1**, applied to the deposit
+population after the compactness filter (NOT to the ROI band -- measured, that starves
+compactness and makes the take worse). With the layer beneath removed, arc assembly is safe
+to enable everywhere, which is what recovers the ring. Two traps live here:
+
+- The two archives move in OPPOSITE directions and both are correct. 2026-08-31 goes
+  0.294 -> 0.515 (it was reporting one arc); 2026-08-30 goes 0.62 -> 0.50 (it was padding
+  the ring with ring 1's crest where ring 2 was thin). The confirmation is the fitted radius:
+  spread across three repeat takes of ONE physical ring collapses 7.24 mm -> 0.29 mm on the
+  2026-08-31 stack, and lands within 0.3 mm of layer 1's own radius on 2026-08-30.
+- **Layer 2 is still INVALID and must stay that way.** `tests/test_extrusion_golden.py`
+  holds `LAYER2_MAX_COMPLETENESS = 0.75` for exactly this: on the 2026-08-30 stack the
+  circumference genuinely is not there, and a change that "recovers" it is measuring
+  something that does not exist. Do not raise that ceiling.
+
+What is NOT fixed, and is the real blocker for measuring a stack from one pose: the
+2026-08-31 layer-2 crest still carries a contiguous ~50 deg sector the chain cannot use.
+Counting ROI points per 10 deg sector in the bead annulus of that frame, the 140-190 deg band
+falls to 22-121 against 250-466 everywhere else in the SAME frame (layer 1 of the same
+archive: 60-377). A 19 mm stack seen from one top-down pose shadows itself. That is a
+CAPTURE problem and it is what `docs/multiview-inspection-*` exists for.
+
+(Do not confuse that with the 2026-08-30 archive, where `test_extrusion_golden.py` records
+200-530 **valid depth pixels** per 10 deg sector -- a different measurement on a different
+frame, and the reason those takes are the false-positive guard rather than this one.)
+
+**Also fixed on the way:** offline reprocess scored takes against `trial.json`'s **pre-Apply**
+setup, so its `build_plane_z_mm` was 4.259 mm where every applied path says 0.0 -- the whole
+height band sat 4.26 mm above where the live run had it. Harmless until now (the ROI margin
+is 15 mm) but fatal to a floor derived from `nominal_z_mm` inside a 4.6 mm layer.
+`reprocess_saved_layer` now shares `plan_for_archived_take` with the figures and the golden
+harness instead of keeping its own drifted copy.
+
+**OPEN, not diagnosed: the backend hard-crashes.** Seven times across 2026-08-30/31 -- five
+sharing one ntdll access violation (WER bucket `755b2d74...`, fault offset `0x2f6a3`, inside
+the NT heap manager = native heap corruption), once as BEX64. Tonight's was pid 2680 at
+19:58:56, ~2.5 s after the measure job wrote `session.json`. It is NOT the segmentation code
+(66 replays of the archived takes on a worker thread with Qt loaded, no crash). `start.ps1`
+captures stdout/stderr, but an access violation unwinds no Python frames, so the log just
+stops mid-poll and the UI shows "Backend not responding". `faulthandler` is now armed in
+`tasni/__main__.py` -> **`%TEMP%\tasni-backend.crash.log`** (append; `TASNI_CRASH_LOG`
+overrides): it dumps every thread's Python stack on the fault. **Read that file first after
+the next crash** -- the process holds Open3D, OpenCV, onnxruntime, PySide2/Qt (via robolink),
+numpy/scipy and matplotlib, and the faulting module alone cannot say which was on the stack.
 
 ## 5. How to work here
 

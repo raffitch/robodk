@@ -183,9 +183,19 @@ def test_radial_trim_settling_leaves_an_uncontaminated_ring_completely_alone():
 
 # --------------------------------------------------- one seam for every caller (§3.7)
 
-def test_measure_take_derives_arc_assembly_from_the_layer_itself(monkeypatch):
-    """assemble_arcs is a property of the take (isolated first layer), not of the
-    caller -- the live/reprocess/figure divergence was the defect."""
+def test_measure_take_and_not_its_caller_decides_arc_assembly(monkeypatch):
+    """``assemble_arcs`` is decided HERE, never by the caller -- the
+    live/reprocess/figure divergence was the defect this pins.
+
+    It used to be derived from the layer (True on layer 1, False above it), on
+    the reasoning that a higher layer's ROI spans the ring beneath and assembly
+    could fuse the two. The value is now True for every layer and the protection
+    moved to where it belongs: ``process_observation`` puts a deposit floor under
+    layer N at the top of layer N-1, so the ring beneath is not in the population
+    being assembled at all. Keeping assembly off was never a substitute -- it
+    left "keep the largest arc and call it the ring" in place, which is how layer
+    2 measured 0.294 complete off a 110 deg arc on 2026-08-31.
+    """
     from tasni.modules.extrusion import processing
     seen = []
     monkeypatch.setattr(processing, "process_observation",
@@ -206,7 +216,11 @@ def test_measure_take_derives_arc_assembly_from_the_layer_itself(monkeypatch):
     assert processing.measure_take(layer=plan.layers[0], **common) == "sentinel"
     assert seen[-1]["assemble_arcs"] is True
     processing.measure_take(layer=plan.layers[1], **common)
-    assert seen[-1]["assemble_arcs"] is False
+    assert seen[-1]["assemble_arcs"] is True
+    # The layer still reaches process_observation -- it is what the deposit floor
+    # is derived from, so a take can never be scored without saying which layer
+    # it is.
+    assert seen[-1]["layer"] is plan.layers[1]
 
 
 def test_ring_geometry_measures_height_against_the_substrate_it_is_given():

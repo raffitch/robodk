@@ -324,12 +324,14 @@ def _filter_deposit(points: np.ndarray, config, counts: dict, *,
     upward-facing crest is a further selection made by :func:`_top_surface`; bead
     width has to be measured before that selection throws the flanks away.
 
-    ``assemble_arcs`` rejoins clusters that are arcs of one ring, for the single
-    isolated ring a characterization -- or layer 1 of a stack -- looks at,
-    neither of which has a ring beneath to protect. It stays OFF above layer 1:
-    there the ROI deliberately spans the ring beneath, and fusing a displaced
-    ring to the crescent of its neighbour would destroy the very displacement
-    the measurement exists to report.
+    ``assemble_arcs`` rejoins clusters that are arcs of one ring. It is ON for
+    every layer, and what makes that safe above layer 1 is NOT here: assembly
+    judges candidates on circle-fit shape alone, so nothing in it can tell an arc
+    of layer N from an arc of the ring beneath, and fusing the two would destroy
+    the very displacement the measurement exists to report. Its caller
+    (:func:`process_observation`) removes the layer beneath from the population
+    first -- see the deposit floor there. Do not enable this on a population that
+    still contains more than one layer.
     """
     clusters = _deposit_clusters(points, config, counts)
     if assemble_arcs and len(clusters) > 1 and search_center_xy is not None:
@@ -675,8 +677,20 @@ def plan_for_archived_take(manifest: dict, trial: dict, *,
         nominal = np.asarray(nominal_xyz, dtype=float).reshape(-1, 3)
         if len(nominal) >= 3:
             center, _ = fit_circle_xy(nominal)
-            setup = setup.model_copy(update={"center_x_mm": float(center[0]),
-                                             "center_y_mm": float(center[1])})
+            update = {"center_x_mm": float(center[0]), "center_y_mm": float(center[1])}
+            # And the build plane, for the same reason the centre is taken from
+            # here: ``trial.json``'s setup is the PRE-Apply one. The 2026-08-31
+            # archive has it at 4.259 mm where every applied path says 0.0, so a
+            # reprocess put the whole height band 4.26 mm above where the live
+            # run had it. It changed no outcome there only because the ROI margin
+            # is 15 mm and swallowed it -- but the deposit floor under layer N is
+            # derived from ``nominal_z_mm``, and a 4 mm error in that datum lands
+            # squarely inside a 4.6 mm layer.
+            layer_index = int(manifest.get("layer_index") or 1)
+            update["build_plane_z_mm"] = float(
+                np.median(nominal[:, 2]) - recipe.bead_diameter_mm / 2
+                - (layer_index - 1) * recipe.layer_height_mm)
+            setup = setup.model_copy(update=update)
     return generate_cylinder_plan(recipe, setup)
 
 
@@ -777,8 +791,9 @@ def process_observation(*, depth: np.ndarray,
     return needs new evidence, not a revert.
 
     ``assemble_arcs`` rejoins ring arcs that the height floor or an occlusion
-    split apart; see :func:`_filter_deposit` for why it is only safe on an
-    isolated ring. Callers should not choose this themselves -- see
+    split apart; see :func:`_filter_deposit` for why it is only safe on a
+    population holding ONE layer, which the deposit floor below guarantees.
+    Callers should not choose this themselves -- see
     :func:`measure_take`, the seam that derives it from the take.
 
     ``stages``, when a dict is passed, is filled with a copy of the cloud at
@@ -899,6 +914,44 @@ def process_observation(*, depth: np.ndarray,
                               min_points=config.cluster_min_points, counts=counts)
     keep("compactness", kept)
     points = kept
+    # Above layer 1, take the layer OFF the stack before anything tries to fit a
+    # ring to it. The ROI above still spans the ring beneath, deliberately -- that
+    # is what keeps a layer which settled low from being amputated, and it is
+    # what lets the compactness filter above judge whole connected structures
+    # rather than the thin arcs a height cut leaves behind (applying this to the
+    # ROI band instead was measured on 2026-08-31: compactness then kept 2 of 7
+    # components and the take got WORSE, completeness 0.294 -> 0.232). But the
+    # thing the chain goes on to FIT is layer N, and height is all that separates
+    # it from layer N-1: the 2026-08-31 layer-2 cloud's height histogram runs
+    # continuously from 1 to 19 mm with no gap at all, because ring 2 sits ON
+    # ring 1 and the camera sees one unbroken flank. Asking DBSCAN to pick "the
+    # ring" out of that solid wall is not a question with an answer.
+    #
+    # Built from COMMANDED geometry on the fitted-substrate datum, exactly as
+    # ``max_h`` is -- not from layer N-1's own MEASURED top, which was tried and
+    # deleted (spec 2026-08-30 §2.4) because a board recorded as crest put that
+    # surface anywhere from 1.50 to 10.86 mm and a margin on top of it cut into
+    # the ring above.
+    #
+    # Its job is SAFETY, not coverage, and the numbers only make sense read that
+    # way: sweeping this floor across the three archived layer-2 takes moves
+    # angular coverage by at most one bin of 36 at every setting from 0 to
+    # 8.5 mm. What it changes is WHAT is in those bins -- ring 1's crest can
+    # neither be assembled into ring 2 nor reported as ring 2's position in a
+    # sector where ring 2 is absent.
+    if int(layer.layer_index) > 1:
+        below_top_mm = (layer.nominal_z_mm - recipe.layer_height_mm
+                        - float(substrate.plane_z(center_xy))
+                        + recipe.bead_diameter_mm / 2)
+        points = points[substrate.height(points) >= below_top_mm]
+        counts["after_layer_floor"] = len(points)
+        substrate_report["layer_floor_mm"] = round(float(below_top_mm), 3)
+        if len(points) < config.cluster_min_points:
+            raise RuntimeError(
+                "no deposited geometry survived the layer floor: nothing sits above "
+                f"the top of layer {int(layer.layer_index) - 1} "
+                f"({below_top_mm:.2f} mm over the fitted substrate); "
+                f"{json.dumps(dict(counts))}")
     # The filter FAILS OPEN on starvation, not on partial rings: a real ring
     # broken into arcs can lose most of its fragments with bypassed = 0, and
     # kept-vs-total components is the only place that shows.
@@ -1082,16 +1135,32 @@ def measure_take(*, depth, geometry, T_work_camera,
                  plan, layer, config, stages=None) -> ProcessingResult:
     """THE entry point for scoring one take -- live, reprocess and figures.
 
-    ``assemble_arcs`` is derived here, from the take itself: layer 1 is an
-    isolated ring (no lower layer for assembly to fuse into), every higher layer
-    keeps the deliberately strict no-assembly path. Callers choosing it
-    independently is how the same archived take scored differently live, on the
-    reprocess button and in its method figure (2026-08-30 handoff §6).
+    Arc assembly is ON for every layer. It used to be layer 1 only, on the
+    reasoning that a higher layer's ROI deliberately spans the ring beneath and
+    assembly -- which judges candidates on circle-fit shape alone -- could fuse a
+    displaced ring to its neighbour's crescent and erase the displacement the
+    experiment exists to report. The fear was real; the remedy was not, because
+    it left the alternative in place: keep the LARGEST ARC and call it the ring.
+    On the cell that is what happened every time. Layer 2 has never once been
+    measured validly -- 0 of 6 takes across 2026-08-30 and 2026-08-31 -- and
+    replaying the 2026-08-31 archive found the ring arriving whole (36/36 angular
+    bins in the work ROI) and leaving DBSCAN as five arcs, the largest spanning
+    110 deg. Completeness 0.294 was never a statement about that ring.
+
+    What makes assembly safe here is not assembly: it is the deposit floor
+    :func:`process_observation` puts under layer N at the top of layer N-1, so
+    the crest of the ring beneath is not in the population being assembled at
+    all. Measured on the three 2026-08-31 layer-2 takes, excluding it moves the
+    fitted centre by 0.12-0.26 mm and leaves the fitted radius at 42.4-42.7 mm.
+
+    Callers choosing this independently is how the same archived take scored
+    differently live, on the reprocess button and in its method figure
+    (2026-08-30 handoff §6), so it stays derived HERE, from the take.
     """
     return process_observation(
         depth=depth, geometry=geometry, T_work_camera=T_work_camera,
         plan=plan, layer=layer, config=config, stages=stages,
-        assemble_arcs=int(layer.layer_index) == 1)
+        assemble_arcs=True)
 
 
 @dataclass

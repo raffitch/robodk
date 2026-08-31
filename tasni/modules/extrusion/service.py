@@ -20,13 +20,12 @@ from ...core.rdk_io import RdkIO
 from ..calibration.service import _camera_hold, ensure_real_robot_link
 from .archive import ExtrusionArchive
 from ..scan.survey_contract import refresh_robot_state
-from .comparison import fit_circle_xy
 from .inspection import (aim_point_mm, cylinder_diameter_mm, framing_standoff,
                          inspection_plan, order_candidates_seed_first,
                          pose_candidates, standoff_fault,
                          standoff_report)
-from .models import CylinderPlan, CylinderRecipe, CylinderSetup, LayerManifest
-from .processing import measure_take
+from .models import CylinderPlan, LayerManifest
+from .processing import measure_take, plan_for_archived_take
 from .surface import surface_check
 from .toolpath import generate_cylinder_plan, points_array
 from .valve import instructions_match
@@ -1177,18 +1176,20 @@ def reprocess_saved_layer(root: str | Path, trial_id: str, layer_index: int,
     # the paper handoff says must never be cited. The manifest holds the take's
     # recipe and nominal_path.json holds its nominal ring -- the centre is FITTED
     # (the archived path is closed, so its mean is biased by radius/N).
-    recipe = manifest.recipe or CylinderRecipe.model_validate(trial["recipe"])
-    setup = CylinderSetup.model_validate(trial["setup"])
+    # Through the SHARED seam, never a second copy of this reasoning: reprocess,
+    # the method figure and the golden harness have to agree about what a take
+    # meant, and the private copy that used to live here had already drifted --
+    # it patched the centre out of the archived ring but left ``build_plane_z_mm``
+    # at trial.json's pre-Apply value, which on the 2026-08-31 archive is 4.259 mm
+    # where every applied path says 0.0.
     nominal_file = layer_dir / (manifest.nominal_path_file or "nominal_path.json")
+    nominal = None
     if nominal_file.is_file():
         payload = json.loads(nominal_file.read_text(encoding="utf-8"))
         nominal = np.asarray(payload.get("points") if isinstance(payload, dict) else payload,
                              dtype=float).reshape(-1, 3)
-        if len(nominal) >= 3:
-            center, _ = fit_circle_xy(nominal)
-            setup = setup.model_copy(update={"center_x_mm": float(center[0]),
-                                             "center_y_mm": float(center[1])})
-    plan = generate_cylinder_plan(recipe, setup)
+    plan = plan_for_archived_take(manifest.model_dump(mode="json"), trial,
+                                  nominal_xyz=nominal)
     if layer_index > len(plan.layers):
         raise RuntimeError("archived layer index exceeds the stored recipe")
     processed = measure_take(

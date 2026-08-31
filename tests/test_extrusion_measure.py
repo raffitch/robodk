@@ -1298,7 +1298,11 @@ def test_repeat_takes_share_one_session(tmp_path, monkeypatch):
     assert fake_measure_processing.calls[-1]["assemble_arcs"] is True
     third = RingMeasureJob(svc, plan, session, 2, annotation={"introduced_offset_mm": [10, 0]},
                            check_collisions=True)(Ctx())
-    assert fake_measure_processing.calls[-1]["assemble_arcs"] is False
+    # True above layer 1 as well since 2026-08-31: what keeps a displaced ring 2
+    # from being assembled onto ring 1's crescent is the deposit floor under
+    # layer N, not the absence of assembly. See
+    # test_measure_take_and_not_its_caller_decides_arc_assembly.
+    assert fake_measure_processing.calls[-1]["assemble_arcs"] is True
     assert json.loads((Path(third["layer_dir"]) / "manifest.json").read_text())["annotation"] == {"introduced_offset_mm": [10, 0]}
     # Session survives a restart.
     reloaded = MeasureSession.load(root, session.trial_id)
