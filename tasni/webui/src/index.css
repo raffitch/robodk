@@ -456,6 +456,15 @@ tr.clickable.selected > td { background: var(--panel-2); box-shadow: inset 2px 0
 .figure-card img {
   width: 100%; height: auto; display: block; border-radius: 5px; background: #fff;
 }
+/* A card whose image has not been requested yet (the gallery fetches a couple at
+   a time instead of opening ten parallel requests). Holds the same ground and a
+   plausible height so nothing jumps as each image arrives. */
+.figure-pending {
+  width: 100%; aspect-ratio: 4 / 3; border-radius: 5px;
+  background: repeating-linear-gradient(
+    -45deg, var(--panel) 0 10px, var(--panel-2) 10px 20px);
+  opacity: .5;
+}
 .figure-card figcaption { font-size: 12px; margin-top: 7px; line-height: 1.5; }
 .figure-card figcaption .hint { display: block; font-size: 11px; }
 .figure-links { display: inline-flex; gap: 10px; margin-top: 4px; }

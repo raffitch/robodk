@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { moduleApi } from "../api/client";
 import { useEvents, type JobEvent } from "../api/events";
 
@@ -176,53 +176,106 @@ const FIGURES: Array<{ stem: string; label: string; hint: string }> = [
   { stem: "profile", label: "Unrolled profile", hint: "height and radial deviation vs angle" },
 ];
 
-/** Figures are rendered on first request, so the first load of a take is slow. */
+/** How many images may be in flight at once. Opening a take used to mount ten
+ *  <img> tags at once, so the browser issued ten parallel GETs and the backend
+ *  answered up to six of them by rendering a matplotlib figure on the spot --
+ *  around 8 MB per take, with the cheap 1-5 kB rasters queued behind the
+ *  expensive renders. Two keeps a slow render from blocking the gallery while
+ *  still letting something appear almost immediately. */
+const FIGURE_CONCURRENCY = 2;
+
+type FigureCard = {
+  key: string;
+  src: string;
+  alt: string;
+  label: string;
+  hint: ReactNode;
+  /** Fetch-order weight: small = cheap = fetched first. The cards keep their
+   *  authored order on screen; only the ORDER THEY ARE REQUESTED IN changes. */
+  cost: number;
+  pdf?: string;
+};
+
+/** Figures are rendered on first request, so the first load of a take is slow.
+ *  They are cached to disk afterwards, so the second load is not. */
 function TakeFigures({ trialId, take }: { trialId: string; take: MeasureTake }) {
   const base = `/api/modules/extrusion/trials/${encodeURIComponent(trialId)}`
     + `/layers/${encodeURIComponent(layerDirName(take))}`;
+
+  const cards = useMemo<FigureCard[]>(() => {
+    const list: FigureCard[] = FIGURES.map(({ stem, label, hint }) => ({
+      key: stem,
+      src: `${base}/figures/${stem}.png`,
+      pdf: `${base}/figures/${stem}.pdf`,
+      alt: `${label} of layer ${take.layer_index} take ${take.take}`,
+      label, hint,
+      // Rendered on demand by matplotlib when missing: the costly ones.
+      cost: 10,
+    }));
+    list.push({
+      key: "color", src: `${base}/files/color.png`, cost: 5,
+      alt: "Colour frame as captured", label: "Colour frame",
+      hint: "what the camera saw",
+    });
+    list.push({
+      key: "comparison", src: `${base}/files/comparison.png`, cost: 1,
+      alt: "Segmentation with nominal and measured paths", label: "Segmentation",
+      hint: "raster the centreline came from",
+    });
+    list.push({
+      key: "skeleton", src: `${base}/files/skeleton.png`, cost: 1,
+      alt: "Skeleton thinned from the segmentation", label: "Skeleton",
+      hint: <>the segmentation thinned to one pixel — the centreline before it was
+        mapped back to 3-D</>,
+    });
+    // Only the last take of a press carries the photo -- the ring does not move
+    // between the frames of one capture, so the others would repeat it.
+    if (take.side_view?.captured) list.push({
+      key: "side", src: `${base}/files/side.png`, cost: 5,
+      alt: `The stack seen from the side after layer ${take.layer_index}`,
+      label: "Side view",
+      hint: <>the stack from {take.side_view.target ?? "the taught side pose"} — a photo
+        for the paper, measured from nothing</>,
+    });
+    return list;
+  }, [base, take.layer_index, take.take, take.side_view]);
+
+  // Rank each card by fetch cost, stable within equal costs.
+  const rank = useMemo(() => {
+    const byCost = cards.map((c, i) => i)
+      .sort((a, b) => cards[a].cost - cards[b].cost || a - b);
+    const out = new Map<number, number>();
+    byCost.forEach((cardIndex, position) => out.set(cardIndex, position));
+    return out;
+  }, [cards]);
+
+  const [settled, setSettled] = useState(0);
+  // A different take is a different gallery: start its queue over.
+  useEffect(() => { setSettled(0); }, [base]);
+
   return <div className="figure-gallery">
-    {FIGURES.map(({ stem, label, hint }) => <figure key={stem} className="figure-card">
-      <a href={`${base}/figures/${stem}.png`} target="_blank" rel="noreferrer">
-        <img src={`${base}/figures/${stem}.png`} alt={`${label} of layer ${take.layer_index} take ${take.take}`} loading="lazy" />
-      </a>
-      <figcaption>
-        <strong>{label}</strong> <span className="hint">{hint}</span>
-        <span className="figure-links">
-          <a href={`${base}/figures/${stem}.png`} target="_blank" rel="noreferrer">PNG</a>
-          <a href={`${base}/figures/${stem}.pdf`} target="_blank" rel="noreferrer">PDF</a>
-        </span>
-      </figcaption>
-    </figure>)}
-    <figure className="figure-card">
-      <a href={`${base}/files/color.png`} target="_blank" rel="noreferrer">
-        <img src={`${base}/files/color.png`} alt="Colour frame as captured" loading="lazy" />
-      </a>
-      <figcaption><strong>Colour frame</strong> <span className="hint">what the camera saw</span></figcaption>
-    </figure>
-    <figure className="figure-card">
-      <a href={`${base}/files/comparison.png`} target="_blank" rel="noreferrer">
-        <img src={`${base}/files/comparison.png`} alt="Segmentation with nominal and measured paths" loading="lazy" />
-      </a>
-      <figcaption><strong>Segmentation</strong> <span className="hint">raster the centreline came from</span></figcaption>
-    </figure>
-    <figure className="figure-card">
-      <a href={`${base}/files/skeleton.png`} target="_blank" rel="noreferrer">
-        <img src={`${base}/files/skeleton.png`} alt="Skeleton thinned from the segmentation" loading="lazy" />
-      </a>
-      <figcaption><strong>Skeleton</strong> <span className="hint">
-        the segmentation thinned to one pixel — the centreline before it was
-        mapped back to 3-D</span></figcaption>
-    </figure>
-    {/* Only the last take of a press carries the photo -- the ring does not move
-        between the frames of one capture, so the others would repeat it. */}
-    {take.side_view?.captured && <figure className="figure-card">
-      <a href={`${base}/files/side.png`} target="_blank" rel="noreferrer">
-        <img src={`${base}/files/side.png`} alt={`The stack seen from the side after layer ${take.layer_index}`} loading="lazy" />
-      </a>
-      <figcaption><strong>Side view</strong> <span className="hint">
-        the stack from {take.side_view.target ?? "the taught side pose"} — a photo for the
-        paper, measured from nothing</span></figcaption>
-    </figure>}
+    {cards.map((card, index) => {
+      const position = rank.get(index) ?? 0;
+      const active = position < settled + FIGURE_CONCURRENCY;
+      // Any completion advances the queue, so one failed or slow image cannot
+      // strand the rest behind it.
+      const advance = () => setSettled((n) => Math.max(n, position + 1));
+      return <figure key={card.key} className="figure-card">
+        <a href={card.src} target="_blank" rel="noreferrer">
+          {active
+            ? <img src={card.src} alt={card.alt} loading="lazy" decoding="async"
+                   onLoad={advance} onError={advance} />
+            : <div className="figure-pending" aria-label={`${card.label} queued`} />}
+        </a>
+        <figcaption>
+          <strong>{card.label}</strong> <span className="hint">{card.hint}</span>
+          {card.pdf && <span className="figure-links">
+            <a href={card.src} target="_blank" rel="noreferrer">PNG</a>
+            <a href={card.pdf} target="_blank" rel="noreferrer">PDF</a>
+          </span>}
+        </figcaption>
+      </figure>;
+    })}
     {take.side_view && !take.side_view.captured && <figure className="figure-card empty">
       <figcaption><strong>Side view</strong> <span className="hint warn-text">
         {take.side_view.error ?? "not captured"}</span></figcaption>

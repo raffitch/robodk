@@ -1822,6 +1822,35 @@ def test_layer_figures_are_served_and_rendered_on_first_request(tmp_path, monkey
     assert client.get(f"{base}/figures/profile.pdf").status_code == 200
 
 
+def test_an_unchanged_take_image_revalidates_instead_of_being_resent(tmp_path, monkeypatch):
+    """Reopening a take must not re-download the gallery it already has.
+
+    Opening one take asks for ten images (~8 MB on a real trial). Starlette's
+    FileResponse sets an ETag but never answers a conditional request, so every
+    click used to resend all of it -- the whole reason the row felt slow the
+    second time. The validator is keyed on the FILE, not the URL, because
+    Reprocess rewrites a take in place and the operator must never be pinned to
+    the pre-reprocess picture.
+    """
+    layer_dir = archived_take(tmp_path / "runs" / "extrusion", monkeypatch)
+    client = TestClient(create_app(AppConfig()))
+    url = "/api/modules/extrusion/trials/t1/layers/layer-001/figures/plan.png"
+
+    first = client.get(url)
+    etag = first.headers["etag"]
+    assert first.status_code == 200 and first.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+    cached = client.get(url, headers={"If-None-Match": etag})
+    assert cached.status_code == 304
+    assert not cached.content
+
+    rendered = layer_dir / "figures" / "plan.png"
+    rendered.write_bytes(rendered.read_bytes() + b"\x00")
+    after = client.get(url, headers={"If-None-Match": etag})
+    assert after.status_code == 200, "a rewritten figure must not stay cached"
+    assert after.headers["etag"] != etag
+
+
 def test_archived_frames_are_served_from_the_allowlist_only(tmp_path, monkeypatch):
     archived_take(tmp_path / "runs" / "extrusion", monkeypatch)
     client = TestClient(create_app(AppConfig()))

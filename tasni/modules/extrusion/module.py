@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -27,9 +28,16 @@ if TYPE_CHECKING:
     from fastapi import APIRouter
 
 try:  # FastAPI is optional at import time; the helpers below need HTTPException.
-    from fastapi import HTTPException
+    from fastapi import HTTPException, Request
 except ImportError:  # pragma: no cover - exercised only without the web extra
     HTTPException = None  # type: ignore[assignment]
+    Request = None  # type: ignore[assignment]
+
+# Serializes on-demand figure rendering across request threads. FastAPI runs a
+# sync `def` endpoint in a threadpool, so opening one take used to start up to
+# six matplotlib renders at once. Module scope, not per-instance: the guarantee
+# wanted is "one render at a time in this process".
+_FIGURE_RENDER_LOCK = threading.Lock()
 
 
 class GenerateBody(BaseModel):
@@ -889,27 +897,54 @@ class ExtrusionModule(WorkflowModule):
                 raise HTTPException(404, f"no archived take at {trial_id}/{layer_dir}")
             return path
 
+        # Opening a take re-requests all ~8 MB of its images, every time. Starlette
+        # sets an ETag on a FileResponse but never answers a conditional request
+        # (checked against starlette 1.3.1), so the browser re-downloaded the lot
+        # on each click even though it already held every byte. Answer the
+        # revalidation instead: `no-cache` means "ask me each time", and the reply
+        # is a header-only 304 unless the file really changed.
+        #
+        # Deliberately NOT `immutable`: Reprocess rewrites a take's rasters and
+        # figures IN PLACE, at the same URL, so a long max-age would pin the
+        # operator to the pre-reprocess pictures. Keying the ETag on mtime+size
+        # means a reprocess invalidates itself.
+        def _archive_file(request, path, media):
+            from fastapi.responses import FileResponse, Response
+            stat = path.stat()
+            etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+            headers = {"ETag": etag, "Cache-Control": "no-cache"}
+            if request.headers.get("if-none-match") == etag:
+                return Response(status_code=304, headers=headers)
+            return FileResponse(path, media_type=media, headers=headers)
+
         @router.get("/trials/{trial_id}/layers/{layer_dir}/files/{name}")
-        def layer_file(trial_id: str, layer_dir: str, name: str):
-            from fastapi.responses import FileResponse
+        def layer_file(request: Request, trial_id: str, layer_dir: str, name: str):
             media = SERVED_FILES.get(name)
             if media is None:
                 raise HTTPException(404, f"not a served file: {name!r}")
             path = _layer_directory(trial_id, layer_dir) / name
             if not path.is_file():
                 raise HTTPException(404, f"{name} was not archived for this take")
-            return FileResponse(path, media_type=media)
+            return _archive_file(request, path, media)
 
         @router.get("/trials/{trial_id}/layers/{layer_dir}/figures/{name}")
-        def layer_figure(trial_id: str, layer_dir: str, name: str):
-            """Render on first request, then serve. Never touches the robot."""
-            from fastapi.responses import FileResponse
+        def layer_figure(request: Request, trial_id: str, layer_dir: str, name: str):
+            """Render on first request, then serve. Never touches the robot.
+
+            Rendering is serialized: a take's gallery asks for several figures at
+            once, and matplotlib renders are CPU-heavy enough that answering them
+            concurrently made the whole page slower, not faster -- and this
+            process already had one native crash from two BLAS runtimes
+            multithreading at once (see docs, commit bcd05cd).
+            """
             media = FIGURE_TYPES.get(name.rpartition(".")[2])
             if media is None:
                 raise HTTPException(404, f"not a figure: {name!r}")
             path = _layer_directory(trial_id, layer_dir)
             try:
-                return FileResponse(ensure_figure(path, name), media_type=media)
+                with _FIGURE_RENDER_LOCK:
+                    rendered = ensure_figure(path, name)
+                return _archive_file(request, rendered, media)
             except (ValueError, FileNotFoundError) as exc:
                 raise HTTPException(404, str(exc)) from exc
             except ImportError as exc:                       # the `figures` extra
@@ -917,9 +952,8 @@ class ExtrusionModule(WorkflowModule):
                     503, f"figures need matplotlib (pip install -e .[figures]): {exc}") from exc
 
         @router.get("/trials/{trial_id}/figures/{name}")
-        def trial_figure(trial_id: str, name: str):
+        def trial_figure(request: Request, trial_id: str, name: str):
             """Every layer's latest take in one picture -- plan and oblique."""
-            from fastapi.responses import FileResponse
             media = FIGURE_TYPES.get(name.rpartition(".")[2])
             if media is None:
                 raise HTTPException(404, f"not a figure: {name!r}")
@@ -932,7 +966,9 @@ class ExtrusionModule(WorkflowModule):
             if root not in path.parents or not (path / "trial.json").is_file():
                 raise HTTPException(404, f"no such trial: {trial_id}")
             try:
-                return FileResponse(ensure_figure(path, name), media_type=media)
+                with _FIGURE_RENDER_LOCK:
+                    rendered = ensure_figure(path, name)
+                return _archive_file(request, rendered, media)
             except (ValueError, FileNotFoundError) as exc:
                 raise HTTPException(404, str(exc)) from exc
 
