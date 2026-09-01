@@ -46,6 +46,25 @@ W, H = 320, 240
 K = np.array([[300.0, 0, 160.0], [0, 300.0, 120.0], [0, 0, 1.0]])
 TABLE_HALF_MM = 150.0
 _ORIG_ROOT = runs.REPO_ROOT
+
+
+@pytest.fixture(autouse=True)
+def _never_write_into_the_real_runs_dir(tmp_path):
+    """Point ``runs/`` at a tmpdir for EVERY test in this file.
+
+    ``poses_generate`` persists the target plan so a restarted backend can run
+    the targets still in the station. Most tests here call it without
+    redirecting ``runs.REPO_ROOT``, so without this fixture they write a plan
+    full of fixture geometry (a 299.2 mm square at the origin) into the
+    operator's live ``runs/scan/``. That happened on 2026-09-01; the plan's
+    target-count guard refused it on the cell, but a test suite must not be
+    reaching into real run data at all.
+    """
+    runs.REPO_ROOT = tmp_path
+    try:
+        yield
+    finally:
+        runs.REPO_ROOT = _ORIG_ROOT
 # A fixed, deterministic, non-zero "camera frame timestamp (server clock)" so tests
 # can assert the locked survey record's measurement_ts is real (not the 0.0 default).
 FRAME_TIMESTAMP = 1_700_000_000.5
