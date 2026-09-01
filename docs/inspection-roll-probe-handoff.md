@@ -1,6 +1,10 @@
 # Roll probe: is what we are missing locked to the camera, or to the scene?
 
-Task page. Opened 2026-09-01. One robot excursion, one ring, no new code required.
+Task page. Opened 2026-09-01; corrected after review the same day. The roll sequence
+uses one unchanged ring/stack and **three measurement excursions (A-B-A)**; the preceding
+spatial-filter A/B adds its own control captures. Existing code can capture the evidence,
+but the layer-2/dropout and residual-correlation readings still need a small offline probe
+extension (§4).
 
 This is a **re-run**. The probe exists (`tools/probe_roll_pair.py`), a pair is already
 on disk, and the probe **refused to read it** — see "What happened last time". Nothing
@@ -29,10 +33,18 @@ It is not *perfectly* single-variable, and that is what killed the first attempt
 printed board moved the noise floor itself (§2). The protocol in §3 is designed around
 that confound — not merely around operator care.
 
-The third row is the one that matters most. Your noise is **static, not temporal**,
-which is why more frames per pose buy nothing. Static noise still averages down *if it
-decorrelates with pose* — and the entire case for multi-view rests on that assumption,
-which has never been tested. A roll pair tests it for one excursion.
+The third row is the one that matters most. The 1.176 / 0.130 mm numbers came from the
+2026-08-30 headroom scene at ~447 mm, not from this two-ring stack at 300 mm. A direct
+2026-09-01 replay of the latest layer-2 burst still found the same qualitative result:
+robust spatial substrate sigma 0.608 → 0.569 → 0.549 → 0.506 → 0.496 mm over its five
+frames, against 0.126 mm mean per-pixel temporal sigma on 246,917 common board pixels.
+Static structure dominates, but the monotonic change also says the production burst was
+**still settling**. More frames at one settled pose buy little against static structure;
+the current first five are not proof of what a settled burst buys.
+
+Static noise can average down *if it decorrelates with pose* — and the entire case for
+multi-view rests on that assumption, which has never been tested. The captures below make
+that test possible, but the existing halo-only pair statistic does not perform it (§4).
 
 ---
 
@@ -54,7 +66,7 @@ VERDICT: NOT A CONTROLLED COMPARISON. The two captures do not share a noise floo
 so neither 'baseline-locked' nor 'real geometry' can be read off them.
 ```
 
-**Two facts to carry into the re-run:**
+**Three facts to carry into the re-run:**
 
 1. **90° was requested; 60° was delivered.** The probe's own protocol says to set
    `inspection_roll_candidates_deg [90, 60, 0]`; the planner could not reach 90 and
@@ -68,15 +80,21 @@ so neither 'baseline-locked' nor 'real geometry' can be read off them.
    `provenance.T_work_camera`. Run the probe on the pair the moment capture B lands;
    that line IS the achieved-roll check.
 
-2. **Capture B was a worse capture — and probably *because* it was rolled.** Substrate
+2. **Capture B was a worse capture; the roll is a candidate cause, not an isolated
+   cause.** Substrate
    sigma 0.866 mm against A's 0.591 (ratio 1.46, the gate is 25%), the derived floor
    **pinned at its 2.0 mm clamp ceiling**, the skirt pattern gone from two clean lobes
    to four at three times the amplitude, and a fitted radius of 44.10 mm where A gave
-   42.64 on the same untouched ring. The probe's own post-mortem (the comparability
-   comment in `tools/probe_roll_pair.py`) attributes this to the roll itself: the IR
-   projector's dot pattern turned against the printed board along with the baseline.
-   If that is right, "same light, same standoff, try harder" fails the same gate
-   again — the fix has to be in the *design* of the pair (§3), not in operator care.
+   42.64 on the same untouched ring. Rolling the IR projector's dot pattern against the
+   printed board is a plausible cause, but the pair also changed recipe and absolute
+   viewpoint (fact 3). The refused pair cannot assign causality to any one of them.
+
+3. **The old pair was not the same viewpoint.** Capture A's trial used bead diameter
+   8.9 mm; B used 15.0 mm. Both inspection records said 300 mm standoff, but standoff is
+   measured from the recipe-derived aim height. `T_work_camera` therefore placed the
+   optical centres at work Z 313.159 and 319.259 mm — **6.100 mm apart** — while their
+   optical axes agreed. That exactly follows the 6.1 mm recipe change. Freeze the whole
+   applied plan/recipe/toolpath fingerprint in the re-run, not merely the standoff field.
 
 The raw axis numbers the probe printed (work-frame disagreement 19.8°,
 baseline-relative 79.8°) **are not an answer** and must not be quoted. The probe prints
@@ -86,19 +104,43 @@ them under an explicit refusal for exactly this reason.
 
 ## 3. Protocol
 
+### 3.1 First decision gate: test the spatial filter
+
+Before spending the roll excursions, run the already-built **current/default versus
+`RS_SPATIAL=0`** A/B on the same untouched two-ring stack at roll 0. This is the only
+untried lever with a measured direct mechanism for losing the ring: the camera read the
+crest ~1.5 mm low against the operator's five ruler readings, and the stock disparity-domain
+spatial filter uses `smooth_delta=20` while the 4–11 mm relief spans only ~1.4–3.9 disparity
+pixels at 300 mm (`server/server_unicast_syncronous.py`, commit `f9c4a53`).
+
+- If spatial-off materially restores the low crest/dropout without turning board noise
+  into a false ring, stop and tune that path before asking multi-view to repair it.
+- If it does not restore the sector, restore the default chain and continue below.
+- The greeting archives whether `spatial` was present, so on/off is distinguishable.
+  It does **not** archive `RS_SPATIAL_SMOOTH_DELTA`; do not run a delta sweep until that
+  value is added to provenance (or each arm is otherwise immutably labelled).
+
+### 3.2 Controlled roll capture
+
 Place one ring — or leave the current 2-ring stack in place if the dropout is the
 target — and **do not touch it for the whole protocol.**
 
-**Both captures are rolled, symmetrically: A at +30°, B at −30°.** Do not repeat the
+**Use A-B-A: A1 at +30°, B at −30°, A2 at +30°.** Do not repeat the
 0-vs-60 design that failed. Symmetric rolls still rotate the baseline 60° between the
-captures — the discriminating variable is intact — but both captures now suffer the same
-*class* of dot-pattern-vs-board interaction, which is the best available shot at a
-shared noise floor. The roll-0 takes already on disk
+two orientations — the discriminating variable is intact — while A1 versus A2 measures
+ordinary drift/repeatability. Calling +30 and −30 the same *class* of projector interaction
+does not make them equal; only the returning A2 control can show whether the comparison
+was stable. The roll-0 takes already on disk
 (`runs/extrusion/20260831-195459-19838507/layer-002*`, tilt 0 / azimuth 0 / standoff
 300 mm) remain the work-frame reference for where the dropout sector sits; they are
 **not** capture A of the pair.
 
-1. **Capture A (+30°).** In `tasni.config.json`'s `extrusion` block set
+Before A1, set `measure_depth_fusion_frames` to **10** for this diagnostic only. The
+archive retains all ten raw frames; analyze the **last five** after the filter chain has
+advanced, rather than treating the visibly converging first five as settled. Apply the
+same setting to every arm and restore it afterwards.
+
+1. **Capture A1 (+30°).** In `tasni.config.json`'s `extrusion` block set
    `inspection_roll_candidates_deg` to `[30, 0]`, **restart the backend**, confirm
    `GET /api/health` → `build.stale == false`, run the measurement.
 2. **Capture B (−30°).** Set `[-30, 0]` (candidates are plain floats tried in list
@@ -106,20 +148,33 @@ shared noise floor. The roll-0 takes already on disk
    `repeats`. Do **not** ask for 90° anywhere: it sits exactly on
    `max_tool_axis_spin_deg`'s default limit of 90 and was refused last time. Leave that
    limit alone and keep every candidate comfortably inside it.
-3. **Verify the achieved rolls immediately** — run the probe on the pair (§2, fact 1);
-   its "baselines differ by" line is the check. Under 15° apart the probe declares the
-   pair inconclusive itself; if a capture fell through to roll 0, stop and fix the
-   reachability before spending more cell time.
-4. **Restore `inspection_roll_candidates_deg`** afterwards. It is a startup value; a
-   forgotten override silently changes every later take.
+3. **Capture A2 (+30° again).** Restore `[30, 0]`, restart, confirm, and repeat without
+   touching the stack or changing the applied plan.
+4. **Verify achieved rolls immediately.** Run the existing pair probe twice: A1-vs-B
+   and A2-vs-B. Each should report a baseline gap near 60°; A1 and A2 should return to
+   the same baseline. Under 15° apart from B is inconclusive and means a rolled pose
+   probably fell through to 0. Do not read any refused verdict.
+5. **Restore both startup overrides** (`inspection_roll_candidates_deg` and
+   `measure_depth_fusion_frames`) afterwards. A forgotten value silently changes every
+   later take.
 
-**Hold everything else equal anyway.** Same standoff, same tilt (0 — a 15° tilt costs
+**Hold everything else equal anyway.** Same applied plan, recipe, toolpath fingerprint,
+work frame, search centre, absolute camera position, standoff, same tilt (0 — a 15° tilt costs
 3–4 mm of plane noise against 0.65 mm at zero), same ambient light, same laser power
-(pinned to 150 in the systemd unit; confirm it did not move). After capture B, before
-anything else, compare `report["substrate"]["sigma_mm"]` between the pair. **Within 25%
-and both floors off the 2.0 mm clamp, or the pair is void** — the probe will refuse it.
+(pinned to 150 in the systemd unit; confirm it did not move). After A2, compare
+`report["substrate"]["sigma_mm"]` between all three captures.
+**Within 25% and every floor off the 2.0 mm clamp, or the comparison is void** — the
+existing probe enforces this per pair. Also compare substrate p99/inlier fraction, valid
+depth fraction, `T_work_camera` translation/optical axis, temperatures, depth unit,
+filter list, preset and laser. Equal global sigma alone cannot prove that two angular
+noise patterns are comparable. Depth exposure/gain are not currently archived, which is
+a disclosed residual confound.
 
-**If a symmetric pair still fails the sigma gate, stop — do not iterate on the cell.**
+Most importantly, **A1 and A2 must agree with one another**. If the returning control
+does not reproduce the first +30° capture, drift/repeatability is already as large as the
+effect being assigned to roll and B cannot be interpreted.
+
+**If the A-B-A set still fails the comparability gates, stop — do not iterate on the cell.**
 That outcome is itself a finding: the noise floor depends on roll angle on this board,
 and no roll pair can answer the question here. Bring it back to the desk. The remaining
 levers are not more excursions of the same kind: an unprinted matte board under the same
@@ -132,17 +187,20 @@ the halo lives on), or accepting the tilted-star offline A/B (`tools/multiview_a
 ## 4. Reading it
 
 `tools/probe_roll_pair.py` implements the decision rule for the **halo** (it measures
-lifted board points in the skirt annulus). Its rule generalises:
+lifted board points in the skirt annulus). It also fits each capture's ring centre/radius
+independently, so a biased fit moves the annulus being compared. A controlled reader must
+use one shared centre/radius (or at least report sensitivity to that choice). Its frame rule
+generalises only to the quantity actually measured:
 
 - **baseline-relative peaks agree, work-frame peaks rotate → CAMERA-LOCKED.** Two rolls
   close the gap at zero tilt cost. Strictly, the probe measures one specific static
-  artifact — the lifted-board axis — not per-pixel noise decorrelation, so this verdict
-  is strong evidence that the static noise is pose-locked, not yet proof that it
-  averages down. The offline merged-vs-top-only A/B (`tools/multiview_ab.py`, §5) is
-  what turns it into proof, at zero robot time.
+  artifact — the lifted-board axis — not per-pixel noise decorrelation and not the ring
+  dropout. This verdict says the **halo** is camera-locked; it cannot prove that all static
+  noise averages down.
 - **work-frame peaks agree, baseline-relative peaks rotate → SCENE-LOCKED.** Extra views
   of the same kind will not help; the tilted star (a genuinely different viewpoint) is
-  the only thing that can, and the static noise will *not* average down.
+  the only thing that can remove that **particular scene-locked quantity**. It does not
+  prove that the separate static residual field is scene-locked too.
 
 **For the layer-2 dropout the measurement is different and the probe does not do it
 yet.** The dropout is an absence, not a lifted shelf: count ROI points per 10° sector
@@ -150,6 +208,20 @@ and find where they collapse, then express that sector twice — in work-frame a
 relative to that capture's own baseline axis (`T_work_camera[:3, 0]`). Exactly one of the
 two should agree between A and B. Same rule, different quantity; extend the probe or
 write a sibling, and delete it once the answer is in.
+
+**For the static-noise question, neither angular statistic is enough.** Using the archived
+raw bursts, rasterise the surrounding substrate into the work frame, remove a fitted plane
+and common low-frequency shape, then compare:
+
+- within-pose residual correlation (A1 frames with A1, B with B, A2 with A2);
+- A1-vs-A2 correlation in work coordinates — the repeatability/drift control;
+- cross-roll correlation in work coordinates; and
+- cross-roll correlation after expressing the residual maps in each camera's own
+  baseline coordinates.
+
+That is the direct test of whether the 0.5–0.6 mm static residual decorrelates. The halo
+axis can support it, not substitute for it. Capturing A-B-A can happen before this sibling
+exists because `depth-frames.npy` preserves the evidence; **declaring the result cannot**.
 
 Baseline for the current stack, so a re-run is comparable — 2026-08-31 layer-002,
 reprocessed offline with the deposit-floor fix (`bd455a7`, which landed at 21:56 — two
@@ -183,7 +255,10 @@ alarmed by.
 
 ## 5. The multi-view branch nobody ever used
 
-**If the answer comes back CAMERA-LOCKED, do not start building.** Most of it exists.
+**If the answer comes back CAMERA-LOCKED, do not start building from scratch.** Most of
+the registration/archive machinery exists — but the branch's shipped pose set is tilted,
+while a baseline-locked dropout first calls for cheaper **zero-tilt roll fusion**. Reuse
+the machinery; do not assume the Mercedes-star pose set is the answer.
 
 `origin/worktree-multiview-inspection` @ **`96a17f6`** — worktree already checked out at
 `.claude/worktrees/multiview-inspection`. **17 commits, +3659 lines**, never merged, never
@@ -240,3 +315,10 @@ the star merges at. The UI withholds the toggle there for that reason.
   "has anyone reprocessed this?" cross-check. Reprocessing it breaks that permanently.
 - **Do not read a refused verdict.** The probe prints its axis numbers even when it
   refuses the pair. They are diagnostics, not results.
+- **Robot settling is not filter settling.** `settle_s` elapses before the host opens
+  the depth stream; the Jetson's spatial/temporal blocks advance only when `getFrames()`
+  is called. The latest five-frame burst was still converging, which is why this protocol
+  archives ten and reads the last five.
+- **A 300 mm standoff is relative to the aim point, not an absolute camera-Z invariant.**
+  Changing bead diameter moved the old pair's camera by 6.1 mm. Compare
+  `T_work_camera`, and freeze the complete applied plan.

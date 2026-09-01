@@ -306,18 +306,20 @@ is 15 mm) but fatal to a floor derived from `nominal_z_mm` inside a 4.6 mm layer
 `reprocess_saved_layer` now shares `plan_for_archived_take` with the figures and the golden
 harness instead of keeping its own drifted copy.
 
-**NEXT on the cell, one excursion: the roll probe.**
+**NEXT on the cell: spatial-filter A/B, then the controlled A-B-A roll probe if needed.**
 **[docs/inspection-roll-probe-handoff.md](docs/inspection-roll-probe-handoff.md)** is the
-task page. Rolling the camera about its own optical axis is the only single-variable move
-that separates a stereo/sensor artifact from real geometry, and three open problems ride on
-the answer at once: the layer-2 dropout, the board halo, and -- the big one -- whether the
-STATIC depth noise (1.176 mm spatial vs 0.130 temporal) decorrelates with pose. That last
-is the assumption the entire multi-view case rests on and it has never been tested. NOTE it
-is a RE-RUN: `tools/probe_roll_pair.py` exists, a pair is already on disk, and the probe
-REFUSED it (capture B's substrate sigma 0.866 vs A's 0.591, floor pinned at its 2.0 mm
-clamp) -- so the difficulty is holding the noise floor equal, not the manoeuvre. Also: 90
-deg was requested and the planner delivered 60; read the achieved roll off `T_work_camera`,
-never off the config.
+task page. First use the already-built `RS_SPATIAL=0` control on the untouched two-ring
+stack: the stock spatial filter is the only untried lever with a measured direct mechanism
+for the ~1.5 mm crest-height shortfall. If it does not recover the sector, capture
+**+30 / -30 / +30** (three excursions, ten raw frames each, analyze the last five), freezing
+the complete applied plan and reading achieved roll off `T_work_camera`. The old pair was
+not merely a mismatched noise floor: its recipes used 8.9 vs 15.0 mm bead diameter, which
+moved the absolute camera centre **6.1 mm**, so it was not one viewpoint. The existing
+`tools/probe_roll_pair.py` reads the board halo only; a sibling must count the layer-2
+dropout by 10 deg sector and directly correlate substrate residual maps before anyone can
+claim the static noise decorrelates. The probe can be written after capture because
+`depth-frames.npy` preserves the evidence, but no halo verdict substitutes for it. Also:
+90 deg was requested last time and the planner delivered 60; never weaken the spin limit.
 
 **Built, never used, never merged: multi-view inspection.**
 `origin/worktree-multiview-inspection` @ `96a17f6` (worktree at
