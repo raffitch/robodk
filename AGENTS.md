@@ -306,6 +306,31 @@ is 15 mm) but fatal to a floor derived from `nominal_z_mm` inside a 4.6 mm layer
 `reprocess_saved_layer` now shares `plan_for_archived_take` with the figures and the golden
 harness instead of keeping its own drifted copy.
 
+**NEXT on the cell, one excursion: the roll probe.**
+**[docs/inspection-roll-probe-handoff.md](docs/inspection-roll-probe-handoff.md)** is the
+task page. Rolling the camera about its own optical axis is the only single-variable move
+that separates a stereo/sensor artifact from real geometry, and three open problems ride on
+the answer at once: the layer-2 dropout, the board halo, and -- the big one -- whether the
+STATIC depth noise (1.176 mm spatial vs 0.130 temporal) decorrelates with pose. That last
+is the assumption the entire multi-view case rests on and it has never been tested. NOTE it
+is a RE-RUN: `tools/probe_roll_pair.py` exists, a pair is already on disk, and the probe
+REFUSED it (capture B's substrate sigma 0.866 vs A's 0.591, floor pinned at its 2.0 mm
+clamp) -- so the difficulty is holding the noise floor equal, not the manoeuvre. Also: 90
+deg was requested and the planner delivered 60; read the achieved roll off `T_work_camera`,
+never off the config.
+
+**Built, never used, never merged: multi-view inspection.**
+`origin/worktree-multiview-inspection` @ `96a17f6` (worktree at
+`.claude/worktrees/multiview-inspection`) is **17 commits and +3659 lines** -- the star
+capture, the shared-circle registration, `tools/multiview_ab.py` (offline A/B, no robot
+time), 1356 lines of tests and a written cell A/B protocol. It is 45 commits behind main
+and predates the halved voxel, the radial-trim fixed point and the layer-N deposit floor,
+so its "1 mm voxel" count trap is stale. It also carries a fix **main still lacks**:
+`depth_plane_check` taking incidence from the actual pose instead of assuming a
+straight-down view -- without it main's arrival gate rejects any frame tilted past roughly
+18 deg at 300 mm, so no tilted capture works on main at all. Worth cherry-picking on its
+own merits. Do not rebuild any of this from scratch.
+
 **OPEN, not diagnosed: the backend hard-crashes.** Seven times across 2026-08-30/31 -- five
 sharing one ntdll access violation (WER bucket `755b2d74...`, fault offset `0x2f6a3`, inside
 the NT heap manager = native heap corruption), once as BEX64. Tonight's was pid 2680 at
