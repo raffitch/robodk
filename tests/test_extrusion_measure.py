@@ -1263,6 +1263,22 @@ def test_fusion_geometry_ignores_live_telemetry_but_not_calibration_changes():
     assert _same_reconstruction_geometry(first, changed_intrinsics) is False
 
 
+def test_fusion_geometry_ignores_the_provenance_only_smooth_delta():
+    """``spatial_smooth_delta`` is provenance, like temps and the achieved preset --
+    it is carried so an A/B is readable afterwards, NOT so fusion can police it. The
+    guard compares only what moves a reconstructed point or changes the frame layout;
+    adding a provenance field to it would abort real bursts over a label."""
+    from dataclasses import replace
+    from tasni.modules.extrusion.measure import _same_reconstruction_geometry
+
+    first = gf.aligned(syn.K_720P, (16, 16))
+    relabelled = replace(
+        first, spatial_smooth_delta=4.0,
+        raw={**first.raw, "filter_options": {"spatial_smooth_delta": 4.0}})
+
+    assert _same_reconstruction_geometry(first, relabelled) is True
+
+
 def test_measure_fuses_five_top_frames_and_archives_the_raw_burst(tmp_path, monkeypatch):
     svc, rdk, camera = measure_env(tmp_path, monkeypatch)
     svc.config.extrusion.measure_depth_fusion_frames = 5

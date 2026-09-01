@@ -42,6 +42,13 @@ class CameraGeometry:
     device: dict
     raw: dict
     legacy: bool = False
+    # The smooth_delta the Jetson's spatial filter ACTUALLY ran at, or None when the
+    # chain had no spatial filter (`"spatial" not in raw["filters"]`) -- and also None
+    # for every greeting archived before the server started reporting it, which is
+    # every take under runs/ up to 2026-09-01. Provenance only: nothing here
+    # back-projects with it. It exists so the two arms of a smooth_delta A/B are
+    # distinguishable on disk (docs/inspection-roll-probe-handoff.md 3.1).
+    spatial_smooth_delta: float | None = None
 
     @staticmethod
     def _K(block: dict) -> np.ndarray:
@@ -62,13 +69,23 @@ class CameraGeometry:
         T = np.eye(4); T[:3, :3] = R; T[:3, 3] = t
         depth, color = d["depth"], d["color"]
         coeffs = np.asarray(depth.get("coeffs") or [0, 0, 0, 0, 0], float)[:5]
+        # `filter_options` arrived 2026-09-01; every greeting archived under runs/
+        # before that has no such key, and those archives are re-read on every
+        # reprocess and every figure render. Absent, malformed or null all mean the
+        # same readable thing -- unknown -- and none of them may raise.
+        options = d.get("filter_options")
+        delta = options.get("spatial_smooth_delta") if isinstance(options, dict) else None
+        try:
+            delta = None if delta is None else float(delta)
+        except (TypeError, ValueError):
+            delta = None
         return cls(
             protocol=2, depth_unit_mm=float(d["depth_unit_mm"]),
             depth_K=cls._K(depth), depth_size=(int(depth["width"]), int(depth["height"])),
             depth_dist=coeffs, color_size=(int(color["width"]), int(color["height"])),
             color_K_factory=cls._K(color), T_color_depth=T,
             temps=dict(d.get("temps") or {}), device=dict(d.get("device") or {}),
-            raw=dict(d), legacy=False)
+            raw=dict(d), legacy=False, spatial_smooth_delta=delta)
 
     @classmethod
     def legacy_aligned(cls, K_color, size, *, depth_unit_mm: float = 1.0) -> "CameraGeometry":

@@ -62,7 +62,16 @@ def static_geometry(profile, rs) -> StaticGeometry:
 
 
 def build_greeting(static: StaticGeometry, *, depth_unit_mm: float, filters: list,
-                   temps: dict, global_time_enabled, achieved: dict, device: dict) -> dict:
+                   temps: dict, global_time_enabled, achieved: dict, device: dict,
+                   spatial_smooth_delta) -> dict:
+    """``filters`` names the chain that ran; ``filter_options`` says what it ran AT.
+
+    ``spatial_smooth_delta`` is the ACHIEVED value read back off the spatial filter,
+    ``None`` when no spatial filter is in the chain (or when the SDK would not report
+    it). It is REQUIRED rather than defaulted: it is the only record of which arm of a
+    smooth_delta A/B a take came from, and a greeting path that forgot it would archive
+    two indistinguishable arms with no error (docs/inspection-roll-probe-handoff.md 3.1).
+    """
     return {
         "protocol": 2,
         "aligned": False,
@@ -74,6 +83,10 @@ def build_greeting(static: StaticGeometry, *, depth_unit_mm: float, filters: lis
             "translation_mm": np.asarray(static.t_dc_mm, float).round(6).tolist(),
         },
         "filters": list(filters),
+        "filter_options": {
+            "spatial_smooth_delta": (None if spatial_smooth_delta is None
+                                     else float(spatial_smooth_delta)),
+        },
         "device": {**dict(device),
                    "visual_preset": achieved.get("visual_preset"),
                    "laser_power": achieved.get("laser_power")},

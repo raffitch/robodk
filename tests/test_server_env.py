@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
 sys.modules.setdefault("pyrealsense2", SimpleNamespace())
@@ -61,6 +63,12 @@ def test_laser_power_defaults_to_leave_alone():
 # the same discipline RS_LASER_POWER and RS_VISUAL_PRESET already follow.
 
 
+# librealsense's own defaults, as a freshly constructed filter reports them. The
+# spatial filter's smooth_delta is 20 -- the number the whole archive was measured
+# under and the one an "unset" env var silently inherits.
+SDK_DEFAULTS = {"spatial": {"filter_smooth_delta": 20.0}}
+
+
 class _FakeFilter:
     def __init__(self, kind):
         self.kind = kind
@@ -68,6 +76,15 @@ class _FakeFilter:
 
     def set_option(self, option, value):
         self.options[option] = value
+
+    def get_option(self, option):
+        """What the filter is ACTUALLY set to -- an explicit set, else the SDK default."""
+        if option in self.options:
+            return float(self.options[option])
+        try:
+            return float(SDK_DEFAULTS[self.kind][option])
+        except KeyError:
+            raise RuntimeError(f"{self.kind} has no option {option!r}")
 
 
 class _FakeRs:
@@ -159,6 +176,103 @@ def test_garbage_spatial_env_does_not_kill_the_service(monkeypatch):
         assert [f.kind for f in chain] == [
             "threshold", "disparity", "spatial", "temporal", "disparity_inv"]
         assert next(f for f in chain if f.kind == "spatial").options == {}
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+# ------------------------------------- the ACHIEVED smooth_delta, in the greeting
+# The filter-name list already tells an archived take whether `spatial` ran, so the
+# RS_SPATIAL arm is readable afterwards. The DELTA is not: with the filter present,
+# a take run at delta 20 and a take run at delta 4 archive byte-identical
+# provenance, and the two arms of a delta sweep become indistinguishable the moment
+# the operator forgets which was which. docs/inspection-roll-probe-handoff.md 3.1
+# blocks the sweep on exactly this.
+#
+# It must be the ACHIEVED value, read back off the filter object that actually
+# processes the frames -- not an echo of the env var. The env var's own default
+# (-1 = "don't touch") names no number at all, and the number it silently inherits
+# is librealsense's, which a future SDK is free to change under us.
+
+def _greeting(monkeypatch, **env):
+    """A full protocol-2 greeting, built the way a connecting client gets one, with
+    the filter chain that ``env`` produces actually installed."""
+    chain = _chain(monkeypatch, **env)
+    from server import rs_geometry
+
+    srv.depth_filters = chain
+    static = rs_geometry.StaticGeometry(
+        depth={"width": 1280, "height": 720, "fx": 640.0, "fy": 640.0, "ppx": 640.0,
+               "ppy": 360.0, "model": "none", "coeffs": [0.0] * 5},
+        color={"width": 1920, "height": 1080, "fx": 960.0, "fy": 960.0, "ppx": 960.0,
+               "ppy": 540.0, "model": "none", "coeffs": [0.0] * 5},
+        R_dc=np.eye(3), t_dc_mm=np.zeros(3),
+        depth_size=(1280, 720), color_size=(1920, 1080))
+    sensor = SimpleNamespace()
+    pipeline = SimpleNamespace(get_active_profile=lambda: SimpleNamespace(
+        get_device=lambda: SimpleNamespace(first_depth_sensor=lambda: sensor)))
+    snap = srv.CameraSnapshot(
+        pipeline=pipeline, depth_unit_mm=0.1, geometry=static,
+        achieved={"visual_preset": 0.0, "laser_power": 150.0},
+        device={"serial": "S1", "fw": "5.16.0.1", "librealsense": "2.55.1"},
+        generation=0)
+    monkeypatch.setattr(srv, "_camera_snapshot", lambda: snap)
+    return srv.make_greeting()
+
+
+def test_the_greeting_records_the_smooth_delta_the_filter_actually_ran_with(monkeypatch):
+    """Unset env still archives a NUMBER -- the SDK default the filter is really at."""
+    try:
+        greeting = _greeting(monkeypatch)
+        assert "spatial" in greeting["filters"]
+        assert greeting["filter_options"]["spatial_smooth_delta"] == 20.0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_a_lowered_smooth_delta_reaches_the_greeting(monkeypatch):
+    """The delta-sweep arm. Two takes captured under different deltas must not
+    archive the same provenance."""
+    try:
+        greeting = _greeting(monkeypatch, RS_SPATIAL_SMOOTH_DELTA="4")
+        assert greeting["filter_options"]["spatial_smooth_delta"] == 4.0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_no_spatial_filter_is_recorded_distinctly_from_the_sdk_default(monkeypatch):
+    """RS_SPATIAL=0 means there is no spatial filter at all -- not "spatial at 20".
+    Recording the env var instead of the achieved value would blur the two."""
+    try:
+        greeting = _greeting(monkeypatch, RS_SPATIAL="0")
+        assert "spatial" not in greeting["filters"]
+        assert greeting["filter_options"]["spatial_smooth_delta"] is None
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_a_smooth_delta_that_cannot_be_read_back_does_not_kill_the_service(monkeypatch):
+    """Provenance is never worth the camera. An SDK that refuses the read-back must
+    leave the chain intact and the service serving -- with the value recorded as
+    unknown rather than as a number nobody measured."""
+    class _NoReadback(_FakeRs):
+        @staticmethod
+        def spatial_filter():
+            f = _FakeFilter("spatial")
+            f.get_option = lambda option: (_ for _ in ()).throw(
+                RuntimeError("option not supported by this build"))
+            return f
+
+    try:
+        _chain(monkeypatch)                       # reload under a clean env first
+        monkeypatch.setattr(srv, "rs", _NoReadback)
+        chain = srv.setup_depth_filters()
+        assert [f.kind for f in chain] == [
+            "threshold", "disparity", "spatial", "temporal", "disparity_inv"]
+        assert srv.SPATIAL_SMOOTH_DELTA is None
     finally:
         monkeypatch.undo()
         importlib.reload(srv)

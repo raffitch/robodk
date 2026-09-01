@@ -30,6 +30,65 @@ def test_greeting_parses_and_rejects_protocol_1():
         dg.CameraGeometry.from_greeting({**g.raw, "protocol": 1})
 
 
+def test_from_greeting_carries_the_achieved_spatial_smooth_delta():
+    """A take's provenance must say what the spatial filter ran AT, not just that it
+    ran -- otherwise the two arms of a smooth_delta A/B are indistinguishable on disk
+    (docs/inspection-roll-probe-handoff.md 3.1)."""
+    base = gf.offset(color_K=K_C, color_size=SIZE_C).raw
+    g = dg.CameraGeometry.from_greeting(
+        {**base, "filter_options": {"spatial_smooth_delta": 4.0}})
+    assert g.spatial_smooth_delta == 4.0
+    # ...and it survives the round trip into the archive manifest.
+    assert g.to_dict()["filter_options"]["spatial_smooth_delta"] == 4.0
+
+    control = dg.CameraGeometry.from_greeting(
+        {**base, "filters": ["threshold", "disparity", "temporal", "disparity_inv"],
+         "filter_options": {"spatial_smooth_delta": None}})
+    assert control.spatial_smooth_delta is None
+
+
+def test_a_greeting_without_filter_options_still_parses():
+    """Backward compatibility, and it is not optional: every greeting already on disk
+    under runs/ predates this field. ``from_greeting`` reads those archives on every
+    reprocess and every figure render -- a KeyError here would make the whole existing
+    archive unreadable."""
+    old = dict(gf.offset(color_K=K_C, color_size=SIZE_C).raw)
+    old.pop("filter_options", None)
+    assert "filter_options" not in old
+
+    g = dg.CameraGeometry.from_greeting(old)               # must not raise
+    assert g.protocol == 2 and g.depth_unit_mm == 0.1
+    assert g.spatial_smooth_delta is None                  # unknown, not fabricated
+    assert "filter_options" not in g.to_dict()             # nothing invented into raw
+
+
+def test_legacy_aligned_geometry_reports_no_smooth_delta():
+    g = gf.aligned(K_C, SIZE_C)
+    assert g.spatial_smooth_delta is None
+
+
+def test_every_greeting_already_on_disk_still_parses():
+    """The same guard against the REAL archive rather than a fixture. Skips where
+    runs/ is absent (it is git-ignored), so the synthetic test above is the one that
+    always runs; this one is what catches a field the fixtures happen not to model."""
+    import json
+
+    root = Path(__file__).resolve().parents[1] / "runs" / "extrusion"
+    manifests = sorted(root.glob("*/*/manifest.json")) if root.is_dir() else []
+    if not manifests:
+        pytest.skip("no extrusion archive on this machine (runs/ is git-ignored)")
+    checked = 0
+    for path in manifests:
+        raw = (json.loads(path.read_text()).get("provenance") or {}).get("camera_geometry")
+        if not raw:
+            continue                                    # pre-protocol-2 take
+        g = dg.CameraGeometry.from_greeting(raw)         # must not raise
+        assert g.protocol == 2 and g.depth_unit_mm > 0
+        assert g.spatial_smooth_delta is None            # these predate the field
+        checked += 1
+    assert checked, "the archive holds no protocol-2 greeting to check"
+
+
 def test_backproject_applies_units_and_extrinsic():
     g = gf.offset(color_K=K_C, color_size=SIZE_C)
     truth = np.array([[0.0, 0.0, 400.0], [30.0, -20.0, 410.0], [-45.0, 25.0, 395.0]])

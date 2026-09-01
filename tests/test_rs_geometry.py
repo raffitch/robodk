@@ -75,6 +75,7 @@ def test_greeting_is_one_json_line_with_protocol_2():
                                             "disparity_inv"],
         temps={"asic_c": 41.5, "projector_c": 38.0}, global_time_enabled=True,
         achieved={"visual_preset": 0.0, "laser_power": 150.0},
+        spatial_smooth_delta=20.0,
         device={"serial": "S1", "fw": "5.16.00.01", "librealsense": "2.55.1"})
     line = rs_geometry.greeting_line(g)
     assert line.endswith(b"\n") and line.count(b"\n") == 1
@@ -85,3 +86,42 @@ def test_greeting_is_one_json_line_with_protocol_2():
     np.testing.assert_allclose(back["depth_to_color"]["rotation_row_major"], R_TRUE, atol=1e-12)
     assert back["depth_to_color"]["translation_mm"][0] == 14.7
     assert back["device"]["visual_preset"] == 0.0 and back["temps"]["asic_c"] == 41.5
+
+
+def _static():
+    ext, rs = _fake_rs(column_major=True)
+    depth, color = _profiles(ext)
+    return rs_geometry.StaticGeometry(
+        depth=rs_geometry.intrinsics_dict(depth.intrinsics),
+        color=rs_geometry.intrinsics_dict(color.intrinsics),
+        R_dc=R_TRUE, t_dc_mm=T_TRUE_M * 1000.0,
+        depth_size=(1280, 720), color_size=(1920, 1080))
+
+
+def _greeting(filters=None, **kw):
+    return rs_geometry.build_greeting(
+        _static(), depth_unit_mm=0.1,
+        filters=filters or ["threshold", "disparity", "spatial", "temporal",
+                            "disparity_inv"],
+        temps={"asic_c": 41.5}, global_time_enabled=True,
+        achieved={"visual_preset": 0.0, "laser_power": 150.0},
+        device={"serial": "S1"}, **kw)
+
+
+def test_the_greeting_carries_the_spatial_filters_achieved_smooth_delta():
+    """The filter NAMES say whether the spatial filter ran; only this says what it
+    ran AT. Without it the two arms of a smooth_delta A/B archive identical
+    provenance (docs/inspection-roll-probe-handoff.md 3.1)."""
+    g = _greeting(spatial_smooth_delta=4.0)
+    assert g["filter_options"]["spatial_smooth_delta"] == 4.0
+    assert json.loads(rs_geometry.greeting_line(g).decode("utf-8")
+                      )["filter_options"]["spatial_smooth_delta"] == 4.0
+
+
+def test_no_spatial_filter_records_null_not_a_number():
+    """``None`` is the control arm (no spatial filter at all), and it must be JSON
+    ``null`` -- distinct from any delta a running filter could report."""
+    g = _greeting(spatial_smooth_delta=None,
+                  filters=["threshold", "disparity", "temporal", "disparity_inv"])
+    assert g["filter_options"]["spatial_smooth_delta"] is None
+    assert b'"spatial_smooth_delta":null' in rs_geometry.greeting_line(g)

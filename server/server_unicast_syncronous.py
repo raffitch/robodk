@@ -954,6 +954,23 @@ DEPTH_FILTER_NAMES = (["threshold", "disparity"]
                       + (["spatial"] if RS_SPATIAL else [])
                       + ["temporal", "disparity_inv"])
 
+# The smooth_delta the spatial filter is ACTUALLY running at, read back off the
+# filter object by setup_depth_filters(); None means there is no spatial filter in
+# the chain (RS_SPATIAL=0) -- or, if "spatial" IS in DEPTH_FILTER_NAMES, that the
+# SDK would not report the option. Archived in the greeting's `filter_options`.
+#
+# The name list above can be derived from the env constants, but the delta cannot:
+# RS_SPATIAL_SMOOTH_DELTA's own default is -1.0, "don't touch", which names no
+# number at all -- the filter then runs at librealsense's default (20 today, and
+# nothing stops a future SDK from changing it). Echoing the env var into provenance
+# would therefore archive "-1" for every take ever measured, which is not a setting
+# any take was captured under. So this is read off the object that filters the
+# frames, and it is a global rather than a return value because make_greeting has
+# no access to the chain. Nothing rebinds it after startup (the chain is built once,
+# before main() accepts a client, and a camera rebuild does not touch it), so unlike
+# the camera globals it cannot tear against a rebuild.
+SPATIAL_SMOOTH_DELTA = None
+
 
 STATIC_GEOMETRY = None      # rs_geometry.StaticGeometry, set by openPipeline
 ACHIEVED_OPTIONS = {}       # read-back values, set by openPipeline
@@ -1175,6 +1192,7 @@ def make_greeting(snapshot: CameraSnapshot = None) -> dict:
     return rs_geometry.build_greeting(
         snap.geometry, depth_unit_mm=snap.depth_unit_mm,
         filters=list(DEPTH_FILTER_NAMES),
+        spatial_smooth_delta=SPATIAL_SMOOTH_DELTA,
         temps=rs_config.read_temperatures(sensor, rs, log=_log),
         global_time_enabled=rs_config.read_global_time_enabled(sensor, rs, log=_log),
         achieved=snap.achieved, device=snap.device)
@@ -1665,15 +1683,31 @@ def setup_depth_filters():
     """threshold -> disparity -> spatial -> temporal -> disparity_inv, on NATIVE depth.
     No decimation (full-resolution scan data) and NO hole filling: a filled pixel is
     fabricated depth, and it was fabricated exactly where the metrology cares
-    (surface edges). Threshold first so background is never smoothed into an edge."""
+    (surface edges). Threshold first so background is never smoothed into an edge.
+
+    Also publishes the spatial filter's ACHIEVED smooth_delta into
+    ``SPATIAL_SMOOTH_DELTA`` for the greeting -- read back off the filter, so an
+    untouched filter archives the number it is really at rather than the env var's
+    "-1 = don't touch". The read-back is guarded: provenance is never worth the
+    camera, so an SDK that will not report the option leaves the chain intact and the
+    value unknown (the filter list still says whether `spatial` ran)."""
+    global SPATIAL_SMOOTH_DELTA
     threshold = rs.threshold_filter(RS_DEPTH_MIN_M, RS_DEPTH_MAX_M)
     chain = [threshold, rs.disparity_transform(True)]
+    SPATIAL_SMOOTH_DELTA = None
     if RS_SPATIAL:
         spatial = rs.spatial_filter()
         if RS_SPATIAL_SMOOTH_DELTA >= 0:
             spatial.set_option(rs.option.filter_smooth_delta, RS_SPATIAL_SMOOTH_DELTA)
+        try:
+            SPATIAL_SMOOTH_DELTA = float(spatial.get_option(rs.option.filter_smooth_delta))
+        except Exception as e:
+            print(f"WARNING: could not read back filter_smooth_delta ({e}) — takes "
+                  f"captured now will not record which delta they ran at", flush=True)
         chain.append(spatial)
     chain += [rs.temporal_filter(), rs.disparity_transform(False)]
+    print(f"RealSense: depth filters {DEPTH_FILTER_NAMES}, "
+          f"spatial smooth_delta = {SPATIAL_SMOOTH_DELTA}", flush=True)
     return chain
 
 def _serve_client(conn, addr):

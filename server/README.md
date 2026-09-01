@@ -89,6 +89,15 @@ The chain costs the Nano roughly a second per frame and has no CUDA or OpenMP pa
 inside librealsense, so that cost is irreducible short of shortening the chain
 (`docs/sensor-layer-capability-review-2026-08-30.md`).
 
+Two env levers exist for the crest-height A/B, both defaulting to current behaviour:
+`RS_SPATIAL=0` drops the spatial filter, `RS_SPATIAL_SMOOTH_DELTA` lowers its
+edge-preservation threshold. **Both arms are readable off an archived take**: the
+greeting's `filters` list names the chain that ran, and `filter_options.spatial_smooth_delta`
+carries the delta it ACTUALLY ran at — read back off the filter object, so an untouched
+filter records librealsense's own default (20) rather than the `-1 = don't touch` env
+value. `null` there means there was no spatial filter at all (or, if `spatial` IS in
+`filters`, that the SDK refused the read-back).
+
 ### Depth is NOT aligned
 
 `getFrames()` returns the **native** depth frame and the colour frame side by side.
