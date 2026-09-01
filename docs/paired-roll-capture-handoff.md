@@ -103,6 +103,59 @@ tilt ladder to `tilt 10 / azimuth 270`. That moved the camera 52 mm sideways
 
 ---
 
+## 3b. What was wrong on the 17:10 run (`a61dcda`, fixed, UNVERIFIED)
+
+The vertical view measured fine (radius 40.1 mm, bead 8.4 mm, centre 207.7/147.0)
+and the horizontal one was **skipped**, for both roll 90 and roll -90:
+
+```
+no reachable pose: ... no IK solution on the neutral arm branch
+(wrist flip allowed) within +/-105 deg of the start pose
+```
+
+Not the branch flags — the **magnitude bound**, built on a wrong model of where a
+roll goes. `wrist_allowance_deg` assumed a roll about a nadir optical axis costs
+about `|roll|` on **A6**, and capped at `|roll| + 15 = 105`. That holds only when
+the camera's optical axis IS the flange Z. Here it is not, and the roll lands
+almost entirely on **A4**.
+
+The one rolled pose that has ever solved on this cell says so outright
+(`165716-8c5ee676/characterize-02`, roll 90 at tilt 10 / azimuth 270):
+
+| axis | rotation from start |
+|---|---|
+| A4 | **-102.54 deg** |
+| A6 | +3.97 deg |
+
+A 90 deg roll costs ~1.15x its own angle on the bounded axis, and that solve
+cleared the 105 deg cap by 2.5 deg. The tilt-0 pose — the only one that makes a
+real pair — costs more, so every branch was filtered out. That relaxing the
+wrist-flip FLAG (`033c70b`) did **not** help is what proves the bound was the
+binding filter.
+
+Margin 15 -> **60** (cap 150 deg for a 90 deg roll). A genuine wrist flip
+(180 deg on A4) is still refused with 30 deg to spare; front/rear and elbow stay
+locked and both collision validation and `program_neutral_wrist_report` still run
+against the same widened limit.
+
+**The tilt-0 A4 cost is still unmeasured** — known only to exceed 105 — which is
+why 60 is generous rather than tight. The next paired run archives
+`axis_4_rotation_deg` for the horizontal take; read it and set the cap from that
+number instead of from a model. `tasni.config.json` is git-ignored, so the
+default in `core/config.py` is the only thing that ships.
+
+## 3c. The branch guard abort on `171010-1c8aafb0/characterize-01` (no action)
+
+Reproduced offline, identical numbers. The skeleton is an open arc plus **one
+19 px arm** at work angle 18.5 deg running outward from r 41 to r 60 mm;
+`spur_limit` is 14 px, so it is never pruned and leaves exactly one degree-3
+node (`branch_pixels: 1` on all three attempts). The arm is 214 points at
+**2.30 mm** above the fitted substrate where the floor cut is 1.708 mm and the
+ring crest is 9.15 mm — the board halo, clearing the floor by 0.6 mm, at r 46-52
+where the tightest radial trim band (10 mm about r 41.55) keeps everything out to
+51.5 mm. The same shelf sits at 280-340 deg; this take's baseline is 178.9 deg,
+so it straddles the baseline axis. **The guard was right. Do not loosen it.**
+
 ## 4. Traps
 
 ### 4.1 Anything that silently substitutes a different viewpoint
