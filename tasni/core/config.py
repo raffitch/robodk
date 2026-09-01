@@ -845,11 +845,33 @@ class ExtrusionConfig(_Model):
     inspection_pair_roll_deg: float = Field(default=90.0, gt=0, le=180)
     # Wrist headroom ON TOP of a commanded roll. `max_tool_axis_spin_deg` guards
     # against IK landing on a far-off wrist branch; a roll we asked for is not
-    # that, and a 90 deg roll about a nadir axis costs ~90 deg of A6, landing
-    # exactly on the 90 deg default (the gate is `> limit`, so it was decided by
-    # floating point and got refused on this cell). The guard therefore applies
-    # to the UNCOMMANDED part: |roll| + this.
-    inspection_roll_wrist_margin_deg: float = Field(default=15.0, ge=0, le=90)
+    # that, so the guard applies to the UNCOMMANDED part: |roll| + this.
+    #
+    # 15 was the first guess, and it was built on a wrong model of where a roll
+    # goes. It assumed a 90 deg roll about a nadir optical axis costs ~90 deg of
+    # A6. On this cell it does not: the camera's optical axis is not the flange
+    # Z, and the roll lands almost entirely on **A4**. Measured, from the only
+    # rolled pose that ever solved here (2026-09-01 16:57,
+    # runs/extrusion/20260901-165716-8c5ee676/characterize-02, roll 90 at tilt
+    # 10 / azimuth 270): axis 4 turned **-102.54 deg** and axis 6 only +3.97 --
+    # i.e. a 90 deg roll costs ~1.15x its own angle on the bounded axis, and
+    # that solve cleared the 105 deg cap by 2.5 deg. The tilt-0 pose, the only
+    # one that makes a real pair (a tilted second view is a different
+    # measurement, not a pair), costs more than 105 and so every branch was
+    # filtered out -- reported as "no reachable pose", which reads like the arm
+    # cannot do it when in fact the arm rotates 90 deg about Z trivially and it
+    # was this number refusing it. Relaxing the wrist-flip FLAG (033c70b) did
+    # not help, which is what proves the magnitude bound is the binding filter.
+    #
+    # 60 puts the cap at 150 deg for a 90 deg roll. That still refuses a genuine
+    # wrist flip (180 deg on A4) with 30 deg to spare, and front/rear + elbow
+    # stay locked, collision validation still runs, and
+    # `program_neutral_wrist_report` still checks the interpolated path against
+    # this same widened limit. The exact tilt-0 A4 cost is not yet measured --
+    # it is only known to exceed 105 -- so this is deliberately generous: the
+    # next paired run archives `axis_4_rotation_deg` for the horizontal take,
+    # and the cap can then be set from that number instead of from a model.
+    inspection_roll_wrist_margin_deg: float = Field(default=60.0, ge=0, le=90)
     inspection_tilt_candidates_deg: list[float] = Field(
         default_factory=lambda: [0.0, 10.0])
     inspection_azimuth_candidates_deg: list[float] = Field(

@@ -391,11 +391,18 @@ def wrist_allowance_deg(setup, roll_deg: float | None, config) -> float:
     """How far the wrist may deviate, given a roll we asked for on purpose.
 
     ``max_tool_axis_spin_deg`` guards against IK reaching a pose on a wildly
-    different wrist branch. A COMMANDED roll is not that: rolling the camera 90°
-    about a nadir optical axis necessarily moves A6 by about 90°, so gating it at
-    a 90° limit refuses the very thing that was requested — and 90 against 90 is
-    decided by floating point, which is why a 90° roll was refused on this cell
-    before.
+    different wrist branch. A COMMANDED roll is not that: it necessarily turns
+    the wrist by roughly the angle asked for, so gating it at a limit near that
+    angle refuses the very thing that was requested.
+
+    Which axis pays is a property of the MOUNT, not of the roll. It is tempting
+    to assume a roll about the optical axis is a pure A6 turn; that holds only
+    when the camera's optical axis is the flange Z. On this cell it is not, and
+    the roll lands almost entirely on **A4** — measured -102.54° of A4 against
+    +3.97° of A6 for a 90° roll (2026-09-01 16:57). So the margin has to cover
+    an axis turning by MORE than the commanded angle, not exactly it; see
+    ``ExtrusionConfig.inspection_roll_wrist_margin_deg`` for the numbers and for
+    why the default is generous rather than tight.
 
     So the limit is applied to the UNCOMMANDED part: the deviation the request
     itself implies, plus a margin. With no forced roll this returns the setup's
