@@ -1812,6 +1812,83 @@ def setup_depth_filters():
         DEPTH_FILTER_NAMES, FILTER_OPTIONS), flush=True)
     return chain
 
+
+class SettingError(ValueError):
+    """A SET the caller must hear about: unknown key, bad number, refused knob."""
+
+
+def apply_filter_settings(updates):
+    """Validate + apply runtime filter settings; return the new achieved values.
+
+    All-or-nothing: any unknown key or refused value raises SettingError BEFORE
+    anything is touched -- a caller that thinks it changed something must never
+    have half-changed it. An empty ``updates`` is a pure read: current achieved
+    values back, nothing rebuilt, no generation bump, nobody's session ends.
+
+    A write rebuilds the chain from FILTER_SETTINGS under _camera_lock and bumps
+    _camera_generation LAST -- the same ordering invariant _rebuild_pipeline
+    documents -- so _stale_greeting_close retires every session greeted under
+    the old chain and no frame is ever archived under a greeting that describes
+    a chain it did not run through (spec 3.4: a filter swap does not change
+    geometry, so the fusion guard cannot catch it; this is what does).
+
+    Known, accepted caveat (spec 3.4): _rebuild_pipeline treats a moved
+    generation as "another thread already rebuilt the wedged pipeline" and skips
+    one recovery attempt, so a SET landing during a genuine camera wedge delays
+    recovery by one timeout cycle. It self-heals; do not "fix" it here.
+
+    A runtime override lives only in FILTER_SETTINGS (RAM): a restart re-imports
+    the module and re-reads env, which is the whole safety argument (spec 4.2).
+    There is deliberately no persist path."""
+    global depth_filters, _camera_generation
+    unknown = sorted(k for k in updates if k not in FILTER_SETTINGS)
+    if unknown:
+        raise SettingError("unknown setting(s): {} (settable: {})".format(
+            ", ".join(unknown), ", ".join(sorted(FILTER_SETTINGS))))
+    if float(updates.get("decimation", 0.0)) != 0.0:
+        raise SettingError("decimation changes the depth geometry the greeting "
+                           "declares; it stays restart-path only (spec 2.5)")
+    if not updates:
+        return dict(FILTER_OPTIONS)
+    clean = dict((k, float(v)) for k, v in updates.items())
+    if "hole_filling" in clean:                    # constructor arg, not an rs.option:
+        clean["hole_filling"] = min(max(clean["hole_filling"], -1.0), 2.0)
+    with _camera_lock:
+        FILTER_SETTINGS.update(clean)
+        depth_filters = setup_depth_filters()
+        _camera_generation += 1        # LAST: retires every session greeted before it
+    print("Runtime SET applied: {} -> generation {}".format(
+        clean, _camera_generation), flush=True)
+    return dict(FILTER_OPTIONS)
+
+
+def _handle_set(line):
+    """One ``SET [key=value ...]`` line -> one JSON reply line. Never raises.
+
+    Unknown COMMANDS in the burst loop stay forgiving (a newer client against an
+    older server should degrade, not die), but an unknown SETTING inside a SET is
+    an ERROR: the caller believes it changed something it did not (spec test 4)."""
+    try:
+        updates = {}
+        for token in line.decode("ascii", "replace").split()[1:]:
+            key, eq, raw = token.partition("=")
+            if not eq:
+                raise SettingError(
+                    "malformed token {!r}: expected key=value".format(token))
+            try:
+                updates[key] = float(raw)
+            except ValueError:
+                raise SettingError("{}={!r} is not a number".format(key, raw))
+        achieved = apply_filter_settings(updates)
+        reply = {"ok": True, "filters": list(DEPTH_FILTER_NAMES),
+                 "filter_options": achieved}
+    except SettingError as exc:
+        reply = {"ok": False, "error": str(exc)}
+    except Exception as exc:      # a bug must degrade to an error line, not kill the thread
+        reply = {"ok": False, "error": "internal: {!r}".format(exc)}
+    return json.dumps(reply, separators=(",", ":")).encode("utf-8") + b"\n"
+
+
 def _serve_client(conn, addr):
     """Run handle_client for one client and ALWAYS close its socket.
 

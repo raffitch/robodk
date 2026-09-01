@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 from pathlib import Path
@@ -473,3 +474,159 @@ def test_apply_option_degrades_when_the_sdk_lacks_the_option_name(monkeypatch):
     finally:
         monkeypatch.undo()
         importlib.reload(srv)
+
+
+# ------------------------------------------------- runtime-parameters, Task 4
+# spec 3.1/3.4 and tests 1,2,4,5,6,7: the SET core, without the socket.
+
+def _fresh(monkeypatch, **env):
+    """Reloaded module with the fake SDK installed and a chain built (the state
+    stream_burst runs under)."""
+    chain = _chain(monkeypatch, **env)
+    srv.depth_filters = chain
+    srv._reset_camera_state()
+    return chain
+
+
+def test_bare_set_reads_without_changing_or_retiring(monkeypatch):
+    """spec test 1: SET with no arguments is a read -- achieved values back,
+    nothing rebuilt, nobody's session ends."""
+    try:
+        _fresh(monkeypatch)
+        gen = srv._camera_generation
+        reply = json.loads(srv._handle_set(b"SET"))
+        assert reply["ok"] is True
+        assert reply["filter_options"]["spatial_smooth_delta"] == 20.0
+        assert reply["filters"] == ["threshold", "disparity", "spatial",
+                                    "temporal", "disparity_inv"]
+        assert srv._camera_generation == gen
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_set_applies_and_the_new_chain_serves_the_next_frame(monkeypatch):
+    """spec test 3 shape: set -> achieved read-back -> and the module global the
+    serving loops read (depth_filters) IS the new chain."""
+    try:
+        _fresh(monkeypatch)
+        reply = json.loads(srv._handle_set(
+            b"SET spatial_smooth_delta=8 temporal_persistency=5"))
+        assert reply["ok"] is True
+        assert reply["filter_options"]["spatial_smooth_delta"] == 8.0
+        assert reply["filter_options"]["temporal_persistency"] == 5.0
+        spatial = next(f for f in srv.depth_filters if f.kind == "spatial")
+        assert spatial.options["filter_smooth_delta"] == 8.0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_set_spatial_0_reaches_both_greeting_fields(monkeypatch):
+    """spec test 2: the control arm must be visible in BOTH `filters` and
+    `filter_options` of the next greeting."""
+    try:
+        _fresh(monkeypatch)
+        reply = json.loads(srv._handle_set(b"SET spatial=0"))
+        assert "spatial" not in reply["filters"]
+        assert reply["filter_options"]["spatial_smooth_delta"] is None
+        assert srv.DEPTH_FILTER_NAMES == ["threshold", "disparity", "temporal",
+                                          "disparity_inv"]
+        assert srv.FILTER_OPTIONS["spatial_smooth_delta"] is None
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_a_write_retires_sessions_greeted_before_it(monkeypatch):
+    """spec test 6: the generation the old sessions were greeted under is stale
+    the moment a write lands -- _stale_greeting_close then ends them. (The reply
+    goes out before the issuing session's own close: Task 5 sends it in the SET
+    branch, and the loop only checks staleness at the NEXT iteration.)"""
+    try:
+        _fresh(monkeypatch)
+        greeted = srv._camera_generation
+        json.loads(srv._handle_set(b"SET spatial_smooth_delta=8"))
+        assert srv._greeting_is_stale(greeted)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_unknown_setting_is_an_error_and_nothing_is_applied(monkeypatch):
+    """spec test 4: unknown COMMANDS stay forgiving, but an unknown SETTING means
+    the caller believes it changed something it did not. All-or-nothing: the
+    valid key in the same line must NOT land either."""
+    try:
+        _fresh(monkeypatch)
+        gen = srv._camera_generation
+        reply = json.loads(srv._handle_set(b"SET spatial=0 laser_power=300"))
+        assert reply["ok"] is False and "laser_power" in reply["error"]
+        assert "spatial" in srv.DEPTH_FILTER_NAMES          # untouched
+        assert srv._camera_generation == gen                 # nobody retired
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_malformed_and_non_numeric_tokens_are_errors(monkeypatch):
+    try:
+        _fresh(monkeypatch)
+        assert json.loads(srv._handle_set(b"SET spatial"))["ok"] is False
+        assert json.loads(srv._handle_set(b"SET spatial_smooth_delta=lots"))["ok"] is False
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_out_of_range_set_reports_the_clamped_value(monkeypatch):
+    """spec test 5, end to end through the SET path."""
+    try:
+        _fresh(monkeypatch)
+        reply = json.loads(srv._handle_set(b"SET spatial_smooth_delta=500"))
+        assert reply["ok"] is True
+        assert reply["filter_options"]["spatial_smooth_delta"] == 50.0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_decimation_stays_refused_at_runtime(monkeypatch):
+    """spec 2.2/2.5 (amended): enabling decimation would change the depth
+    geometry the greeting already declared. Refused, loudly."""
+    try:
+        _fresh(monkeypatch)
+        reply = json.loads(srv._handle_set(b"SET decimation=2"))
+        assert reply["ok"] is False and "geometry" in reply["error"]
+        assert json.loads(srv._handle_set(b"SET decimation=0"))["ok"] is True
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_hole_filling_round_trips_and_minus_one_removes_it(monkeypatch):
+    try:
+        _fresh(monkeypatch)
+        reply = json.loads(srv._handle_set(b"SET hole_filling=1"))
+        assert reply["filters"][-1] == "hole_filling"
+        assert reply["filter_options"]["hole_filling"] == 1.0
+        reply = json.loads(srv._handle_set(b"SET hole_filling=-1"))
+        assert "hole_filling" not in reply["filters"]
+        assert reply["filter_options"]["hole_filling"] is None
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_restart_returns_to_the_unit_files_values(monkeypatch):
+    """spec test 7 / 4.2 -- THE central property: an override cannot survive a
+    restart. A restart re-imports the module, which re-reads env."""
+    try:
+        _fresh(monkeypatch)
+        json.loads(srv._handle_set(b"SET spatial_smooth_delta=8 depth_max_m=0.9"))
+        assert srv.FILTER_SETTINGS["spatial_smooth_delta"] == 8.0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+    assert srv.FILTER_SETTINGS["spatial_smooth_delta"] == -1.0
+    assert srv.FILTER_SETTINGS["depth_max_m"] == 1.5
