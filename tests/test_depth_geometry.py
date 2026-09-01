@@ -84,7 +84,16 @@ def test_every_greeting_already_on_disk_still_parses():
             continue                                    # pre-protocol-2 take
         g = dg.CameraGeometry.from_greeting(raw)         # must not raise
         assert g.protocol == 2 and g.depth_unit_mm > 0
-        assert g.spatial_smooth_delta is None            # these predate the field
+        # The archive now spans BOTH sides of the 2026-09-01 greeting change, so
+        # this asserts the mapping rather than one era: a take whose greeting has
+        # no filter_options must read as UNKNOWN (never as a fabricated 20), and a
+        # take that carries one must read back exactly what it recorded. The
+        # backward-compatibility guard is that neither raises.
+        recorded = (raw.get("filter_options") or {}).get("spatial_smooth_delta")
+        if recorded is None:
+            assert g.spatial_smooth_delta is None, path
+        else:
+            assert g.spatial_smooth_delta == float(recorded), path
         checked += 1
     assert checked, "the archive holds no protocol-2 greeting to check"
 
