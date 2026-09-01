@@ -490,9 +490,11 @@ export default function Extrusion() {
   }, [guideOpen]);
   const [confirmMotion, setConfirmMotion] = useState(false);
   // Capture each frame twice from one trip out — as chosen, then rolled 90°.
-  // Off by default: it doubles the takes, and every archived measurement so far
-  // is single-orientation, so turning it on is a deliberate choice per run.
-  const [pairedOrientations, setPairedOrientations] = useState(false);
+  // ON by default, and it applies to EVERY step of the run (characterization
+  // included): the pair is only comparable if the whole sequence is captured the
+  // same way, and an operator should not have to remember a checkbox per press
+  // for a property of the run. Untick it to go back to single-orientation takes.
+  const [pairedOrientations, setPairedOrientations] = useState(true);
   const [paper, setPaper] = useState<string | null>(null);
   const [openTake, setOpenTake] = useState<string | null>(null);
   const [showStack, setShowStack] = useState(false);
@@ -820,8 +822,12 @@ export default function Extrusion() {
       await api.post("/measure/characterize", {
         confirm_robot_motion: confirmMotion,
         collision_check_enabled: false,
+        paired_orientations: pairedOrientations,
       });
-      setMessage("CHARACTERIZE started — collision validation OFF; the robot moves the camera over ring 1, measures it and returns.");
+      setMessage("CHARACTERIZE started — collision validation OFF; the robot moves the camera over ring 1, measures it and returns."
+        + (pairedOrientations
+          ? " Both orientations on one trip; the vertical view is the one that seeds the recipe."
+          : ""));
       refreshStatus();
     } catch (e: any) { setBusy(false); setMessage(e.message); }
   };

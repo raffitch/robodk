@@ -107,6 +107,9 @@ class CharacterizeBody(BaseModel):
     confirm_robot_motion: bool = False
     confirm_close_range_tool_clear: bool = False
     collision_check_enabled: bool = False
+    # Characterize the ring from both orientations on one trip out. The FIRST
+    # (vertical) is what seeds the recipe; the rolled one is an extra view.
+    paired_orientations: bool = False
 
 
 class SurfaceCenterBody(BaseModel):
@@ -714,7 +717,9 @@ class ExtrusionModule(WorkflowModule):
             self._active_measure_job = RingCharacterizeJob(
                 services, self._plan, session,
                 check_collisions=body.collision_check_enabled,
-                close_range_tool_clear=body.confirm_close_range_tool_clear)
+                close_range_tool_clear=body.confirm_close_range_tool_clear,
+                rolls=([None, float(services.config.extrusion.inspection_pair_roll_deg)]
+                       if body.paired_orientations else None))
             try:
                 services.jobs.start(self._active_measure_job, name="extrusion-characterize")
             except JobBusy as exc:
@@ -728,7 +733,14 @@ class ExtrusionModule(WorkflowModule):
                 raise HTTPException(409, "characterize a ring first")
             if services.jobs.running:
                 raise HTTPException(409, "wait for the current job to finish")
-            found = session.characterizations[-1]
+            # The recipe's radius/centre/height come from here, so a PAIRED
+            # characterization must apply its vertical view: seeding the plan
+            # from the rolled orientation would derive the geometry from the
+            # very view under test. Sessions predating paired capture carry no
+            # `orientation`, so fall back to the last one as before.
+            upright = [c for c in session.characterizations
+                       if c.get("orientation") in (None, "vertical")]
+            found = (upright or session.characterizations)[-1]
             self._restore_plan_from_session()
             base_recipe, base_setup = self._session_base(session)
             recipe = base_recipe.model_copy(update={

@@ -115,3 +115,42 @@ def test_headroom_never_tightens_a_looser_configured_limit():
 ])
 def test_orientation_labels(roll, label):
     assert _roll_label(roll) == label
+
+
+# -- which characterization seeds the recipe -----------------------------------
+# A characterization sets the plan's radius, centre and layer height, so every
+# later take is scored against it. Applying the ROLLED view would derive the
+# whole geometry from the very orientation under test, and nothing downstream
+# would notice -- the plan would simply be wrong for the rest of the trial.
+
+def pick(characterizations):
+    """The selection rule from measure/apply-characterization."""
+    upright = [c for c in characterizations
+               if c.get("orientation") in (None, "vertical")]
+    return (upright or characterizations)[-1]
+
+
+def test_apply_takes_the_vertical_view_not_the_last_one():
+    chosen = pick([{"index": 1, "orientation": "vertical"},
+                   {"index": 2, "orientation": "horizontal"}])
+    assert chosen["index"] == 1
+
+
+def test_apply_still_takes_the_last_when_none_are_labelled():
+    """Sessions predating paired capture carry no orientation at all."""
+    assert pick([{"index": 1}, {"index": 2}])["index"] == 2
+
+
+def test_apply_takes_the_newest_vertical_when_several_exist():
+    chosen = pick([{"index": 1, "orientation": "vertical"},
+                   {"index": 2, "orientation": "horizontal"},
+                   {"index": 3, "orientation": "vertical"}])
+    assert chosen["index"] == 3
+
+
+def test_apply_falls_back_rather_than_crashing_on_only_rolled_views():
+    """If the vertical view failed and only a rolled one landed, applying a
+    wrong-but-present recipe beats an exception -- but it must be possible to
+    see which it was, which is why orientation is carried on the summary."""
+    chosen = pick([{"index": 2, "orientation": "horizontal"}])
+    assert chosen["index"] == 2 and chosen["orientation"] == "horizontal"

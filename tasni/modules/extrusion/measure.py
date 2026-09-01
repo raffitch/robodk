@@ -442,12 +442,13 @@ def _capture_at_pose(services, ctx: JobContext, T_work_camera) -> dict:
 
 def _inspect_and_capture(services, ctx: JobContext, plan: CylinderPlan, layer, *,
                          inspection_name: str, start_joints, seed_pose, collisions: bool,
-                         artifacts: list[str], near_mm: float | None = None) -> dict:
+                         artifacts: list[str], near_mm: float | None = None,
+                         roll_deg: float | None = None) -> dict:
     """Move the camera to the derived pose, settle, read the pose, grab ONE frame."""
     moved = _move_to_inspection(
         services, ctx, plan, layer, inspection_name=inspection_name,
         start_joints=start_joints, seed_pose=seed_pose, collisions=collisions,
-        artifacts=artifacts, near_mm=near_mm)
+        artifacts=artifacts, near_mm=near_mm, roll_deg=roll_deg)
     return {**moved, **_capture_at_pose(services, ctx, moved["T_work_camera"])}
 
 
@@ -1011,12 +1012,18 @@ class RingCharacterizeJob:
 
     def __init__(self, services, plan: CylinderPlan, session: MeasureSession, *,
                  check_collisions: bool = True,
-                 close_range_tool_clear: bool = False):
+                 close_range_tool_clear: bool = False,
+                 rolls: "list[float | None] | None" = None):
         self.services = services
         self.plan = plan.model_copy(deep=True)
         self.session = session
         self.check_collisions = bool(check_collisions)
         self.close_range_tool_clear = bool(close_range_tool_clear)
+        # The FIRST orientation defines the recipe; any later one is an extra
+        # observation of the same ring. Order matters here in a way it does not
+        # for a measurement: applying a rolled characterization would seed the
+        # whole plan's radius/centre/height from the view under test.
+        self.rolls: list[float | None] = list(rolls) if rolls else [None]
         self.result: dict | None = None
 
     def __call__(self, ctx: JobContext) -> dict:
@@ -1029,19 +1036,35 @@ class RingCharacterizeJob:
         artifacts: list[str] = []
         current_program: str | None = None
         start_joints = _prepare_robot(services, ctx, self.plan, label="extrusion-characterize")
+        summaries: list[dict] = []
         try:
             with _camera_hold(services, "extrusion-characterize"):
-                ctx.progress(1, 3, "moving the camera over the ring")
+              for order, roll in enumerate(self.rolls):
+                ctx.check_cancel()
+                label = _roll_label(roll)
+                where = f" ({label})" if len(self.rolls) > 1 else ""
+                ctx.progress(1, 3, f"moving the camera over the ring{where}")
                 current_program = inspection_name
-                captured = _inspect_and_capture(
-                    services, ctx, self.plan, layer, inspection_name=inspection_name,
-                    start_joints=start_joints, seed_pose=self.session.last_pose,
-                    collisions=self.check_collisions, artifacts=artifacts,
-                    near_mm=(ecfg.measure_close_range_min_mm
-                             if self.close_range_tool_clear else None))
+                try:
+                    captured = _inspect_and_capture(
+                        services, ctx, self.plan, layer, inspection_name=inspection_name,
+                        start_joints=start_joints, seed_pose=self.session.last_pose,
+                        collisions=self.check_collisions, artifacts=artifacts,
+                        near_mm=(ecfg.measure_close_range_min_mm
+                                 if self.close_range_tool_clear else None),
+                        roll_deg=roll)
+                except RuntimeError as exc:
+                    # Losing the FIRST orientation is a run failure: it is the one
+                    # the recipe comes from. A later one is an extra view, so an
+                    # unreachable wrist costs that view and says so.
+                    if order == 0:
+                        raise
+                    ctx.log(f"WARNING {label} characterization SKIPPED — "
+                            f"no reachable pose: {exc}")
+                    continue
                 current_program = None
                 frame = captured["frame"]
-                ctx.progress(2, 3, "characterizing the ring")
+                ctx.progress(2, 3, f"characterizing the ring{where}")
                 index = archive.next_characterization_index(self.session.trial_id)
                 provenance = {**_provenance(services),
                               "T_work_camera": np.asarray(
@@ -1051,6 +1074,7 @@ class RingCharacterizeJob:
                               # records native, unaligned, 0.1 mm depth with nothing
                               # saying so (Task 9 review, Important 5).
                               "camera_geometry": frame.geometry.to_dict(),
+                              "orientation": label,
                               "depth_fusion": captured["depth_fusion"]}
                 try:
                     found = characterize_ring(
@@ -1079,12 +1103,24 @@ class RingCharacterizeJob:
                     if captured["inspect"]["pose"]:
                         self.session.last_pose = captured["inspect"]["pose"]
                     self.session.save()
+                    if order > 0:
+                        # The recipe already came from the first orientation; a
+                        # failed extra view is evidence, not a run failure.
+                        ctx.log(f"WARNING {label} characterization invalid "
+                                f"(archived at {capture_dir}): {exc}")
+                        continue
                     raise RuntimeError(
                         f"ring characterization invalid; raw RGB-D archived: {capture_dir}: "
                         f"{exc}") from exc
                 summary = {**found.summary(), "index": index, "timestamp": _utcnow(),
                            "capture_ms": captured["capture_ms"],
                            "inspection_pose": captured["inspect"]["pose"],
+                           # Which view this is. `measure/apply-characterization`
+                           # seeds the whole plan from a characterization, so it
+                           # must take the VERTICAL one -- applying a rolled view
+                           # would derive radius/centre/height from the very
+                           # orientation under test.
+                           "orientation": label,
                            "search_center_mm": [self.plan.setup.center_x_mm,
                                                 self.plan.setup.center_y_mm]}
                 capture_dir = archive.write_characterization(
@@ -1098,17 +1134,24 @@ class RingCharacterizeJob:
                             "provenance": provenance})
                 summary["capture_dir"] = str(capture_dir)
                 self.session.characterizations.append(summary)
+                summaries.append(summary)
                 if captured["inspect"]["pose"]:
                     self.session.last_pose = captured["inspect"]["pose"]
                 self.session.save()
-                ctx.log(f"ring: radius {found.radius_mm:.1f} mm, bead {found.bead_width_mm:.1f} mm, "
+                ctx.log(f"ring{where}: radius {found.radius_mm:.1f} mm, "
+                        f"bead {found.bead_width_mm:.1f} mm, "
                         f"height {found.top_z_min_mm:.1f}-{found.top_z_max_mm:.1f} mm "
                         f"(mean {found.top_z_mean_mm:.1f}), centre "
                         f"({found.center_mm[0]:.1f}, {found.center_mm[1]:.1f})")
             ctx.progress(3, 3, "returning to the start pose")
+            # The FIRST orientation is the one the recipe comes from, so it is
+            # what this result reports even when a rolled view followed it.
+            primary = summaries[0]
             self.result = {"kind": "ring_characterize", "mode": MODE,
                            "trial_id": self.session.trial_id,
-                           "characterization": summary, "capture_dir": str(capture_dir)}
+                           "characterization": primary,
+                           "orientations": [s["orientation"] for s in summaries],
+                           "capture_dir": primary["capture_dir"]}
             return self.result
         finally:
             if current_program:
