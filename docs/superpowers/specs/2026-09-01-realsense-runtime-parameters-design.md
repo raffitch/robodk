@@ -6,6 +6,8 @@ per arm. A `smooth_delta` sweep of five values is five deploys, and the operator
 run one without an agent on the Jetson.
 
 **Status: design only. No code has been written. The approval gate is unmet.**
+Reviewed 2026-09-01 (claim-by-claim against the code); the four review points are
+folded in below and the open questions are now decisions (§6).
 
 ---
 
@@ -47,7 +49,7 @@ outlive the process.
 | spatial `smooth_delta` | env | in |
 | spatial `magnitude`, `smooth_alpha`, `holes_fill` | SDK defaults, never touched | in |
 | temporal `smooth_alpha`, `smooth_delta`, `persistency` | SDK defaults, never touched | in |
-| threshold min/max | `RS_DEPTH_MIN_M=0.15`, `RS_DEPTH_MAX_M=1.5` module constants | **undecided — §6.4** |
+| threshold min/max | `RS_DEPTH_MIN_M=0.15`, `RS_DEPTH_MAX_M=1.5` module constants | in — §6.4 (gains env vars) |
 | decimation | absent, deliberately (full-resolution scan data) | in, default off |
 | hole filling | absent, deliberately (fabricates depth at surface edges) | in, default off |
 
@@ -96,7 +98,10 @@ re-chase those four.
 
 ### 3.1 One command, on the existing protocol
 
-The command loop is line-based and already ignores unknown commands. Add:
+The only line-based command loop the server has is the **burst session's**
+(CAP/GET/CLEAR, which already ignores unknown commands); the streaming path is a
+one-shot 64-byte handshake followed by a frame push with no command reads at all.
+`SET` is therefore a burst-session command:
 
 ```
 SET spatial=0 spatial_smooth_delta=8
@@ -105,10 +110,19 @@ SET spatial=0 spatial_smooth_delta=8
 answered by one JSON line: the ACHIEVED values after the change, in the same shape the
 greeting's `filter_options` uses. `SET` with no arguments is a read.
 
+Handler ordering mirrors the rebuild's documented invariant ("`_camera_generation` is
+the LAST thing a rebuild rebinds"): rebind the chain and its derived globals first,
+bump the generation last, **then** send the reply. The issuing session was itself
+greeted under the old generation, so the loop's next staleness check ends it — after
+the reply is out. A set-then-disconnect client is trivial; a client that wants to keep
+capturing reconnects into a fresh greeting that records the new values.
+
 Rejected alternatives: a REST sidecar on the Jetson (a second service to supervise, a
 second thing to secure, and it would let a browser change the camera under a running
-capture); and a config file the server watches (a file-watch race against a capture, and
-it survives restarts, which is exactly the property §4.2 says not to have).
+capture); a config file the server watches (a file-watch race against a capture, and
+it survives restarts, which is exactly the property §4.2 says not to have); and a new
+handshake mode (`MODE SET`) — workable, but it duplicates a command path the burst
+session already has, and a multi-key `SET` line would crowd the 64-byte handshake read.
 
 ### 3.2 Scope: the safe tier only, for now
 
@@ -127,7 +141,9 @@ per-connection achieved-value provenance would be a provenance disaster: two arm
 A/B, indistinguishable on disk, with no error.
 
 Consequence: every knob in §2.2 must appear in `filter_options`, not just the two that do
-today. A knob that can be changed but not recorded must not ship.
+today. A knob that can be changed but not recorded must not ship. And
+`DEPTH_FILTER_NAMES`, today computed once at import, must be derived from the live
+chain, so the greeting's `filters` list tells the truth after a swap.
 
 ### 3.4 A change ends in-flight sessions
 
@@ -139,6 +155,16 @@ with no error — and the existing fusion guard would not catch it, because it c
 Reuse the camera-generation mechanism that already exists for pipeline rebuilds: a `SET`
 bumps the generation, and `_stale_greeting_close` ends any session greeted under the old
 one. The client already handles that path by reconnecting and being greeted afresh.
+In-flight threads hold a reference to the old chain list, so they finish their pass on
+the old chain and the post-acquisition staleness check discards the frame — the existing
+double-check pattern covers the swap with no new machinery.
+
+One caveat from overloading the generation counter: `_rebuild_pipeline(observed_generation)`
+treats "the generation moved" as "another thread already rebuilt the wedged pipeline"
+and skips recovery. A `SET` landing during a genuine camera wedge can therefore cancel
+one recovery attempt. It self-heals — the next timeout retries against the fresh
+generation — so the cost is one recovery cycle of latency, not correctness; stated here
+so nobody rediscovers it as a bug. `SET` takes `_camera_lock`, as the rebuild does.
 
 ### 3.5 Where the value lives
 
@@ -181,6 +207,15 @@ under the first. The generation bump makes this loud rather than silent — the 
 client's session ends. That is the right behaviour, but it should be a documented
 behaviour rather than a surprise.
 
+### 4.5 The frames right after a `SET` are unsettled
+
+A `SET` rebuilds the chain, so the temporal filter restarts with no history — and an
+unsettled burst does not even correlate with itself (the 2026-08-31 static-field
+measurements: +0.045 self-correlation unsettled vs +0.937 settled). Any A/B driven
+through `SET` must settle past the swap before its first counted frame, exactly as the
+roll-probe protocol already settles after motion. The forced reconnect helps (a fresh
+session, greeted afresh) but does not by itself wait.
+
 ---
 
 ## 5. Testing
@@ -201,28 +236,34 @@ Cases that matter, in TDD order:
    something it did not.
 5. An out-of-range value is clamped and the clamped value reported (mirrors
    `_set_with_readback`).
-6. A `SET` bumps the generation and ends a session greeted under the old one.
+6. A `SET` bumps the generation and ends a session greeted under the old one — and the
+   issuing session receives its reply line before its own close (§3.1 ordering).
 7. Restart discards a runtime override and returns to the unit file's value.
 8. Every greeting already on disk still parses — the archive walk in
    `tests/test_depth_geometry.py` extends to the new fields.
+9. The new `RS_DEPTH_MIN_M`/`RS_DEPTH_MAX_M` env vars (§6.4) reach the threshold
+   filter at start, like the existing four knobs.
 
 ---
 
-## 6. Open questions
+## 6. Decisions
 
-These need an answer before implementation. They are listed rather than silently decided.
+Opened 2026-09-01 as questions, resolved the same day in review.
 
-1. **Auto-pull during a sweep (§4.3)** — check-between-arms, or pause the timer? Leaning
-   check-between-arms: fewer moving parts, and it also catches an unrelated restart.
-2. **Should `SET` be refused while a burst session is open**, rather than ending it? Ending
-   it is safe but costs the operator a re-tour. Refusing is politer but adds a state
-   machine. Leaning end-it, because it reuses machinery that already exists.
-3. **Does the sweep want a driver tool** (`tools/rs_sweep.py`: set, capture, restore,
-   repeat), or is a manual loop enough for the two or three sweeps actually planned?
-   Leaning no tool until a second sweep is actually requested.
-4. **Do the threshold min/max belong in the safe tier?** They are host-side and harmless
-   mechanically, but they silently bound every measurement's valid range, so a forgotten
-   override is more consequential than a filter parameter. Possibly worth excluding.
+1. **Auto-pull during a sweep (§4.3): check between arms.** The sweep reads the greeting
+   for provenance anyway, so comparing achieved values between arms is nearly free — and
+   it also catches an unrelated restart, which pausing the timer would not.
+2. **`SET` under an open burst session: end it, don't refuse.** It reuses machinery that
+   already exists. The honest cost: mid-tour this cascades to the per-pose fallback,
+   which re-tours the robot — expensive but loud, which is the right kind of failure.
+3. **No sweep driver tool** (`tools/rs_sweep.py`) until a second sweep is actually
+   requested; a manual loop covers the two or three planned.
+4. **Threshold min/max: in the safe tier.** The risk named against them — silently
+   bounding every measurement's valid range — is precisely what the §3.3 provenance rule
+   neutralizes: recorded on every take, dead on restart. Excluding them would mean a
+   threshold A/B still costs a deploy, the very friction this design exists to remove.
+   They enter cleanly: add `RS_DEPTH_MIN_M`/`RS_DEPTH_MAX_M` env vars alongside, so the
+   knob has all three §3.5 layers rather than being runtime-only.
 
 ---
 
