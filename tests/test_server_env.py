@@ -799,6 +799,37 @@ def _burst_session(monkeypatch, script):
     return conn
 
 
+def test_a_successful_set_replies_then_ends_the_session(monkeypatch):
+    """spec test 6, the half only the socket can show. The unit tests above prove
+    the generation MOVES; this proves the move actually reaches
+    ``_stale_greeting_close`` in the burst loop -- and in the right order.
+
+    Both halves matter and neither implies the other. Reply-then-close: the SET
+    branch sends before it `continue`s, so the issuing client gets its achieved
+    values rather than a bare disconnect. Close-at-all: a session that survived
+    its own SET would keep CAPping through the NEW chain while its greeting still
+    describes the OLD one -- fusing frames from two chains into one median, which
+    `_same_reconstruction_geometry` cannot catch because a filter swap does not
+    change geometry (spec 3.4). The trailing CLEARs must therefore go UNSERVED."""
+    try:
+        _fresh(monkeypatch)
+        gen = srv._camera_generation
+        conn = _burst_session(monkeypatch, b"SET spatial_smooth_delta=8\nCLEAR\nCLEAR\n")
+
+        assert srv._camera_generation == gen + 1              # the write retired it
+        assert conn.sent[0] == b"BURST READY\n"
+        reply = json.loads(conn.sent[-1])
+        assert reply["ok"] is True                            # reply went out FIRST
+        assert reply["filter_options"]["spatial_smooth_delta"] == 8.0
+        # ...and then the loop's top-of-iteration staleness check ended the session:
+        # neither CLEAR was served (each would have appended a b'\x00\x00\x00\x00').
+        assert len(conn.sent) == 2, conn.sent
+        assert conn.remaining == b"CLEAR\nCLEAR\n"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
 def test_an_over_long_set_line_is_refused_and_ends_the_session(monkeypatch):
     """review Important-1: _recv_line stops AT its cap and leaves the rest of the
     line -- terminating newline included -- in the socket, where the loop reads it

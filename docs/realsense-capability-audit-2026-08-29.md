@@ -297,7 +297,7 @@ now measures real support. Expect the validity number to drop and the mesh's
 an omission rather than a recorded decision. This runtime-parameters branch (commit `1ab6dab`;
 **not yet merged to `main`**) turns that absence into an explicit runtime knob:
 `FILTER_SETTINGS["hole_filling"]` defaults to `-1.0` (off) and is only added to the chain when
-`>= 0` (`server/server_unicast_syncronous.py:972` default, `:1822-1825` conditional add). "We
+`>= 0` (`server/server_unicast_syncronous.py:972` default, `:1902-1905` conditional add). "We
 do not fill holes, on purpose" is now a value recorded in every greeting's `filter_options`,
 not an absence a reader has to infer.
 
@@ -343,7 +343,7 @@ pitch ratio, ~1.5×); intrinsics auto-calibration coverage unchanged.
 
 **FIXED** (2026-08-29, `54ab1da` on `main`, the sensor-layer full-fidelity batch) — colour
 streams at 1080p: `COLOR_SIZE = (1920, 1080)` (`server/server_unicast_syncronous.py:878`),
-consumed by `cfg.enable_stream(rs.stream.color, ...)` (`:1155`). Landed together with R3 (raw
+consumed by `cfg.enable_stream(rs.stream.color, ...)` (`:1174`). Landed together with R3 (raw
 depth, no Jetson-side upsampling to 1080p), matching this finding's own "do this after R3"
 ordering.
 
