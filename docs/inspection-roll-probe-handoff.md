@@ -1,10 +1,10 @@
 # Roll probe: is what we are missing locked to the camera, or to the scene?
 
 Task page. Opened 2026-09-01; corrected after review the same day. The roll sequence
-uses one unchanged ring/stack and **three measurement excursions (A-B-A)**; the preceding
-spatial-filter A/B adds its own control captures. Existing code can capture the evidence,
-but the layer-2/dropout and residual-correlation readings still need a small offline probe
-extension (§4).
+uses one unchanged ring/stack and **three measurement captures (A-B-A)** — three config
+edits and backend restarts, which can all happen in one cell session, not three trips;
+the preceding spatial-filter A/B adds its own control captures. Both offline readings
+now exist (`tools/probe_roll_readings.py`, §4), so no code is needed before capturing.
 
 This is a **re-run**. The probe exists (`tools/probe_roll_pair.py`), a pair is already
 on disk, and the probe **refused to read it** — see "What happened last time". Nothing
@@ -42,9 +42,32 @@ Static structure dominates, but the monotonic change also says the production bu
 **still settling**. More frames at one settled pose buy little against static structure;
 the current first five are not proof of what a settled burst buys.
 
+A second 2026-09-01 replay, by a different estimator, puts a much sharper edge on the
+settling half of that. Correlating each burst's **residual field** (the fitted plane
+removed, rasterised into polar cells around the ring) frame-to-frame:
+
+| take | within-pose, frame 0 vs frame 4 | vs the other takes, work frame |
+|---|---|---|
+| layer-002 (first burst at the pose) | **+0.045** | +0.053 / +0.052 |
+| layer-002-take02 | **+0.937** | +0.960 vs take03 |
+| layer-002-take03 | **+0.937** | +0.960 vs take02 |
+
+Two settled bursts of the same ring reproduce each other's static field at **+0.96** —
+the structure is extremely repeatable, and the measurement is sensitive enough to see it
+go away. The first burst at a fresh pose does not even reproduce **itself** (+0.045), and
+is uncorrelated with both settled takes. So the unsettled burst is not merely noisier;
+its residual field is *transient filter state*, carrying almost none of the static
+structure. Nothing observed lands between those two populations.
+
+(The two replays use different estimators and regions and their absolute numbers differ —
+the sigma series above is a robust spatial sigma over the fit disc, the correlations here
+are over a polar annulus outside the bead. Both say the same thing about settling; quote
+whichever, but do not mix them into one series.)
+
 Static noise can average down *if it decorrelates with pose* — and the entire case for
 multi-view rests on that assumption, which has never been tested. The captures below make
-that test possible, but the existing halo-only pair statistic does not perform it (§4).
+that test possible, and `tools/probe_roll_readings.py` (§4) now performs the test; the
+existing halo-only pair statistic still does not.
 
 ---
 
@@ -117,8 +140,13 @@ pixels at 300 mm (`server/server_unicast_syncronous.py`, commit `f9c4a53`).
   into a false ring, stop and tune that path before asking multi-view to repair it.
 - If it does not restore the sector, restore the default chain and continue below.
 - The greeting archives whether `spatial` was present, so on/off is distinguishable.
-  It does **not** archive `RS_SPATIAL_SMOOTH_DELTA`; do not run a delta sweep until that
-  value is added to provenance (or each arm is otherwise immutably labelled).
+  Since 2026-09-01 it also archives the delta the filter ACTUALLY ran at, as
+  `provenance.camera_geometry.filter_options.spatial_smooth_delta` (read back off the
+  filter, so an untouched chain records 20, not the `-1` env default; `null` = no spatial
+  filter). A delta sweep is therefore readable afterwards — **but only from takes captured
+  by a Jetson running that server**: every take already on disk has no `filter_options`
+  key at all, and the host reports those as unknown rather than as 20. Deploy the server
+  before the sweep, and check the first take's manifest actually carries the field.
 
 ### 3.2 Controlled roll capture
 
@@ -140,6 +168,17 @@ archive retains all ten raw frames; analyze the **last five** after the filter c
 advanced, rather than treating the visibly converging first five as settled. Apply the
 same setting to every arm and restore it afterwards.
 
+Two things to know about that setting. First, the *production* median still fuses all
+ten, unsettled frames included — the comparability gate and the reported metrics are
+therefore computed over a partly-unsettled burst. That is the same in all three arms so
+the comparison survives, but do not quote a take's own `sigma_mm` as if it described the
+settled camera. Second, `probe_roll_readings.py` enforces settling directly: it
+correlates each burst's first and last frame and **refuses any capture below +0.5**
+(measured populations: +0.937 settled, +0.045 unsettled — nothing in between). If you
+would rather not spend ten frames per pose, the cheap alternative is a throwaway warm-up
+capture at each pose that you discard; the two repeat takes on disk show a burst is
+already settled by the *second* one at the same pose.
+
 1. **Capture A1 (+30°).** In `tasni.config.json`'s `extrusion` block set
    `inspection_roll_candidates_deg` to `[30, 0]`, **restart the backend**, confirm
    `GET /api/health` → `build.stale == false`, run the measurement.
@@ -150,10 +189,11 @@ same setting to every arm and restore it afterwards.
    limit alone and keep every candidate comfortably inside it.
 3. **Capture A2 (+30° again).** Restore `[30, 0]`, restart, confirm, and repeat without
    touching the stack or changing the applied plan.
-4. **Verify achieved rolls immediately.** Run the existing pair probe twice: A1-vs-B
-   and A2-vs-B. Each should report a baseline gap near 60°; A1 and A2 should return to
-   the same baseline. Under 15° apart from B is inconclusive and means a rolled pose
-   probably fell through to 0. Do not read any refused verdict.
+4. **Verify achieved rolls immediately** — `py -3.10 tools/probe_roll_readings.py <A1>
+   <B> <A2>`. It prints the baseline separation A1–B (should be near 60°) and the
+   baseline return A1–A2 (should be near 0°), and refuses the set if either the noise
+   floors disagree, a burst never settled, or the rolls came out under 15° apart —
+   which means a rolled pose fell through to 0. Do not read any refused verdict.
 5. **Restore both startup overrides** (`inspection_roll_candidates_deg` and
    `measure_depth_fusion_frames`) afterwards. A forgotten value silently changes every
    later take.
@@ -186,11 +226,15 @@ the halo lives on), or accepting the tilted-star offline A/B (`tools/multiview_a
 
 ## 4. Reading it
 
-`tools/probe_roll_pair.py` implements the decision rule for the **halo** (it measures
-lifted board points in the skirt annulus). It also fits each capture's ring centre/radius
-independently, so a biased fit moves the annulus being compared. A controlled reader must
-use one shared centre/radius (or at least report sensitivity to that choice). Its frame rule
-generalises only to the quantity actually measured:
+Two readers, one per question.
+
+**`tools/probe_roll_pair.py` — the halo.** Lifted board points in the skirt annulus.
+The independent-fit defect the review found is **fixed**: it now takes one shared
+centre/radius from capture A and prints how far each capture's own fit sits from it.
+That number is worth reading on its own — on the refused 2026-08-31 pair the two fits
+were **3.90 mm apart on the same untouched ring**, so the two arms had been compared
+through annuli 3.9 mm out of register. Its frame rule generalises only to the quantity
+it actually measures:
 
 - **baseline-relative peaks agree, work-frame peaks rotate → CAMERA-LOCKED.** Two rolls
   close the gap at zero tilt cost. Strictly, the probe measures one specific static
@@ -202,26 +246,41 @@ generalises only to the quantity actually measured:
   the only thing that can remove that **particular scene-locked quantity**. It does not
   prove that the separate static residual field is scene-locked too.
 
-**For the layer-2 dropout the measurement is different and the probe does not do it
-yet.** The dropout is an absence, not a lifted shelf: count ROI points per 10° sector
-and find where they collapse, then express that sector twice — in work-frame angle and
-relative to that capture's own baseline axis (`T_work_camera[:3, 0]`). Exactly one of the
-two should agree between A and B. Same rule, different quantity; extend the probe or
-write a sibling, and delete it once the answer is in.
+**`tools/probe_roll_readings.py` — the dropout and the static field.** Run it on the
+whole set at once:
 
-**For the static-noise question, neither angular statistic is enough.** Using the archived
-raw bursts, rasterise the surrounding substrate into the work frame, remove a fitted plane
-and common low-frequency shape, then compare:
+```
+py -3.10 tools/probe_roll_readings.py <A1> <B> <A2>
+```
 
-- within-pose residual correlation (A1 frames with A1, B with B, A2 with A2);
-- A1-vs-A2 correlation in work coordinates — the repeatability/drift control;
-- cross-roll correlation in work coordinates; and
-- cross-roll correlation after expressing the residual maps in each camera's own
-  baseline coordinates.
+It gates before it reads (comparability, then settling, then whether the rolls actually
+separated), uses one shared centre/radius for every capture, and reports two independent
+quantities:
 
-That is the direct test of whether the 0.5–0.6 mm static residual decorrelates. The halo
-axis can support it, not substitute for it. Capturing A-B-A can happen before this sibling
-exists because `depth-frames.npy` preserves the evidence; **declaring the result cannot**.
+- **The dropout**, as ROI points per 10° sector in a band around the ring. It does **not**
+  report "where the dropout is": measured against the real archive, the layer-2 deficit is
+  multi-lobed — a deep collapse at 140–190° (counts 6, 13, 65, 80 per 10°) plus lesser
+  lows at 30°, 240°, 260° and 330° — so any single "dropout axis" averages them into a
+  number pointing at none of them (it returns 249°). The verdict instead comes from
+  **registering the two whole profiles**: a scene-locked dropout registers near 0°, a
+  camera-locked one near the change in baseline angle. That is robust to the extra lobes,
+  and it was always the real question — not where the dropout is, only whether it moved
+  with the camera.
+- **The static residual field**, rasterised into polar cells on the board annulus, plane
+  removed, radially-symmetric component removed (it carries no angular information, so it
+  can only inflate a correlation toward 1). Low angular frequency is deliberately **kept**:
+  the stereo artifact being hunted is itself a 2-cycle pattern, so an angular high-pass
+  would delete the signal along with the nuisance. It reports the within-pose floor, the
+  A1-vs-A2 repeatability ceiling, and the cross-roll correlation in work versus baseline
+  coordinates — the direct test of whether the 0.5–0.6 mm static residual decorrelates.
+
+Sanity anchors from the archive, so a re-run has something to land against: two settled
+same-roll takes correlate at **+0.960**, and no cross-roll number can legitimately beat
+that ceiling. The probe says so if one does.
+
+Both readings are one quantity each. Agreement between them is the result; a split verdict
+means neither is safe to build on. Delete the probe and its tests together once the answer
+is in.
 
 Baseline for the current stack, so a re-run is comparable — 2026-08-31 layer-002,
 reprocessed offline with the deposit-floor fix (`bd455a7`, which landed at 21:56 — two
@@ -243,13 +302,19 @@ archive, banned for 2026-08-30 (§6).
 
 Two numbers describe the dropout and they are **not the same quantity** — do not let
 them collide. The **140–190°** figure (≈50° wide, §1's table) is where per-10°-sector
-ROI *counts* collapse (22–121 points against 250–466 elsewhere). The **~175° max
-angular gap / ~0.51 completeness** above is a *measured-path* metric: about half the
-path is missing — presumably a wider sparse arc around that severe core, though the
-reconciliation has not been checked. The sibling probe counts raw ROI points per
-sector, so 140–190° on the roll-0 takes is the number it must reproduce first;
-explaining the wider path gap is part of reading the result, not a discrepancy to be
-alarmed by.
+ROI *counts* collapse. The **~175° max angular gap / ~0.51 completeness** above is a
+*measured-path* metric: about half the path is missing, a wider sparse arc around that
+severe core.
+
+The count figure is now confirmed directly off the archive (`probe_roll_readings.py` on
+the three roll-0 takes, one shared centre, ring band r 31.8–51.8 mm). Per 10° sector,
+take 1: the collapse runs **80, 6, 65, 122, 13** across 140–190° against a maximum of
+455 elsewhere — §1's "22–121 against 250–466" holds. What §1 does *not* say, and the
+sibling reading had to learn, is that the deficit is **multi-lobed**: further lows sit at
+30° (28), 240° (69), 260° (51) and 330° (54). That is why the verdict registers whole
+profiles instead of locating an axis (§4). The three same-roll takes reproduce each
+other's profile to within 2.4–6.5°, which is the drift floor any cross-roll shift must
+beat.
 
 ---
 

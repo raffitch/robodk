@@ -182,13 +182,21 @@ def load_take(take_dir: Path) -> dict:
     }
 
 
-def skirt_histogram(take: dict) -> dict:
-    """Above-floor board in the annulus just outside the ring, by angle."""
+def skirt_histogram(take: dict, centre=None, radius=None) -> dict:
+    """Above-floor board in the annulus just outside the ring, by angle.
+
+    ``centre``/``radius`` override the take's OWN ring fit, and the caller is
+    expected to pass one shared reference for every capture being compared.
+    Letting each capture use its own fit moves the annulus between the two arms,
+    so a fit biased in one of them shows up as an angular difference that is
+    really a radial one (2026-09-01 review of docs/inspection-roll-probe-handoff.md).
+    """
     pts, h = take["points"], take["height"]
-    cx, cy = take["centre"]
+    cx, cy = take["centre"] if centre is None else centre
+    ring_radius = take["radius"] if radius is None else float(radius)
     r = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
-    inner = take["radius"] + SKIRT_INNER_MM
-    outer = take["radius"] + SKIRT_OUTER_MM
+    inner = ring_radius + SKIRT_INNER_MM
+    outer = ring_radius + SKIRT_OUTER_MM
     band = (r >= inner) & (r <= outer)
     over = band & (h >= take["floor"])
 
@@ -218,19 +226,27 @@ def main() -> int:
                     help="write a polar comparison figure to this path")
     args = ap.parse_args()
 
-    takes = []
-    for path in (args.take_a, args.take_b):
-        take = load_take(Path(path))
-        take["skirt"] = skirt_histogram(take)
-        takes.append(take)
+    takes = [load_take(Path(path)) for path in (args.take_a, args.take_b)]
+    # ONE annulus for both captures, taken from A. Each capture fitting its own
+    # ring moved the skirt between the two arms being compared, so a fit biased
+    # in one arm read as an angular difference (2026-09-01 review).
+    shared_centre, shared_radius = takes[0]["centre"], takes[0]["radius"]
+    for take in takes:
+        take["skirt"] = skirt_histogram(take, centre=shared_centre,
+                                        radius=shared_radius)
 
     print("=" * 78)
+    print(f"shared skirt reference (from A): centre "
+          f"{np.asarray(shared_centre).round(2).tolist()}  radius {shared_radius:.2f} mm")
     for tag, take in zip("AB", takes):
         s = take["skirt"]
         print(f"capture {tag}: {take['dir']}")
         print(f"  commanded roll {take['roll_deg']:.1f} deg, tilt {take['tilt_deg']:.1f} deg"
               f"   run {'VALID' if take['valid'] else 'aborted (fine -- raw frame is what we read)'}")
-        print(f"  ring centre {take['centre'].round(2).tolist()}  radius {take['radius']:.2f} mm")
+        print(f"  own ring fit: centre {take['centre'].round(2).tolist()}  "
+              f"radius {take['radius']:.2f} mm"
+              f"  ({float(np.linalg.norm(np.asarray(take['centre']) - np.asarray(shared_centre))):.2f} mm "
+              "from the shared reference)")
         print(f"  substrate sigma {take['sigma']:.3f} mm, floor {take['floor']:.3f} mm")
         print(f"  camera baseline in the work frame: {take['baseline_deg']:.1f} deg (axis, 0-180)")
         print(f"  skirt annulus r {s['inner_mm']:.1f}-{s['outer_mm']:.1f} mm: "
