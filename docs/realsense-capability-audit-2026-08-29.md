@@ -15,6 +15,11 @@ unless it says "spec".
 2.05 % lateral scale) and A4 (hole filling in the metrology chain) reappear here as R3 and
 R5 because the sensor-layer fix is the same fix.
 
+**Update (2026-09-01):** the safe-tier depth-filter chain (spatial, temporal, threshold,
+hole-filling) is now runtime-settable via a `SET` command on the burst protocol, with every
+achieved value recorded in the per-connection greeting's `filter_options` and every override
+dying on a service restart — see the status lines added to R2, R3, R5 and R7 below.
+
 ---
 
 ## 1. What is actually running (measured)
@@ -181,6 +186,12 @@ same patch. Then `tools/characterize_distance.py` before/after — plane RMS sho
 to the filtered/averaged outputs (still worth having, since the median and TSDF then have
 sub-mm structure to average).
 
+**FIXED** (2026-08-29, `54ab1da` on `main`, the sensor-layer full-fidelity batch) —
+`depth_units` is now always set and read back to `DEPTH_UNITS_M = 0.0001` (0.1 mm),
+unconditionally, unlike the leave-alone default used for laser power/preset:
+`server/rs_config.py:18` (constant), `:75-76` (set + read-back). Confirmed against the
+current tree, not merely the commit message.
+
 ### R3 — `align(color)` on the Jetson discards ~50 % of the depth field
 
 Depth FOV is 87°×58°, RGB is 69°×42° (spec). On the image plane that is
@@ -208,6 +219,13 @@ operation it has; the host gets the full field and one camera model.
 a known length measured **from the depth cloud alone** at three standoffs (VDI/VDE 2634-2
 sphere-spacing style) — reads within noise of true, where today it reads +2 %; (c) a flat
 platform locks with fewer `TasniScan_*` poses at the same coverage gate.
+
+**FIXED** (2026-08-29, `54ab1da` on `main`, the sensor-layer full-fidelity batch) — there is
+no `align()`/`rs.align` call anywhere left in `server/server_unicast_syncronous.py`; depth
+ships native/unaligned and the greeting says so on the wire (`"aligned": False`,
+`server/rs_geometry.py:79`), carrying the depth intrinsics and the depth→colour extrinsic
+(`server/rs_geometry.py:29-61`, `static_geometry`/`build_greeting`) for the host to
+back-project with one camera model. Closes audit A1's 2.05 % scale bug with it.
 
 ### R4 — Advanced mode is available and never used; the device runs an unrecorded Custom
 
@@ -272,6 +290,16 @@ downstream step, do it host-side after R3 with a method that marks filled pixels
 now measures real support. Expect the validity number to drop and the mesh's
 `measured_mesh_min_support_views` filtering to become *less* necessary.
 
+**FIXED** in two steps. The `threshold_filter` clip ahead of `spatial`
+(`RS_DEPTH_MIN_M`/`RS_DEPTH_MAX_M`) and dropping `hole_filling` out of the chain both landed
+2026-08-29 in `54ab1da` on `main` — but there `hole_filling` was simply absent from the code,
+an omission rather than a recorded decision. This runtime-parameters branch (commit `1ab6dab`;
+**not yet merged to `main`**) turns that absence into an explicit runtime knob:
+`FILTER_SETTINGS["hole_filling"]` defaults to `-1.0` (off) and is only added to the chain when
+`>= 0` (`server/server_unicast_syncronous.py:972` default, `:1822-1825` conditional add). "We
+do not fill holes, on purpose" is now a value recorded in every greeting's `filter_options`,
+not an absence a reader has to infer.
+
 ### R6 — The left IR stream is enabled and never read
 
 `cfg.enable_stream(rs.stream.infrared, 1)` with no consumer costs USB bandwidth and a little
@@ -311,6 +339,12 @@ colour conversion at 1080p is the CPU cost R1 removes.
 
 **Acceptance.** Reprojection RMS on the calibration board drops (expect roughly the pixel-
 pitch ratio, ~1.5×); intrinsics auto-calibration coverage unchanged.
+
+**FIXED** (2026-08-29, `54ab1da` on `main`, the sensor-layer full-fidelity batch) — colour
+streams at 1080p: `COLOR_SIZE = (1920, 1080)` (`server/server_unicast_syncronous.py:878`),
+consumed by `cfg.enable_stream(rs.stream.color, ...)` (`:1155`). Landed together with R3 (raw
+depth, no Jetson-side upsampling to 1080p), matching this finding's own "do this after R3"
+ordering.
 
 ### R8 — The IMU is unused
 
