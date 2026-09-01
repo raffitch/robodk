@@ -224,13 +224,12 @@ def test_garbage_spatial_env_does_not_kill_the_service(monkeypatch):
 # (-1 = "don't touch") names no number at all, and the number it silently inherits
 # is librealsense's, which a future SDK is free to change under us.
 
-def _greeting(monkeypatch, **env):
-    """A full protocol-2 greeting, built the way a connecting client gets one, with
-    the filter chain that ``env`` produces actually installed."""
-    chain = _chain(monkeypatch, **env)
+def _snapshot(generation=0):
+    """The CameraSnapshot a connecting client is greeted from, filled from the
+    module globals exactly the way ``_camera_snapshot()`` fills it (filter
+    description included -- that is what makes the greeting coherent)."""
     from server import rs_geometry
 
-    srv.depth_filters = chain
     static = rs_geometry.StaticGeometry(
         depth={"width": 1280, "height": 720, "fx": 640.0, "fy": 640.0, "ppx": 640.0,
                "ppy": 360.0, "model": "none", "coeffs": [0.0] * 5},
@@ -241,11 +240,21 @@ def _greeting(monkeypatch, **env):
     sensor = SimpleNamespace()
     pipeline = SimpleNamespace(get_active_profile=lambda: SimpleNamespace(
         get_device=lambda: SimpleNamespace(first_depth_sensor=lambda: sensor)))
-    snap = srv.CameraSnapshot(
+    return srv.CameraSnapshot(
         pipeline=pipeline, depth_unit_mm=0.1, geometry=static,
         achieved={"visual_preset": 0.0, "laser_power": 150.0},
         device={"serial": "S1", "fw": "5.16.0.1", "librealsense": "2.55.1"},
-        generation=0)
+        generation=generation,
+        filter_names=list(srv.DEPTH_FILTER_NAMES),
+        filter_options=dict(srv.FILTER_OPTIONS))
+
+
+def _greeting(monkeypatch, **env):
+    """A full protocol-2 greeting, built the way a connecting client gets one, with
+    the filter chain that ``env`` produces actually installed."""
+    chain = _chain(monkeypatch, **env)
+    srv.depth_filters = chain
+    snap = _snapshot()
     monkeypatch.setattr(srv, "_camera_snapshot", lambda: snap)
     return srv.make_greeting()
 
@@ -730,6 +739,188 @@ def test_non_finite_values_are_rejected(monkeypatch):
             srv._handle_set(b"SET spatial_smooth_delta=-inf"))["ok"] is False
         assert srv._camera_generation == gen                  # nothing landed
         assert srv.FILTER_SETTINGS["spatial_smooth_delta"] == -1.0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+# ------------------------------------------- whole-branch review, Important 1
+# The SET line's read cap, over the socket. These are the only tests that drive
+# stream_burst's command loop, so they use a scripted fake connection: the loop
+# touches nothing on a socket but recv / sendall / settimeout.
+
+
+class _FakeConn:
+    """A socket the burst loop can talk to: scripted bytes in, sends recorded.
+
+    ``recv`` returning b'' models the peer closing, which is what ends the loop
+    once the script is exhausted. ``remaining`` is the point of the whole fake --
+    it shows what the server left UNREAD in the stream, which is precisely the
+    hazard an over-long line creates."""
+
+    def __init__(self, script):
+        self._inbox = bytearray(script)
+        self.sent = []
+        self.timeouts = []
+
+    def recv(self, n):
+        if not self._inbox:
+            return b""                      # peer closed
+        chunk = bytes(self._inbox[:n])
+        del self._inbox[:n]
+        return chunk
+
+    def sendall(self, data):
+        self.sent.append(bytes(data))
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def setsockopt(self, *args):
+        pass
+
+    @property
+    def remaining(self):
+        return bytes(self._inbox)
+
+
+def _burst_session(monkeypatch, script):
+    """Run ONE stream_burst session over ``script`` and hand back the fake socket.
+
+    ``greet`` is stubbed to report the live generation without sending: these
+    tests are about the command loop's line handling, and a real greeting would
+    drag in device I/O (temperatures, global time) that has nothing to do with
+    it. The generation it returns is real, so the staleness check still behaves."""
+    monkeypatch.setattr(srv, "turbojpeg",
+                        SimpleNamespace(TurboJPEG=lambda path: None))
+    monkeypatch.setattr(srv, "greet", lambda conn: srv._camera_generation)
+    conn = _FakeConn(script)
+    srv.stream_burst(conn, ("test-client", 0))
+    return conn
+
+
+def test_an_over_long_set_line_is_refused_and_ends_the_session(monkeypatch):
+    """review Important-1: _recv_line stops AT its cap and leaves the rest of the
+    line -- terminating newline included -- in the socket, where the loop reads it
+    as the next command. Two failures follow. The loud one: the cut lands
+    mid-token, _handle_set refuses, and the residual tail is then swallowed by the
+    loop's forgiving unknown-command rule. The silent one, tested here: the cut
+    lands on a token BOUNDARY, so the truncated line is VALID -- it applies a
+    SUBSET of the requested keys under "ok":true and archives that subset in the
+    greeting as the whole SET. That defeats apply_filter_settings' all-or-nothing
+    rule from the socket layer. Reachable in ordinary use, not theoretical: spec
+    4.1 tells a sweep to send an explicit restore line between arms, and a 12-key
+    restore is 260 bytes against the 256 this shipped with. There is nothing to
+    resync to, so hitting the cap must end the session."""
+    try:
+        _fresh(monkeypatch)
+        gen = srv._camera_generation
+        settings = dict(srv.FILTER_SETTINGS)
+
+        # A line whose cut falls EXACTLY on a token boundary (the silent case),
+        # with a DIFFERENT key past the cut so the truncated prefix is a strict
+        # subset of what the caller asked for.
+        head, token = b"SET ", b"spatial_smooth_delta=8 "
+        n = (srv.SET_LINE_MAXLEN - len(head)) // len(token)
+        pad = b" " * (srv.SET_LINE_MAXLEN - len(head) - n * len(token))
+        over_long = head + pad + token * n + b"spatial=0"
+        assert len(over_long) > srv.SET_LINE_MAXLEN
+        assert over_long[:srv.SET_LINE_MAXLEN].endswith(token)
+
+        conn = _burst_session(monkeypatch, over_long + b"\nCLEAR\n")
+
+        reply = json.loads(conn.sent[-1])
+        assert reply["ok"] is False, reply
+        assert "byte" in reply["error"], reply          # names the length problem
+        assert srv.FILTER_SETTINGS == settings           # nothing applied
+        assert srv._camera_generation == gen             # nobody retired
+        # The session ended: the trailing CLEAR was never served, and its bytes
+        # (behind the unread tail) are still in the stream -- which is exactly why
+        # the server must not try to resync past them.
+        assert conn.sent[0] == b"BURST READY\n"
+        assert len(conn.sent) == 2
+        assert conn.remaining.startswith(b"spatial=0")
+        assert b"CLEAR" in conn.remaining
+
+        # ...and this is what accepting the truncated line would have meant: the
+        # prefix _recv_line hands back is itself a perfectly valid SET that drops
+        # `spatial=0` and answers ok:true.
+        would_have = json.loads(
+            srv._handle_set(over_long[:srv.SET_LINE_MAXLEN].strip()))
+        assert would_have["ok"] is True
+        assert srv.FILTER_SETTINGS["spatial_smooth_delta"] == 8.0   # applied
+        assert srv.FILTER_SETTINGS["spatial"] == 1.0                # silently dropped
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_a_full_explicit_restore_line_is_read_whole(monkeypatch):
+    """The same finding from the other side, and the regression test the original
+    cap would have failed: the line spec 4.1 tells a sweep to send between arms --
+    every FILTER_SETTINGS key with its value -- must be read WHOLE and applied.
+    Built from the LIVE key set rather than a hardcoded string, so it keeps
+    tracking the real knob list as that list grows."""
+    try:
+        _fresh(monkeypatch)
+        restore = ("SET " + " ".join(
+            "{}={}".format(key, float(value))
+            for key, value in sorted(srv.FILTER_SETTINGS.items()))).encode("ascii")
+        # 260 bytes today. If this ever drops under 256 the regression is no longer
+        # being exercised and the sizing argument needs revisiting.
+        assert len(restore) > 256, len(restore)
+        assert len(restore) < srv.SET_LINE_MAXLEN, len(restore)
+
+        json.loads(srv._handle_set(b"SET spatial_smooth_delta=8"))      # arm A
+        assert srv.FILTER_SETTINGS["spatial_smooth_delta"] == 8.0
+
+        conn = _burst_session(monkeypatch, restore + b"\n")
+
+        reply = json.loads(conn.sent[-1])
+        assert reply["ok"] is True, reply
+        assert srv.FILTER_SETTINGS["spatial_smooth_delta"] == -1.0      # restored
+        assert reply["filter_options"]["spatial_smooth_delta"] == 20.0  # SDK default
+        # The whole line was consumed. Under the old 256-byte cap the tail was left
+        # sitting in the socket, to be read as a bogus command of its own.
+        assert conn.remaining == b""
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+# ------------------------------------------- whole-branch review, Important 2
+# The greeting's filter description must come from the SNAPSHOT, structurally.
+
+
+def test_the_greeting_describes_the_snapshots_chain_not_the_live_globals(monkeypatch):
+    """review Important-2: make_greeting used to read DEPTH_FILTER_NAMES and
+    FILTER_OPTIONS as unlocked module globals while taking the generation from the
+    locked snapshot -- and a runtime SET rebinds exactly those two, from another
+    client's thread. It was correct only because both call paths happened to take
+    the snapshot BEFORE those reads. Reorder them above it and the tear inverts to
+    an OLD chain description under a NEW generation: a greeting
+    _stale_greeting_close never retires, describing a chain its frames do not run
+    through -- the silent provenance corruption this branch exists to prevent.
+    Pin it structurally: mutate the globals after the snapshot and the greeting
+    must still report the snapshot."""
+    try:
+        _chain(monkeypatch)
+        # The coherence now lives in _camera_snapshot, so it must carry them.
+        live = srv._camera_snapshot()
+        assert live.filter_names == srv.DEPTH_FILTER_NAMES
+        assert live.filter_options == srv.FILTER_OPTIONS
+
+        snap = _snapshot()
+        # A concurrent SET lands between the snapshot and the greeting build.
+        monkeypatch.setattr(srv, "DEPTH_FILTER_NAMES",
+                            ["threshold", "disparity", "temporal", "disparity_inv"])
+        monkeypatch.setattr(srv, "FILTER_OPTIONS",
+                            dict(srv.FILTER_OPTIONS, spatial_smooth_delta=None))
+
+        greeting = srv.make_greeting(snap)
+        assert greeting["filters"] == snap.filter_names
+        assert "spatial" in greeting["filters"]
+        assert greeting["filter_options"]["spatial_smooth_delta"] == 20.0
     finally:
         monkeypatch.undo()
         importlib.reload(srv)

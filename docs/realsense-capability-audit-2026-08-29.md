@@ -224,7 +224,8 @@ platform locks with fewer `TasniScan_*` poses at the same coverage gate.
 no `align()`/`rs.align` call anywhere left in `server/server_unicast_syncronous.py`; depth
 ships native/unaligned and the greeting says so on the wire (`"aligned": False`,
 `server/rs_geometry.py:79`), carrying the depth intrinsics and the depth→colour extrinsic
-(`server/rs_geometry.py:29-61`, `static_geometry`/`build_greeting`) for the host to
+(`server/rs_geometry.py:29-61` `extrinsic_row_major`/`static_geometry`, and
+`server/rs_geometry.py:64-95` `build_greeting`, which emits those fields) for the host to
 back-project with one camera model. Closes audit A1's 2.05 % scale bug with it.
 
 ### R4 — Advanced mode is available and never used; the device runs an unrecorded Custom

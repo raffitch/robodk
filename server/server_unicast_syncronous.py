@@ -1027,9 +1027,12 @@ DEVICE_INFO = {}
 # just back-projects every depth frame of that connection through the wrong
 # numbers. `generation` is stamped in the same breath so a connection can later
 # tell whether the camera it was greeted with is still the one streaming.
+# `filter_names`/`filter_options` ride along for the same reason: a runtime SET is
+# a live concurrent writer of them (see _camera_snapshot).
 CameraSnapshot = namedtuple(
     "CameraSnapshot",
-    "pipeline depth_unit_mm geometry achieved device generation")
+    "pipeline depth_unit_mm geometry achieved device generation "
+    "filter_names filter_options")
 
 
 def _camera_snapshot() -> CameraSnapshot:
@@ -1039,7 +1042,22 @@ def _camera_snapshot() -> CameraSnapshot:
     runs inside it; startup binds them before any client thread exists), so reading
     them under the same lock is what makes the set atomic.
 
-    The lock is held only for the six reads -- no device I/O inside it, so a slow or
+    That now includes ``DEPTH_FILTER_NAMES``/``FILTER_OPTIONS``: a runtime ``SET``
+    (``apply_filter_settings``) rebinds both and then bumps ``_camera_generation``,
+    from another client's thread, while this one is being greeted. Reading them
+    here rather than in ``make_greeting`` is what makes the pairing STRUCTURAL
+    instead of an accident of statement order. Taken outside the lock they could
+    tear either way, and one direction is fatal: a greeting carrying the OLD chain
+    description under the NEW generation is never retired by
+    ``_stale_greeting_close``, so every frame of that connection is archived as
+    having run through a chain it did not -- the silent provenance corruption the
+    whole runtime-SET design exists to prevent. (The other direction, new
+    description with the old generation, is merely a stale greeting, and staleness
+    is retired before a single frame goes out.) Both are captured as COPIES so the
+    snapshot stays a value even if a future writer ever mutates in place instead of
+    rebinding.
+
+    The lock is held only for these reads -- no device I/O inside it, so a slow or
     hung control transfer can never keep the supervisor from rebuilding. A reader
     that arrives mid-rebuild does WAIT for it (``_rebuild_pipeline`` holds the lock
     across the backoff and the multi-second ``openPipeline``), but it would have
@@ -1049,7 +1067,8 @@ def _camera_snapshot() -> CameraSnapshot:
     """
     with _camera_lock:
         return CameraSnapshot(pipeline, depth_unit_mm, STATIC_GEOMETRY,
-                              ACHIEVED_OPTIONS, DEVICE_INFO, _camera_generation)
+                              ACHIEVED_OPTIONS, DEVICE_INFO, _camera_generation,
+                              list(DEPTH_FILTER_NAMES), dict(FILTER_OPTIONS))
 
 
 def _greeting_is_stale(generation) -> bool:
@@ -1227,13 +1246,21 @@ def make_greeting(snapshot: CameraSnapshot = None) -> dict:
     a rebuild running concurrently cannot hand a connecting client a mixture of two
     opens. The temperature/global-time reads are live device I/O and happen after
     the snapshot, outside the lock.
+
+    The filter DESCRIPTION comes off ``snap`` too, not the module globals. It
+    used to read ``DEPTH_FILTER_NAMES``/``FILTER_OPTIONS`` as unlocked globals,
+    which was safe only because those statements happened to sit after the snapshot
+    was taken; a runtime ``SET`` writes them concurrently, so reordering the reads
+    above the snapshot would have paired an old chain description with a new
+    generation -- a greeting nothing retires, describing a chain its frames never
+    ran through. See ``_camera_snapshot``.
     """
     snap = _camera_snapshot() if snapshot is None else snapshot
     sensor = snap.pipeline.get_active_profile().get_device().first_depth_sensor()
     return rs_geometry.build_greeting(
         snap.geometry, depth_unit_mm=snap.depth_unit_mm,
-        filters=list(DEPTH_FILTER_NAMES),
-        filter_options=dict(FILTER_OPTIONS),
+        filters=list(snap.filter_names),
+        filter_options=dict(snap.filter_options),
         temps=rs_config.read_temperatures(sensor, rs, log=_log),
         global_time_enabled=rs_config.read_global_time_enabled(sensor, rs, log=_log),
         achieved=snap.achieved, device=snap.device)
@@ -1595,11 +1622,20 @@ def stream_h264(conn, addr, bitrate_kbps, scan_telemetry=False):
 
 
 def _recv_line(conn, maxlen=64):
-    """Read one newline-terminated command line from ``conn`` (CAP/GET/CLEAR).
+    """Read one newline-terminated command line from ``conn`` (CAP/GET/CLEAR/SET).
 
     Commands are tiny and the client sends one at a time (it waits for each reply
     before sending the next), so a byte-at-a-time read can't over-read into the next
-    command or into frame data. Returns b'' if the peer closed."""
+    command or into frame data. Returns b'' if the peer closed.
+
+    ``maxlen`` is a HARD STOP, not a truncating convenience. When it is reached the
+    rest of the line -- INCLUDING its terminating newline -- is left unread in the
+    socket, and the next call reads that tail as a command in its own right. There
+    is therefore no way to resync (nothing distinguishes the tail from a real
+    command), so a caller MUST treat ``len(result) >= maxlen`` as a protocol error
+    rather than as a line; see the SET branch of ``stream_burst`` for what that
+    costs if it doesn't. The default stays deliberately tight: CAP/GET/CLEAR are
+    3-5 bytes, so anything near 64 on those is already garbage."""
     buf = bytearray()
     while len(buf) < maxlen:
         ch = conn.recv(1)
@@ -1609,6 +1645,17 @@ def _recv_line(conn, maxlen=64):
             break
         buf.extend(ch)
     return bytes(buf)
+
+
+# The SET line's own read cap -- SET is the one command that is not a fixed 3-5
+# byte verb. A full explicit restore (every FILTER_SETTINGS key with its value,
+# which spec 4.1 tells a sweep to send between arms rather than trusting the
+# previous arm's leftover state) measures 260 bytes with today's twelve keys, so
+# the 256 this shipped with cut a perfectly legitimate line -- this was reachable
+# in ordinary use, not a theoretical edge. 512 leaves room for the key set to grow
+# by half again. It is a cap, never a truncation point: see _recv_line and the SET
+# branch of stream_burst.
+SET_LINE_MAXLEN = 512
 
 
 def stream_burst(conn, addr, max_frames=64):
@@ -1635,6 +1682,8 @@ def stream_burst(conn, addr, max_frames=64):
                   before it (THIS one included, after the reply) is closed and
                   reconnects into a fresh greeting. Bare SET = read-only.
                   Overrides die on restart -- the unit file stays the boot truth.
+                  A SET line of SET_LINE_MAXLEN bytes or more is refused with
+                  ok:false and ENDS the session (it could not be read whole).
 
     The buffer is RAM-only and is ALSO dropped when the connection ends (finally), so
     an abandoned/dropped burst leaves NO data on the Jetson — no disk garbage. Between
@@ -1660,13 +1709,44 @@ def stream_burst(conn, addr, max_frames=64):
             # The next command may be many seconds away (the robot is moving between
             # poses); wait generously rather than dropping the connection.
             conn.settimeout(180.0)
-            # maxlen 256: a multi-key SET line (spec 3.1) outgrows the default 64.
-            line = _recv_line(conn, maxlen=256)
+            # A multi-key SET line (spec 3.1) outgrows _recv_line's tight default;
+            # SET_LINE_MAXLEN documents the sizing. CAP/GET/CLEAR are unaffected --
+            # they are 3-5 bytes and would still be garbage at 64.
+            line = _recv_line(conn, maxlen=SET_LINE_MAXLEN)
             cmd = line.strip().upper()
             if not cmd:
                 break                      # peer closed
 
             if cmd == b'SET' or cmd.startswith(b'SET '):
+                if len(line) >= SET_LINE_MAXLEN:
+                    # The read hit the cap, so the REST of this line -- its newline
+                    # included -- is still in the socket, and the next _recv_line
+                    # would read that tail as a command. Two things then go wrong,
+                    # and the second is why this must be fatal rather than just an
+                    # error reply:
+                    #   * usually the cut lands mid-token, _handle_set refuses
+                    #     loudly, and the residual tail is silently swallowed by the
+                    #     loop's forgiving unknown-command rule -- so the operator
+                    #     sees one error and never learns a second "command" was
+                    #     eaten;
+                    #   * if the cut happens to land on a token boundary the
+                    #     truncated line is VALID: it applies a SUBSET of the
+                    #     requested keys, answers "ok":true, and archives that
+                    #     subset in the greeting as though it were the whole SET.
+                    #     That is a silent partial apply -- precisely the failure
+                    #     the all-or-nothing rule in apply_filter_settings exists to
+                    #     prevent, arriving through the socket layer instead.
+                    # There is no safe resync (nothing distinguishes the tail from a
+                    # real command), so refuse loudly, apply NOTHING, and end the
+                    # session: the client's existing reconnect path gets a clean
+                    # stream and a fresh greeting. Do NOT "simplify" this back into
+                    # accepting the truncated line.
+                    conn.sendall(_json_line({"ok": False, "error": (
+                        "SET line reached the {} byte cap; the read was truncated, "
+                        "so NOTHING was applied and this session is ending -- "
+                        "reconnect and send fewer keys per line".format(
+                            SET_LINE_MAXLEN))}))
+                    break
                 # Runtime filter settings (runtime-parameters spec 3.1). Reply
                 # FIRST; a successful WRITE bumped the generation, so the
                 # top-of-loop staleness check ends this session on the next
@@ -1904,12 +1984,25 @@ def apply_filter_settings(updates):
                 FILTER_SETTINGS.update(previous)
                 raise SettingError("rejected by the filter chain: {}".format(exc))
             _camera_generation += 1    # LAST: retires every session greeted before it
+        # Read inside the lock, like the two globals below it. This journal line is
+        # the operator's breadcrumb for which arm of an A/B a take belongs to, and
+        # a second client's SET landing between the release and the print would
+        # make it name a generation this call did not produce.
+        generation = _camera_generation
         achieved = dict(FILTER_OPTIONS)
         names = list(DEPTH_FILTER_NAMES)
     if updates:
         print("Runtime SET applied: {} -> generation {}".format(
-            clean, _camera_generation), flush=True)
+            clean, generation), flush=True)
     return achieved, names
+
+
+def _json_line(payload):
+    """One JSON object, framed as the SET protocol's single reply line.
+
+    Shared so the over-long-line refusal in ``stream_burst`` and ``_handle_set``'s
+    replies cannot drift into two different framings on the same wire."""
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
 
 
 def _handle_set(line):
@@ -1944,7 +2037,7 @@ def _handle_set(line):
         reply = {"ok": False, "error": str(exc)}
     except Exception as exc:      # a bug must degrade to an error line, not kill the thread
         reply = {"ok": False, "error": "internal: {!r}".format(exc)}
-    return json.dumps(reply, separators=(",", ":")).encode("utf-8") + b"\n"
+    return _json_line(reply)
 
 
 def _serve_client(conn, addr):

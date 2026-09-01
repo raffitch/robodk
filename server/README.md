@@ -153,7 +153,7 @@ for sends.
 | Client sends | Server does |
 |---|---|
 | `MODE FULL V2` | Greeting, then continuous `depth+colour` frames. |
-| `MODE BURST V2` | `BURST READY\n`, the greeting, then the CAP/GET/CLEAR loop below. |
+| `MODE BURST V2` | `BURST READY\n`, the greeting, then the CAP/GET/CLEAR/SET loop below. |
 | `MODE COLOR [Q<n>] [H264 [B<kbps>]] [SCAN]` (or a bare `C`) | Colour only. **No greeting.** `Q<n>` clamps JPEG quality to 10..100; `H264` switches to the hardware encoder; `B<kbps>` clamps 500..20000 (default 4000); `SCAN` additionally publishes scan telemetry. |
 | `MODE TELEMETRY` | Length-prefixed JSON telemetry side-channel; no greeting, no frames. |
 | **anything else that wants depth** — no line at all, a bare `MODE FULL`, garbage | **Refused**: `ERR protocol 2 required; send MODE FULL V2\n`, then close. |
@@ -189,7 +189,7 @@ per-pose depth transfer over the cell's Wi-Fi (a full frame can take 6–11 s):
   `<I idx><I thumb_len><thumb JPEG>` for the live per-pose strip (`thumb_len=0` = skip).
 - `GET` — `<I count>` then every buffered frame in the framing above.
 - `CLEAR` — drop the buffer, reply `<I 0>`.
-- `SET [k=v ...]` — one JSON line: `{"ok":true,"filters":[...],"filter_options":{...}}` (achieved values) or `{"ok":false,"error":"..."}`. A successful write retires the generation — sessions greeted before it end (the issuing one too, after the reply) and reconnect into a fresh greeting. A bare `SET` is a read. Overrides never survive a service restart.
+- `SET [k=v ...]` — one JSON line: `{"ok":true,"filters":[...],"filter_options":{...}}` (achieved values) or `{"ok":false,"error":"..."}`. A successful write retires the generation — sessions greeted before it end (the issuing one too, after the reply) and reconnect into a fresh greeting. A bare `SET` is a read. Overrides never survive a service restart. A `SET` line of **512 bytes or more** (`SET_LINE_MAXLEN`) is refused with `ok:false` and **ends the session**: the line could not be read whole, its unread tail would be replayed as a command, and a cut landing on a token boundary would otherwise apply a silent *subset* of the keys. Reconnect and send fewer keys per line — a full 12-key restore is ~260 bytes, so this is a runaway, not a sweep.
 
 The buffer is RAM-only and is dropped in `finally`, so an abandoned burst leaves
 nothing on the Jetson. Command reads use a 180 s timeout (the robot is moving

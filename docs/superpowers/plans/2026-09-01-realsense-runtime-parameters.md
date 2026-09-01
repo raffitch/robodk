@@ -1097,6 +1097,33 @@ _, dec = one_shot(b"SET decimation=2")
 assert not dec["ok"], dec
 print("decimation refused: OK")
 
+# 7. Over-long SET is refused LOUDLY and the session ends. This distinguishes the
+#    fixed behaviour from the original bug: a line past SET_LINE_MAXLEN used to be
+#    read truncated, leaving its tail in the socket to be replayed as a command --
+#    and if the cut fell on a token boundary it applied a SUBSET of the keys under
+#    "ok":true. Expect ok:false naming the length, then a CLOSED connection.
+s, _ = burst_session()
+s.sendall(b"SET " + b"spatial_smooth_delta=20 " * 40 + b"\n")   # ~960 bytes
+long_reply = json.loads(recv_line(s))
+assert not long_reply["ok"] and "byte" in long_reply["error"], long_reply
+assert s.recv(64) == b"", "over-long SET did not end the session"
+s.close()
+print("over-long SET refused and session ended: OK")
+
+# 8. Inverted thresholds. This probes the REAL rs.threshold_filter, which the fake
+#    SDK in the unit tests cannot answer for: either its constructor raises (and
+#    apply_filter_settings' rollback path catches it -> ok:false, FILTER_SETTINGS
+#    restored) or it accepts the pair silently and clips every pixel away (-> ok:true
+#    with achieved min>max, and the next CAP returns an empty depth frame). Both are
+#    informative; record which one the camera does. Restore afterwards either way.
+_, inv = one_shot(b"SET depth_min_m=1.0 depth_max_m=0.5")
+print("inverted thresholds ->", "REFUSED by the SDK" if not inv["ok"]
+      else "ACCEPTED, achieved %s" % {k: inv["filter_options"][k]
+                                      for k in ("depth_min_m", "depth_max_m")})
+_, restored = one_shot(b"SET depth_min_m=0.15 depth_max_m=1.5")
+assert restored["ok"], restored
+print("thresholds restored: OK")
+
 print("\nALL LIVE CHECKS PASSED. Now restart the service and re-run step 3's check")
 print("expecting the BASELINE value back (spec test 7):", baseline)
 ```
