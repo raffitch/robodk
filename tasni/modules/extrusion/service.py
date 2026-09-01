@@ -457,17 +457,33 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
     # frame-referenced one is only reachable through a wrist flip.
     reference_x = [float(v) for v in rdk.camera_axes_in_frame(
         plan.setup.inspection_tool, plan.setup.work_frame, start_joints)[:3, 0]]
-    # A forced roll is the variable under test, so it is the ONLY candidate and
-    # it is not re-ordered by the seed: reaching for the previous pose first is
-    # help when roll is a means, and silent sabotage when roll is the measurement.
+    # A forced roll is the variable under test, so it is not re-ordered by the
+    # seed: reaching for the previous pose first is help when roll is a means,
+    # and silent sabotage when roll is the measurement.
     spin_limit = wrist_allowance_deg(plan.setup, roll_deg, config)
     if roll_deg is None:
         candidates = order_candidates_seed_first(
             pose_candidates(aim, framing["standoff_mm"], config, reference_x),
             seed_pose)
     else:
-        candidates = pose_candidates(aim, framing["standoff_mm"], config,
-                                     reference_x, rolls=[float(roll_deg)])
+        # NO TILT LADDER. The whole point of a paired capture is that the second
+        # view differs from the first by ROLL ALONE; letting it fall through to
+        # tilt/azimuth silently substitutes a different viewpoint. Measured on
+        # the cell 2026-09-01: roll 90 at tilt 0 had no IK, the walk accepted
+        # tilt 10/azimuth 270 instead, and that moved the camera 52 mm sideways
+        # and tilted it 10° -- which collapsed the substrate separation and made
+        # the characterization invalid. Incidence costs ~4x what distance costs
+        # (2026-08-13 characterization), so a tilted "pair" is not a pair.
+        #
+        # The one permitted alternative is the OPPOSITE roll. Rolling by θ and by
+        # θ-180 puts the camera's X axis on the SAME LINE, just reversed, and the
+        # stereo baseline is an axis rather than a direction -- so the two are
+        # interchangeable for this measurement, and trying both is what makes a
+        # 90° roll reachable when only one wrist direction solves.
+        mirror = float(roll_deg) - 180.0
+        candidates = pose_candidates(
+            aim, framing["standoff_mm"], config, reference_x,
+            rolls=[float(roll_deg), mirror], tilts=[0.0], azimuths=[0.0])
     for candidate in candidates:
         descriptor = {k: v for k, v in candidate.items() if k != "T"}
         made = rdk.create_inspection_target(
@@ -475,7 +491,12 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
             inspection_tool=plan.setup.inspection_tool,
             work_frame=plan.setup.work_frame,
             neutral_joints=start_joints,
-            maximum_wrist_rotation_deg=spin_limit)
+            maximum_wrist_rotation_deg=spin_limit,
+            # A commanded roll IS a wrist reorientation, so the wrist-flip flag
+            # is allowed to differ from neutral for it -- and only for it.
+            # Front/rear and elbow stay locked: those swing the arm through the
+            # cell, which is what the branch guard is actually for.
+            allow_wrist_flip=roll_deg is not None)
         if not made["created"]:
             rejected.append({**descriptor, "reason": made["reason"]})
             continue

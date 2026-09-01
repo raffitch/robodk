@@ -345,7 +345,8 @@ class RdkIO:
 
     def solve_joints_on_neutral_branch(
             self, T: np.ndarray, neutral_joints, previous_joints=None,
-            maximum_wrist_rotation_deg: float = 90.0):
+            maximum_wrist_rotation_deg: float = 90.0,
+            allow_wrist_flip: bool = False):
         """Solve an extrusion pose without allowing an elbow/wrist branch flip.
 
         RoboDK's seeded ``SolveIK`` can still select the opposite wrist solution
@@ -354,6 +355,15 @@ class RdkIO:
         configuration (front/rear, elbow and wrist-flip flags), bound axes 4 and 6
         relative to neutral, then choose the solution nearest both neutral and the
         preceding path point. This is read-only; no robot joints are set here.
+
+        ``allow_wrist_flip`` relaxes ONLY the third configuration flag, and only
+        for a roll that was commanded on purpose. Rolling the camera 90° about
+        its own optical axis IS a wrist reorientation, so demanding the identical
+        flip flag refuses exactly what was asked for -- measured on the cell
+        2026-09-01, where a reachable 90° roll came back as "no IK solution on
+        the neutral wrist branch". Front/rear and elbow stay locked either way:
+        those are the branch changes that swing the arm through the cell, and
+        they are what the guard exists for. The axis-4/6 bound still applies.
         """
         import robodk.robomath as robomath
 
@@ -363,9 +373,13 @@ class RdkIO:
         prior_reference = neutral_joints if previous_joints is None else previous_joints
         previous_values = self._joint_values(prior_reference)
         robot = self.robot()
+        # Compare only the flags that must not change. RoboDK's config triple is
+        # (front/rear, elbow, wrist-flip); a commanded roll legitimately changes
+        # the last one, so it is dropped from the comparison in that case only.
+        keep = 2 if allow_wrist_flip else 3
         try:
             neutral_config = tuple(
-                int(round(v)) for v in robot.JointsConfig(neutral_joints).list()[:3])
+                int(round(v)) for v in robot.JointsConfig(neutral_joints).list()[:keep])
         except Exception:
             neutral_config = None
 
@@ -395,7 +409,7 @@ class RdkIO:
             if neutral_config is not None:
                 try:
                     config = tuple(
-                        int(round(v)) for v in robot.JointsConfig(joints).list()[:3])
+                        int(round(v)) for v in robot.JointsConfig(joints).list()[:keep])
                 except Exception:
                     config = neutral_config
                 if config != neutral_config:
@@ -1844,7 +1858,8 @@ class RdkIO:
     def create_inspection_target(self, *, name: str, T: np.ndarray,
                                  inspection_tool: str, work_frame: str,
                                  neutral_joints,
-                                 maximum_wrist_rotation_deg: float = 90.0) -> dict:
+                                 maximum_wrist_rotation_deg: float = 90.0,
+                                 allow_wrist_flip: bool = False) -> dict:
         """Create a derived inspection target at camera pose ``T`` (work frame).
 
         ``T`` places the **camera** — the inspection tool's TCP — not the flange:
@@ -1873,10 +1888,13 @@ class RdkIO:
             old.Delete()
         limit = float(maximum_wrist_rotation_deg)
         joints = self.solve_joints_on_neutral_branch(
-            np.asarray(T, dtype=float), neutral_joints, self.robot().Joints(), limit)
+            np.asarray(T, dtype=float), neutral_joints, self.robot().Joints(), limit,
+            allow_wrist_flip=allow_wrist_flip)
         if joints is None:
+            branch = ("neutral arm branch (wrist flip allowed)" if allow_wrist_flip
+                      else "neutral wrist branch")
             return {"created": False, "target": name,
-                    "reason": ("no IK solution on the neutral wrist branch within "
+                    "reason": (f"no IK solution on the {branch} within "
                                f"±{limit:.0f} deg of the start pose")}
         deltas = [self._joint_delta_deg(joints, neutral_joints, axis=axis)
                   for axis, _ in self.WRIST_AXES]

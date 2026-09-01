@@ -47,17 +47,43 @@ def test_the_ladders_first_entry_is_zero_so_a_listed_roll_never_runs():
 
 
 def test_a_forced_roll_replaces_the_ladder_entirely():
-    """A single candidate: an unreachable roll must fail, never fall back."""
+    """An unreachable roll must fail, never quietly capture at 0."""
     got = rolls_of(pose_candidates(AIM, 300.0, ExtrusionConfig(), None, rolls=[90.0]))
     assert set(got) == {90.0}, "no other roll may remain as a silent fallback"
+    assert 0.0 not in got
 
 
-def test_a_forced_roll_still_expands_over_tilt_fallbacks():
-    """Roll is pinned; tilt/azimuth fallbacks stay available for reachability."""
+def test_a_forced_roll_gets_NO_tilt_ladder():
+    """A pair must differ by roll ALONE.
+
+    Cell 2026-09-01: roll 90 at tilt 0 had no IK, the walk fell through to
+    tilt 10 / azimuth 270, and that moved the camera 52 mm sideways and tilted
+    it 10° -- collapsing the substrate separation and invalidating the
+    characterization. A tilted "pair" is not a pair: incidence costs ~4x what
+    distance costs.
+    """
     cfg = ExtrusionConfig()
-    got = pose_candidates(AIM, 300.0, cfg, None, rolls=[90.0])
-    assert len(got) > 1
-    assert {c["roll_deg"] for c in got} == {90.0}
+    got = pose_candidates(AIM, 300.0, cfg, None, rolls=[90.0],
+                          tilts=[0.0], azimuths=[0.0])
+    assert {c["tilt_deg"] for c in got} == {0.0}
+    assert {c["azimuth_deg"] for c in got} == {0.0}
+
+
+def test_opposite_roll_puts_the_baseline_on_the_same_axis():
+    """Why θ-180 is a legitimate fallback and a tilt is not.
+
+    Rolling by θ and θ-180 puts the camera X axis on the same LINE, reversed.
+    The stereo baseline is an axis, not a direction, so the two are the same
+    measurement -- which is what makes trying both safe when only one wrist
+    direction solves.
+    """
+    a = pose_candidates(AIM, 300.0, ExtrusionConfig(), None, rolls=[90.0],
+                        tilts=[0.0], azimuths=[0.0])[0]["T"]
+    b = pose_candidates(AIM, 300.0, ExtrusionConfig(), None, rolls=[-90.0],
+                        tilts=[0.0], azimuths=[0.0])[0]["T"]
+    assert np.allclose(a[:3, 0], -b[:3, 0], atol=1e-9), "same line, reversed"
+    assert np.allclose(a[:3, 2], b[:3, 2], atol=1e-9), "same optical axis"
+    assert np.allclose(a[:3, 3], b[:3, 3], atol=1e-9), "same position"
 
 
 def test_a_forced_roll_actually_rotates_the_pose():

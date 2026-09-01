@@ -159,7 +159,8 @@ def pose_from_aim(aim_mm, standoff_mm: float, *, tilt_deg: float = 0.0,
 
 
 def pose_candidates(aim_mm, standoff_mm: float, config,
-                    reference_x=None, rolls=None) -> list[dict]:
+                    reference_x=None, rolls=None,
+                    tilts=None, azimuths=None) -> list[dict]:
     """Ordered poses to try: straight down first, tilted only as a fallback.
 
     Roll is tried before tilt because rotating about the optical axis costs the
@@ -177,8 +178,10 @@ def pose_candidates(aim_mm, standoff_mm: float, config,
     """
     rolls = ([float(v) for v in rolls] if rolls is not None
              else [float(v) for v in config.inspection_roll_candidates_deg])
-    tilts = [float(v) for v in config.inspection_tilt_candidates_deg]
-    azimuths = [float(v) for v in config.inspection_azimuth_candidates_deg]
+    tilts = ([float(v) for v in tilts] if tilts is not None
+             else [float(v) for v in config.inspection_tilt_candidates_deg])
+    azimuths = ([float(v) for v in azimuths] if azimuths is not None
+                else [float(v) for v in config.inspection_azimuth_candidates_deg])
     ordered: list[tuple[float, float, float]] = [(0.0, 0.0, roll) for roll in rolls]
     for tilt in tilts:
         if tilt == 0.0:
