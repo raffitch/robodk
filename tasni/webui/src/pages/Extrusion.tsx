@@ -489,6 +489,10 @@ export default function Extrusion() {
     if (!guideOpen && dialog.open) dialog.close();
   }, [guideOpen]);
   const [confirmMotion, setConfirmMotion] = useState(false);
+  // Capture each frame twice from one trip out — as chosen, then rolled 90°.
+  // Off by default: it doubles the takes, and every archived measurement so far
+  // is single-orientation, so turning it on is a deliberate choice per run.
+  const [pairedOrientations, setPairedOrientations] = useState(false);
   const [paper, setPaper] = useState<string | null>(null);
   const [openTake, setOpenTake] = useState<string | null>(null);
   const [showStack, setShowStack] = useState(false);
@@ -859,14 +863,20 @@ export default function Extrusion() {
                       phase: takePhase || undefined, note: measureNote },
         confirm_robot_motion: confirmMotion,
         collision_check_enabled: false, repeats, excursions,
+        paired_orientations: pairedOrientations,
       });
       // Echo the ground truth back: it is the number every detection-error
       // figure is measured against, and nothing else on screen repeats it.
       const batch = excursions > 1
         ? ` — ${excursions} trips out and back, unattended; do not touch the cell`
         : repeats > 1 ? ` — ${repeats} frames on one trip, arm parked` : "";
+      const paired = pairedOrientations
+        ? " Each frame is captured twice from one trip — vertical, then the camera"
+          + " rolled 90° (horizontal)."
+        : "";
       setMessage(`MEASURE started — recording as ${annotationLabel(layerIndex, takePhase, [dx, dy])}`
-        + `${batch}. Collision validation OFF; camera move only, no extrusion, no valve.`);
+        + `${batch}. Collision validation OFF; camera move only, no extrusion, no valve.`
+        + paired);
       refreshStatus();
     } catch (e: any) { setBusy(false); setMessage(e.message); }
   };
@@ -1550,6 +1560,15 @@ export default function Extrusion() {
             <input type="checkbox" checked={confirmMotion}
                    onChange={(e) => setConfirmMotion(e.target.checked)} />
             Hands clear — the robot may move the camera</label>}
+          {active.moves && <label className="go-confirm"
+            title={"Captures every frame twice from ONE trip out: once as the pose "
+                 + "generator chooses it, then again with the camera rolled 90° about "
+                 + "its own optical axis. One trip, so nothing moves between the two "
+                 + "views. Doubles the takes and the time at the pose; the arm's "
+                 + "travel is paid once."}>
+            <input type="checkbox" checked={pairedOrientations}
+                   onChange={(e) => setPairedOrientations(e.target.checked)} />
+            Vertical + horizontal (roll the camera 90° for a second view)</label>}
           <button className="go-btn" disabled={active.disabled}
                   onClick={active.onRun}>{active.button}</button>
           {(busy || status?.running) && <button className="secondary" onClick={cancel}>Cancel</button>}

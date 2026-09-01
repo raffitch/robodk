@@ -96,6 +96,11 @@ class MeasureLayerBody(FingerprintBody):
     side_photo: bool | None = None
     confirm_close_range_tool_clear: bool = False
     collision_check_enabled: bool = False
+    # Capture each frame twice from ONE trip out: once as the pose generator
+    # chooses ("vertical") and once with the camera rolled about its optical
+    # axis ("horizontal"). One trip, because the pair is only worth having if
+    # nothing moved between the two views.
+    paired_orientations: bool = False
 
 
 class CharacterizeBody(BaseModel):
@@ -778,15 +783,19 @@ class ExtrusionModule(WorkflowModule):
                 annotation=body.annotation, check_collisions=body.collision_check_enabled,
                 close_range_tool_clear=body.confirm_close_range_tool_clear,
                 repeats=body.repeats, excursions=body.excursions,
-                side_photo=body.side_photo)
+                side_photo=body.side_photo,
+                rolls=([None, float(services.config.extrusion.inspection_pair_roll_deg)]
+                       if body.paired_orientations else None))
             try:
                 services.jobs.start(self._active_measure_job, name="extrusion-measure")
             except JobBusy as exc:
                 raise HTTPException(409, str(exc))
+            orientations = 2 if body.paired_orientations else 1
             return {"status": "started", "mode": MEASURE_MODE, "trial_id": session.trial_id,
                     "layer_index": body.layer_index, "take": session.next_take(body.layer_index),
                     "repeats": body.repeats, "excursions": body.excursions,
-                    "takes_requested": body.repeats * body.excursions}
+                    "paired_orientations": body.paired_orientations,
+                    "takes_requested": body.repeats * body.excursions * orientations}
 
         @router.get("/status")
         def status() -> dict:

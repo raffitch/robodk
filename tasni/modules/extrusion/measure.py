@@ -276,7 +276,8 @@ def take_summary(layer_dir: Path, manifest: dict, *, reprocessed: bool = False) 
 
 def _move_to_inspection(services, ctx: JobContext, plan: CylinderPlan, layer, *,
                         inspection_name: str, start_joints, seed_pose, collisions: bool,
-                        artifacts: list[str], near_mm: float | None = None) -> dict:
+                        artifacts: list[str], near_mm: float | None = None,
+                        roll_deg: float | None = None) -> dict:
     """Take the camera out to the derived pose, settle, and read where it landed.
 
     Split out of the capture so ONE excursion can serve several frames: with the
@@ -289,7 +290,8 @@ def _move_to_inspection(services, ctx: JobContext, plan: CylinderPlan, layer, *,
     inspect = _build_inspection_move(
         rdk, plan, layer, inspection_name=inspection_name, config=ecfg,
         camera=services.config.camera, start_joints=start_joints,
-        seed_pose=seed_pose, collisions=collisions, near_mm=near_mm)
+        seed_pose=seed_pose, collisions=collisions, near_mm=near_mm,
+        roll_deg=roll_deg)
     ctx.check_cancel()
     artifacts.extend(inspect["artifacts"])
     # What the excursion costs the print starts here: the arm leaving the path.
@@ -605,6 +607,19 @@ def capture_side_photo(services, ctx: JobContext, *, start_joints) -> dict:
     return record
 
 
+def _roll_label(roll: float | None) -> str:
+    """Operator-facing name for an orientation.
+
+    The pair is spoken about as vertical/horizontal because that is what it looks
+    like at the cell; the archive keeps the angle, which is what a reader needs.
+    """
+    if roll is None or float(roll) == 0.0:
+        return "vertical"
+    if abs(abs(float(roll)) - 90.0) < 1e-6:
+        return "horizontal"
+    return f"roll {float(roll):g}°"
+
+
 class RingMeasureJob:
     """Measure a hand-placed ring: inspect, capture, process, archive, return.
 
@@ -632,7 +647,8 @@ class RingMeasureJob:
                  check_collisions: bool = True,
                  close_range_tool_clear: bool = False,
                  repeats: int = 1, excursions: int = 1,
-                 side_photo: bool | None = None):
+                 side_photo: bool | None = None,
+                 rolls: "list[float | None] | None" = None):
         if not 1 <= layer_index <= len(plan.layers):
             raise ValueError(f"layer_index {layer_index} outside 1..{len(plan.layers)}")
         self.services = services
@@ -646,6 +662,12 @@ class RingMeasureJob:
         self.excursions = max(1, int(excursions))
         self.side_photo = (services.config.extrusion.side_capture_enabled
                            if side_photo is None else bool(side_photo))
+        # Orientations captured per trip out. ``[None]`` = today's behaviour: one
+        # take, roll chosen by the config ladder. ``[None, 90.0]`` is the paired
+        # capture -- the same ring seen twice from one trip, the second with the
+        # camera rolled about its optical axis. One trip, because the comparison
+        # is only worth anything if nothing else moved between the two.
+        self.rolls: list[float | None] = list(rolls) if rolls else [None]
         self.results: list[dict] = []
         self.result: dict | None = None
 
@@ -655,10 +677,14 @@ class RingMeasureJob:
         inspection_name = _program_name(self.plan, self.layer_index, "MEASURE") + "_Inspect"
         archive = ExtrusionArchive(REPO_ROOT / "runs" / "extrusion")
         start_joints = _prepare_robot(services, ctx, self.plan, label="extrusion-measure")
-        total = self.excursions * self.repeats
+        total = self.excursions * self.repeats * len(self.rolls)
         if total > 1:
+            orientations = ("" if len(self.rolls) == 1 else
+                            f" x {len(self.rolls)} orientation(s) "
+                            f"({', '.join(_roll_label(r) for r in self.rolls)})")
             ctx.log(f"layer {self.layer_index}: {self.excursions} excursion(s) x "
-                    f"{self.repeats} frame(s) at the pose = {total} takes, unattended")
+                    f"{self.repeats} frame(s) at the pose{orientations} = {total} "
+                    f"takes, unattended")
         for excursion in range(1, self.excursions + 1):
             ctx.check_cancel()
             self._one_excursion(ctx, layer=layer, inspection_name=inspection_name,
@@ -688,6 +714,7 @@ class RingMeasureJob:
                        # The batch as a whole, so a caller that asked for five
                        # takes can tell five happened from the result alone.
                        "takes_recorded": [r["take"] for r in self.results],
+                       "orientations": [_roll_label(r) for r in self.rolls],
                        "excursions": self.excursions, "repeats": self.repeats,
                        "takes_requested": total, "stopped_early": stopped_early,
                        "invalid_batch": invalid_batch,
@@ -757,19 +784,40 @@ class RingMeasureJob:
                         if self.excursions > 1 else "")
                 ctx.progress(len(self.results), total,
                              f"layer {self.layer_index}: moving the camera{trip}")
-                current_program = inspection_name
-                moved = _move_to_inspection(
-                    services, ctx, self.plan, layer, inspection_name=inspection_name,
-                    start_joints=start_joints, seed_pose=self.session.last_pose,
-                    collisions=self.check_collisions, artifacts=artifacts,
-                    near_mm=(ecfg.measure_close_range_min_mm
-                             if self.close_range_tool_clear else None))
-                current_program = None
-                for repeat in range(1, self.repeats + 1):
+                for index, roll in enumerate(self.rolls):
                     ctx.check_cancel()
-                    last_dir = self._one_take(ctx, layer=layer, archive=archive,
-                                              moved=moved, excursion=excursion,
-                                              repeat=repeat, total=total)
+                    if len(self.rolls) > 1:
+                        ctx.progress(len(self.results), total,
+                                     f"layer {self.layer_index}: "
+                                     f"{_roll_label(roll)} orientation{trip}")
+                    current_program = inspection_name
+                    try:
+                        moved = _move_to_inspection(
+                            services, ctx, self.plan, layer,
+                            inspection_name=inspection_name,
+                            start_joints=start_joints, seed_pose=self.session.last_pose,
+                            collisions=self.check_collisions, artifacts=artifacts,
+                            near_mm=(ecfg.measure_close_range_min_mm
+                                     if self.close_range_tool_clear else None),
+                            roll_deg=roll)
+                    except RuntimeError as exc:
+                        # The FIRST orientation is the measurement; losing it is a
+                        # run failure exactly as before. A later one is an extra
+                        # view, so an unreachable wrist costs that view and says
+                        # so -- loudly, and never by silently substituting an
+                        # angle that would archive as if it were the one asked for.
+                        if index == 0:
+                            raise
+                        ctx.log(f"WARNING {_roll_label(roll)} orientation SKIPPED — "
+                                f"no reachable pose: {exc}")
+                        continue
+                    current_program = None
+                    for repeat in range(1, self.repeats + 1):
+                        ctx.check_cancel()
+                        last_dir = self._one_take(
+                            ctx, layer=layer, archive=archive, moved=moved,
+                            excursion=excursion, repeat=repeat, total=total,
+                            roll=roll)
             # Publication figures are deliberately NOT rendered in the live job.
             # The existing figure endpoint renders a requested PNG/PDF from this
             # archive on demand. Matplotlib took 90-108 s per take on the cell and,
@@ -816,7 +864,8 @@ class RingMeasureJob:
 
     # -- one fused observation, processed and archived -----------------------
     def _one_take(self, ctx: JobContext, *, layer, archive: ExtrusionArchive,
-                  moved: dict, excursion: int, repeat: int, total: int) -> Path:
+                  moved: dict, excursion: int, repeat: int, total: int,
+                  roll: float | None = None) -> Path:
         services = self.services
         ecfg = services.config.extrusion
         take = self.session.next_take(self.layer_index)
@@ -824,8 +873,10 @@ class RingMeasureJob:
         T_work_camera = moved["T_work_camera"]
         parked = (f" (frame {repeat} of {self.repeats}, arm parked)"
                   if self.repeats > 1 else "")
+        orientation = f" [{_roll_label(roll)}]" if len(self.rolls) > 1 else ""
         ctx.progress(len(self.results), total,
-                     f"layer {self.layer_index} take {take}: capturing{parked}")
+                     f"layer {self.layer_index} take {take}: capturing"
+                     f"{orientation}{parked}")
         captured = _capture_at_pose(services, ctx, T_work_camera)
         frame, capture_ms = captured["frame"], captured["capture_ms"]
         ctx.progress(len(self.results), total, f"take {take}: processing the frame")
@@ -848,6 +899,13 @@ class RingMeasureJob:
                         "excursion_index": excursion,
                         "repeat_index": repeat,
                         "repeats_in_excursion": self.repeats,
+                        # Which half of a paired capture this is. The label is
+                        # for the operator; `commanded_roll_deg` on the pose is
+                        # the number, and T_work_camera is the only PROOF of the
+                        # angle actually achieved.
+                        "orientation": _roll_label(roll),
+                        "orientations_in_excursion": [
+                            _roll_label(r) for r in self.rolls],
                         "depth_fusion": captured["depth_fusion"],
                         "T_work_camera": np.asarray(T_work_camera, dtype=float).tolist(),
                         # The frame's own greeting: native depth intrinsics and

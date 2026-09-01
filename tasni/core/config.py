@@ -838,6 +838,18 @@ class ExtrusionConfig(_Model):
     # measured incidence costing ~4x what distance costs.
     inspection_roll_candidates_deg: list[float] = Field(
         default_factory=lambda: [0.0, 180.0, 90.0, 270.0])
+    # The second orientation of a PAIRED capture ("horizontal"): the same ring,
+    # same trip out, camera rolled about its own optical axis. It is not part of
+    # the ladder above -- that is a fallback list whose first entry always wins,
+    # so a roll in it is never actually used. This is commanded outright.
+    inspection_pair_roll_deg: float = Field(default=90.0, gt=0, le=180)
+    # Wrist headroom ON TOP of a commanded roll. `max_tool_axis_spin_deg` guards
+    # against IK landing on a far-off wrist branch; a roll we asked for is not
+    # that, and a 90 deg roll about a nadir axis costs ~90 deg of A6, landing
+    # exactly on the 90 deg default (the gate is `> limit`, so it was decided by
+    # floating point and got refused on this cell). The guard therefore applies
+    # to the UNCOMMANDED part: |roll| + this.
+    inspection_roll_wrist_margin_deg: float = Field(default=15.0, ge=0, le=90)
     inspection_tilt_candidates_deg: list[float] = Field(
         default_factory=lambda: [0.0, 10.0])
     inspection_azimuth_candidates_deg: list[float] = Field(

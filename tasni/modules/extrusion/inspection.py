@@ -159,15 +159,24 @@ def pose_from_aim(aim_mm, standoff_mm: float, *, tilt_deg: float = 0.0,
 
 
 def pose_candidates(aim_mm, standoff_mm: float, config,
-                    reference_x=None) -> list[dict]:
+                    reference_x=None, rolls=None) -> list[dict]:
     """Ordered poses to try: straight down first, tilted only as a fallback.
 
     Roll is tried before tilt because rotating about the optical axis costs the
     measurement nothing (the surface is still fronto-parallel) while giving the
     wrist a genuinely different configuration to reach — often the difference
     between an unreachable and a reachable pose on this KUKA.
+
+    ``rolls`` FORCES the roll list instead of reading the config ladder. That is
+    the difference between "roll is a way to reach an awkward pose" and "roll is
+    the variable under test": the config value is a fallback ladder whose first
+    entry (0°) always solves, so a roll appearing later in it is never actually
+    used. A caller that wants a specific orientation must pass it here — and pass
+    exactly one, so an unreachable roll fails loudly instead of quietly capturing
+    at some other angle that looks identical in the archive.
     """
-    rolls = [float(v) for v in config.inspection_roll_candidates_deg]
+    rolls = ([float(v) for v in rolls] if rolls is not None
+             else [float(v) for v in config.inspection_roll_candidates_deg])
     tilts = [float(v) for v in config.inspection_tilt_candidates_deg]
     azimuths = [float(v) for v in config.inspection_azimuth_candidates_deg]
     ordered: list[tuple[float, float, float]] = [(0.0, 0.0, roll) for roll in rolls]

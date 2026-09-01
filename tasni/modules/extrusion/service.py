@@ -387,11 +387,33 @@ def _require_program_valid(report: dict, layer_index: int) -> None:
             f"{report['percent_ok']:.1f}%: {report['problems'] or 'unspecified path problem'}")
 
 
+def wrist_allowance_deg(setup, roll_deg: float | None, config) -> float:
+    """How far the wrist may deviate, given a roll we asked for on purpose.
+
+    ``max_tool_axis_spin_deg`` guards against IK reaching a pose on a wildly
+    different wrist branch. A COMMANDED roll is not that: rolling the camera 90°
+    about a nadir optical axis necessarily moves A6 by about 90°, so gating it at
+    a 90° limit refuses the very thing that was requested — and 90 against 90 is
+    decided by floating point, which is why a 90° roll was refused on this cell
+    before.
+
+    So the limit is applied to the UNCOMMANDED part: the deviation the request
+    itself implies, plus a margin. With no forced roll this returns the setup's
+    limit unchanged, so every existing path keeps exactly today's guard.
+    """
+    limit = float(setup.maximum_tool_axis_spin_deg)
+    if roll_deg is None:
+        return limit
+    margin = float(getattr(config, "inspection_roll_wrist_margin_deg", 15.0))
+    return max(limit, abs(float(roll_deg)) + margin)
+
+
 def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
                            inspection_name: str, config, camera,
                            start_joints, seed_pose: dict | None = None,
                            collisions: bool = True,
-                           near_mm: float | None = None) -> dict:
+                           near_mm: float | None = None,
+                           roll_deg: float | None = None) -> dict:
     """Create the inspection program for one layer and return its validation.
 
     Manual mode moves to the taught target, exactly as before. Automatic mode
@@ -435,8 +457,17 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
     # frame-referenced one is only reachable through a wrist flip.
     reference_x = [float(v) for v in rdk.camera_axes_in_frame(
         plan.setup.inspection_tool, plan.setup.work_frame, start_joints)[:3, 0]]
-    candidates = order_candidates_seed_first(
-        pose_candidates(aim, framing["standoff_mm"], config, reference_x), seed_pose)
+    # A forced roll is the variable under test, so it is the ONLY candidate and
+    # it is not re-ordered by the seed: reaching for the previous pose first is
+    # help when roll is a means, and silent sabotage when roll is the measurement.
+    spin_limit = wrist_allowance_deg(plan.setup, roll_deg, config)
+    if roll_deg is None:
+        candidates = order_candidates_seed_first(
+            pose_candidates(aim, framing["standoff_mm"], config, reference_x),
+            seed_pose)
+    else:
+        candidates = pose_candidates(aim, framing["standoff_mm"], config,
+                                     reference_x, rolls=[float(roll_deg)])
     for candidate in candidates:
         descriptor = {k: v for k, v in candidate.items() if k != "T"}
         made = rdk.create_inspection_target(
@@ -444,7 +475,7 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
             inspection_tool=plan.setup.inspection_tool,
             work_frame=plan.setup.work_frame,
             neutral_joints=start_joints,
-            maximum_wrist_rotation_deg=plan.setup.maximum_tool_axis_spin_deg)
+            maximum_wrist_rotation_deg=spin_limit)
         if not made["created"]:
             rejected.append({**descriptor, "reason": made["reason"]})
             continue
@@ -459,8 +490,7 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
             # collision does -- an unusable viewpoint is not a run failure.
             try:
                 wrist = rdk.program_neutral_wrist_report(
-                    inspection_name, start_joints,
-                    plan.setup.maximum_tool_axis_spin_deg)
+                    inspection_name, start_joints, spin_limit)
             except RuntimeError as error:
                 rejected.append({**descriptor, "reason": str(error)})
                 continue
@@ -475,6 +505,13 @@ def _build_inspection_move(rdk: RdkIO, plan: CylinderPlan, layer, *,
                          "fill_fraction": framing["fill_fraction"],
                          "roll_reference": "camera_at_start",
                          "roll_reference_x": reference_x,
+                         # Which orientation of a paired capture this take is.
+                         # None = the ordinary ladder chose the roll; a number
+                         # means it was COMMANDED, which is what makes the pair
+                         # readable apart in the archive. The achieved angle is
+                         # still only provable from T_work_camera.
+                         "commanded_roll_deg": roll_deg,
+                         "wrist_allowance_deg": spin_limit,
                          "joints": made.get("joints"),
                          "axis_4_rotation_deg": made.get("axis_4_rotation_deg"),
                          "axis_5_rotation_deg": made.get("axis_5_rotation_deg"),
