@@ -397,12 +397,15 @@ time and buys nothing.
   lever. Note `docs/inspection-roll-probe-handoff.md` §3.1's "deploy the server before
   the sweep" **predates the SET tier** — an arm is now one socket line, no deploy;
   only the per-take `filter_options` read-back rule there still binds.
-- **The host-side SET sender still does not exist in the repo.** The A/B above was
-  driven from a scratch script: open `CameraClient.burst()`, send
-  `SET key=value ...\n`, read one JSON line. Bare `SET` is read-only and prints the
-  achieved chain — use it to confirm the arm before AND after. The explicit restore
-  that spec 4.1 requires is, for today's device: `spatial=1 spatial_smooth_delta=20
-  spatial_magnitude=2 spatial_smooth_alpha=0.5 spatial_holes_fill=0
-  temporal_smooth_alpha=0.4 temporal_smooth_delta=20 temporal_persistency=3
-  depth_min_m=0.15 depth_max_m=1.5 decimation=0` (224 bytes; `hole_filling` reads back
-  null and must be omitted, not sent).
+- **Driving an arm is now one command** — `tools/camera_set.py`, added 2026-09-01
+  because the merged runtime-parameters work was server-side only and the A/B above
+  had to be hand-rolled:
+  ```
+  py -3.10 tools/camera_set.py              # READ-ONLY: prints the achieved arm
+  py -3.10 tools/camera_set.py spatial=0    # one arm, no deploy, no restart
+  py -3.10 tools/camera_set.py --restore    # the full spec-4.1 explicit restore
+  ```
+  Confirm the arm with the bare read-only form BEFORE and AFTER every run, and read
+  each take's actual arm from its archived `filter_options` — never from what you
+  sent, because a Jetson service restart mid-sweep silently reverts to the unit
+  file's defaults.
