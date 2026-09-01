@@ -18,10 +18,6 @@ import rs_config
 import rs_geometry
 
 ASFOUND_DIR = os.environ.get("RS_ASFOUND_DIR", "/home/jetson/robodk-characterization")
-# Work-volume clip ahead of the spatial filter (audit R5): background depth must not
-# be smoothed into surface edges, and nothing may fabricate depth.
-RS_DEPTH_MIN_M = 0.15
-RS_DEPTH_MAX_M = 1.5
 
 port = 1024
 SCAN_COLOR_JPEG_QUALITY = 100
@@ -946,12 +942,42 @@ RS_LASER_POWER = _env_number('RS_LASER_POWER', -1.0)
 RS_SPATIAL = int(_env_number('RS_SPATIAL', 1))
 RS_SPATIAL_SMOOTH_DELTA = _env_number('RS_SPATIAL_SMOOTH_DELTA', -1.0)
 
+# Work-volume clip ahead of the spatial filter (audit R5): background depth must
+# not be smoothed into surface edges, and nothing may fabricate depth. Env vars
+# since 2026-09-01 (runtime-parameters spec 6.4) so the knob has all three
+# precedence layers; the defaults are the constants every archived take was
+# clipped under.
+RS_DEPTH_MIN_M = _env_number('RS_DEPTH_MIN_M', 0.15)
+RS_DEPTH_MAX_M = _env_number('RS_DEPTH_MAX_M', 1.5)
+
+# The single source the depth-filter chain is built from. Env feeds it once at
+# import (the unit file's boot defaults); a runtime SET (stream_burst) may
+# rewrite entries later, which cannot survive a restart -- that impermanence is
+# the safety argument of the runtime-parameters spec (4.2). -1.0 = leave the
+# SDK's own default alone, the same sentinel RS_SPATIAL_SMOOTH_DELTA uses.
+# `decimation` is recorded but pinned at 0: enabling it would change the depth
+# geometry the greeting already declared (spec 2.2/2.5), so a SET refuses it.
+FILTER_SETTINGS = {
+    "spatial":                float(RS_SPATIAL),
+    "spatial_smooth_delta":   RS_SPATIAL_SMOOTH_DELTA,
+    "spatial_magnitude":      -1.0,
+    "spatial_smooth_alpha":   -1.0,
+    "spatial_holes_fill":     -1.0,
+    "temporal_smooth_alpha":  -1.0,
+    "temporal_smooth_delta":  -1.0,
+    "temporal_persistency":   -1.0,
+    "depth_min_m":            RS_DEPTH_MIN_M,
+    "depth_max_m":            RS_DEPTH_MAX_M,
+    "hole_filling":           -1.0,
+    "decimation":             0.0,
+}
+
 # Derived from the SAME constants the chain is built from, at module level, so
 # the greeting cannot describe a chain that did not run and no call ordering can
 # leave it stale. This list is archived as provenance on every take, and it is
 # the ONLY record of which arm of the A/B a take came from.
 DEPTH_FILTER_NAMES = (["threshold", "disparity"]
-                      + (["spatial"] if RS_SPATIAL else [])
+                      + (["spatial"] if FILTER_SETTINGS["spatial"] else [])
                       + ["temporal", "disparity_inv"])
 
 # The smooth_delta the spatial filter is ACTUALLY running at, read back off the
@@ -1692,13 +1718,15 @@ def setup_depth_filters():
     camera, so an SDK that will not report the option leaves the chain intact and the
     value unknown (the filter list still says whether `spatial` ran)."""
     global SPATIAL_SMOOTH_DELTA
-    threshold = rs.threshold_filter(RS_DEPTH_MIN_M, RS_DEPTH_MAX_M)
+    threshold = rs.threshold_filter(FILTER_SETTINGS["depth_min_m"],
+                                    FILTER_SETTINGS["depth_max_m"])
     chain = [threshold, rs.disparity_transform(True)]
     SPATIAL_SMOOTH_DELTA = None
-    if RS_SPATIAL:
+    if FILTER_SETTINGS["spatial"]:
         spatial = rs.spatial_filter()
-        if RS_SPATIAL_SMOOTH_DELTA >= 0:
-            spatial.set_option(rs.option.filter_smooth_delta, RS_SPATIAL_SMOOTH_DELTA)
+        if FILTER_SETTINGS["spatial_smooth_delta"] >= 0:
+            spatial.set_option(rs.option.filter_smooth_delta,
+                               FILTER_SETTINGS["spatial_smooth_delta"])
         try:
             SPATIAL_SMOOTH_DELTA = float(spatial.get_option(rs.option.filter_smooth_delta))
         except Exception as e:

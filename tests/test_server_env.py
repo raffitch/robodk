@@ -70,9 +70,9 @@ SDK_DEFAULTS = {"spatial": {"filter_smooth_delta": 20.0}}
 
 
 class _FakeFilter:
-    def __init__(self, kind):
+    def __init__(self, kind, options=None):
         self.kind = kind
-        self.options = {}
+        self.options = dict(options or {})
 
     def set_option(self, option, value):
         self.options[option] = value
@@ -93,7 +93,7 @@ class _FakeRs:
 
     @staticmethod
     def threshold_filter(lo, hi):
-        return _FakeFilter("threshold")
+        return _FakeFilter("threshold", {"min_distance": lo, "max_distance": hi})
 
     @staticmethod
     def disparity_transform(forward):
@@ -273,6 +273,48 @@ def test_a_smooth_delta_that_cannot_be_read_back_does_not_kill_the_service(monke
         assert [f.kind for f in chain] == [
             "threshold", "disparity", "spatial", "temporal", "disparity_inv"]
         assert srv.SPATIAL_SMOOTH_DELTA is None
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+# ------------------------------------------------- runtime-parameters, Task 1
+# spec 6.4: threshold min/max join the safe tier, with env vars so the knob has
+# all three precedence layers (unit file / env / runtime SET) instead of being
+# runtime-only.
+
+def test_threshold_env_vars_reach_the_filter(monkeypatch):
+    try:
+        chain = _chain(monkeypatch, RS_DEPTH_MIN_M="0.2", RS_DEPTH_MAX_M="0.9")
+        thr = next(f for f in chain if f.kind == "threshold")
+        assert thr.options == {"min_distance": 0.2, "max_distance": 0.9}
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_thresholds_default_to_todays_constants(monkeypatch):
+    """No env set must clip exactly as today: every archived take was measured
+    under 0.15..1.5 m."""
+    try:
+        chain = _chain(monkeypatch)
+        thr = next(f for f in chain if f.kind == "threshold")
+        assert thr.options == {"min_distance": 0.15, "max_distance": 1.5}
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_filter_settings_is_fed_by_env(monkeypatch):
+    """FILTER_SETTINGS is the single source the chain is built from; env feeds it
+    at import. -1 keeps the existing 'leave the SDK default alone' sentinel."""
+    try:
+        _chain(monkeypatch, RS_SPATIAL="0", RS_SPATIAL_SMOOTH_DELTA="4")
+        assert srv.FILTER_SETTINGS["spatial"] == 0
+        assert srv.FILTER_SETTINGS["spatial_smooth_delta"] == 4.0
+        assert srv.FILTER_SETTINGS["depth_min_m"] == 0.15
+        assert srv.FILTER_SETTINGS["hole_filling"] == -1.0
+        assert srv.FILTER_SETTINGS["decimation"] == 0.0
     finally:
         monkeypatch.undo()
         importlib.reload(srv)
