@@ -3,8 +3,16 @@
 Current purpose: give future agents a low-token entry point into the Tasni app,
 scan/calibration logic, RoboDK connection, and Jetson camera server.
 
-Last updated: 2026-08-28. Active branch: `main` (`calibration-improvements` merged in
+Last updated: 2026-09-01. Active branch: `main` (`calibration-improvements` merged in
 `51849b1`, 2026-08-25).
+
+> **IN PROGRESS (2026-09-01) — paired vertical/horizontal capture.** One press now takes
+> each frame twice from one trip out, the second with the camera rolled 90°. Shipped and
+> defaulted ON, run on the cell ONCE, and the two bugs that run exposed are fixed but not
+> re-verified. Pick it up at
+> **[paired-roll-capture-handoff.md](paired-roll-capture-handoff.md)**; the science is in
+> [ring2-scan-handoff.md](ring2-scan-handoff.md) (the pose and spatial-filter levers are
+> both closed — only the camera roll is still open).
 
 > **OPEN BLOCKER — live print, the arm does not move.** If you are picking that up, read
 > **[live-print-next-session.md](live-print-next-session.md)** first; the evidence is in
