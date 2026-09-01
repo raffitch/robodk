@@ -433,3 +433,32 @@ def test_out_of_range_values_are_clamped_to_the_sdk_range(monkeypatch):
     finally:
         monkeypatch.undo()
         importlib.reload(srv)
+
+
+def test_apply_option_degrades_when_the_sdk_lacks_the_option_name(monkeypatch):
+    """A pyrealsense2 build that lacks one of _OPTION_MAP's option names must not
+    crash setup_depth_filters() -- under Restart=always with no start limit that
+    is exactly the infinite crash-loop with the camera dark the read-back guard
+    exists to prevent. The affected knob records None (unknown), not a
+    fabricated number, and the chain still comes back complete and correctly
+    ordered -- the service keeps serving."""
+    class _MissingMagnitude(_FakeRs):
+        class option:
+            filter_smooth_delta = "filter_smooth_delta"
+            filter_smooth_alpha = "filter_smooth_alpha"
+            holes_fill = "holes_fill"
+            min_distance = "min_distance"
+            max_distance = "max_distance"
+            # filter_magnitude intentionally absent
+
+    try:
+        _chain(monkeypatch, RS_SPATIAL="1")   # reload under a clean env first
+        monkeypatch.setattr(srv, "rs", _MissingMagnitude)
+        srv.FILTER_SETTINGS["spatial_magnitude"] = 3.0
+        chain = srv.setup_depth_filters()
+        assert [f.kind for f in chain] == [
+            "threshold", "disparity", "spatial", "temporal", "disparity_inv"]
+        assert srv.FILTER_OPTIONS["spatial_magnitude"] is None
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)

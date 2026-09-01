@@ -1724,7 +1724,12 @@ def _apply_option(filt, option_name, value):
     exposes one (spec test 5; mirrors rs_config._set_with_readback's discipline:
     a bad value must never take the service down -- the achieved read-back in
     FILTER_OPTIONS is what gets archived, so a clamp is visible, not silent)."""
-    option = getattr(rs.option, option_name)
+    try:
+        option = getattr(rs.option, option_name)
+    except Exception as exc:
+        print("WARNING: this pyrealsense2 build has no option {!r} ({}); {} left "
+              "at its previous value".format(option_name, exc, option_name), flush=True)
+        return
     try:
         rng = filt.get_option_range(option)
         value = min(max(float(value), float(rng.min)), float(rng.max))
