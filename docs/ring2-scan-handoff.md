@@ -333,11 +333,46 @@ stack, separates them — and it makes a quantitative prediction rather than a v
 > sectors stay at 120–129° and 250–269° in the work frame and the ratio about the new
 > baseline collapses toward 1.0.**
 
-That arm needs `inspection_roll_candidates_deg` in `tasni.config.json` (automatic pose)
-plus a backend restart, so it is a separate sitting from the three arms in §3 — which
-use one taught pose and no restart at all. Keep every candidate well inside
-`max_tool_axis_spin_deg` (90 is ON the limit and was refused before); 60° is ample, since
-the effect is 180°-periodic and 10° sectors resolve a 60° shift easily.
+### 4.2 Running the roll arm — protocol
+
+Arm and disarm it with `tools/inspection_roll.py`; it exists because three separate
+mistakes here each produce a run that looks fine and answers nothing.
+
+**Adding 90° to the candidate list does nothing.** The default
+`inspection_roll_candidates_deg` is the *fallback ladder* `[0, 180, 90, 270]`, and the
+generator accepts the FIRST candidate with IK that passes validation — roll 0 always
+does, so 90 is never reached. A forced roll must be the **only** candidate. And it must
+be the only one for a second reason: with `[90, 0]`, a refused 90 quietly captures at
+roll 0 and archives a take that looks ordinary. Armed as a single value, a refusal fails
+the run loudly instead.
+
+**90° sits exactly ON the wrist limit.** A roll about a nadir optical axis is
+essentially that much A6, `max_tool_axis_spin_deg` defaults to 90, and the gate is
+`abs(delta) > limit` — so exact-90 passes only if floating point cooperates. It was
+refused on this cell before. Give it headroom in the **trial's setup**
+(`maximum_tool_axis_spin_deg`, e.g. 110), never in the global default: the looser limit
+then applies to one measure-only trial, is recorded in its fingerprint and `trial.json`,
+and never reaches a print path — which matters on a cell with a documented wrist-flip
+history. If you would rather not touch the limit at all, **85° answers the same question**:
+the effect is 180°-periodic, so 85° still swings along↔across almost fully, and 10°
+sectors resolve it trivially.
+
+**The config is read at startup**, so arming changes nothing until the backend restarts.
+The plan survives that restart — `_restore_plan_from_session` rebuilds it from
+`session.applied` — so a roll can be swapped mid-trial without losing the session.
+
+Sequence, on one untouched stack:
+
+1. Build the stack and measure normally (roll 0, ladder disarmed). This is the
+   comparable arm — the ring-1 layer doubles as a null control, since ring 1 alone
+   showed no anisotropy (0.91–0.95).
+2. `py -3.10 tools/inspection_roll.py 90`, restart, re-measure **the same layer**.
+3. `py -3.10 tools/inspection_roll.py --disarm`, restart, when finished.
+
+**Verify the achieved roll before believing anything.** Read the first rolled take's
+`provenance.T_work_camera` and check its X-axis angle in the work frame actually moved
+(179.8° → ~269.8° for a 90° roll). Never trust that a roll happened because it was
+requested — that is the same rule the filter arms follow.
 
 Whatever happens, **record which**. A run that is not written down costs the same robot
 time and buys nothing.
