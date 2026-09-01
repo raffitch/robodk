@@ -12,6 +12,7 @@ robot's current pose, so the fused surface + work frame are checked end to end.
 """
 from __future__ import annotations
 
+import json
 import re
 import sys
 import tempfile
@@ -3829,3 +3830,71 @@ def test_rejection_message_does_not_claim_a_lock_placed_a_crop():
     assert "no survey record" in aimed, aimed
     assert "placed on the lock" not in aimed, aimed
     print("[reject text] region line names the true source of size AND position")
+
+
+def test_a_run_that_fails_after_fusion_still_archives_its_evidence():
+    """A 16-pose real-robot tour must never end with an empty run directory.
+
+    2026-09-01 on the cell: a cage was added around the platform, the dominant
+    plane came out at 17% of the cloud, ``work_plane_from_points`` raised, and
+    the whole tour was lost -- runs/scan/20260901-113149/ was EMPTY. There was
+    nothing to diagnose the cage from and nothing to re-fit offline, so the only
+    way forward was to drive the robot again, blind.
+
+    The coverage-gate rejection path in this same file already saves its
+    artifacts before raising. Every post-fusion failure must do the same: the
+    fused cloud is what the analysis choked on, so the fused cloud is what has
+    to survive.
+
+    Patches the plane fit rather than rendering clutter, deliberately -- the
+    contract is "the analysis raised", not "the analysis raised for this one
+    reason".
+    """
+    pytest.importorskip("open3d", reason="open3d not installed — `pip install -e .[scan]`")
+    services, state = _build_fakes()
+    scan_service.generate_scan_targets(services)
+
+    with tempfile.TemporaryDirectory() as t:
+        runs.REPO_ROOT = Path(t)
+
+        def fake_new_run_dir(mid, stamp):
+            d = Path(t) / "runs" / mid / stamp
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+
+        orig_dir = scan_service.new_run_dir
+        orig_fit = scan_service.work_plane_from_points
+        scan_service.new_run_dir = fake_new_run_dir
+
+        def exploding_fit(*a, **k):
+            raise ValueError("dominant plane covers only 17% of the cloud (< 25%)")
+
+        scan_service.work_plane_from_points = exploding_fit
+        try:
+            job = scan_service.ScanCaptureJob(services, scan_service.ScanParams())
+            with pytest.raises(ValueError, match="dominant plane"):
+                job(_Ctx())
+
+            run_dirs = sorted((Path(t) / "runs" / "scan").glob("*"))
+            assert run_dirs, "no run directory was created at all"
+            run_dir = run_dirs[-1]
+
+            cloud = run_dir / "failed_cloud.ply"
+            assert cloud.is_file() and cloud.stat().st_size > 0, (
+                f"the fused cloud was not archived; {run_dir.name} holds "
+                f"{[p.name for p in run_dir.iterdir()]}")
+
+            report = run_dir / "failure.json"
+            assert report.is_file(), "no failure.json naming what went wrong"
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            assert "dominant plane" in payload["error"]
+            assert payload["stage"] == "analysis"
+            # The numbers that identify a too-generous ROI without re-running.
+            assert payload["points"] > 0
+            assert payload["roi"]["radius_m"] > 0
+            assert len(payload["aim_mm"]) == 3
+        finally:
+            scan_service.new_run_dir = orig_dir
+            scan_service.work_plane_from_points = orig_fit
+
+    print("[archive] a post-fusion failure leaves the fused cloud + failure.json")

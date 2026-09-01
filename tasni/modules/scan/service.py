@@ -3361,6 +3361,54 @@ def _save_scan_artifacts(run_dir, *, mesh, measured_mesh, reference_mesh, raw_me
 _ROI_PREFILTER_SCALE = 2.0
 
 
+def _save_failure_evidence(run_dir, *, cloud, error, stage: str, scfg,
+                           center_mm, n_views: int, log) -> None:
+    """Leave the fused cloud and the numbers behind when a run dies after fusion.
+
+    A scan run is a real-robot tour. Losing it costs minutes of cell time and,
+    worse, leaves nothing to diagnose from -- on 2026-09-01 a cage around the
+    platform pushed the dominant plane to 17% of the cloud, ``work_plane_from_points``
+    raised, and the run directory was left EMPTY, so the only way to learn
+    anything was to drive the robot again blind.
+
+    The coverage-gate rejection below already saves its artifacts before raising;
+    this is the same courtesy for every other post-fusion failure. Best-effort by
+    construction: it runs while an exception is in flight, so it must never
+    replace that exception with one of its own.
+    """
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "stage": stage,
+            "error": f"{type(error).__name__}: {error}",
+            "n_views": int(n_views),
+            "points": int(len(cloud.points)) if cloud is not None else 0,
+            "aim_mm": ([float(v) for v in np.asarray(center_mm, float).reshape(3)]
+                       if center_mm is not None else None),
+            # The ROI is the first thing to suspect when the cloud is full of
+            # things that are not the work surface: it is sized to drop a room,
+            # not to isolate a platform.
+            "roi": {"enabled": bool(scfg.roi_enabled),
+                    "radius_m": float(scfg.roi_radius_m),
+                    "below_m": float(scfg.roi_below_m),
+                    "above_m": float(scfg.roi_above_m)},
+            "min_inlier_frac": float(scfg.min_inlier_frac),
+        }
+        (run_dir / "failure.json").write_text(json.dumps(payload, indent=2),
+                                              encoding="utf-8")
+        if cloud is not None and len(cloud.points):
+            import open3d as o3d
+            o3d.io.write_point_cloud(str(run_dir / "failed_cloud.ply"), cloud)
+            log(f"the run failed, but its fused cloud ({payload['points']} pts) was "
+                f"saved to {run_dir.name}/failed_cloud.ply with failure.json — "
+                f"re-fit it offline instead of re-running the robot")
+        else:
+            log(f"the run failed before a cloud existed; wrote "
+                f"{run_dir.name}/failure.json")
+    except Exception as save_error:      # noqa: BLE001 - never mask the real failure
+        log(f"could not save failure evidence: {save_error}")
+
+
 def _fusion_roi_box(scfg, center_mm):
     """The base-frame box (metres) fusion may integrate, or ``None`` for everything.
 
@@ -3488,6 +3536,11 @@ class ScanCaptureJob:
 
         stamp = time.strftime("%Y%m%d-%H%M%S")
         run_dir = new_run_dir("scan", stamp)
+        # Held outside the try so the failure handler can archive whatever the run
+        # got as far as producing, including nothing.
+        fused_cloud = None
+        aim_mm = None
+        views = []
 
         try:
             with _camera_hold(self.services, "scan-run"):
@@ -3545,6 +3598,9 @@ class ScanCaptureJob:
                     else:
                         ctx.log(f"ROI crop would keep only {n1} pts — using the full cloud "
                                 f"(widen scan.roi_radius_m if the surface was clipped)")
+
+            # From here on the run has something worth keeping if it dies.
+            fused_cloud, aim_mm = cloud, center_mm
 
             pts = cloud_points_m(cloud)
             if len(pts) == 0:
@@ -3681,6 +3737,15 @@ class ScanCaptureJob:
                     f"{report['plane']['inlier_frac']:.0%}). Review, then Insert.")
             return {"kind": "scan", "run_dir": str(run_dir), "can_insert": True,
                     **report}
+        except Exception as run_error:
+            # Never swallow: the caller still sees the real failure. This only makes
+            # sure the tour that produced it is not lost with it.
+            if self.params.save_artifacts:
+                _save_failure_evidence(
+                    run_dir, cloud=fused_cloud, error=run_error,
+                    stage="analysis" if fused_cloud is not None else "capture",
+                    scfg=scfg, center_mm=aim_mm, n_views=len(views), log=ctx.log)
+            raise
         finally:
             if start_joints is not None:
                 try:
