@@ -65,8 +65,24 @@ def test_laser_power_defaults_to_leave_alone():
 
 # librealsense's own defaults, as a freshly constructed filter reports them. The
 # spatial filter's smooth_delta is 20 -- the number the whole archive was measured
-# under and the one an "unset" env var silently inherits.
-SDK_DEFAULTS = {"spatial": {"filter_smooth_delta": 20.0}}
+# under and the one an "unset" env var silently inherits. Temporal: alpha 0.4,
+# delta 20, persistency index 3 (exposed by the SDK as the `holes_fill` option on
+# the temporal filter -- three knobs ride that one option name, disambiguated by
+# which filter object they are set on).
+SDK_DEFAULTS = {
+    "spatial":  {"filter_smooth_delta": 20.0, "filter_magnitude": 2.0,
+                 "filter_smooth_alpha": 0.5, "holes_fill": 0.0},
+    "temporal": {"filter_smooth_alpha": 0.4, "filter_smooth_delta": 20.0,
+                 "holes_fill": 3.0},
+}
+
+# The option ranges librealsense advertises, for the clamp path (spec test 5).
+SDK_RANGES = {
+    "spatial":  {"filter_smooth_delta": (1.0, 50.0), "filter_magnitude": (1.0, 5.0),
+                 "filter_smooth_alpha": (0.25, 1.0), "holes_fill": (0.0, 5.0)},
+    "temporal": {"filter_smooth_alpha": (0.0, 1.0), "filter_smooth_delta": (1.0, 100.0),
+                 "holes_fill": (0.0, 8.0)},
+}
 
 
 class _FakeFilter:
@@ -86,10 +102,19 @@ class _FakeFilter:
         except KeyError:
             raise RuntimeError(f"{self.kind} has no option {option!r}")
 
+    def get_option_range(self, option):
+        lo, hi = SDK_RANGES[self.kind][option]   # KeyError -> caller's except path
+        return SimpleNamespace(min=lo, max=hi)
+
 
 class _FakeRs:
     class option:
         filter_smooth_delta = "filter_smooth_delta"
+        filter_magnitude = "filter_magnitude"
+        filter_smooth_alpha = "filter_smooth_alpha"
+        holes_fill = "holes_fill"
+        min_distance = "min_distance"
+        max_distance = "max_distance"
 
     @staticmethod
     def threshold_filter(lo, hi):
@@ -106,6 +131,10 @@ class _FakeRs:
     @staticmethod
     def temporal_filter():
         return _FakeFilter("temporal")
+
+    @staticmethod
+    def hole_filling_filter(mode):
+        return _FakeFilter("hole_filling", {"holes_fill": float(mode)})
 
 
 def _chain(monkeypatch, **env):
@@ -272,7 +301,7 @@ def test_a_smooth_delta_that_cannot_be_read_back_does_not_kill_the_service(monke
         chain = srv.setup_depth_filters()
         assert [f.kind for f in chain] == [
             "threshold", "disparity", "spatial", "temporal", "disparity_inv"]
-        assert srv.SPATIAL_SMOOTH_DELTA is None
+        assert srv.FILTER_OPTIONS["spatial_smooth_delta"] is None
     finally:
         monkeypatch.undo()
         importlib.reload(srv)
@@ -315,6 +344,92 @@ def test_filter_settings_is_fed_by_env(monkeypatch):
         assert srv.FILTER_SETTINGS["depth_min_m"] == 0.15
         assert srv.FILTER_SETTINGS["hole_filling"] == -1.0
         assert srv.FILTER_SETTINGS["decimation"] == 0.0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+# ------------------------------------------------- runtime-parameters, Task 2
+# spec 2.2: every safe-tier knob applied when set, SDK-default when not, and the
+# ACHIEVED values published for the greeting (spec 3.3: a knob that can be
+# changed but not recorded must not ship).
+
+def test_every_new_knob_reaches_its_filter(monkeypatch):
+    try:
+        chain = _chain(monkeypatch, RS_SPATIAL="1")
+        srv.FILTER_SETTINGS.update({
+            "spatial_magnitude": 3.0, "spatial_smooth_alpha": 0.6,
+            "spatial_holes_fill": 1.0, "temporal_smooth_alpha": 0.2,
+            "temporal_smooth_delta": 40.0, "temporal_persistency": 5.0,
+            "hole_filling": 2.0})
+        chain = srv.setup_depth_filters()
+        spatial = next(f for f in chain if f.kind == "spatial")
+        temporal = next(f for f in chain if f.kind == "temporal")
+        hole = next(f for f in chain if f.kind == "hole_filling")
+        assert spatial.options == {"filter_magnitude": 3.0, "filter_smooth_alpha": 0.6,
+                                   "holes_fill": 1.0}
+        assert temporal.options == {"filter_smooth_alpha": 0.2,
+                                    "filter_smooth_delta": 40.0, "holes_fill": 5.0}
+        assert hole.options == {"holes_fill": 2.0}
+        assert [f.kind for f in chain] == ["threshold", "disparity", "spatial",
+                                          "temporal", "disparity_inv", "hole_filling"]
+        assert srv.DEPTH_FILTER_NAMES == [f.kind for f in chain]
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_untouched_knobs_leave_the_sdk_defaults_alone(monkeypatch):
+    """-1 everywhere must reproduce today's chain EXACTLY -- options untouched,
+    no hole_filling filter -- because every number in the archive was measured
+    under it."""
+    try:
+        chain = _chain(monkeypatch)
+        assert [f.kind for f in chain] == ["threshold", "disparity", "spatial",
+                                          "temporal", "disparity_inv"]
+        assert next(f for f in chain if f.kind == "spatial").options == {}
+        assert next(f for f in chain if f.kind == "temporal").options == {}
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_achieved_options_are_read_back_not_echoed(monkeypatch):
+    """FILTER_OPTIONS reports what the filters are AT (SDK defaults when
+    untouched), never the -1 sentinel -- the greeting archives these."""
+    try:
+        _chain(monkeypatch)
+        assert srv.FILTER_OPTIONS == {
+            "spatial_smooth_delta": 20.0, "spatial_magnitude": 2.0,
+            "spatial_smooth_alpha": 0.5, "spatial_holes_fill": 0.0,
+            "temporal_smooth_alpha": 0.4, "temporal_smooth_delta": 20.0,
+            "temporal_persistency": 3.0,
+            "depth_min_m": 0.15, "depth_max_m": 1.5,
+            "hole_filling": None, "decimation": 0.0}
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_absent_spatial_reports_none_for_its_options(monkeypatch):
+    try:
+        _chain(monkeypatch, RS_SPATIAL="0")
+        assert srv.FILTER_OPTIONS["spatial_smooth_delta"] is None
+        assert srv.FILTER_OPTIONS["spatial_magnitude"] is None
+        assert "spatial" not in srv.DEPTH_FILTER_NAMES
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_out_of_range_values_are_clamped_to_the_sdk_range(monkeypatch):
+    """spec test 5. The SDK advertises smooth_delta 1..50; a request of 500 must
+    land at 50 and the ACHIEVED 50 is what gets recorded."""
+    try:
+        _chain(monkeypatch)
+        srv.FILTER_SETTINGS["spatial_smooth_delta"] = 500.0
+        srv.setup_depth_filters()
+        assert srv.FILTER_OPTIONS["spatial_smooth_delta"] == 50.0
     finally:
         monkeypatch.undo()
         importlib.reload(srv)

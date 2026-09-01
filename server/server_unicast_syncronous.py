@@ -980,22 +980,36 @@ DEPTH_FILTER_NAMES = (["threshold", "disparity"]
                       + (["spatial"] if FILTER_SETTINGS["spatial"] else [])
                       + ["temporal", "disparity_inv"])
 
-# The smooth_delta the spatial filter is ACTUALLY running at, read back off the
-# filter object by setup_depth_filters(); None means there is no spatial filter in
-# the chain (RS_SPATIAL=0) -- or, if "spatial" IS in DEPTH_FILTER_NAMES, that the
-# SDK would not report the option. Archived in the greeting's `filter_options`.
-#
-# The name list above can be derived from the env constants, but the delta cannot:
-# RS_SPATIAL_SMOOTH_DELTA's own default is -1.0, "don't touch", which names no
-# number at all -- the filter then runs at librealsense's default (20 today, and
-# nothing stops a future SDK from changing it). Echoing the env var into provenance
-# would therefore archive "-1" for every take ever measured, which is not a setting
-# any take was captured under. So this is read off the object that filters the
-# frames, and it is a global rather than a return value because make_greeting has
-# no access to the chain. Nothing rebinds it after startup (the chain is built once,
-# before main() accepts a client, and a camera rebuild does not touch it), so unlike
-# the camera globals it cannot tear against a rebuild.
-SPATIAL_SMOOTH_DELTA = None
+# The ACHIEVED value of every safe-tier knob, read back by setup_depth_filters()
+# off the objects that actually process frames; None = that filter is absent from
+# the chain, or the SDK would not report the option. Archived in the greeting's
+# `filter_options` -- it is the ONLY record of which arm of an A/B a take came
+# from (docs/inspection-roll-probe-handoff.md 3.1). Read-back rather than an echo
+# of FILTER_SETTINGS because the -1 sentinel names no number at all: the filter
+# then runs at librealsense's default, which a future SDK is free to change.
+# Rebound (with DEPTH_FILTER_NAMES) by every setup_depth_filters() call -- at
+# boot, and on every runtime SET -- always under _camera_lock or before any
+# client thread exists, and always BEFORE _camera_generation moves, so a greeting
+# can never pair old names with new options.
+FILTER_OPTIONS = {}
+
+# wire key -> (chain filter kind, rs.option attribute name). Temporal persistency
+# and both hole-fill knobs ride the SDK's one `holes_fill` option, disambiguated
+# by which filter object they are set on. threshold and hole_filling take their
+# values through their CONSTRUCTORS (handled in setup_depth_filters), so this map
+# only drives set_option for spatial/temporal -- but it drives READ-BACK for all.
+_OPTION_MAP = {
+    "spatial_smooth_delta":  ("spatial",      "filter_smooth_delta"),
+    "spatial_magnitude":     ("spatial",      "filter_magnitude"),
+    "spatial_smooth_alpha":  ("spatial",      "filter_smooth_alpha"),
+    "spatial_holes_fill":    ("spatial",      "holes_fill"),
+    "temporal_smooth_alpha": ("temporal",     "filter_smooth_alpha"),
+    "temporal_smooth_delta": ("temporal",     "filter_smooth_delta"),
+    "temporal_persistency":  ("temporal",     "holes_fill"),
+    "depth_min_m":           ("threshold",    "min_distance"),
+    "depth_max_m":           ("threshold",    "max_distance"),
+    "hole_filling":          ("hole_filling", "holes_fill"),
+}
 
 
 STATIC_GEOMETRY = None      # rs_geometry.StaticGeometry, set by openPipeline
@@ -1218,7 +1232,7 @@ def make_greeting(snapshot: CameraSnapshot = None) -> dict:
     return rs_geometry.build_greeting(
         snap.geometry, depth_unit_mm=snap.depth_unit_mm,
         filters=list(DEPTH_FILTER_NAMES),
-        spatial_smooth_delta=SPATIAL_SMOOTH_DELTA,
+        spatial_smooth_delta=FILTER_OPTIONS.get("spatial_smooth_delta"),
         temps=rs_config.read_temperatures(sensor, rs, log=_log),
         global_time_enabled=rs_config.read_global_time_enabled(sensor, rs, log=_log),
         achieved=snap.achieved, device=snap.device)
@@ -1705,37 +1719,92 @@ def stream_burst(conn, addr, max_frames=64):
         print(f"Burst session with {addr} closed; cleared {n} buffered frame(s)")
 
 
-def setup_depth_filters():
-    """threshold -> disparity -> spatial -> temporal -> disparity_inv, on NATIVE depth.
-    No decimation (full-resolution scan data) and NO hole filling: a filled pixel is
-    fabricated depth, and it was fabricated exactly where the metrology cares
-    (surface edges). Threshold first so background is never smoothed into an edge.
+def _apply_option(filt, option_name, value):
+    """Set one filter option, clamped to the SDK's advertised range when it
+    exposes one (spec test 5; mirrors rs_config._set_with_readback's discipline:
+    a bad value must never take the service down -- the achieved read-back in
+    FILTER_OPTIONS is what gets archived, so a clamp is visible, not silent)."""
+    option = getattr(rs.option, option_name)
+    try:
+        rng = filt.get_option_range(option)
+        value = min(max(float(value), float(rng.min)), float(rng.max))
+    except Exception:
+        pass                       # no range API on this build: try the raw value
+    try:
+        filt.set_option(option, value)
+    except Exception as exc:
+        print("WARNING: could not set {}={:g} ({}); the filter keeps its "
+              "previous value".format(option_name, value, exc), flush=True)
 
-    Also publishes the spatial filter's ACHIEVED smooth_delta into
-    ``SPATIAL_SMOOTH_DELTA`` for the greeting -- read back off the filter, so an
-    untouched filter archives the number it is really at rather than the env var's
-    "-1 = don't touch". The read-back is guarded: provenance is never worth the
-    camera, so an SDK that will not report the option leaves the chain intact and the
-    value unknown (the filter list still says whether `spatial` ran)."""
-    global SPATIAL_SMOOTH_DELTA
-    threshold = rs.threshold_filter(FILTER_SETTINGS["depth_min_m"],
-                                    FILTER_SETTINGS["depth_max_m"])
-    chain = [threshold, rs.disparity_transform(True)]
-    SPATIAL_SMOOTH_DELTA = None
-    if FILTER_SETTINGS["spatial"]:
-        spatial = rs.spatial_filter()
-        if FILTER_SETTINGS["spatial_smooth_delta"] >= 0:
-            spatial.set_option(rs.option.filter_smooth_delta,
-                               FILTER_SETTINGS["spatial_smooth_delta"])
+
+def _achieved_filter_options(by_kind):
+    """One achieved value per wire key, read off the filters that will run.
+    Guarded per option: provenance is never worth the camera, so a refused
+    read-back records None (unknown) and the service keeps serving.
+    `decimation` is a constant 0.0 -- this tier cannot enable it (it would
+    change the depth geometry the greeting already declared, spec 2.2/2.5), and
+    recording the 0 makes "we do not decimate, on purpose" a value instead of an
+    absence someone has to infer."""
+    def read(kind, option_name):
+        filt = by_kind.get(kind)
+        if filt is None:
+            return None
         try:
-            SPATIAL_SMOOTH_DELTA = float(spatial.get_option(rs.option.filter_smooth_delta))
-        except Exception as e:
-            print(f"WARNING: could not read back filter_smooth_delta ({e}) — takes "
-                  f"captured now will not record which delta they ran at", flush=True)
-        chain.append(spatial)
-    chain += [rs.temporal_filter(), rs.disparity_transform(False)]
-    print(f"RealSense: depth filters {DEPTH_FILTER_NAMES}, "
-          f"spatial smooth_delta = {SPATIAL_SMOOTH_DELTA}", flush=True)
+            return float(filt.get_option(getattr(rs.option, option_name)))
+        except Exception as exc:
+            print("WARNING: could not read back {}.{} ({}) -- takes captured now "
+                  "will not record it".format(kind, option_name, exc), flush=True)
+            return None
+    achieved = {}
+    for key in _OPTION_MAP:
+        kind, option_name = _OPTION_MAP[key]
+        achieved[key] = read(kind, option_name)
+    achieved["decimation"] = 0.0
+    return achieved
+
+
+def setup_depth_filters():
+    """threshold -> disparity -> [spatial] -> temporal -> disparity_inv ->
+    [hole_filling], on NATIVE depth, built ENTIRELY from FILTER_SETTINGS.
+
+    No decimation ever (it changes the depth geometry the greeting declares --
+    restart path only, spec 2.5) and hole filling only by explicit request: a
+    filled pixel is fabricated depth, fabricated exactly where the metrology
+    cares (surface edges). Threshold first so background is never smoothed into
+    an edge; hole filling last, in the depth domain, per Intel's recommended
+    order. -1.0 anywhere = leave that SDK default alone.
+
+    Also rebinds DEPTH_FILTER_NAMES and FILTER_OPTIONS (the achieved values,
+    read back off these very objects) so the greeting always describes the chain
+    that is actually installed -- see the FILTER_OPTIONS comment block for the
+    ordering contract with _camera_generation."""
+    global DEPTH_FILTER_NAMES, FILTER_OPTIONS
+    s = FILTER_SETTINGS
+    by_kind = {"threshold": rs.threshold_filter(float(s["depth_min_m"]),
+                                                float(s["depth_max_m"]))}
+    chain = [by_kind["threshold"], rs.disparity_transform(True)]
+    names = ["threshold", "disparity"]
+    if s["spatial"]:
+        by_kind["spatial"] = rs.spatial_filter()
+        chain.append(by_kind["spatial"])
+        names.append("spatial")
+    by_kind["temporal"] = rs.temporal_filter()
+    chain += [by_kind["temporal"], rs.disparity_transform(False)]
+    names += ["temporal", "disparity_inv"]
+    if s["hole_filling"] >= 0:
+        by_kind["hole_filling"] = rs.hole_filling_filter(int(s["hole_filling"]))
+        chain.append(by_kind["hole_filling"])
+        names.append("hole_filling")
+    for key in _OPTION_MAP:
+        kind, option_name = _OPTION_MAP[key]
+        if kind in ("threshold", "hole_filling"):
+            continue               # constructed with their values above
+        if kind in by_kind and s[key] >= 0:
+            _apply_option(by_kind[kind], option_name, s[key])
+    DEPTH_FILTER_NAMES = names
+    FILTER_OPTIONS = _achieved_filter_options(by_kind)
+    print("RealSense: depth filters {}, options {}".format(
+        DEPTH_FILTER_NAMES, FILTER_OPTIONS), flush=True)
     return chain
 
 def _serve_client(conn, addr):
