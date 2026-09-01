@@ -1232,7 +1232,7 @@ def make_greeting(snapshot: CameraSnapshot = None) -> dict:
     return rs_geometry.build_greeting(
         snap.geometry, depth_unit_mm=snap.depth_unit_mm,
         filters=list(DEPTH_FILTER_NAMES),
-        spatial_smooth_delta=FILTER_OPTIONS.get("spatial_smooth_delta"),
+        filter_options=dict(FILTER_OPTIONS),
         temps=rs_config.read_temperatures(sensor, rs, log=_log),
         global_time_enabled=rs_config.read_global_time_enabled(sensor, rs, log=_log),
         achieved=snap.achieved, device=snap.device)

@@ -260,6 +260,17 @@ def test_the_greeting_records_the_smooth_delta_the_filter_actually_ran_with(monk
         importlib.reload(srv)
 
 
+def test_the_greeting_carries_the_full_achieved_options(monkeypatch):
+    try:
+        greeting = _greeting(monkeypatch)
+        assert greeting["filter_options"] == srv.FILTER_OPTIONS
+        assert greeting["filter_options"]["temporal_persistency"] == 3.0
+        assert greeting["filter_options"]["depth_max_m"] == 1.5
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
 def test_a_lowered_smooth_delta_reaches_the_greeting(monkeypatch):
     """The delta-sweep arm. Two takes captured under different deltas must not
     archive the same provenance."""

@@ -302,6 +302,21 @@ def test_legacy_geometry_flags_itself():
     assert g.to_dict()["legacy_aligned"] is True
 
 
+def test_a_greeting_with_the_full_runtime_filter_options_still_parses():
+    """2026-09-01: the server reports EVERY safe-tier knob in filter_options, not
+    just spatial_smooth_delta. from_greeting lifts the delta as before and the
+    rest ride `raw` into the archive manifest untouched (spec test 8)."""
+    base = gf.offset(color_K=K_C, color_size=SIZE_C).raw
+    full = {"spatial_smooth_delta": 8.0, "spatial_magnitude": 2.0,
+            "spatial_smooth_alpha": 0.5, "spatial_holes_fill": 0.0,
+            "temporal_smooth_alpha": 0.4, "temporal_smooth_delta": 20.0,
+            "temporal_persistency": 3.0, "depth_min_m": 0.15, "depth_max_m": 1.5,
+            "hole_filling": None, "decimation": 0.0}
+    g = dg.CameraGeometry.from_greeting({**base, "filter_options": full})
+    assert g.spatial_smooth_delta == 8.0
+    assert g.to_dict()["filter_options"] == full
+
+
 def test_color_registered_takes_no_factory_k_alias():
     """``ColorRegistered`` must ask for the colour K that PRODUCED ``uv``, by that
     name only -- no ``color_K_factory=`` alias, and no default.
