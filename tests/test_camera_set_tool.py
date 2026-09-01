@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -47,10 +48,18 @@ def test_restore_omits_hole_filling():
     assert "hole_filling" not in cs.STOCK
 
 
-def test_over_long_line_is_refused_locally(monkeypatch):
-    """Better a readable local error than a silently ended session."""
-    monkeypatch.setattr(cs, "CameraClient", lambda *a, **k: pytest.fail(
+def test_over_long_line_is_refused_before_a_connection_is_opened(monkeypatch):
+    """Better a readable local error than a silently ended session.
+
+    The guard must fire before ``burst()``, not merely before the reply is read:
+    the server ENDS the session on an over-long line, so opening one at all is
+    the thing to avoid.
+    """
+    from tasni.core.camera import CameraClient
+
+    monkeypatch.setattr(CameraClient, "burst", lambda *a, **k: pytest.fail(
         "must not open a connection for a line the server would refuse"))
+    monkeypatch.setattr(cs, "load_config", lambda: SimpleNamespace(camera=None))
     with pytest.raises(SystemExit, match="ENDS the session"):
         cs.send([f"k{i}=0" for i in range(200)])
 
@@ -70,3 +79,54 @@ def test_arm_is_read_off_the_achieved_options(delta, expected):
 def test_describe_survives_a_reply_with_no_options():
     """An older/odd reply must not raise -- it is a diagnostic, not a gate."""
     assert cs.describe({"ok": True, "filters": []})
+
+
+# -- the read-only web surface -------------------------------------------------
+# The chain read must never open a competing connection to the UNICAST camera
+# server while something else holds it: that steals the frame the holder is
+# waiting for. Same rule /api/health already follows, now shared by both.
+import tasni.webapp.server as ws  # noqa: E402
+
+
+def _services(*, lease=False, job=False, live=False):
+    return SimpleNamespace(
+        camera_lease=SimpleNamespace(held=lease, owner="live-preview"),
+        jobs=SimpleNamespace(running=job),
+        live=SimpleNamespace(running=live))
+
+
+def test_camera_is_free_when_nothing_holds_it():
+    assert ws.camera_busy_reason(_services()) == ""
+
+
+@pytest.mark.parametrize("holder, expected", [
+    ({"lease": True}, "live-preview"),
+    ({"job": True}, "running job"),
+    ({"live": True}, "live preview"),
+])
+def test_every_holder_blocks_the_read(holder, expected):
+    reason = ws.camera_busy_reason(_services(**holder))
+    assert reason, "a held camera must report a reason, not an empty string"
+    assert expected in reason
+
+
+def test_the_lease_owner_wins_over_the_coarse_flags():
+    """The lease names the precise holder; the flags are only a fallback."""
+    reason = ws.camera_busy_reason(_services(lease=True, job=True, live=True))
+    assert "live-preview" in reason
+
+
+@pytest.mark.parametrize("delta, arm, stock", [
+    (20.0, "stock", True),
+    (None, "spatial OFF", False),
+    (5.0, "smooth_delta 5", False),
+    (8.5, "smooth_delta 8.5", False),
+])
+def test_arm_label_is_derived_from_the_achieved_delta(delta, arm, stock):
+    assert ws.filter_arm_label({"spatial_smooth_delta": delta}) == (arm, stock)
+
+
+def test_arm_label_treats_a_missing_key_as_spatial_off():
+    """No key at all means no spatial filter -- it must not claim stock."""
+    assert ws.filter_arm_label({}) == ("spatial OFF", False)
+    assert ws.filter_arm_label(None) == ("spatial OFF", False)

@@ -22,6 +22,44 @@ from ..core.health import ROBODK_API_PORT, connection_route, tcp_probe
 from ..modules.base import ServiceContainer
 from ..modules.registry import build_registry
 
+# The spatial filter's stock smooth_delta, as the device reports it. Only used to
+# LABEL a read-back as stock-or-not for the operator; nothing here writes it.
+STOCK_SMOOTH_DELTA = 20.0
+
+
+def camera_busy_reason(services) -> str:
+    """Who holds the camera, or ``""`` when it is free.
+
+    The camera server is UNICAST: it serves one client, so anything that opens a
+    connection while a capture runs steals the frame the holder is waiting for.
+    Every read-side probe must consult this first. The lease's owner label is the
+    precise holder ("live-preview", "calibration-run", ...); the job/live flags
+    are the coarse fallback for a holder that predates the lease.
+    """
+    if services.camera_lease.held:
+        return f"in use by {services.camera_lease.owner}"
+    if services.jobs.running:
+        return "in use by running job"
+    if services.live.running:
+        return "in use by live preview"
+    return ""
+
+
+def filter_arm_label(options: dict) -> tuple[str, bool]:
+    """Label a filter-chain read-back as ``(arm, is_stock)``.
+
+    Derived ONLY from the achieved options the device reported. Never from a
+    remembered write: an override dies on restart, and the Jetson's auto-pull
+    timer restarts the camera whenever ``server/`` changes, so a remembered value
+    can be a lie while a read-back cannot.
+    """
+    delta = (options or {}).get("spatial_smooth_delta")
+    if delta is None:
+        return "spatial OFF", False
+    if delta == STOCK_SMOOTH_DELTA:
+        return "stock", True
+    return f"smooth_delta {delta:g}", False
+
 DIST_DIR = Path(__file__).resolve().parents[1] / "webui" / "dist"
 
 
@@ -45,6 +83,40 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         mods = sorted(registry.all(), key=lambda m: (m.order, m.title))
         return {"modules": [m.meta() for m in mods]}
 
+    @app.get("/api/camera/filter-chain")
+    def camera_filter_chain() -> dict:
+        """READ-ONLY: which depth-filter arm the camera is actually on.
+
+        Deliberately its own endpoint rather than a field on /api/health, which
+        the dashboard polls: reading the chain means opening a real connection to
+        a UNICAST server, so it must be on demand, and it must refuse while
+        anything else holds the camera.
+
+        Why this is worth surfacing at all: a runtime override DIES ON RESTART,
+        and the Jetson's auto-pull timer restarts the camera whenever `server/`
+        changes -- so an A/B arm can silently revert to the unit file's default
+        mid-sweep. Without this, that is only discoverable afterwards, by reading
+        each take's archived `filter_options`.
+
+        Never writes. Changing the chain stays a deliberate act at the terminal
+        (`tools/camera_set.py`), because a successful write retires the camera
+        generation and invalidates comparability with everything measured before.
+        """
+        busy = camera_busy_reason(services)
+        if busy:
+            return {"available": False, "state": "in_use", "detail": busy}
+        try:
+            reply = services.camera.filter_chain()
+        except Exception as exc:
+            return {"available": False, "state": "offline", "detail": str(exc)}
+        if not reply.get("ok"):
+            return {"available": False, "state": "refused",
+                    "detail": str(reply.get("error"))}
+        options = reply.get("filter_options") or {}
+        arm, stock = filter_arm_label(options)
+        return {"available": True, "state": "ok", "arm": arm, "stock": stock,
+                "filters": reply.get("filters") or [], "options": options}
+
     @app.get("/api/health")
     def health() -> dict:
         cam = services.config.camera
@@ -53,14 +125,7 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
         # client and a probe would steal the frame the lease holder expects. The
         # lease's owner label gives the precise holder ("live-preview",
         # "calibration-run", ...); fall back to the coarse job/live flags.
-        if services.camera_lease.held:
-            busy = f"in use by {services.camera_lease.owner}"
-        elif services.jobs.running:
-            busy = "in use by running job"
-        elif services.live.running:
-            busy = "in use by live preview"
-        else:
-            busy = ""
+        busy = camera_busy_reason(services)
         if busy:
             # Mid-capture the running client has already resolved the host, so
             # report it rather than opening a competing probe.
@@ -85,6 +150,9 @@ def create_app(config: AppConfig | None = None) -> FastAPI:
             "robodk": {"ok": robodk_ok, "detail": f"API :{ROBODK_API_PORT}"},
             "camera": camera,
             "job": {"status": services.jobs.status, "running": services.jobs.running},
+            # deliberately NOT the depth filter chain: reading it needs a real
+            # connection to a unicast server, so it lives behind its own
+            # on-demand endpoint rather than riding a frequently-polled probe.
             # Whether this process is still running the code that is on disk.
             # Editing tasni/**.py does nothing until the app restarts, and a cell
             # test against stale code looks exactly like a failed fix.

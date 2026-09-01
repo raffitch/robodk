@@ -34,14 +34,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tasni.core.camera import CameraClient  # noqa: E402
+from tasni.core.camera import CameraClient, CameraError  # noqa: E402
 from tasni.core.config import load_config  # noqa: E402
 
-# The server refuses a SET line of this many bytes or more AND ends the session,
-# because a truncated line cannot be resynced (see _recv_line). Checked here so a
-# too-long sweep line fails locally with a readable message instead of dropping
-# the connection.
-SET_LINE_MAXLEN = 512
+# Re-exported from the client so the CLI, its tests and the read-only web
+# endpoint all speak of ONE limit. The server refuses a SET line of this many
+# bytes or more AND ends the session, because a truncated line cannot be
+# resynced (see the server's _recv_line).
+SET_LINE_MAXLEN = CameraClient.SET_LINE_MAXLEN
 
 # The stock chain, as read back off the device 2026-09-01. `hole_filling` reads
 # back null -- no such filter in the chain -- so it is OMITTED rather than sent.
@@ -53,24 +53,17 @@ STOCK = (
 
 
 def send(assignments: list[str], *, timeout: float = 30.0) -> dict:
-    """Send one SET line and return the server's parsed reply. No args = read-only."""
-    line = ("SET " + " ".join(assignments)).strip() if assignments else "SET"
-    payload = (line + "\n").encode()
-    if len(payload) >= SET_LINE_MAXLEN:
-        raise SystemExit(
-            f"SET line is {len(payload)} bytes; the server refuses >= {SET_LINE_MAXLEN} "
-            "and ENDS the session. Send fewer keys.")
-    client = CameraClient(load_config().camera)
-    with client.burst(timeout=timeout) as session:
-        sock = session._sock
-        sock.sendall(payload)
-        buf = bytearray()
-        while not buf.endswith(b"\n"):
-            chunk = sock.recv(1)
-            if not chunk:
-                raise SystemExit(f"server closed mid-reply; got {bytes(buf)!r}")
-            buf.extend(chunk)
-    return json.loads(bytes(buf).decode())
+    """Send one SET line and return the server's parsed reply. No args = read-only.
+
+    The protocol itself lives on ``CameraClient.filter_chain`` so the CLI and the
+    read-only web endpoint cannot drift apart; this only turns the client's
+    errors into clean CLI exits.
+    """
+    try:
+        return CameraClient(load_config().camera).filter_chain(
+            assignments, timeout=timeout)
+    except CameraError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def describe(reply: dict) -> str:

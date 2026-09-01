@@ -3,6 +3,7 @@ import { NavLink } from "react-router-dom";
 import { apiGet, type ModuleMeta } from "../api/client";
 import { useEvents } from "../api/events";
 import { useHealth } from "../api/useHealth";
+import DepthChainBadge from "./DepthChainBadge";
 import StatusPill from "./StatusPill";
 
 export default function Layout({ children }: { children: ReactNode }) {
@@ -58,6 +59,10 @@ export default function Layout({ children }: { children: ReactNode }) {
               ? `${health.camera.route} · ${health.camera.endpoint}`
               : "checking…"} />
           <StatusPill label="link" ok={connected} detail="job event stream" />
+          {/* Re-read once the camera is free again: it cannot be read while a
+              capture holds the unicast server, and a job restart is exactly
+              when an override may have silently reverted. */}
+          <DepthChainBadge refreshKey={health?.job.running} />
         </div>
       </header>
       <div className="layout">

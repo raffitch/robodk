@@ -422,6 +422,41 @@ class CameraClient:
     def grab_color(self, *, with_depth: bool = False) -> np.ndarray:
         return self.grab(with_depth=with_depth).color
 
+    # The server refuses a SET line of this many bytes or more AND ends the
+    # session (a truncated line cannot be resynced -- see the server's
+    # _recv_line), so an over-long line is caught here, before a connection is
+    # opened: a readable error beats a dropped session.
+    SET_LINE_MAXLEN = 512
+
+    def filter_chain(self, assignments=(), *, timeout: float | None = None) -> dict:
+        """Read -- or with ``assignments``, change -- the depth filter chain.
+
+        ``assignments`` is a sequence of ``"key=value"`` strings. **Empty means a
+        bare ``SET``, which is READ-ONLY**: it returns the achieved chain without
+        touching it, and is the only trustworthy way to confirm which arm of an
+        A/B the device is actually on.
+
+        Two things a caller must respect, both enforced by the server rather than
+        here. A successful WRITE retires the camera generation, closing every
+        session greeted before it -- so it must never be sent while a capture is
+        in flight, or the take dies. And a write DIES ON RESTART: the unit file
+        stays the boot truth, which is why a sweep sends an explicit restore
+        between arms instead of trusting leftover state.
+
+        Returns the server's parsed reply: ``{"ok": bool, "filters": [...],
+        "filter_options": {...}}`` with ACHIEVED values, or ``ok`` False plus an
+        ``error``. Never read a take's arm from what you sent -- read it from the
+        archived ``filter_options``.
+        """
+        line = ("SET " + " ".join(assignments)).strip() if assignments else "SET"
+        payload = (line + "\n").encode()
+        if len(payload) >= self.SET_LINE_MAXLEN:
+            raise CameraError(
+                f"SET line is {len(payload)} bytes; the server refuses "
+                f">= {self.SET_LINE_MAXLEN} and ENDS the session. Send fewer keys.")
+        with self.burst(timeout=timeout) as session:
+            return session.filter_chain(payload)
+
     @contextmanager
     def burst(self, *, timeout: float | None = None):
         """Open a burst-capture session (see :class:`_BurstSession`).
@@ -517,6 +552,23 @@ class _BurstSession:
         """Drop the server's RAM buffer — delete the captured data on the Jetson."""
         self._sock.sendall(b"CLEAR\n")
         self._client._recv_exact(self._sock, 4)        # ack
+
+    def filter_chain(self, payload: bytes) -> dict:
+        """Send one already-framed ``SET`` line; return the single JSON reply.
+
+        Unlike CAP/GET/CLEAR the reply here is a newline-terminated JSON LINE,
+        not a length prefix, so it is read a byte at a time to avoid over-reading
+        into whatever follows on the connection.
+        """
+        self._sock.sendall(payload)
+        buf = bytearray()
+        while not buf.endswith(b"\n"):
+            chunk = self._sock.recv(1)
+            if not chunk:
+                raise CameraError(
+                    f"camera server closed mid-SET-reply; got {bytes(buf)!r}")
+            buf.extend(chunk)
+        return json.loads(bytes(buf).decode())
 
 
 class _TelemetryReader:
