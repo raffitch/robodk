@@ -70,6 +70,49 @@ lows at 30°, 240°, 260° and 330°. The camera baseline did **not** move: 179.
 this is **not** a controlled comparison and must not be read as one — it is the reason
 the roll probe exists.
 
+### 2.1 What the archive already settles (added 2026-09-01 evening, offline, no robot)
+
+Four things were measured off the 13:13 archive before spending any robot time. They
+narrow the experiment but do **not** replace it.
+
+**(a) The dead sectors are not dark. The shadow explanation is REFUTED.** The colour
+image shows the taller stack casting a much bigger shadow than ring 1 did, which is a
+tempting story. It is wrong: projecting every ring-band point into the colour image and
+taking the mean luma per sector, the *deadest* sector of all — 120–129°, at 6–8 ROI
+points — is one of the **brightest** (luma 92.4 against a 63–105 range). Correlation
+between sector brightness and ROI yield is only +0.32, and it is carried entirely by
+250–269°, which happens to be both dark and dead. Do not spend a lighting excursion.
+
+**(b) The camera returns depth in the dead sectors — it just reads the TABLE there.**
+In 120–140° the raw back-projected cloud still has 756–764 points in the ring band
+(against 1040–1228 in a live sector), but only 75–86 of them sit above the substrate
+floor, and their median height is **−0.3 to +0.15 mm**, i.e. substrate level, where a
+live sector reads 5.4–7.7 mm. So this is not "no data". The ring's crest specifically
+is not being resolved as elevated at those angles.
+
+**(c) The dropout appeared WITH ring 2, at an unchanged pose.** The layer-1 and layer-2
+inspection poses are the same XY, both nadir (`zaxis = -Z`), 2.6 mm apart in Z. At that
+same pose, ring 1 alone yields 340 ROI points at 120–129°; the two-ring stack yields 8.
+
+**(d) This stack's yield is strongly anisotropic about the stereo baseline — but that
+is NOT a fixed camera property.** Folding sector yield onto |angle − baseline| gives:
+
+| take | along-baseline | across-baseline | ratio |
+|---|---|---|---|
+| 13:13 layer-001 (ring 1 alone) | 225 | 247 | **0.91–0.95** |
+| 13:13 layer-002 take04/05 (settled) | 340 | 148 | **2.27–2.30** |
+| 2026-08-30 20:24 layer-002 (also 2 rings, baseline 179.1°) | 277–298 | 254–274 | **1.05–1.11** |
+
+The 2-ring stack of 08-30 is the counter-example that matters: **same baseline, same
+kind of scene, ratio 1.09** — so a pure stereo-aperture artifact of the baseline cannot
+be the whole story, or that take would show it too. The anisotropy is highly
+reproducible *within* a trial (2.27 vs 2.30) and absent in the same trial's layer 1, so
+it is a real property of *this stack seen from this viewpoint* — and the archive cannot
+say which of the two owns it. **That is precisely the camera-vs-scene question, and only
+a controlled roll on the untouched stack answers it.** The one archived capture at a
+genuinely different baseline (119.1°, 2026-08-31 17:12) is a different trial and stack,
+so it is confounded exactly as the roll-probe handoff warns.
+
 ---
 
 ## 3. Protocol
@@ -137,9 +180,29 @@ Use the trial's work centre and the same band §2's profile used:
 ```python
 from tools.probe_roll_readings import load_take, sector_counts
 import numpy as np
-c = np.array([209.45, 147.10])          # trial.json setup centre, shared by all takes
+# session.json's APPLIED setup centre -- what every take was actually scored
+# against. NOT trial.json's setup centre (209.45, 147.10), which is the
+# pre-characterization placement and sits 2.3 mm away in Y.
+c = np.array([208.940, 144.867])
 t = load_take("runs/extrusion/<trial>/layer-002")
 p = sector_counts(t["points"][t["roi"]][:, :2], c, inner_mm=32.6, outer_mm=52.6)
+```
+
+That centre is independently corroborated: ring 1's eight takes fit their centre to
+(209.0–209.3, 144.8–145.2), agreeing with it to **0.3 mm**. Per-take `fit_ring` centres
+are not usable for this — on `layer-001-take08` the same call returns (196.05, 143.69),
+**12.9 mm** away, which would rotate every sector label.
+
+Recomputed on the pinned centre, the §2 profile reproduces across all four layer-002
+takes, so the dropout is stable rather than noise (take05, ROI points per 10°):
+
+```
+  0-59    473  484  345  172  199  210
+ 60-119   253  195  177  132  231  144
+120-179     6   69   48  203  277  459     <- 120-129 is the deep hole
+180-239   495  306  100  173  372  371
+240-299   191   36   12  187  184   27     <- 250-269 the second
+300-359    48  293  172  174  317  440
 ```
 
 Outcomes, and they lead different places (arm letters from §3):
@@ -163,6 +226,31 @@ Outcomes, and they lead different places (arm letters from §3):
 If **A2 disagrees materially with A1**, the comparison was not stable and the B arm
 is not interpretable — say so rather than picking the convenient reading.
 
+**Report the along/across-baseline ratio for every arm** (§2.1d), not just completeness.
+It is the statistic that carries the camera-vs-scene question: this stack reads **2.27–2.30**
+from the automatic pose, where its own ring 1 reads 0.91–0.95. A ratio that stays near
+2.3 through a pose change and a filter change is evidence the geometry is at fault; one
+that collapses toward 1.0 names whichever lever moved it.
+
+### 4.1 Why the roll arm is still the decisive one
+
+The archive can show the anisotropy but cannot own it (§2.1d): the 2026-08-30 two-ring
+stack read 1.09 at the same baseline, so "the baseline does it" is already falsified as
+a complete explanation, and no capture at a *different* baseline exists that is not also
+a different stack. Only rotating the camera about its optical axis, on this untouched
+stack, separates them — and it makes a quantitative prediction rather than a vague one:
+
+> **If the anisotropy is camera-locked, a roll of θ moves the dead sectors by θ and the
+> along/across ratio stays ≈2.3 about the NEW baseline. If it is scene-locked, the dead
+> sectors stay at 120–129° and 250–269° in the work frame and the ratio about the new
+> baseline collapses toward 1.0.**
+
+That arm needs `inspection_roll_candidates_deg` in `tasni.config.json` (automatic pose)
+plus a backend restart, so it is a separate sitting from the three arms in §3 — which
+use one taught pose and no restart at all. Keep every candidate well inside
+`max_tool_axis_spin_deg` (90 is ON the limit and was refused before); 60° is ample, since
+the effect is 180°-periodic and 10° sectors resolve a 60° shift easily.
+
 Whatever happens, **record which**. A run that is not written down costs the same robot
 time and buys nothing.
 
@@ -183,7 +271,19 @@ time and buys nothing.
   takes. Any take captured by a Jetson running that server records what the filter
   really ran at; takes older than it record `null`, meaning UNKNOWN, never 20.
 - **Do not reprocess the 2026-08-30 archive** — `tests/test_extrusion_golden.py` uses
-  its `report.json` as a "has anyone reprocessed this?" cross-check.
+  its `report.json` as a "has anyone reprocessed this?" cross-check. (Reading it with
+  `probe_roll_readings.load_take`, as §2.1d does, is not reprocessing: it writes
+  nothing.)
+- **Manual inspection changes the plan fingerprint.** `plan_fingerprint` hashes the
+  whole setup, `inspection_auto` and `inspection_target` included
+  (`modules/extrusion/toolpath.py:13`), so pointing the run at `ScanAtRing2` yields a
+  different fingerprint from the 13:13 session's `applied` one and `/measure/layer`
+  refuses it as the stale-plan artifact. The correct move is a **new session** carrying
+  the SAME characterization-applied recipe and placement (radius 42.0, layer height 2.6,
+  bead 8.1, centre 208.940/144.867 — from `session.json`'s `applied`), changing ONLY the
+  two inspection fields. The nominal circle is then bit-identical, so completeness, gap
+  and radius stay directly comparable. Do **not** re-characterize: that would move the
+  centre and break comparability with the 13:13 numbers.
 - **The spatial-filter A/B is folded into §3 as arms B/A2** (updated 2026-09-01: the
   runtime SET made it a one-line arm change, so it no longer waits for a separate
   excursion). It is the only untried lever with a measured mechanism for losing a
