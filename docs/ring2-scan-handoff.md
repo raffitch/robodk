@@ -40,10 +40,28 @@ The inspection pose barely moves between the two layers — **2.6 mm** of camera
 the substrate fit is just as clean. So the difference is not standoff and not the
 substrate. Something about ring 2 *as seen from a ring-1-shaped pose* is not coming back.
 
-`ScanAtRing2` breaks that: it is the first pose chosen to frame ring 2 on its own terms.
-If ring 2 measures cleanly from there, the fault is the automatic inspection pose for
-layer N, which is a bounded, fixable thing. If it still drops out, the fault is in the
-ring or the sensor, and the roll probe (§5) is the next instrument, not more poses.
+> ### ⚠️ CORRECTION 2026-09-01 15:0x — `ScanAtRing2` IS the automatic pose
+>
+> This page was opened on the premise that `ScanAtRing2` is "the first pose chosen to
+> frame ring 2 on its own terms". **It is not.** Read out of the running station against
+> the 13:13 layer-002 archive:
+>
+> | | position (work frame) | orientation | baseline |
+> |---|---|---|---|
+> | archived automatic layer-2 pose | 208.940, 144.867, 310.700 | nadir | 179.8° |
+> | `ScanAtRing2` (arm parked on it) | 208.940, 144.867, 310.700 | nadir | 179.8° |
+> | **delta** | **0.000 mm** | **0.000°** | **0.00°** |
+>
+> Bit-identical. The taught target reproduces the automatic viewpoint exactly, so
+> **layer-002 takes 03–05 of the 13:13 trial already ARE the capture this page asked
+> for**, and a "does ring 2 measure better from `ScanAtRing2`?" run cannot answer
+> anything — it re-measures a configuration already on disk.
+>
+> What survives: the pose lever is **tested and dead**, not untested. The remaining
+> levers are the spatial filter (§3 arm B) and the camera roll (§4.1) — and since the
+> arm is already parked on this exact pose, the filter A/B costs **zero robot motion**.
+> Arm A1 is retained, but as a *control* (does the cell still reproduce 13:13 today?),
+> never as a test of the viewpoint.
 
 ---
 
@@ -127,10 +145,12 @@ so it is confounded exactly as the roll-probe handoff warns.
    anything else; a stale target is worse than no target. Capture uses **manual
    inspection mode** (`inspection_auto=false`, `inspection_target="ScanAtRing2"` —
    `tasni/modules/extrusion/models.py`), so no new code.
-3. **Arm A1 — stock chain, the comparable capture.** Measure **layer 2** from
-   `ScanAtRing2`, one press, `repeats=3` (what the 13:36 baseline triple used). Read
-   takes 2–3; the first burst at a fresh pose is not settled (§4). **Every vs-13:13
-   conclusion comes from this arm only.**
+3. **Arm A1 — stock chain, the CONTROL.** Measure **layer 2** from `ScanAtRing2`, one
+   press, `repeats=3` (what the 13:36 baseline triple used). Read takes 2–3; the first
+   burst is not settled (§4). Since the target is the automatic pose (see the correction
+   in §1), this arm asks only *"does the cell still reproduce 13:36 today?"* — it must
+   land near completeness 0.25–0.26, gap ≈267°, along/across ≈2.3. If it does not, the
+   stack or the cell moved and **nothing else on this page is interpretable**.
 4. **Arm B — spatial filter off, via the runtime SET (no deploy, no restart).** With
    the robot home and **no capture in flight**, send `SET spatial=0` on TCP 1024 and
    confirm the `{"ok":true,...}` reply. Then the same press again (`repeats=3`). A
@@ -207,11 +227,12 @@ takes, so the dropout is stable rather than noise (take05, ROI points per 10°):
 
 Outcomes, and they lead different places (arm letters from §3):
 
-- **Ring 2 measures cleanly from `ScanAtRing2` in arm A1** (completeness > 0.9,
-  gap < 30°). The automatic layer-N inspection pose is the fault. Compare that pose's
-  `T_work_camera` against `ScanAtRing2`'s and find what differs — the standoff is
-  nearly identical, so look at where the ring sits in frame and at incidence, not at
-  distance. Arms B/A2 still deliver the never-run crest-height A/B for free.
+- **Arm A1 does NOT reproduce the 13:36 numbers.** Stop. The stack or the cell moved
+  since 13:13 and every comparison on this page is void — re-establish a baseline
+  before spending anything else. (This is the only outcome A1 can now produce that
+  changes what you do: it is the automatic pose, so "ring 2 measures cleanly from
+  `ScanAtRing2`" is not on the table — that configuration is already on disk at
+  completeness 0.25.)
 - **A1 drops out, B (spatial off) restores it.** Mechanism found in one excursion:
   `smooth_delta=20` against a ring spanning under 4 disparity pixels. Stop and tune
   the spatial path before asking multi-view or more poses to repair it.
@@ -258,6 +279,25 @@ time and buys nothing.
 
 ## 5. Traps
 
+- **The KUKA must be in EXT/AUT, not T1, or the capture hangs uncancellably.**
+  (2026-09-01, cost 16 minutes.) `_move_to_inspection` dispatches the inspection move
+  as a RoboDK program with `real_robot=True` and then blocks in `_wait_program`
+  (`modules/extrusion/service.py:295`), which has **no timeout** and only tests
+  `ctx.cancelled` *between* polls. In T1 the controller needs the enabling switch held
+  and will not execute a driver-dispatched program, so RoboDK waits for a completion
+  that mode cannot produce and `POST /cancel` returns `cancelling` and does nothing.
+  This happens even when the arm is **already standing on the target** and the move is
+  zero-distance. How to recognise it, in the order that separates causes:
+  `/api/health` keeps answering in ~200 ms with `robodk: ok` (it proves nothing);
+  **`/station-options` blocks**, because the wedged job holds the shared `services.rdk`;
+  the Jetson shows **no ESTABLISHED connection on 1024** (`ss -tn state established
+  '( sport = :1024 )'`) while health still says `camera: in_use`, since the lease flag
+  outlives the socket; and RoboDK's CPU barely advances while `Responding` stays True.
+  Do **not** kill RoboDK or the backend to escape it: a program already dispatched runs
+  on the controller, so killing the host does not stop the arm. Switch the robot to
+  EXT/AUT and re-run. `robot.ConnectedState()` reporting `(0, 'Ready')` does **not**
+  mean the robot will accept a dispatched program — it only means the driver is
+  connected.
 - **Layer ≥ 2 has a known history.** Before `bd455a7` the chain measured the largest
   surviving arc of the stack rather than layer N, so any completeness number from
   before 2026-08-31 21:56 is not comparable. The archived `report.json` of older takes
