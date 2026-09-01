@@ -679,7 +679,10 @@ def test_a_rejected_rebuild_rolls_back_filter_settings_and_stays_unwedged(monkey
             raise RuntimeError("the SDK refused this configuration")
 
         monkeypatch.setattr(srv, "setup_depth_filters", boom)
-        reply = json.loads(srv._handle_set(b"SET depth_min_m=2.0"))
+        # Any setting that reaches the rebuild will do; this one is deliberately
+        # NOT a depth threshold, since an inverted pair is now refused before the
+        # rebuild is ever attempted and would exercise a different branch.
+        reply = json.loads(srv._handle_set(b"SET spatial_smooth_delta=8"))
         assert reply["ok"] is False
         assert "rejected" in reply["error"]
         assert srv.FILTER_SETTINGS == previous            # rolled back exactly
@@ -952,6 +955,44 @@ def test_the_greeting_describes_the_snapshots_chain_not_the_live_globals(monkeyp
         assert greeting["filters"] == snap.filter_names
         assert "spatial" in greeting["filters"]
         assert greeting["filter_options"]["spatial_smooth_delta"] == 20.0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_an_inverted_depth_threshold_pair_is_refused(monkeypatch):
+    """MEASURED ON THE CELL 2026-09-01: `SET depth_min_m=1.0 depth_max_m=0.5`
+    came back ok:true with both values achieved.
+
+    depth_min_m/depth_max_m reach librealsense through the threshold filter's
+    CONSTRUCTOR, not through set_option, so `_apply_option`'s range clamp never
+    sees them -- and the real SDK does not object to min > max. The chain then
+    passes nothing at all: every depth frame comes back empty while the reply,
+    the greeting and the archived provenance all say the settings applied. That
+    is the worst shape a failure can take here, because a take captured under it
+    looks exactly like a take of an empty scene.
+
+    Both orderings are checked: the pair can be inverted by writing either half
+    against whatever the other one already is.
+    """
+    try:
+        _fresh(monkeypatch)
+        gen = srv._camera_generation
+
+        reply = json.loads(srv._handle_set(b"SET depth_min_m=1.0 depth_max_m=0.5"))
+        assert reply["ok"] is False, reply
+        assert "depth_min_m" in reply["error"] and "depth_max_m" in reply["error"]
+        assert srv._camera_generation == gen            # nobody retired
+        assert srv.FILTER_SETTINGS["depth_min_m"] == srv.RS_DEPTH_MIN_M
+        assert srv.FILTER_SETTINGS["depth_max_m"] == srv.RS_DEPTH_MAX_M
+
+        # ...and against the value already in force, not just within one command
+        assert json.loads(srv._handle_set(b"SET depth_min_m=9.0"))["ok"] is False
+        assert json.loads(srv._handle_set(b"SET depth_max_m=0.05"))["ok"] is False
+
+        # a sane pair still applies
+        ok = json.loads(srv._handle_set(b"SET depth_min_m=0.2 depth_max_m=1.2"))
+        assert ok["ok"] is True, ok
     finally:
         monkeypatch.undo()
         importlib.reload(srv)

@@ -1973,6 +1973,21 @@ def apply_filter_settings(updates):
     clean = dict((k, float(v)) for k, v in updates.items())
     if "hole_filling" in clean:                    # constructor arg, not an rs.option:
         clean["hole_filling"] = min(max(clean["hole_filling"], -1.0), 2.0)
+    # depth_min_m/depth_max_m reach librealsense through the threshold filter's
+    # CONSTRUCTOR, not through set_option, so _apply_option's range clamp never
+    # sees them -- and the real SDK does NOT object to min > max. Measured on the
+    # cell 2026-09-01: `SET depth_min_m=1.0 depth_max_m=0.5` returned ok:true with
+    # both values achieved, and the chain then passes nothing at all. Every depth
+    # frame would come back empty while the reply, the greeting and the archived
+    # provenance all said the settings applied -- a take captured under it is
+    # indistinguishable from a take of an empty scene. Checked against the values
+    # ALREADY IN FORCE, so inverting the pair one half at a time is refused too.
+    lo = clean.get("depth_min_m", FILTER_SETTINGS["depth_min_m"])
+    hi = clean.get("depth_max_m", FILTER_SETTINGS["depth_max_m"])
+    if lo >= hi:
+        raise SettingError(
+            "depth_min_m ({:g}) must be below depth_max_m ({:g}); the SDK accepts "
+            "an inverted pair and then returns empty depth".format(lo, hi))
     with _camera_lock:
         if updates:
             previous = dict(FILTER_SETTINGS)
