@@ -181,6 +181,73 @@ SET guardrails (all live-verified 2026-09-01, `server/server_unicast_syncronous.
 
 ---
 
+## 3.5 RESULT — run 2026-09-01 15:38, trial `20260901-153855-8fe68421`
+
+All three arms ran, 16 takes, **zero arm motion** (the arm was already parked on the
+target). Every take's arm is verified from its own
+`provenance.camera_geometry.filter_options.spatial_smooth_delta`.
+
+### The spatial filter is FALSIFIED as the mechanism
+
+The A/B that `docs/inspection-roll-probe-handoff.md` §3.1 had been deferring since
+2026-08-31, run properly at last on an untouched stack:
+
+| arm | n | ROI points | across-baseline | along/across ratio |
+|---|---|---|---|---|
+| A1 stock (`delta 20`) | 5 | 8023 | 145.7 | 2.25–2.35 |
+| **B spatial OFF** (`null`) | 6 | **7684** | **141.9** | **2.18–2.28** |
+| A2 stock, restored | 3 | 8007 | 144.2 | 2.24–2.41 |
+
+Switching the spatial filter off did **not** recover the missing sectors. It returned
+*fewer* points everywhere (−4%) and left the anisotropy intact. The dead sectors
+(120–130°, 250–270°, 290–300°) sit in exactly the same places in all three arms. The
+`smooth_delta=20` vs "<4 disparity pixels" story was the leading hypothesis and it is
+now dead — **do not spend anything more on it.**
+
+**A1 versus A2 is the drift control and it PASSES** (2.25–2.35 against 2.24–2.41), so
+the B arm is interpretable rather than a comparison against a moving baseline.
+
+### The stack has NOT moved since 13:13
+
+A1 reproduces the 13:13 settled takes on every stable measure (ratio 2.27/2.30 then,
+2.25–2.35 now; ROI n ≈ 8000 both). Four and a half hours and a backend restart apart.
+The anisotropy is a real, reproducible property of this configuration.
+
+### ⚠️ `path_completeness` is NOT a stable readout — do not tune against it
+
+The same 16 takes, same pose, same stack, same chain, report completeness anywhere from
+**0.253 to 0.891** while the underlying sector coverage varies by only a few percent:
+
+| take | completeness | gap | fitted radius | ROI points | ratio |
+|---|---|---|---|---|---|
+| A1 take02 | 0.253 | 268.8° | 37.68 | 7721 | 2.25 |
+| A1 take03 | 0.624 | 135.4° | 43.37 | 8039 | 2.32 |
+| B take07 | **0.891** | **39.2°** | 42.21 | 7762 | 2.18 |
+| B take10 | 0.263 | 265.2° | 41.89 | 7664 | 2.26 |
+
+Take 07 is the best ring-2 measurement ever recorded — and take 10, six presses later on
+the *same* filter arm, is back at the old 0.26. The swing tracks where the circle fit
+lands (radius 37.7–44.2 against a nominal 42.0), not what the camera saw: on a ring with
+a 100°+ gap the fit is under-constrained, and completeness is measured against the
+nominal circle, so a fit that drifts a few mm in radius swings completeness by a factor
+of three. **Reading take 07 alone would have "proved" spatial-off is a huge win. The
+coverage statistic says it is not.** Judge levers on ROI coverage and the along/across
+ratio; treat a single take's completeness as noise.
+
+This also explains the layer-2 invalidity in a way the earlier framing missed: two
+compounding faults, a real sensor-level anisotropy AND a fit that cannot stabilise on a
+partial ring. Fixing only one will not produce a valid layer-2 measurement.
+
+### Branch-guard aborts are now routine on this stack
+
+6 of 16 takes died with "branch guard exhausted after 3 attempts" — the frame measures
+the bead at 4.2–4.6 mm against the recipe's 8.1 mm, giving `spur_limit` 7 px. The take
+still archives raw RGB-D, so the coverage analysis above survives it; only the pipeline's
+own metrics are lost. Do not loosen the guard (see the run-day note in
+`docs/pfh-paper-handoff.md`) — reprocess instead.
+
+---
+
 ## 4. Reading it
 
 **Settling first, before any conclusion.** Measured 2026-09-01 on the 2026-08-31
@@ -324,10 +391,18 @@ time and buys nothing.
   two inspection fields. The nominal circle is then bit-identical, so completeness, gap
   and radius stay directly comparable. Do **not** re-characterize: that would move the
   centre and break comparability with the 13:13 numbers.
-- **The spatial-filter A/B is folded into §3 as arms B/A2** (updated 2026-09-01: the
-  runtime SET made it a one-line arm change, so it no longer waits for a separate
-  excursion). It is the only untried lever with a measured mechanism for losing a
-  ring: `smooth_delta` 20 against a ring spanning under 4 disparity pixels at 300 mm.
-  Note `docs/inspection-roll-probe-handoff.md` §3.1's "deploy the server before the
-  sweep" **predates the SET tier** — arming an arm needs no deploy now; only the
-  per-take `filter_options` read-back rule there still binds.
+- **The spatial-filter A/B is DONE and NEGATIVE** (§3.5, 2026-09-01). Turning the
+  filter off does not recover the sectors; it loses 4% of the points and leaves the
+  anisotropy at 2.2. Do not re-run it, and do not treat `smooth_delta` as an open
+  lever. Note `docs/inspection-roll-probe-handoff.md` §3.1's "deploy the server before
+  the sweep" **predates the SET tier** — an arm is now one socket line, no deploy;
+  only the per-take `filter_options` read-back rule there still binds.
+- **The host-side SET sender still does not exist in the repo.** The A/B above was
+  driven from a scratch script: open `CameraClient.burst()`, send
+  `SET key=value ...\n`, read one JSON line. Bare `SET` is read-only and prints the
+  achieved chain — use it to confirm the arm before AND after. The explicit restore
+  that spec 4.1 requires is, for today's device: `spatial=1 spatial_smooth_delta=20
+  spatial_magnitude=2 spatial_smooth_alpha=0.5 spatial_holes_fill=0
+  temporal_smooth_alpha=0.4 temporal_smooth_delta=20 temporal_persistency=3
+  depth_min_m=0.15 depth_max_m=1.5 decimation=0` (224 bytes; `hole_filling` reads back
+  null and must be omitted, not sent).
