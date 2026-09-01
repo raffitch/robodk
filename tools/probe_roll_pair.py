@@ -20,6 +20,14 @@ not fix anything and is not part of the chain; delete it once the answer is in.
 
 Protocol
 --------
+SUPERSEDED 2026-09-01 -- follow docs/inspection-roll-probe-handoff.md section 3
+instead. The 0-vs-rolled design below was tried on 2026-08-31 and refused by
+this script's own comparability gate: rolling also turns the IR projector's dot
+pattern against the printed board, so the rolled capture had a different noise
+floor. The re-run uses a SYMMETRIC pair (+30 / -30 deg -- same 60 deg baseline
+gap, same class of pattern-vs-board interaction on both sides). Original design,
+kept for the record:
+
 Two TOP-DOWN characterizations of the SAME, UNTOUCHED ring, differing only in
 ``extrusion.inspection_roll_candidates_deg`` (tilt stays 0, so the plane noise
 floor stays ~0.65 mm rather than the 3-4 mm a 15 deg tilt would cost):
