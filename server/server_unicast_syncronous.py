@@ -4,6 +4,7 @@ import subprocess
 import threading
 import traceback
 import json
+import math
 import os
 import time
 from collections import deque, namedtuple
@@ -1818,7 +1819,7 @@ class SettingError(ValueError):
 
 
 def apply_filter_settings(updates):
-    """Validate + apply runtime filter settings; return the new achieved values.
+    """Validate + apply runtime filter settings; return (filter_options, filters).
 
     All-or-nothing: any unknown key or refused value raises SettingError BEFORE
     anything is touched -- a caller that thinks it changed something must never
@@ -1831,6 +1832,25 @@ def apply_filter_settings(updates):
     the old chain and no frame is ever archived under a greeting that describes
     a chain it did not run through (spec 3.4: a filter swap does not change
     geometry, so the fusion guard cannot catch it; this is what does).
+
+    ``FILTER_OPTIONS`` and ``DEPTH_FILTER_NAMES`` are read back TOGETHER, inside
+    the same locked section that does the write (or, for a read, the same locked
+    section that touches nothing) -- never one before the lock and one after.
+    One thread per accepted connection can call this concurrently, and reading
+    the two globals separately would let a second SET land in the gap, handing a
+    caller a reply pairing one chain's names with a DIFFERENT chain's options.
+
+    If ``setup_depth_filters()`` rejects the new values (e.g. an SDK-level
+    constructor refusing an inverted ``depth_min_m``/``depth_max_m``),
+    ``FILTER_SETTINGS`` is rolled back to what it held before this call, so the
+    rejection surfaces as one failed SET rather than poisoning the dict every
+    later SET rebuilds from -- without this, a single bad value would wedge
+    runtime parameters until a restart, which is exactly what this whole feature
+    exists to avoid needing. ``depth_filters``/``DEPTH_FILTER_NAMES``/
+    ``FILTER_OPTIONS`` need no matching rollback: ``setup_depth_filters`` only
+    rebinds them at its very end, after every filter object has already been
+    built without raising, so a raise there never touches them in the first
+    place.
 
     Known, accepted caveat (spec 3.4): _rebuild_pipeline treats a moved
     generation as "another thread already rebuilt the wedged pipeline" and skips
@@ -1848,18 +1868,26 @@ def apply_filter_settings(updates):
     if float(updates.get("decimation", 0.0)) != 0.0:
         raise SettingError("decimation changes the depth geometry the greeting "
                            "declares; it stays restart-path only (spec 2.5)")
-    if not updates:
-        return dict(FILTER_OPTIONS)
     clean = dict((k, float(v)) for k, v in updates.items())
     if "hole_filling" in clean:                    # constructor arg, not an rs.option:
         clean["hole_filling"] = min(max(clean["hole_filling"], -1.0), 2.0)
     with _camera_lock:
-        FILTER_SETTINGS.update(clean)
-        depth_filters = setup_depth_filters()
-        _camera_generation += 1        # LAST: retires every session greeted before it
-    print("Runtime SET applied: {} -> generation {}".format(
-        clean, _camera_generation), flush=True)
-    return dict(FILTER_OPTIONS)
+        if updates:
+            previous = dict(FILTER_SETTINGS)
+            FILTER_SETTINGS.update(clean)
+            try:
+                depth_filters = setup_depth_filters()
+            except Exception as exc:
+                FILTER_SETTINGS.clear()
+                FILTER_SETTINGS.update(previous)
+                raise SettingError("rejected by the filter chain: {}".format(exc))
+            _camera_generation += 1    # LAST: retires every session greeted before it
+        achieved = dict(FILTER_OPTIONS)
+        names = list(DEPTH_FILTER_NAMES)
+    if updates:
+        print("Runtime SET applied: {} -> generation {}".format(
+            clean, _camera_generation), flush=True)
+    return achieved, names
 
 
 def _handle_set(line):
@@ -1876,12 +1904,20 @@ def _handle_set(line):
                 raise SettingError(
                     "malformed token {!r}: expected key=value".format(token))
             try:
-                updates[key] = float(raw)
+                value = float(raw)
             except ValueError:
                 raise SettingError("{}={!r} is not a number".format(key, raw))
-        achieved = apply_filter_settings(updates)
-        reply = {"ok": True, "filters": list(DEPTH_FILTER_NAMES),
-                 "filter_options": achieved}
+            if not math.isfinite(value):
+                # nan/inf both parse as valid floats. Unchecked, nan would land
+                # in FILTER_SETTINGS while `s[key] >= 0` (setup_depth_filters'
+                # own guard) is False for nan, so the filter silently keeps its
+                # SDK default -- FILTER_SETTINGS then claims a value that never
+                # reached anything.
+                raise SettingError(
+                    "{}={!r} must be finite".format(key, raw))
+            updates[key] = value
+        achieved, names = apply_filter_settings(updates)
+        reply = {"ok": True, "filters": names, "filter_options": achieved}
     except SettingError as exc:
         reply = {"ok": False, "error": str(exc)}
     except Exception as exc:      # a bug must degrade to an error line, not kill the thread

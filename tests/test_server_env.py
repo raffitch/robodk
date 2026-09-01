@@ -492,7 +492,7 @@ def test_bare_set_reads_without_changing_or_retiring(monkeypatch):
     """spec test 1: SET with no arguments is a read -- achieved values back,
     nothing rebuilt, nobody's session ends."""
     try:
-        _fresh(monkeypatch)
+        chain = _fresh(monkeypatch)
         gen = srv._camera_generation
         reply = json.loads(srv._handle_set(b"SET"))
         assert reply["ok"] is True
@@ -500,6 +500,8 @@ def test_bare_set_reads_without_changing_or_retiring(monkeypatch):
         assert reply["filters"] == ["threshold", "disparity", "spatial",
                                     "temporal", "disparity_inv"]
         assert srv._camera_generation == gen
+        # a read must not touch the chain object either -- only a write rebuilds.
+        assert srv.depth_filters is chain
     finally:
         monkeypatch.undo()
         importlib.reload(srv)
@@ -604,6 +606,23 @@ def test_decimation_stays_refused_at_runtime(monkeypatch):
         importlib.reload(srv)
 
 
+def test_decimation_refusal_is_all_or_nothing(monkeypatch):
+    """review rider 3: the unknown-key gate already has all-or-nothing coverage
+    (test_unknown_setting_is_an_error_and_nothing_is_applied); the decimation
+    gate did not -- a valid key riding along in the same line must not land."""
+    try:
+        _fresh(monkeypatch)
+        gen = srv._camera_generation
+        reply = json.loads(
+            srv._handle_set(b"SET spatial_smooth_delta=8 decimation=2"))
+        assert reply["ok"] is False
+        assert srv.FILTER_SETTINGS["spatial_smooth_delta"] == -1.0   # untouched
+        assert srv._camera_generation == gen                          # nobody retired
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
 def test_hole_filling_round_trips_and_minus_one_removes_it(monkeypatch):
     try:
         _fresh(monkeypatch)
@@ -630,3 +649,87 @@ def test_restart_returns_to_the_unit_files_values(monkeypatch):
         importlib.reload(srv)
     assert srv.FILTER_SETTINGS["spatial_smooth_delta"] == -1.0
     assert srv.FILTER_SETTINGS["depth_max_m"] == 1.5
+
+
+def test_a_rejected_rebuild_rolls_back_filter_settings_and_stays_unwedged(monkeypatch):
+    """review Important-1: apply_filter_settings used to update FILTER_SETTINGS
+    BEFORE calling setup_depth_filters(). If the rebuild then raised (e.g. the
+    SDK refusing an inverted depth_min_m/depth_max_m), FILTER_SETTINGS was left
+    holding values no chain ever ran with -- and because every later SET
+    rebuilds from that same dict, EVERY SUBSEQUENT SET failed identically until
+    a restart. This is the only branch that was completely untested before this
+    fix: pin that a rejected rebuild rolls FILTER_SETTINGS back exactly, moves
+    nobody's generation, and leaves the next ordinary SET able to succeed."""
+    try:
+        _fresh(monkeypatch)
+        gen = srv._camera_generation
+        previous = dict(srv.FILTER_SETTINGS)
+        real_setup = srv.setup_depth_filters
+
+        def boom():
+            raise RuntimeError("the SDK refused this configuration")
+
+        monkeypatch.setattr(srv, "setup_depth_filters", boom)
+        reply = json.loads(srv._handle_set(b"SET depth_min_m=2.0"))
+        assert reply["ok"] is False
+        assert "rejected" in reply["error"]
+        assert srv.FILTER_SETTINGS == previous            # rolled back exactly
+        assert srv._camera_generation == gen               # nobody retired
+
+        # not wedged: restore the real rebuild and confirm a following ordinary
+        # SET still succeeds -- FILTER_SETTINGS was not left poisoned.
+        monkeypatch.setattr(srv, "setup_depth_filters", real_setup)
+        assert json.loads(
+            srv._handle_set(b"SET spatial_smooth_delta=8"))["ok"] is True
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_generation_bump_happens_strictly_after_the_rebuild(monkeypatch):
+    """review Important-2: test_a_write_retires_sessions_greeted_before_it only
+    checks FINAL state, so it would still pass if `_camera_generation += 1` were
+    moved above `depth_filters = setup_depth_filters()` -- exactly the ordering
+    bug the whole design exists to prevent (a client greeted between the bump
+    and the rebuild would get old names/options stamped with the new
+    generation, never be retired, and read frames through a chain its greeting
+    does not describe). Spy on setup_depth_filters to pin the order directly."""
+    try:
+        _fresh(monkeypatch)
+        gen = srv._camera_generation
+        real = srv.setup_depth_filters
+
+        def spy():
+            assert srv._camera_generation == gen, \
+                "generation bumped before the rebuild"
+            return real()
+
+        monkeypatch.setattr(srv, "setup_depth_filters", spy)
+        reply = json.loads(srv._handle_set(b"SET spatial_smooth_delta=8"))
+        assert reply["ok"] is True
+        assert srv._camera_generation == gen + 1
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
+
+
+def test_non_finite_values_are_rejected(monkeypatch):
+    """review rider 2: float("nan") and float("inf") both parse as valid
+    floats. Unchecked, SET spatial_smooth_delta=nan would land in
+    FILTER_SETTINGS while setup_depth_filters' own `s[key] >= 0` guard is False
+    for nan, so the filter silently keeps its SDK default -- FILTER_SETTINGS
+    then claims a value that never reached anything."""
+    try:
+        _fresh(monkeypatch)
+        gen = srv._camera_generation
+        assert json.loads(
+            srv._handle_set(b"SET spatial_smooth_delta=nan"))["ok"] is False
+        assert json.loads(
+            srv._handle_set(b"SET spatial_smooth_delta=inf"))["ok"] is False
+        assert json.loads(
+            srv._handle_set(b"SET spatial_smooth_delta=-inf"))["ok"] is False
+        assert srv._camera_generation == gen                  # nothing landed
+        assert srv.FILTER_SETTINGS["spatial_smooth_delta"] == -1.0
+    finally:
+        monkeypatch.undo()
+        importlib.reload(srv)
