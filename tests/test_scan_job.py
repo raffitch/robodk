@@ -3898,3 +3898,72 @@ def test_a_run_that_fails_after_fusion_still_archives_its_evidence():
             scan_service.work_plane_from_points = orig_fit
 
     print("[archive] a post-fusion failure leaves the fused cloud + failure.json")
+
+
+def test_a_restarted_backend_restores_the_plan_from_the_targets_still_in_robodk():
+    """Targets outlive the backend; the plan that gave them meaning must too.
+
+    TasniScan_* live in RoboDK and survive a restart, but everything /run needs
+    -- surface_size_mm, survey, crop_size_mm, provenance, lock token -- was
+    in-memory instance state, rebuilt empty on every start. Running restored
+    targets without it means BOTH bounding branches are skipped (crop_size_mm
+    and surface_size_mm are None), so _locked_work_region never places the
+    locked rectangle and the run silently reports the raw fitted plane as the
+    work surface. On a platform flush with a larger surface that is simply the
+    wrong answer, reported as success.
+
+    So a fresh ScanModule that finds targets in RoboDK must rebuild the SAME
+    ScanParams the generating instance would have used -- which is also what
+    lets the operator skip re-locking and re-generating after a restart.
+    """
+    import tasni.modules.scan.module as scan_module
+
+    services, _state, started = _build_fakes_with_jobs()
+    with tempfile.TemporaryDirectory() as t:
+        orig_root = runs.REPO_ROOT
+        runs.REPO_ROOT = Path(t)
+        try:
+            before = scan_module.ScanModule(services)
+            before.surface_lock(scan_module.SurfaceLockBody(mode="auto"))
+            before.poses_generate()
+            before.run()
+            params_before = started["job"].params
+            # the plan is worth restoring only if it actually carries placement
+            assert params_before.surface_size_mm or params_before.crop_size_mm
+
+            # a restart: new instance, same RoboDK, targets still there
+            after = scan_module.ScanModule(services)
+            assert after._planned_surface_size_mm is None, "fixture no longer models a restart"
+            assert len(services.rdk.list_targets(services.config.scan.target_prefix)) > 0
+
+            after.run()
+            params_after = started["job"].params
+
+            # Everything but the survey must come back identical.
+            assert params_after.voxel_size_m == params_before.voxel_size_m
+            assert params_after.crop_size_mm == params_before.crop_size_mm
+            assert params_after.surface_size_mm == params_before.surface_size_mm
+            assert params_after.boundary_provenance == params_before.boundary_provenance
+
+            # The survey is compared through a JSON round trip, because that is
+            # what persistence does to it: JSON has no tuple, so every tuple in
+            # the record comes back a list. Nothing else may change -- this still
+            # catches a dropped key, a mangled number or a wrong value, and every
+            # consumer reads these through np.asarray, which cannot tell the two
+            # containers apart. Asserting tuple identity would be asserting an
+            # in-memory representation detail, not behaviour.
+            assert json.loads(json.dumps(params_before.survey)) == params_after.survey
+
+            # The one thing that actually has to hold: the rectangle lands in the
+            # same place. This is the failure being prevented -- a restored run
+            # that silently falls back to the camera aim.
+            from tasni.modules.scan.service import survey_placement
+            centre_before, x_before = survey_placement(params_before.survey)
+            centre_after, x_after = survey_placement(params_after.survey)
+            assert centre_before is not None and centre_after is not None
+            np.testing.assert_allclose(centre_after, centre_before, atol=1e-9)
+            np.testing.assert_allclose(x_after, x_before, atol=1e-9)
+        finally:
+            runs.REPO_ROOT = orig_root
+
+    print("[restart] targets still in RoboDK -> plan restored, run keeps its placement")

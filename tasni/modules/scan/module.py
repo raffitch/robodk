@@ -7,6 +7,7 @@ the pure ``reconstruct``/``plane``/``depth_gate`` libraries.
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
 import uuid
@@ -309,6 +310,7 @@ class ScanModule(WorkflowModule):
                 self._planned_provenance = result_dict.get("boundary_provenance")
                 self._planned_survey = result_dict.get("survey")
                 self._targets_token = result_dict.get("lock_token") or ""
+                self._save_plan()
             self._locked_surface = None
             return result_dict
         except LargeSurfaceRequired as e:
@@ -319,6 +321,85 @@ class ScanModule(WorkflowModule):
             raise HTTPException(400, str(e))
         except Exception as e:
             raise HTTPException(503, f"RoboDK/camera unavailable: {e}")
+
+    # ---- the plan behind the targets, across a restart ---------------------
+    # TasniScan_* live in the station and survive a backend restart; the plan
+    # that gives them meaning lived only in this instance. Running restored
+    # targets without it skips BOTH bounding branches (crop_size_mm and
+    # surface_size_mm are None), so _locked_work_region never places the locked
+    # rectangle and the run reports the raw fitted plane as the work surface --
+    # wrong, and reported as success. Persisting the plan next to the targets
+    # keeps them meaningful, and lets the operator skip re-locking and
+    # re-generating (the slow part: the lock plus a 48-pose collision sweep).
+    _PLAN_FILE = "planned_targets.json"
+
+    def _plan_path(self):
+        from ...core import runs
+        return runs.module_dir("scan") / self._PLAN_FILE
+
+    def _save_plan(self) -> None:
+        """Record the plan that produced the targets now in the station."""
+        try:
+            prefix = self.services.config.scan.target_prefix
+            payload = {
+                "target_prefix": prefix,
+                "target_count": len(self.services.rdk.list_targets(prefix)),
+                "voxel_size_m": self._planned_voxel_m,
+                "crop_size_mm": (list(self._planned_crop_mm)
+                                 if self._planned_crop_mm else None),
+                "surface_size_mm": (list(self._planned_surface_size_mm)
+                                    if self._planned_surface_size_mm else None),
+                "boundary_provenance": self._planned_provenance,
+                "survey": self._planned_survey,
+                "lock_token": self._targets_token,
+            }
+            path = self._plan_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as e:      # noqa: BLE001 - never fail a good generate over this
+            log.warning("could not save the target plan: %s", e)
+
+    def _restore_plan(self) -> bool:
+        """Reload the plan for targets this process did not generate.
+
+        Only when this instance has no plan of its own, and only when the file
+        still describes the targets actually in the station -- a stale plan
+        against a different set of targets is worse than no plan, because it
+        would place a rectangle measured somewhere else.
+        """
+        if self._planned_survey or self._planned_surface_size_mm or self._planned_crop_mm:
+            return False                      # this instance planned them; trust that
+        try:
+            path = self._plan_path()
+            if not path.is_file():
+                return False
+            plan = json.loads(path.read_text(encoding="utf-8"))
+            prefix = self.services.config.scan.target_prefix
+            if plan.get("target_prefix") != prefix:
+                return False
+            if int(plan.get("target_count") or 0) != len(
+                    self.services.rdk.list_targets(prefix)):
+                log.warning("ignoring the saved target plan: it describes %s targets "
+                            "but the station has %s", plan.get("target_count"),
+                            len(self.services.rdk.list_targets(prefix)))
+                return False
+            self._planned_voxel_m = plan.get("voxel_size_m")
+            crop = plan.get("crop_size_mm")
+            self._planned_crop_mm = tuple(crop) if crop else None
+            extent = plan.get("surface_size_mm")
+            self._planned_surface_size_mm = tuple(extent) if extent else None
+            self._planned_provenance = plan.get("boundary_provenance")
+            self._planned_survey = plan.get("survey")
+            # Both sides of the Task 8 guard, together. It exists to catch a
+            # re-lock or unlock AFTER generation; a restart is neither, and the
+            # targets still match the lock this plan came from. Restoring only
+            # the targets' side would make the guard refuse every restored run.
+            self._targets_token = plan.get("lock_token") or ""
+            self._current_lock_token = self._targets_token or None
+            return True
+        except Exception as e:      # noqa: BLE001 - a bad plan file must not block a run
+            log.warning("could not restore the target plan: %s", e)
+            return False
 
     def run(self) -> dict:
         """Start the capture+fuse job for the currently generated TasniScan_*
@@ -338,6 +419,9 @@ class ScanModule(WorkflowModule):
         sc = services.config.scan
         if services.jobs.running:
             raise HTTPException(409, "a job is already running")
+        if self._restore_plan():
+            log.info("restored the saved target plan for the TasniScan_* already in "
+                     "the station — no re-lock or re-generate needed")
         token = self._targets_token
         if token and self._current_lock_token != token:
             raise HTTPException(409, "targets predate the current surface lock "
