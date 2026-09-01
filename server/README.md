@@ -189,6 +189,7 @@ per-pose depth transfer over the cell's Wi-Fi (a full frame can take 6–11 s):
   `<I idx><I thumb_len><thumb JPEG>` for the live per-pose strip (`thumb_len=0` = skip).
 - `GET` — `<I count>` then every buffered frame in the framing above.
 - `CLEAR` — drop the buffer, reply `<I 0>`.
+- `SET [k=v ...]` — one JSON line: `{"ok":true,"filters":[...],"filter_options":{...}}` (achieved values) or `{"ok":false,"error":"..."}`. A successful write retires the generation — sessions greeted before it end (the issuing one too, after the reply) and reconnect into a fresh greeting. A bare `SET` is a read. Overrides never survive a service restart.
 
 The buffer is RAM-only and is dropped in `finally`, so an abandoned burst leaves
 nothing on the Jetson. Command reads use a 180 s timeout (the robot is moving

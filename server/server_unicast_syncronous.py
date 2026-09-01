@@ -1627,6 +1627,14 @@ def stream_burst(conn, addr, max_frames=64):
                   (identical per-frame framing to the normal stream, so the client
                   reuses its decoder).
         CLEAR  -> drop the buffer; reply ``<I 0>``.
+        SET    -> ``SET [key=value ...]``: change safe-tier depth-filter settings
+                  at runtime (runtime-parameters spec). Reply is ONE JSON line:
+                  {"ok":true,"filters":[...],"filter_options":{...}} with the
+                  ACHIEVED values, or {"ok":false,"error":"..."}. A successful
+                  write retires the camera generation: every session greeted
+                  before it (THIS one included, after the reply) is closed and
+                  reconnects into a fresh greeting. Bare SET = read-only.
+                  Overrides die on restart -- the unit file stays the boot truth.
 
     The buffer is RAM-only and is ALSO dropped when the connection ends (finally), so
     an abandoned/dropped burst leaves NO data on the Jetson — no disk garbage. Between
@@ -1652,9 +1660,23 @@ def stream_burst(conn, addr, max_frames=64):
             # The next command may be many seconds away (the robot is moving between
             # poses); wait generously rather than dropping the connection.
             conn.settimeout(180.0)
-            cmd = _recv_line(conn).strip().upper()
+            # maxlen 256: a multi-key SET line (spec 3.1) outgrows the default 64.
+            line = _recv_line(conn, maxlen=256)
+            cmd = line.strip().upper()
             if not cmd:
                 break                      # peer closed
+
+            if cmd == b'SET' or cmd.startswith(b'SET '):
+                # Runtime filter settings (runtime-parameters spec 3.1). Reply
+                # FIRST; a successful WRITE bumped the generation, so the
+                # top-of-loop staleness check ends this session on the next
+                # iteration -- after the reply is out. The client reconnects
+                # into a fresh greeting that records the new values. A bare SET
+                # (a read) bumps nothing and the session continues. NOTE the
+                # case split: keys are lowercase, so parse from `line`, not
+                # the uppercased `cmd`.
+                conn.sendall(_handle_set(line.strip()))
+                continue
 
             if cmd == b'CAP':
                 depth = color = None

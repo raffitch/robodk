@@ -50,7 +50,7 @@ outlive the process.
 | spatial `magnitude`, `smooth_alpha`, `holes_fill` | SDK defaults, never touched | in |
 | temporal `smooth_alpha`, `smooth_delta`, `persistency` | SDK defaults, never touched | in |
 | threshold min/max | `RS_DEPTH_MIN_M=0.15`, `RS_DEPTH_MAX_M=1.5` module constants | in — §6.4 (gains env vars) |
-| decimation | absent, deliberately (full-resolution scan data) | in, default off |
+| decimation | absent, deliberately (full-resolution scan data) | in as a recorded constant 0 — enabling it at runtime is refused (it changes the depth geometry the greeting declared; restart path, §2.5) |
 | hole filling | absent, deliberately (fabricates depth at surface edges) | in, default off |
 
 Decimation and hole filling are included as *explicit* toggles defaulting off, so that
