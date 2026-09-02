@@ -4,6 +4,10 @@ Entry point for **any** agent working in this repo — Codex, Cursor, Copilot, a
 Claude session. It carries the operational knowledge that is otherwise only in one
 assistant's private memory store, so nothing here depends on which tool you are.
 
+That private memory is now mirrored into the repo too — **[.claude/memory/](.claude/memory/)**
+holds 44 notes on what was measured, what was tried and **refused**, and which fixes are
+load-bearing. Read **[.claude/README.md](.claude/README.md)** for how to restore it.
+
 **[CLAUDE.md](CLAUDE.md) is the full project brief** — what this station is, the RoboDK
 extract/sync loop, the `tasni/` platform, the north star, the roadmap. Read it after this
 file. Everything in it applies to you too; the filename is historical.

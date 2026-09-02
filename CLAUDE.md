@@ -26,8 +26,14 @@ For fast orientation before opening long handoff docs, read
 
 **[AGENTS.md](AGENTS.md)** is the tool-agnostic entry point (Codex, Cursor, a fresh
 Claude): the working agreement, the environment traps, and what is currently open.
-Keep it in sync when any of those change — it is the only copy of that knowledge that
-is not inside one assistant's private memory.
+Keep it in sync when any of those change.
+
+**[.claude/README.md](.claude/README.md)** is the assistant context: the accumulated
+project memory (`.claude/memory/`, 44 notes on what was measured, what was tried and
+**refused**, and which fixes are load-bearing) plus how to restore it and the
+Superpowers plugin on a new machine. That memory used to live only in one laptop's
+`~/.claude` and is now mirrored into the repo — refresh it before committing with
+`py -3.10 tools/sync_claude_memory.py` (`--check` exits 1 on drift).
 
 ## The editing loop
 
@@ -126,7 +132,7 @@ you drive the real cell, not an empty station). Run it on Windows with
 `.\start.ps1 prod` builds + serves on :8000. (`start.sh` is the Git Bash equivalent.)
 
 ## Roadmap / status (updated 2026-06-22)
-- ✅ Extract macros → monorepo → GitHub (private: `raffitch/robodk`)
+- ✅ Extract macros → monorepo → GitHub (private: `raffitch/tasni`)
 - ✅ Best-practices research → [docs/best-practices-review.md](docs/best-practices-review.md)
 - ✅ **#2 Jetson hardening**: monorepo, systemd service, deploy tool, cron cleanup
 - ✅ **#1 Calibration module = the app's first slice** (merged to `main`; local commits

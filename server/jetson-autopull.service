@@ -1,6 +1,6 @@
 [Unit]
 Description=Auto-pull robodk monorepo branch and restart camera on server changes
-Documentation=https://github.com/raffitch/robodk
+Documentation=https://github.com/raffitch/tasni
 After=network-online.target
 Wants=network-online.target
 

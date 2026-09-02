@@ -32,7 +32,7 @@ AUTOPULL_SH_LOCAL = os.path.join(HERE, "..", "server", "jetson-autopull.sh")
 AUTOPULL_SVC_LOCAL = os.path.join(HERE, "..", "server", "jetson-autopull.service")
 AUTOPULL_TIMER_LOCAL = os.path.join(HERE, "..", "server", "jetson-autopull.timer")
 
-REPO_URL = "https://github.com/raffitch/robodk.git"
+REPO_URL = "https://github.com/raffitch/tasni.git"
 REPO_DIR = "/home/jetson/robodk"
 VENV_PY = "/home/jetson/EtherSenseServer/ethenv/bin/python"
 SERVER = "/home/jetson/robodk/server/server_unicast_syncronous.py"

@@ -1,6 +1,6 @@
 [Unit]
 Description=RealSense D435i EtherSense camera server (RoboDK scan cell)
-Documentation=https://github.com/raffitch/robodk
+Documentation=https://github.com/raffitch/tasni
 After=network-online.target
 Wants=network-online.target
 # Never give up restarting (camera/USB may be slow to enumerate at boot).
