@@ -73,6 +73,15 @@ py -3.10 tools/jetson_deploy.py deploy    # immediate pull + restart from the cu
 py -3.10 tools/jetson_deploy.py bootstrap # (re)install service + auto-pull, idempotent
 ```
 
+Because this repo is **private**, the Nano cannot clone it anonymously the way it
+could the old public one. It authenticates with a **read-only deploy key**
+(`~/.ssh/tasni_deploy`, plus a `Host github-tasni` block in `~/.ssh/config`), scoped
+to this repo alone — so a shop-floor device never holds an account-wide token in
+plaintext. Add the public key under **Settings → Deploy keys** before bootstrapping a
+fresh Nano. Note the auto-pull script exits 0 on *any* failure by design, so a
+credential problem shows up as the camera silently running stale code — check
+`jetson_deploy.py status` after changing anything about the remote.
+
 Device details, firmware versions and known operational issues:
 [docs/jetson-scanner.md](docs/jetson-scanner.md).
 Credentials live in `secrets/jetson.env` — **git-ignored, never committed**.

@@ -32,7 +32,13 @@ AUTOPULL_SH_LOCAL = os.path.join(HERE, "..", "server", "jetson-autopull.sh")
 AUTOPULL_SVC_LOCAL = os.path.join(HERE, "..", "server", "jetson-autopull.service")
 AUTOPULL_TIMER_LOCAL = os.path.join(HERE, "..", "server", "jetson-autopull.timer")
 
-REPO_URL = "https://github.com/raffitch/tasni.git"
+# raffitch/tasni is PRIVATE, so the Jetson cannot clone it anonymously the way it
+# could the old public repo. It authenticates with a read-only DEPLOY KEY:
+#   ~/.ssh/tasni_deploy  + a "Host github-tasni" block in ~/.ssh/config
+# scoped to this one repo, so a shop-floor device never holds an account-wide
+# token in plaintext. Add the public key under the repo's Settings > Deploy keys
+# (read-only) before running bootstrap on a fresh Nano.
+REPO_URL = "github-tasni:raffitch/tasni.git"
 REPO_DIR = "/home/jetson/robodk"
 VENV_PY = "/home/jetson/EtherSenseServer/ethenv/bin/python"
 SERVER = "/home/jetson/robodk/server/server_unicast_syncronous.py"
