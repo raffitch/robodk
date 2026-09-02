@@ -32,3 +32,6 @@ models/*.pt
 
 # Claude Code session worktrees (git worktrees nested in the checkout)
 .claude/worktrees/
+
+# ICASF paper working folder (94 MB of drafts/PDFs) — local only, not source.
+ICASF/
